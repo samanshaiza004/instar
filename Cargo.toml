@@ -1,6 +1,16 @@
-[package]
-name = "youth"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/youth-tree",
+    "crates/youth-runtime",
+    "crates/youth-cli",
+    "guests/counter",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = true

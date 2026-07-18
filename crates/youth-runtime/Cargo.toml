@@ -1,0 +1,8 @@
+[package]
+name = "youth-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth host runtime: Wasmtime engine, component loading, WIT bindings, closed WASI context, serialized app worker."
+
+[dependencies]

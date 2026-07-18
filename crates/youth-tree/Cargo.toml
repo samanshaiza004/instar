@@ -1,0 +1,10 @@
+[package]
+name = "youth-tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure retained semantic-tree engine for Youth: nodes, revisions, patches, validation, atomic batch application, canonical snapshots."
+
+[dependencies]
+
+[dev-dependencies]

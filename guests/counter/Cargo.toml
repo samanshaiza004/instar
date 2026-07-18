@@ -1,0 +1,11 @@
+[package]
+name = "youth-counter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "First valid Youth component: an in-memory counter exporting youth:app/application."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

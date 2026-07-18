@@ -1,0 +1,12 @@
+[package]
+name = "youth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin inspection and test surface for the Youth runtime."
+
+[[bin]]
+name = "youth"
+path = "src/main.rs"
+
+[dependencies]
