@@ -6,3 +6,13 @@ license.workspace = true
 description = "Youth host runtime: Wasmtime engine, component loading, WIT bindings, closed WASI context, serialized app worker."
 
 [dependencies]
+thiserror = "2.0.19"
+tokio = { version = "1.53.0", features = ["rt", "sync", "macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+wasmtime = "46"
+wasmtime-wasi = "46"
+youth-tree = { path = "../youth-tree" }
+
+[dev-dependencies]
+tracing-subscriber = "0.3.23"
+wat = "1.253.0"
