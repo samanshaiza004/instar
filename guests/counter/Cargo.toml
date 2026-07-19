@@ -9,3 +9,4 @@ description = "First valid Youth component: an in-memory counter exporting youth
 crate-type = ["cdylib"]
 
 [dependencies]
+wit-bindgen = "0.51.0"
