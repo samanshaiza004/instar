@@ -6,5 +6,5 @@ license.workspace = true
 description = "Pure retained semantic-tree engine for Youth: nodes, revisions, patches, validation, atomic batch application, canonical snapshots."
 
 [dependencies]
-
-[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
