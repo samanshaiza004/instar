@@ -112,7 +112,11 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "youth script failed with exit code $($process.ExitCode): $stderr"
           }
-          $expected = [IO.File]::ReadAllText("tests/fixtures/three-clicks.expected").Replace("`r`n", "`n")
+          # Compared byte-for-byte on purpose. The canonical format is LF
+          # only, .gitattributes keeps the fixture LF on every checkout, and
+          # Rust's println! never emits CRLF -- so normalizing here would
+          # hide a real determinism regression rather than tolerate noise.
+          $expected = [IO.File]::ReadAllText("tests/fixtures/three-clicks.expected")
           if ($stdout -ne $expected) {
             throw "canonical snapshot differs from tests/fixtures/three-clicks.expected"
           }

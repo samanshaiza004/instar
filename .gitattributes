@@ -1,0 +1,11 @@
+# General rule first: later patterns win in gitattributes, so the
+# specific overrides below must come after this one.
+# Keep every text file LF in the working tree on every platform, so the
+# canonical format's "normalize line endings" rule holds at rest too.
+* text=auto eol=lf
+
+*.wasm binary
+
+# Canonical snapshot fixtures are byte-exact and hashed across platforms.
+# Treat them as binary so no checkout ever rewrites their line endings.
+tests/fixtures/*.expected -text
