@@ -8,3 +8,6 @@ description = "Pure retained semantic-tree engine for Youth: nodes, revisions, p
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

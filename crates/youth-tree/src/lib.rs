@@ -75,6 +75,7 @@ pub struct Limits {
     pub max_children: usize,
     pub max_text_len: usize,
     pub max_label_len: usize,
+    pub max_patches: usize,
 }
 
 impl Default for Limits {
@@ -85,8 +86,104 @@ impl Default for Limits {
             max_children: 4_096,
             max_text_len: 64 * 1024,
             max_label_len: 4 * 1024,
+            max_patches: 10_000,
         }
     }
+}
+
+/// A single ordered mutation to a retained semantic tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Patch {
+    Create {
+        node: Node,
+    },
+    Delete {
+        id: NodeId,
+    },
+    SetText {
+        id: NodeId,
+        value: String,
+    },
+    SetLabel {
+        id: NodeId,
+        value: String,
+    },
+    SetEnabled {
+        id: NodeId,
+        value: bool,
+    },
+    InsertChild {
+        parent: NodeId,
+        index: u32,
+        child: NodeId,
+    },
+    RemoveChild {
+        parent: NodeId,
+        index: u32,
+        expected_child: NodeId,
+    },
+    MoveChild {
+        parent: NodeId,
+        from_index: u32,
+        to_index: u32,
+        expected_child: NodeId,
+    },
+}
+
+/// An atomic, revision-checked sequence of patches.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PatchBatch {
+    pub base_revision: u64,
+    pub next_revision: u64,
+    pub patches: Vec<Patch>,
+}
+
+/// Why an atomic patch batch was rejected.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PatchError {
+    #[error("patch base revision {actual} does not match live revision {expected}")]
+    RevisionMismatch { expected: u64, actual: u64 },
+    #[error("invalid revision transition from {base} to {next} for {patch_count} patches")]
+    InvalidRevisionTransition {
+        base: u64,
+        next: u64,
+        patch_count: usize,
+    },
+    #[error("batch has {actual} patches, exceeding the limit of {max}")]
+    TooManyPatches { actual: usize, max: usize },
+    #[error("patch {patch_index} creates already-existing node {id}")]
+    DuplicateCreate { patch_index: usize, id: NodeId },
+    #[error("patch {patch_index} creates node {id} with attached children")]
+    CreateNotDetached { patch_index: usize, id: NodeId },
+    #[error("patch {patch_index} attaches node {child} more than once")]
+    AttachedTwice { patch_index: usize, child: NodeId },
+    #[error("patch {patch_index} deletes attached node {id}")]
+    DeleteAttached { patch_index: usize, id: NodeId },
+    #[error("patch {patch_index} deletes non-leaf node {id}")]
+    DeleteNonLeaf { patch_index: usize, id: NodeId },
+    #[error("patch {patch_index} refers to unknown node {id}")]
+    UnknownNode { patch_index: usize, id: NodeId },
+    #[error("patch {patch_index} refers to unknown parent {parent}")]
+    UnknownParent { patch_index: usize, parent: NodeId },
+    #[error("patch {patch_index} expected child {expected} but found {actual}")]
+    WrongExpectedChild {
+        patch_index: usize,
+        expected: NodeId,
+        actual: NodeId,
+    },
+    #[error("patch {patch_index} index {index} is out of range for length {len}")]
+    IndexOutOfRange {
+        patch_index: usize,
+        index: u32,
+        len: usize,
+    },
+    #[error("patch {patch_index} applies an operation incompatible with node {id}")]
+    WrongNodeKind { patch_index: usize, id: NodeId },
+    #[error("node {id}, created by patch {patch_index}, is unreachable after the batch")]
+    UnreachableAfterBatch { patch_index: usize, id: NodeId },
+    #[error("staged tree validation failed: {0}")]
+    Validation(#[from] ValidationError),
 }
 
 /// Why an unvalidated snapshot was rejected.
@@ -314,6 +411,233 @@ impl Tree {
         self.nodes.get(&id)
     }
 
+    /// Applies an ordered patch batch atomically.
+    ///
+    /// Every mutation is made to a clone. The live tree is replaced only after
+    /// all patches and full-tree validation succeed.
+    pub fn apply(&mut self, batch: PatchBatch, limits: &Limits) -> Result<(), PatchError> {
+        if batch.base_revision != self.revision {
+            return Err(PatchError::RevisionMismatch {
+                expected: self.revision,
+                actual: batch.base_revision,
+            });
+        }
+        if batch.patches.len() > limits.max_patches {
+            return Err(PatchError::TooManyPatches {
+                actual: batch.patches.len(),
+                max: limits.max_patches,
+            });
+        }
+
+        let valid_transition = if batch.patches.is_empty() {
+            batch.next_revision == batch.base_revision
+        } else {
+            batch
+                .base_revision
+                .checked_add(1)
+                .is_some_and(|next| batch.next_revision == next)
+        };
+        if !valid_transition {
+            return Err(PatchError::InvalidRevisionTransition {
+                base: batch.base_revision,
+                next: batch.next_revision,
+                patch_count: batch.patches.len(),
+            });
+        }
+
+        let mut staged = self.clone();
+        let mut created = BTreeMap::<NodeId, usize>::new();
+        for (patch_index, patch) in batch.patches.into_iter().enumerate() {
+            staged.apply_one(patch, patch_index, &mut created)?;
+        }
+        for (&id, &patch_index) in &created {
+            if id != staged.root && !staged.parents.contains_key(&id) {
+                return Err(PatchError::UnreachableAfterBatch { patch_index, id });
+            }
+        }
+
+        let validated = Self::from_snapshot(
+            TreeSnapshot {
+                revision: batch.next_revision,
+                root: staged.root,
+                nodes: staged.nodes.into_values().collect(),
+            },
+            limits,
+        )?;
+        *self = validated;
+        Ok(())
+    }
+
+    fn apply_one(
+        &mut self,
+        patch: Patch,
+        patch_index: usize,
+        created: &mut BTreeMap<NodeId, usize>,
+    ) -> Result<(), PatchError> {
+        match patch {
+            Patch::Create { node } => {
+                let id = node.id;
+                if self.nodes.contains_key(&id) {
+                    return Err(PatchError::DuplicateCreate { patch_index, id });
+                }
+                if !node.children.is_empty() {
+                    return Err(PatchError::CreateNotDetached { patch_index, id });
+                }
+                self.nodes.insert(id, node);
+                created.insert(id, patch_index);
+            }
+            Patch::Delete { id } => {
+                let node = self
+                    .nodes
+                    .get(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                if self.parents.contains_key(&id) {
+                    return Err(PatchError::DeleteAttached { patch_index, id });
+                }
+                if !node.children.is_empty() {
+                    return Err(PatchError::DeleteNonLeaf { patch_index, id });
+                }
+                self.nodes.remove(&id);
+                created.remove(&id);
+            }
+            Patch::SetText { id, value } => {
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                let NodeData::Text { value: current } = &mut node.data else {
+                    return Err(PatchError::WrongNodeKind { patch_index, id });
+                };
+                *current = value;
+            }
+            Patch::SetLabel { id, value } => {
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                let NodeData::Button { label, .. } = &mut node.data else {
+                    return Err(PatchError::WrongNodeKind { patch_index, id });
+                };
+                *label = value;
+            }
+            Patch::SetEnabled { id, value } => {
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                match &mut node.data {
+                    NodeData::Box { enabled } | NodeData::Button { enabled, .. } => {
+                        *enabled = value;
+                    }
+                    NodeData::Root | NodeData::Text { .. } => {
+                        return Err(PatchError::WrongNodeKind { patch_index, id });
+                    }
+                }
+            }
+            Patch::InsertChild {
+                parent,
+                index,
+                child,
+            } => {
+                let len = self
+                    .nodes
+                    .get(&parent)
+                    .ok_or(PatchError::UnknownParent {
+                        patch_index,
+                        parent,
+                    })?
+                    .children
+                    .len();
+                if !self.nodes.contains_key(&child) {
+                    return Err(PatchError::UnknownNode {
+                        patch_index,
+                        id: child,
+                    });
+                }
+                if self.parents.contains_key(&child) {
+                    return Err(PatchError::AttachedTwice { patch_index, child });
+                }
+                let index_usize = insertion_index(index, len, patch_index)?;
+                let parent_node = self
+                    .nodes
+                    .get_mut(&parent)
+                    .ok_or(PatchError::UnknownParent {
+                        patch_index,
+                        parent,
+                    })?;
+                parent_node.children.insert(index_usize, child);
+                self.parents.insert(child, parent);
+            }
+            Patch::RemoveChild {
+                parent,
+                index,
+                expected_child,
+            } => {
+                let parent_node = self
+                    .nodes
+                    .get_mut(&parent)
+                    .ok_or(PatchError::UnknownParent {
+                        patch_index,
+                        parent,
+                    })?;
+                let index_usize = existing_index(index, parent_node.children.len(), patch_index)?;
+                let actual = parent_node.children.get(index_usize).copied().ok_or(
+                    PatchError::IndexOutOfRange {
+                        patch_index,
+                        index,
+                        len: parent_node.children.len(),
+                    },
+                )?;
+                if actual != expected_child {
+                    return Err(PatchError::WrongExpectedChild {
+                        patch_index,
+                        expected: expected_child,
+                        actual,
+                    });
+                }
+                parent_node.children.remove(index_usize);
+                self.parents.remove(&actual);
+            }
+            Patch::MoveChild {
+                parent,
+                from_index,
+                to_index,
+                expected_child,
+            } => {
+                let parent_node = self
+                    .nodes
+                    .get_mut(&parent)
+                    .ok_or(PatchError::UnknownParent {
+                        patch_index,
+                        parent,
+                    })?;
+                let len = parent_node.children.len();
+                let from = existing_index(from_index, len, patch_index)?;
+                let to = existing_index(to_index, len, patch_index)?;
+                let actual =
+                    parent_node
+                        .children
+                        .get(from)
+                        .copied()
+                        .ok_or(PatchError::IndexOutOfRange {
+                            patch_index,
+                            index: from_index,
+                            len,
+                        })?;
+                if actual != expected_child {
+                    return Err(PatchError::WrongExpectedChild {
+                        patch_index,
+                        expected: expected_child,
+                        actual,
+                    });
+                }
+                let child = parent_node.children.remove(from);
+                parent_node.children.insert(to, child);
+            }
+        }
+        Ok(())
+    }
+
     /// Converts the retained tree to its deterministic exchange representation.
     #[must_use]
     pub fn to_snapshot(&self) -> TreeSnapshot {
@@ -354,6 +678,38 @@ impl Tree {
         }
         output
     }
+}
+
+fn existing_index(index: u32, len: usize, patch_index: usize) -> Result<usize, PatchError> {
+    let converted = usize::try_from(index).map_err(|_| PatchError::IndexOutOfRange {
+        patch_index,
+        index,
+        len,
+    })?;
+    if converted >= len {
+        return Err(PatchError::IndexOutOfRange {
+            patch_index,
+            index,
+            len,
+        });
+    }
+    Ok(converted)
+}
+
+fn insertion_index(index: u32, len: usize, patch_index: usize) -> Result<usize, PatchError> {
+    let converted = usize::try_from(index).map_err(|_| PatchError::IndexOutOfRange {
+        patch_index,
+        index,
+        len,
+    })?;
+    if converted > len {
+        return Err(PatchError::IndexOutOfRange {
+            patch_index,
+            index,
+            len,
+        });
+    }
+    Ok(converted)
 }
 
 fn detect_cycle(nodes: &BTreeMap<NodeId, Node>) -> Result<(), ValidationError> {
@@ -893,5 +1249,731 @@ mod tests {
         let second = validate(canonical_snapshot.clone()).unwrap();
         assert_eq!(second.to_snapshot(), canonical_snapshot);
         assert_eq!(second.canonical(), first.canonical());
+    }
+
+    fn patch_tree(nodes: Vec<Node>) -> Tree {
+        validate(snapshot(1, nodes)).unwrap()
+    }
+
+    fn batch(patches: Vec<Patch>) -> PatchBatch {
+        PatchBatch {
+            base_revision: 7,
+            next_revision: if patches.is_empty() { 7 } else { 8 },
+            patches,
+        }
+    }
+
+    #[test]
+    fn valid_create_attach_batch() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        tree.apply(
+            batch(vec![
+                Patch::Create {
+                    node: node(
+                        2,
+                        NodeData::Text {
+                            value: "hello".into(),
+                        },
+                        &[],
+                    ),
+                },
+                Patch::InsertChild {
+                    parent: id(1),
+                    index: 0,
+                    child: id(2),
+                },
+            ]),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(tree.revision(), 8);
+        assert_eq!(tree.node(id(1)).unwrap().children, vec![id(2)]);
+    }
+
+    #[test]
+    fn valid_detach_delete_batch() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(2, NodeData::Box { enabled: true }, &[]),
+        ]);
+        tree.apply(
+            batch(vec![
+                Patch::RemoveChild {
+                    parent: id(1),
+                    index: 0,
+                    expected_child: id(2),
+                },
+                Patch::Delete { id: id(2) },
+            ]),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(!tree.contains(id(2)));
+        assert_eq!(tree.node_count(), 1);
+    }
+
+    #[test]
+    fn valid_reorder_with_move_child() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2, 3, 4]),
+            node(2, NodeData::Box { enabled: true }, &[]),
+            node(3, NodeData::Box { enabled: true }, &[]),
+            node(4, NodeData::Box { enabled: true }, &[]),
+        ]);
+        tree.apply(
+            batch(vec![Patch::MoveChild {
+                parent: id(1),
+                from_index: 0,
+                to_index: 2,
+                expected_child: id(2),
+            }]),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree.node(id(1)).unwrap().children,
+            vec![id(3), id(4), id(2)]
+        );
+    }
+
+    #[test]
+    fn valid_empty_batch_is_no_op() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let before = tree.clone();
+        tree.apply(batch(vec![]), &Limits::default()).unwrap();
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn rejects_wrong_base_revision() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            PatchBatch {
+                base_revision: 6,
+                next_revision: 6,
+                patches: vec![],
+            },
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::RevisionMismatch {
+                expected: 7,
+                actual: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_skipped_next_revision() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            PatchBatch {
+                base_revision: 7,
+                next_revision: 9,
+                patches: vec![Patch::SetEnabled {
+                    id: id(1),
+                    value: true,
+                }],
+            },
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::InvalidRevisionTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_nonempty_batch_without_revision_increment() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            PatchBatch {
+                base_revision: 7,
+                next_revision: 7,
+                patches: vec![Patch::Delete { id: id(1) }],
+            },
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::InvalidRevisionTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_batch_with_revision_increment() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            PatchBatch {
+                base_revision: 7,
+                next_revision: 8,
+                patches: vec![],
+            },
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::InvalidRevisionTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_create() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::Create {
+                node: node(1, NodeData::Box { enabled: true }, &[]),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::DuplicateCreate { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_create_with_pre_attached_children() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::Create {
+                node: node(2, NodeData::Box { enabled: true }, &[1]),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::CreateNotDetached { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_patches() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let limits = Limits {
+            max_patches: 0,
+            ..Limits::default()
+        };
+        let result = tree.apply(batch(vec![Patch::Delete { id: id(1) }]), &limits);
+        assert!(matches!(
+            result,
+            Err(PatchError::TooManyPatches { actual: 1, max: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_delete_attached_node() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(2, NodeData::Box { enabled: true }, &[]),
+        ]);
+        let result = tree.apply(batch(vec![Patch::Delete { id: id(2) }]), &Limits::default());
+        assert!(matches!(
+            result,
+            Err(PatchError::DeleteAttached { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_delete_non_leaf() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(2, NodeData::Box { enabled: true }, &[3]),
+            node(3, NodeData::Text { value: "x".into() }, &[]),
+        ]);
+        let result = tree.apply(
+            batch(vec![
+                Patch::RemoveChild {
+                    parent: id(1),
+                    index: 0,
+                    expected_child: id(2),
+                },
+                Patch::Delete { id: id(2) },
+            ]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::DeleteNonLeaf { patch_index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_insert_unknown_child() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::InsertChild {
+                parent: id(1),
+                index: 0,
+                child: id(2),
+            }]),
+            &Limits::default(),
+        );
+        assert!(
+            matches!(result, Err(PatchError::UnknownNode { patch_index: 0, id: unknown }) if unknown == id(2))
+        );
+    }
+
+    #[test]
+    fn rejects_insert_unknown_parent() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::InsertChild {
+                parent: id(2),
+                index: 0,
+                child: id(1),
+            }]),
+            &Limits::default(),
+        );
+        assert!(
+            matches!(result, Err(PatchError::UnknownParent { patch_index: 0, parent }) if parent == id(2))
+        );
+    }
+
+    #[test]
+    fn rejects_remove_wrong_expected_child() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(2, NodeData::Box { enabled: true }, &[]),
+        ]);
+        let result = tree.apply(
+            batch(vec![Patch::RemoveChild {
+                parent: id(1),
+                index: 0,
+                expected_child: id(3),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::WrongExpectedChild { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_move_wrong_expected_child() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2, 3]),
+            node(2, NodeData::Box { enabled: true }, &[]),
+            node(3, NodeData::Box { enabled: true }, &[]),
+        ]);
+        let result = tree.apply(
+            batch(vec![Patch::MoveChild {
+                parent: id(1),
+                from_index: 0,
+                to_index: 1,
+                expected_child: id(3),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::WrongExpectedChild { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_index() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::RemoveChild {
+                parent: id(1),
+                index: u32::MAX,
+                expected_child: id(1),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::IndexOutOfRange { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_set_text_on_button() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(
+                2,
+                NodeData::Button {
+                    label: "go".into(),
+                    enabled: true,
+                },
+                &[],
+            ),
+        ]);
+        let result = tree.apply(
+            batch(vec![Patch::SetText {
+                id: id(2),
+                value: "bad".into(),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::WrongNodeKind { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_set_label_on_text() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(
+                2,
+                NodeData::Text {
+                    value: "hello".into(),
+                },
+                &[],
+            ),
+        ]);
+        let result = tree.apply(
+            batch(vec![Patch::SetLabel {
+                id: id(2),
+                value: "bad".into(),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::WrongNodeKind { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_attach_node_twice() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![
+                Patch::Create {
+                    node: node(2, NodeData::Box { enabled: true }, &[]),
+                },
+                Patch::InsertChild {
+                    parent: id(1),
+                    index: 0,
+                    child: id(2),
+                },
+                Patch::InsertChild {
+                    parent: id(1),
+                    index: 1,
+                    child: id(2),
+                },
+            ]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::AttachedTwice { patch_index: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_created_unreachable_node() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![Patch::Create {
+                node: node(2, NodeData::Box { enabled: true }, &[]),
+            }]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::UnreachableAfterBatch { patch_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn wraps_complete_staged_tree_validation_failure() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(
+                2,
+                NodeData::Text {
+                    value: "leaf".into(),
+                },
+                &[],
+            ),
+        ]);
+        let result = tree.apply(
+            batch(vec![
+                Patch::Create {
+                    node: node(3, NodeData::Box { enabled: true }, &[]),
+                },
+                Patch::InsertChild {
+                    parent: id(2),
+                    index: 0,
+                    child: id(3),
+                },
+            ]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::Validation(ValidationError::LeafWithChildren { node: leaf }))
+                if leaf == id(2)
+        ));
+    }
+
+    #[test]
+    fn failed_batch_is_atomic_including_revision_and_canonical_output() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2]),
+            node(
+                2,
+                NodeData::Text {
+                    value: "before".into(),
+                },
+                &[],
+            ),
+        ]);
+        let before_tree = tree.clone();
+        let before_revision = tree.revision();
+        let before_canonical = tree.canonical();
+        let result = tree.apply(
+            batch(vec![
+                Patch::SetText {
+                    id: id(2),
+                    value: "after".into(),
+                },
+                Patch::SetLabel {
+                    id: id(2),
+                    value: "invalid".into(),
+                },
+            ]),
+            &Limits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::WrongNodeKind { patch_index: 1, .. })
+        ));
+        assert_eq!(tree, before_tree);
+        assert_eq!(tree.revision(), before_revision);
+        assert_eq!(tree.canonical(), before_canonical);
+    }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arbitrary_string() -> impl Strategy<Value = String> {
+            prop::collection::vec(any::<char>(), 0..=128)
+                .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        fn arbitrary_node() -> impl Strategy<Value = Node> {
+            (
+                1_u64..=8,
+                0_u8..4,
+                arbitrary_string(),
+                any::<bool>(),
+                prop::collection::vec(1_u64..=8, 0..=16),
+            )
+                .prop_map(|(value, kind, string, enabled, children)| Node {
+                    id: id(value),
+                    data: match kind {
+                        0 => NodeData::Root,
+                        1 => NodeData::Box { enabled },
+                        2 => NodeData::Text { value: string },
+                        _ => NodeData::Button {
+                            label: string,
+                            enabled,
+                        },
+                    },
+                    children: children.into_iter().map(id).collect(),
+                })
+        }
+
+        fn arbitrary_snapshot() -> impl Strategy<Value = TreeSnapshot> {
+            (
+                any::<u64>(),
+                1_u64..=8,
+                prop::collection::vec(arbitrary_node(), 0..=16),
+            )
+                .prop_map(|(revision, root, nodes)| TreeSnapshot {
+                    revision,
+                    root: id(root),
+                    nodes,
+                })
+        }
+
+        fn arbitrary_valid_snapshot() -> impl Strategy<Value = TreeSnapshot> {
+            prop::collection::vec((0_u8..3, arbitrary_string(), any::<bool>()), 0..=7).prop_map(
+                |entries| {
+                    let children = (2_u64..).take(entries.len()).map(id).collect::<Vec<_>>();
+                    let mut nodes = vec![Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children,
+                    }];
+                    nodes.extend(entries.into_iter().enumerate().map(
+                        |(index, (kind, string, enabled))| Node {
+                            id: id(u64::try_from(index).unwrap_or(0) + 2),
+                            data: match kind {
+                                0 => NodeData::Box { enabled },
+                                1 => NodeData::Text { value: string },
+                                _ => NodeData::Button {
+                                    label: string,
+                                    enabled,
+                                },
+                            },
+                            children: vec![],
+                        },
+                    ));
+                    TreeSnapshot {
+                        revision: 7,
+                        root: id(1),
+                        nodes,
+                    }
+                },
+            )
+        }
+
+        fn arbitrary_patch() -> impl Strategy<Value = Patch> {
+            let node_id = (1_u64..=8).prop_map(id);
+            prop_oneof![
+                arbitrary_node().prop_map(|node| Patch::Create { node }),
+                node_id.clone().prop_map(|id| Patch::Delete { id }),
+                (node_id.clone(), arbitrary_string())
+                    .prop_map(|(id, value)| Patch::SetText { id, value }),
+                (node_id.clone(), arbitrary_string())
+                    .prop_map(|(id, value)| Patch::SetLabel { id, value }),
+                (node_id.clone(), any::<bool>())
+                    .prop_map(|(id, value)| Patch::SetEnabled { id, value }),
+                (node_id.clone(), any::<u32>(), node_id.clone()).prop_map(
+                    |(parent, index, child)| {
+                        Patch::InsertChild {
+                            parent,
+                            index,
+                            child,
+                        }
+                    }
+                ),
+                (node_id.clone(), any::<u32>(), node_id.clone()).prop_map(
+                    |(parent, index, expected_child)| Patch::RemoveChild {
+                        parent,
+                        index,
+                        expected_child,
+                    }
+                ),
+                (node_id.clone(), any::<u32>(), any::<u32>(), node_id,).prop_map(
+                    |(parent, from_index, to_index, expected_child)| Patch::MoveChild {
+                        parent,
+                        from_index,
+                        to_index,
+                        expected_child,
+                    }
+                ),
+            ]
+        }
+
+        fn property_limits() -> Limits {
+            Limits {
+                max_nodes: 8,
+                max_depth: 6,
+                max_children: 5,
+                max_text_len: 32,
+                max_label_len: 32,
+                max_patches: 12,
+            }
+        }
+
+        proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn arbitrary_malformed_snapshots_never_panic(snapshot in arbitrary_snapshot()) {
+            let result = Tree::from_snapshot(snapshot, &property_limits());
+            if let Ok(tree) = result {
+                let canonical_snapshot = tree.to_snapshot();
+                let round_trip = Tree::from_snapshot(
+                    canonical_snapshot.clone(),
+                    &property_limits(),
+                )
+                .expect("a validated tree's snapshot must revalidate");
+                prop_assert_eq!(round_trip.to_snapshot(), canonical_snapshot);
+                prop_assert_eq!(round_trip.canonical(), tree.canonical());
+            }
+        }
+
+        #[test]
+        fn arbitrary_patch_batches_are_atomic_and_preserve_invariants(
+            base_revision in prop_oneof![Just(7), any::<u64>()],
+            next_revision in prop_oneof![Just(7), Just(8), any::<u64>()],
+            patches in prop::collection::vec(arbitrary_patch(), 0..=16),
+        ) {
+            let mut tree = patch_tree(vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(2, NodeData::Box { enabled: true }, &[]),
+                node(3, NodeData::Text { value: "seed".into() }, &[]),
+            ]);
+            let before = tree.clone();
+            let before_revision = tree.revision();
+            let before_canonical = tree.canonical();
+            let result = tree.apply(
+                PatchBatch { base_revision, next_revision, patches },
+                &property_limits(),
+            );
+
+            match result {
+                Ok(()) => {
+                    let snapshot = tree.to_snapshot();
+                    let revalidated = Tree::from_snapshot(snapshot.clone(), &property_limits())
+                        .expect("an accepted tree's snapshot must revalidate");
+                    prop_assert_eq!(revalidated.to_snapshot(), snapshot);
+                    prop_assert_eq!(revalidated.canonical(), tree.canonical());
+                }
+                Err(_) => {
+                    prop_assert_eq!(&tree, &before);
+                    prop_assert_eq!(tree.revision(), before_revision);
+                    prop_assert_eq!(tree.canonical(), before_canonical);
+                }
+            }
+        }
+
+
+        #[test]
+        fn valid_snapshots_round_trip_canonically(snapshot in arbitrary_valid_snapshot()) {
+            let tree = Tree::from_snapshot(snapshot, &Limits::default())
+                .expect("the strategy only constructs valid trees");
+            let canonical_snapshot = tree.to_snapshot();
+            let round_trip = Tree::from_snapshot(canonical_snapshot.clone(), &Limits::default())
+                .expect("canonical snapshots must remain valid");
+            prop_assert_eq!(round_trip.to_snapshot(), canonical_snapshot);
+            prop_assert_eq!(round_trip.canonical(), tree.canonical());
+        }
+
+        #[test]
+        fn accepted_batches_always_revalidate(
+            value in arbitrary_string(),
+            enabled in any::<bool>(),
+            move_child in any::<bool>(),
+        ) {
+            let mut tree = patch_tree(vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(2, NodeData::Box { enabled: true }, &[]),
+                node(3, NodeData::Text { value: "seed".into() }, &[]),
+            ]);
+            let mut patches = vec![
+                Patch::SetEnabled { id: id(2), value: enabled },
+                Patch::SetText { id: id(3), value },
+            ];
+            if move_child {
+                patches.push(Patch::MoveChild {
+                    parent: id(1),
+                    from_index: 0,
+                    to_index: 1,
+                    expected_child: id(2),
+                });
+            }
+            tree.apply(batch(patches), &Limits::default())
+                .expect("the strategy only constructs valid batches");
+            let snapshot = tree.to_snapshot();
+            let revalidated = Tree::from_snapshot(snapshot.clone(), &Limits::default())
+                .expect("accepted trees must remain valid");
+            prop_assert_eq!(revalidated.to_snapshot(), snapshot);
+            prop_assert_eq!(revalidated.canonical(), tree.canonical());
+        }
+        }
     }
 }
