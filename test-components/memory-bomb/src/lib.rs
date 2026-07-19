@@ -1,6 +1,6 @@
 //! Containment fixture that allocates until linear-memory growth is denied.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(all(target_os = "wasi", target_env = "p2"))]
 
 wit_bindgen::generate!({
     world: "application",

@@ -624,6 +624,13 @@ The first guest should not use: `println!`, `eprintln!`, `std::fs`,
 `std::net`, `std::env`. Logging is deferred until Youth defines an explicit
 diagnostic import.
 
+Linking Rust's standard library on `wasm32-wasip2` imports `wasi:cli/*`,
+`wasi:io/*`, and `wasi:clocks/*` regardless of whether the guest calls
+them. Importing an interface grants no authority — the host decides what
+it returns, and Youth's context is closed — but the import list is a real
+compatibility surface, so it is budgeted and enforced as an allowlist.
+See [GUEST-PROFILE.md](GUEST-PROFILE.md).
+
 ## 15. Runtime error model
 
 ```rust
@@ -896,7 +903,10 @@ for tree validation.
 
 - One unchanged guest artifact runs on Linux, Windows, and macOS.
 - Canonical output matches across all three.
-- No guest conditional compilation is used.
+- The emitted guest component contains no host-OS or host-architecture
+  specific application behavior. Build-target gating required to keep
+  guest crates workspace-compatible is permitted (see
+  [GUEST-PROFILE.md](GUEST-PROFILE.md)).
 
 **Scope**
 

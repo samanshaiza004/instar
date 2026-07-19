@@ -1,6 +1,6 @@
 //! Containment fixture that applies set-text to a button node.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(all(target_os = "wasi", target_env = "p2"))]
 
 wit_bindgen::generate!({
     world: "application",

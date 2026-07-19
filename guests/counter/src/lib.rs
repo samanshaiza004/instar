@@ -3,11 +3,11 @@
 //! In-memory count is intentionally disposable; restarting the
 //! component resets it.
 
-// The component export symbols only link on wasm; host-target builds of
-// the workspace compile this crate as empty. This is host/target gating,
-// not OS-conditional guest behavior — the wasm artifact is identical
-// regardless of build host.
-#![cfg(target_arch = "wasm32")]
+// Component export symbols only link on the WASIp2 target; host-target
+// builds of the workspace compile this crate as empty. This is
+// build-target gating, not host-OS or host-architecture behavior — the
+// emitted component is identical regardless of the machine building it.
+#![cfg(all(target_os = "wasi", target_env = "p2"))]
 
 use std::cell::RefCell;
 

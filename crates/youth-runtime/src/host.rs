@@ -800,6 +800,46 @@ fn instantiate(
     })
 }
 
+/// Lists the interfaces a component imports, sorted and deduplicated.
+///
+/// Youth's WASI context is closed, so these imports are inert: the host
+/// decides what they return. They are still a real linking and
+/// compatibility surface, so the import list is treated as a dependency
+/// budget rather than left implicit (see `docs/GUEST-PROFILE.md`).
+///
+/// Names are returned without their `@version` suffix so that a patch
+/// bump in the WASI snapshot does not read as a new capability.
+pub fn component_imports(path: impl AsRef<Path>) -> Result<Vec<String>, RuntimeError> {
+    let path = path.as_ref();
+    let component_id = component_identity(path);
+    let limits = RuntimeLimits::default();
+    let engine = crate::shared_engine();
+    let bytes = read_component(path, &component_id, &limits)?;
+    let component = Component::new(engine, &bytes).map_err(|source| {
+        RuntimeError::InvalidComponent(
+            ErrorContext::new(
+                "file is not a valid WebAssembly component",
+                &component_id,
+                AppLifecycle::Loaded,
+                None,
+            )
+            .with_source(source),
+        )
+    })?;
+    let mut imports: Vec<String> = component
+        .component_type()
+        .imports(engine)
+        .map(|(name, _)| {
+            name.split_once('@')
+                .map_or(name, |(base, _)| base)
+                .to_owned()
+        })
+        .collect();
+    imports.sort_unstable();
+    imports.dedup();
+    Ok(imports)
+}
+
 fn read_component(
     path: &Path,
     component_id: &str,
