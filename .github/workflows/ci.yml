@@ -16,7 +16,7 @@ jobs:
       sha256: ${{ steps.hash.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
@@ -59,19 +59,71 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@wasm-tools
       - uses: actions/download-artifact@v4
         with:
           name: counter-wasm
+      - name: Verify guest SHA-256
+        shell: pwsh
+        run: |
+          $component = "target/wasm32-wasip2/release/youth_counter.wasm"
+          $actual = (Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = "${{ needs.guest.outputs.sha256 }}".ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "counter.wasm SHA-256 mismatch: expected $expected, got $actual"
+          }
+          Write-Host "counter.wasm SHA-256: $actual"
+      - name: Validate component
+        run: wasm-tools validate target/wasm32-wasip2/release/youth_counter.wasm
+      - name: Inspect component WIT
+        run: wasm-tools component wit target/wasm32-wasip2/release/youth_counter.wasm
       - name: Format
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Cross-platform canonical snapshot gate
+        shell: pwsh
+        run: |
+          $start = [Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = "cargo"
+          $start.ArgumentList.Add("run")
+          $start.ArgumentList.Add("--quiet")
+          $start.ArgumentList.Add("-p")
+          $start.ArgumentList.Add("youth-cli")
+          $start.ArgumentList.Add("--")
+          $start.ArgumentList.Add("script")
+          $start.ArgumentList.Add("target/wasm32-wasip2/release/youth_counter.wasm")
+          $start.ArgumentList.Add("tests/scripts/three-clicks.json")
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+          $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+          $process = [Diagnostics.Process]::Start($start)
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $stderr = $process.StandardError.ReadToEnd()
+          $process.WaitForExit()
+          if ($process.ExitCode -ne 0) {
+            throw "youth script failed with exit code $($process.ExitCode): $stderr"
+          }
+          $expected = [IO.File]::ReadAllText("tests/fixtures/three-clicks.expected").Replace("`r`n", "`n")
+          if ($stdout -ne $expected) {
+            throw "canonical snapshot differs from tests/fixtures/three-clicks.expected"
+          }
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          [IO.File]::WriteAllText("three-clicks.actual", $stdout, $utf8)
+          [IO.File]::WriteAllText("three-clicks.expected", $expected, $utf8)
+          $actualHash = (Get-FileHash three-clicks.actual -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = (Get-FileHash three-clicks.expected -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "canonical snapshot SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+          Write-Host "canonical snapshot SHA-256: $actualHash"
       - name: Build (release)
         run: cargo build --workspace --release

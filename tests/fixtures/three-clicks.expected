@@ -1,0 +1,4 @@
+root #1
+└── box #2
+    ├── text #3 "Count: 3"
+    └── button #4 "Increment"
