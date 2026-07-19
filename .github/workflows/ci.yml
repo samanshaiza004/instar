@@ -20,8 +20,17 @@ jobs:
         with:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
-      - name: Build counter component
-        run: cargo build -p youth-counter --target wasm32-wasip2 --release
+      - name: Build guest and containment components
+        run: >-
+          cargo build
+          -p youth-counter
+          -p youth-trap-on-mount
+          -p youth-trap-on-handle
+          -p youth-invalid-snapshot
+          -p youth-invalid-patch
+          -p youth-infinite-loop
+          -p youth-memory-bomb
+          --target wasm32-wasip2 --release
       - name: Record SHA-256
         id: hash
         run: |
@@ -32,6 +41,12 @@ jobs:
           name: counter-wasm
           path: |
             target/wasm32-wasip2/release/youth_counter.wasm
+            target/wasm32-wasip2/release/youth_trap_on_mount.wasm
+            target/wasm32-wasip2/release/youth_trap_on_handle.wasm
+            target/wasm32-wasip2/release/youth_invalid_snapshot.wasm
+            target/wasm32-wasip2/release/youth_invalid_patch.wasm
+            target/wasm32-wasip2/release/youth_infinite_loop.wasm
+            target/wasm32-wasip2/release/youth_memory_bomb.wasm
             counter.sha256
           if-no-files-found: error
 
@@ -49,6 +64,9 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: counter-wasm
       - name: Format
         run: cargo fmt --check
       - name: Clippy

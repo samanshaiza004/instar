@@ -5,6 +5,12 @@ members = [
     "crates/youth-runtime",
     "crates/youth-cli",
     "guests/counter",
+    "test-components/trap-on-mount",
+    "test-components/trap-on-handle",
+    "test-components/invalid-snapshot",
+    "test-components/invalid-patch",
+    "test-components/infinite-loop",
+    "test-components/memory-bomb",
 ]
 
 [workspace.package]

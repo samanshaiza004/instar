@@ -1,0 +1,12 @@
+[package]
+name = "youth-invalid-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth containment fixture that returns an invalid initial snapshot."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

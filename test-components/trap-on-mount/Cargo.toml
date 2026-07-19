@@ -1,0 +1,12 @@
+[package]
+name = "youth-trap-on-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth containment fixture that traps while mounting."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

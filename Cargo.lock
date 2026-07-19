@@ -2738,6 +2738,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-infinite-loop"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "youth-invalid-patch"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "youth-invalid-snapshot"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "youth-memory-bomb"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "youth-runtime"
 version = "0.0.1"
 dependencies = [
@@ -2749,6 +2777,20 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "youth-tree",
+]
+
+[[package]]
+name = "youth-trap-on-handle"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "youth-trap-on-mount"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
