@@ -2,13 +2,11 @@ use crate::RuntimeLimits;
 use crate::bindings::youth::app::ui as generated;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // consumed by handle() in the event-turn commit
 pub(crate) struct HostEvent {
     pub sequence: u64,
     pub node: youth_tree::NodeId,
 }
 
-#[allow(dead_code)] // consumed by handle() in the event-turn commit
 pub(crate) fn event_batch(
     revision: u64,
     events: &[HostEvent],

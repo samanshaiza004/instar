@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 /// The canonical tree the counter guest reports at mount (spec section 16).
+#[allow(dead_code)] // This shared module is compiled separately for each integration test.
 pub const MOUNTED_TREE: &str =
     "root #1\n└── box #2\n    ├── text #3 \"Count: 0\"\n    └── button #4 \"Increment\"\n";
 
