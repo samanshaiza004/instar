@@ -12,6 +12,7 @@ pub struct CallBudget {
 pub struct RuntimeLimits {
     pub max_component_size: usize,
     pub max_linear_memory: usize,
+    pub max_table_elements: usize,
     pub max_event_batch: usize,
     pub max_guest_error_message: usize,
     pub max_guest_to_host_transfer: usize,
@@ -26,6 +27,7 @@ impl Default for RuntimeLimits {
         Self {
             max_component_size: 32 * 1024 * 1024,
             max_linear_memory: 128 * 1024 * 1024,
+            max_table_elements: 1_000_000,
             max_event_batch: 256,
             max_guest_error_message: 4 * 1024,
             max_guest_to_host_transfer: 8 * 1024 * 1024,

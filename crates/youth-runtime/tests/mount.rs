@@ -56,6 +56,25 @@ fn oversized_component_files_are_rejected_before_compilation() {
 }
 
 #[test]
+fn oversized_guest_to_host_transfer_is_rejected_during_component_lifting() {
+    let limits = RuntimeLimits {
+        max_guest_to_host_transfer: 32,
+        ..RuntimeLimits::default()
+    };
+    let mut app =
+        YouthApp::load_with_limits(counter_component(), limits).expect("counter component loads");
+
+    let error = app.mount().expect_err("transfer limit is enforced");
+
+    assert_eq!(
+        error.category(),
+        RuntimeErrorCategory::TransferLimitExceeded
+    );
+    assert_eq!(app.lifecycle(), AppLifecycle::Faulted);
+    assert!(app.tree().is_none());
+}
+
+#[test]
 fn garbage_bytes_are_rejected_without_panicking() {
     let dir = tempdir();
     let path = dir.join("garbage.wasm");
