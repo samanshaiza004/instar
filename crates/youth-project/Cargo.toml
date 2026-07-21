@@ -1,0 +1,17 @@
+[package]
+name = "youth-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Strict external project contract shared by Youth tooling."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2"
+toml = "0.9.12"
+walkdir = "2.5.0"
+youth-state = { path = "../youth-state" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

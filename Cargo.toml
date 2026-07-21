@@ -4,6 +4,7 @@ members = [
     "crates/youth-tree",
     "crates/youth-state",
     "crates/youth-sdk",
+    "crates/youth-project",
     "crates/youth-runtime",
     "crates/youth-desktop",
     "crates/youth-cli",
