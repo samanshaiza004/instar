@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [master]
   pull_request:
 
 env:
@@ -24,6 +23,7 @@ jobs:
         run: >-
           cargo build
           -p youth-counter
+          -p youth-sdk-tally
           -p youth-trap-on-mount
           -p youth-trap-on-handle
           -p youth-invalid-snapshot
@@ -49,6 +49,7 @@ jobs:
           name: counter-wasm
           path: |
             target/wasm32-wasip2/release/youth_counter.wasm
+            target/wasm32-wasip2/release/youth_sdk_tally.wasm
             target/wasm32-wasip2/release/youth_trap_on_mount.wasm
             target/wasm32-wasip2/release/youth_trap_on_handle.wasm
             target/wasm32-wasip2/release/youth_invalid_snapshot.wasm
@@ -81,6 +82,7 @@ jobs:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@wasm-tools
+      - uses: taiki-e/install-action@mdbook
       - name: Install Linux window dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y xvfb libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
@@ -107,6 +109,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: SDK documentation and doctests
+        run: cargo doc -p youth-sdk --no-deps && cargo test -p youth-sdk --doc
+      - name: Developer guide
+        run: mdbook build docs/book
       - name: Transaction commit-failure tests
         run: cargo test -p youth-runtime --features test-support --test transactional_state
       - name: Deterministic framebuffer fixture
@@ -156,9 +162,65 @@ jobs:
         run: cargo build --workspace --release
       - name: Desktop release build
         run: cargo build -p youth-desktop --release
-      - name: Native window smoke (Ubuntu/Xvfb)
+      - name: Native doctor smoke (Ubuntu/Xvfb)
         if: runner.os == 'Linux'
-        run: xvfb-run -a cargo run -p youth-desktop -- --window-smoke
-      - name: Native window smoke (hosted desktop)
+        run: xvfb-run -a cargo run --quiet -p youth-cli --release -- doctor --full
+      - name: Native doctor smoke (hosted desktop)
         if: runner.os != 'Linux'
-        run: cargo run -p youth-desktop -- --window-smoke
+        run: cargo run --quiet -p youth-cli --release -- doctor --full
+      - name: External generated project workflow
+        shell: pwsh
+        run: |
+          $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
+          $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
+          $external = Join-Path $env:RUNNER_TEMP "youth-external-tally"
+          & $cli doctor
+          if ($LASTEXITCODE -ne 0) { throw "youth doctor failed" }
+          & $cli new $external --id dev.saman.ci-tally
+          if ($LASTEXITCODE -ne 0) { throw "youth new failed" }
+          Push-Location $external
+          try {
+            & $cli check
+            if ($LASTEXITCODE -ne 0) { throw "youth check failed" }
+            & $cli test
+            if ($LASTEXITCODE -ne 0) { throw "youth test failed" }
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { throw "youth build --release failed" }
+            if (Select-String -Path Cargo.toml -Pattern 'path\s*=') {
+              throw "generated Cargo.toml contains a local path dependency"
+            }
+          } finally {
+            Pop-Location
+          }
+      - name: Ubuntu full dev restart E2E
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="$PWD/target/release/youth"
+          external="$RUNNER_TEMP/youth-external-tally"
+          cd "$external"
+          "$cli" activate target/wasm32-wasip2/debug/tally.wasm \
+            --node 15700045616422714228 \
+            --app-id dev.saman.ci-tally --state-dir .youth/state
+          xvfb-run -a bash -c 'echo $$ > .youth-dev.pid; exec "$1" dev' _ "$cli" >dev.log 2>&1 &
+          dev_wrapper=$!
+          for attempt in $(seq 1 120); do
+            grep -q 'dev: watching' dev.log && break
+            sleep 0.25
+          done
+          grep -q 'dev: watching' dev.log
+          printf '\n// CI supervisor edit\n' >> src/lib.rs
+          for attempt in $(seq 1 120); do
+            grep -q 'dev: restarted' dev.log && break
+            sleep 0.25
+          done
+          grep -q 'dev: restarted' dev.log
+          dev_pid=$(cat .youth-dev.pid)
+          kill -INT "$dev_pid"
+          wait "$dev_wrapper"
+          "$cli" mount target/wasm32-wasip2/debug/tally.wasm \
+            --app-id dev.saman.ci-tally --state-dir .youth/state | grep 'Count: 1'
+      - name: Clean tracked tree
+        shell: bash
+        run: test -z "$(git status --short)"

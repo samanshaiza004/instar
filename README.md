@@ -5,7 +5,29 @@ application components. Applications describe semantic retained UI through a
 typed WIT contract; the host owns rendering, input, durable state, and the
 transaction boundary around every guest turn.
 
-## Milestone 1 — Transactional Visible Counter
+## Developer Preview 0 — External applications
+
+Youth now proves the complete workflow from a repository outside this
+workspace:
+
+```bash
+youth doctor
+youth new tally --id dev.saman.tally
+cd tally
+youth check
+youth test
+youth build --release
+youth dev
+```
+
+The generated application uses a revision-pinned `youth-sdk`, a strict
+language-neutral project manifest and lock, an inspectable WIT snapshot, and
+semantic tests backed by the real runtime. See the
+[Developer Preview guide](docs/book/src/quickstart.md), the authoritative
+[DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
+[tooling findings](docs/DEVELOPER-PREVIEW-FINDINGS.md).
+
+## Transactional Visible Counter foundation
 
 Milestone 1 presents the counter in a native window while preserving the
 headless protocol core. A turn becomes visible only after its semantic output
@@ -35,8 +57,11 @@ snapshot for renderer recovery without calling the guest. See
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker |
+| `crates/youth-sdk` | Guest-facing builders, typed state, lifecycle, and component export adapter |
+| `crates/youth-project` | Strict `Youth.toml`, `Youth.lock`, Cargo, and vendored-WIT contract |
+| `crates/youth-test` | Semantic `.youth-test` parser and real headless runner |
 | `crates/youth-desktop` | Deterministic layout/raster/input plus the provisional native window |
-| `crates/youth-cli` | Headless tools, native `run`, and state maintenance commands |
+| `crates/youth-cli` | Project generation, doctor/check/build/test/dev, native run, and state tools |
 | `guests/counter` | Durable counter component (Rust, `wasm32-wasip2`) |
 | `test-components/` | Malicious/invalid fixtures for containment tests |
 

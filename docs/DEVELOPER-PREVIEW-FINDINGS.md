@@ -15,6 +15,7 @@ There are no open findings at this checkpoint.
 | DP0-F001 | A guest currently owns all protocol plumbing | Addressed | `youth-sdk` owns bindings, lifecycle, state, and wire conversion |
 | DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
 | DP0-F003 | A shallow template copy omitted nested WIT | Addressed | Hash and generate the complete recursive snapshot |
+| DP0-F004 | Supervisor proof should not depend on presentation | Addressed | Run process tests headlessly and native smoke separately |
 
 ## Finding template
 
@@ -88,7 +89,7 @@ There are no open findings at this checkpoint.
 - **Workflow stage:** `youth check`
 - **Platform:** macOS aarch64
 - **Local path:** `/Users/keina/dev/youth-tally`
-- **Commit:** Tally `3a6ec3e` (superseded correction); Youth Gate B follow-up
+- **Commit:** Tally `af7a093`; Youth `c607bf4`
 - **Evidence:** An initial file listing capped at depth four found
   `wit/youth/youth-app.wit` but omitted the deeper
   `wit/youth/deps/youth-state/store.wit`. A generated snapshot containing only
@@ -104,3 +105,28 @@ There are no open findings at this checkpoint.
 - **Resolution:** The embedded template includes the nested state WIT and its
   test materializes both files before checking the locked digest. Project hash
   tests still prove that content and path mutations change it.
+
+### DP0-F004 — Supervisor proof should not depend on presentation
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** Generated Tally
+- **Workflow stage:** `youth dev --headless-supervisor`
+- **Platform:** macOS aarch64
+- **Local path:** `/private/tmp/youth-dev.Nc6tor/tally`
+- **Commit:** `74b4fe3`
+- **Evidence:** The headless child mounted, a valid source edit rebuilt and
+  restarted it, an invalid Rust edit failed while the prior child stayed live,
+  and a corrected edit restarted successfully. Ctrl-C then stopped and reaped
+  the child through the same bounded stdin-shutdown path used by desktop dev.
+- **Developer impact:** Rebuild/process regressions can otherwise be mistaken
+  for hosted-window failures, especially on macOS and Windows CI runners.
+- **Decision:** Keep watcher, rebuild, retention, shutdown, and state-root
+  evidence presentation-independent. Test native window creation separately;
+  reserve the combined source-edit/window E2E for Ubuntu/Xvfb until other
+  hosted displays are stable.
+- **Tooling implication:** `youth dev` has an internal headless supervisor mode
+  and its child has a private stdin shutdown protocol; neither changes the app
+  protocol or public guest API.
+- **Resolution:** Watch-input unit tests, cross-platform headless-child tests,
+  the manual valid/invalid/recovery exercise, and split CI gates cover it.

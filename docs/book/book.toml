@@ -1,0 +1,11 @@
+[book]
+title = "Youth Developer Preview"
+authors = ["Youth contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/mdbook"
+
+[output.html]
+git-repository-url = "https://github.com/samanshaiza004/youth"

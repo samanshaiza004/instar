@@ -2,6 +2,34 @@
 //!
 //! The SDK owns the Rust WIT bindings, component export adapter, lifecycle
 //! bookkeeping, semantic builders, typed state calls, and wire conversion.
+//!
+//! ```no_run
+//! use youth_sdk::prelude::*;
+//!
+//! struct Tally;
+//!
+//! impl Application for Tally {
+//!     fn view(context: &ViewContext) -> Result<Tree> {
+//!         let count = context.state().integer("count")?.unwrap_or(0);
+//!         Ok(Tree::root(BoxNode::column([
+//!             Text::new(node!("count"), format!("Count: {count}")),
+//!             Button::new(node!("increment"), "Increment"),
+//!         ])))
+//!     }
+//!
+//!     fn handle(context: &mut EventContext, events: &Events) -> Result<Update> {
+//!         if events.activated(node!("increment")) {
+//!             let count = context.state().integer("count")?.unwrap_or(0) + 1;
+//!             context.state().set_integer("count", count)?;
+//!             return Ok(Update::new()
+//!                 .set_text(node!("count"), format!("Count: {count}")));
+//!         }
+//!         Ok(Update::unchanged())
+//!     }
+//! }
+//!
+//! youth_sdk::export_app!(Tally);
+//! ```
 
 #![forbid(unsafe_code)]
 
