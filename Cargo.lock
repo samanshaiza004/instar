@@ -2950,6 +2950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-desktop"
+version = "0.0.1"
+dependencies = [
+ "thiserror 2.0.19",
+ "youth-runtime",
+ "youth-tree",
+]
+
+[[package]]
 name = "youth-infinite-loop"
 version = "0.0.1"
 dependencies = [

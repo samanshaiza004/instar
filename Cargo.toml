@@ -4,6 +4,7 @@ members = [
     "crates/youth-tree",
     "crates/youth-state",
     "crates/youth-runtime",
+    "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",
     "test-components/trap-on-mount",
