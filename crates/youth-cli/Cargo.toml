@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 youth-runtime = { path = "../youth-runtime" }
 youth-project = { path = "../youth-project" }
 youth-state = { path = "../youth-state" }
+youth-test = { path = "../youth-test" }
 youth-tree = { path = "../youth-tree" }
 youth-desktop = { path = "../youth-desktop" }
 

@@ -274,6 +274,42 @@ fn probe_state_location() -> Result<(), CliError> {
 }
 
 pub fn check_project() -> Result<(), CliError> {
+    let (project, validation) = build_and_validate(false)?;
+    println!("project: {}", project.root().display());
+    println!("app: {}", project.app_id);
+    println!("protocol: {}", project.manifest.app.protocol);
+    println!("component size: {} bytes", validation.size);
+    println!("check: ok");
+    Ok(())
+}
+
+pub fn build_project(release: bool) -> Result<(), CliError> {
+    let (project, validation) = build_and_validate(release)?;
+    let source = project.cargo_component(release);
+    let destination = project.dist_component();
+    publish_component(&source, &destination)?;
+    println!("component: {}", destination.display());
+    println!("size: {} bytes", validation.size);
+    println!("sha256: {}", validation.sha256);
+    Ok(())
+}
+
+pub async fn test_project() -> Result<(), CliError> {
+    let (project, _) = build_and_validate(false)?;
+    let count = youth_test::run_directory(
+        &project.root().join("tests"),
+        &project.cargo_component(false),
+        &project.app_id,
+    )
+    .await
+    .map_err(|error| message(error.to_string()))?;
+    println!("tests: {count} passed");
+    Ok(())
+}
+
+fn build_and_validate(
+    release: bool,
+) -> Result<(Project, youth_runtime::ComponentValidation), CliError> {
     let current = std::env::current_dir()
         .map_err(|error| message(format!("could not read current directory: {error}")))?;
     let project = Project::discover(&current).map_err(|error| message(error.to_string()))?;
@@ -292,26 +328,76 @@ pub fn check_project() -> Result<(), CliError> {
             &project.manifest.build.target,
         ],
     )?;
-    run_cargo(
-        &project,
-        &[
-            "build",
-            "--locked",
-            "--package",
-            &project.manifest.build.package,
-            "--target",
-            &project.manifest.build.target,
-        ],
-    )?;
-    let component = project.cargo_component(false);
+    let mut build_arguments = vec![
+        "build",
+        "--locked",
+        "--package",
+        &project.manifest.build.package,
+        "--target",
+        &project.manifest.build.target,
+    ];
+    if release {
+        build_arguments.push("--release");
+    }
+    run_cargo(&project, &build_arguments)?;
+    let component = project.cargo_component(release);
     let validation = youth_runtime::validate_component(&component)
         .map_err(|error| message(format!("component validation failed: {error}")))?;
-    println!("project: {}", project.root().display());
-    println!("app: {}", project.app_id);
-    println!("protocol: {}", project.manifest.app.protocol);
-    println!("component size: {} bytes", validation.size);
-    println!("check: ok");
-    Ok(())
+    Ok((project, validation))
+}
+
+fn publish_component(source: &Path, destination: &Path) -> Result<(), CliError> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| message("distribution component has no parent directory"))?;
+    fs::create_dir_all(directory).map_err(|error| io(directory, error))?;
+    let temporary = directory.join(format!(".component-{}.tmp", std::process::id()));
+    if temporary.exists() {
+        return Err(message(format!(
+            "temporary distribution path already exists: {}",
+            temporary.display()
+        )));
+    }
+    let result = (|| {
+        fs::copy(source, &temporary).map_err(|error| io(&temporary, error))?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| io(&temporary, error))?;
+        file.sync_all().map_err(|error| io(&temporary, error))?;
+        replace_file(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), CliError> {
+    match fs::rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if destination.exists()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+        {
+            let backup = destination.with_extension(format!("wasm.old-{}", std::process::id()));
+            fs::rename(destination, &backup).map_err(|error| io(destination, error))?;
+            match fs::rename(temporary, destination) {
+                Ok(()) => {
+                    fs::remove_file(&backup).map_err(|error| io(&backup, error))?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = fs::rename(&backup, destination);
+                    Err(io(destination, error))
+                }
+            }
+        }
+        Err(error) => Err(io(destination, error)),
+    }
 }
 
 fn validate_cargo_metadata(project: &Project) -> Result<(), CliError> {

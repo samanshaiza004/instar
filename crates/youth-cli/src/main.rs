@@ -41,6 +41,13 @@ enum Command {
     },
     /// Validate the current external project and development component.
     Check,
+    /// Build and atomically publish a validated component to `dist`.
+    Build {
+        #[arg(long)]
+        release: bool,
+    },
+    /// Run all semantic `tests/*.youth-test` files headlessly.
+    Test,
     /// Check that a component loads and exports the Youth world. Does not mount.
     Validate { component: PathBuf },
     /// Mount a component and print its initial canonical tree.
@@ -182,6 +189,8 @@ async fn run(command: Command) -> Result<(), CliError> {
     match command {
         Command::New { destination, id } => project_commands::new_project(&destination, &id)?,
         Command::Check => project_commands::check_project()?,
+        Command::Build { release } => project_commands::build_project(release)?,
+        Command::Test => project_commands::test_project().await?,
         Command::Validate { component } => {
             let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;

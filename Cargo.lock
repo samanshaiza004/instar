@@ -4320,6 +4320,7 @@ dependencies = [
  "youth-project",
  "youth-runtime",
  "youth-state",
+ "youth-test",
  "youth-tree",
 ]
 
@@ -4459,6 +4460,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
+]
+
+[[package]]
+name = "youth-test"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "youth-runtime",
+ "youth-sdk",
+ "youth-state",
+ "youth-tree",
 ]
 
 [[package]]
