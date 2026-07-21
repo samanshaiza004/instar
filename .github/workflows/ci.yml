@@ -46,8 +46,9 @@ jobs:
       - name: Record SHA-256
         id: hash
         run: |
-          sha256sum target/wasm32-wasip2/release/youth_counter.wasm | tee counter.sha256
-          echo "sha256=$(cut -d' ' -f1 counter.sha256)" >> "$GITHUB_OUTPUT"
+          digest=$(sha256sum target/wasm32-wasip2/release/youth_counter.wasm | cut -d' ' -f1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          echo "counter.wasm SHA-256: $digest"
       - uses: actions/upload-artifact@v4
         with:
           name: counter-wasm
@@ -68,7 +69,6 @@ jobs:
             target/wasm32-wasip2/release/youth_invalid_patch_after_state_write.wasm
             target/wasm32-wasip2/release/youth_bad_revision_after_state_write.wasm
             target/wasm32-wasip2/release/youth_app_error_after_state_write.wasm
-            counter.sha256
           if-no-files-found: error
 
   host:
@@ -93,6 +93,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: counter-wasm
+          path: target/wasm32-wasip2/release
       - name: Verify guest SHA-256
         shell: pwsh
         run: |

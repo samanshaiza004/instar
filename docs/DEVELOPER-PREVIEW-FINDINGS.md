@@ -6,7 +6,9 @@ automatically authorize new features.
 
 ## Open findings
 
-There are no open findings at this checkpoint.
+| ID | Summary | Next decision |
+| --- | --- | --- |
+| DP0-F008 | GitHub forces legacy action runtimes onto Node.js 24 | Review supported action-major upgrades separately from the CI correctness fix |
 
 ## Findings index
 
@@ -18,6 +20,8 @@ There are no open findings at this checkpoint.
 | DP0-F004 | Supervisor proof should not depend on presentation | Addressed | Run process tests headlessly and native smoke separately |
 | DP0-F005 | Generated artifact names follow the destination | Addressed | Generate CI fixtures into the documented `tally` directory |
 | DP0-F006 | CI evidence must not pollute or exhaust the workspace | Addressed | Use runner-temporary evidence, one feature-complete test build, and reduced debug artifacts |
+| DP0-F007 | Artifact metadata leaked into the checkout | Addressed | Pass digests as job outputs and distribute only ignored test fixtures |
+| DP0-F008 | GitHub forces legacy action runtimes onto Node.js 24 | Open | Keep action-runtime compatibility warnings visible and review upgrades explicitly |
 
 ## Finding template
 
@@ -185,3 +189,51 @@ There are no open findings at this checkpoint.
   workspace cleanliness and resource use as explicit correctness constraints.
 - **Resolution:** The workflow now prints clean-tree diagnostics, keeps
   canonical hash inputs outside the checkout, and reduces duplicate artifacts.
+
+### DP0-F007 — Artifact metadata leaked into the checkout
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** Youth host matrix
+- **Workflow stage:** Artifact download and final clean-tree verification
+- **Platform:** Ubuntu, Windows, and macOS GitHub-hosted runners
+- **Local path:** Youth workspace root
+- **Commit:** `ci: keep guest metadata out of checkout`
+- **Evidence:** The guest job created `counter.sha256` beside the repository,
+  uploaded it with the Wasm fixtures, and every host downloaded it into the
+  checkout. The final gate consequently reported `?? counter.sha256` even
+  though all functional checks passed.
+- **Developer impact:** A build artifact can invalidate source-tree hygiene
+  merely because its extraction location overlaps the checkout.
+- **Decision:** Do not create or distribute a digest file. Send the digest
+  through the existing GitHub Actions job output and keep the artifact limited
+  to Wasm fixtures. Download those fixtures explicitly beneath the ignored
+  `target/` tree because runtime integration tests consume those exact paths.
+- **Tooling implication:** CI metadata belongs in action outputs or
+  runner-temporary storage; only test inputs with deliberate ignored
+  destinations may be downloaded into the checkout.
+- **Resolution:** The hash step now computes one shell value, publishes it as
+  the guest job output, and logs it without writing `counter.sha256`. The host
+  download action extracts the Wasm-only artifact directly into
+  `target/wasm32-wasip2/release`.
+
+### DP0-F008 — GitHub forces legacy action runtimes onto Node.js 24
+
+- **Status:** Open
+- **Observed:** 2026-07-21
+- **Application:** Youth host matrix
+- **Workflow stage:** Action setup and artifact transfer
+- **Platform:** Ubuntu, Windows, and macOS GitHub-hosted runners
+- **Local path:** `.github/workflows/ci.yml`
+- **Commit:** `598d9ba`
+- **Evidence:** GitHub annotates `actions/checkout@v4` and the v4 artifact
+  actions because their declared Node.js 20 runtime is deprecated and the
+  hosted service is forcing execution on Node.js 24.
+- **Developer impact:** The workflow still runs, but future hosted-runner
+  enforcement could turn the warning into a setup failure.
+- **Decision:** Keep the warning open. Review supported major upgrades as a
+  separate dependency change after the correctness regression is green; do not
+  mix unverified action upgrades into the artifact-path repair.
+- **Tooling implication:** CI action runtimes need the same explicit upgrade
+  review as Rust dependencies and toolchain pins.
+- **Resolution:** Pending a focused compatibility upgrade and green matrix.
