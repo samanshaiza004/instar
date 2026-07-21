@@ -15,6 +15,8 @@ use youth_runtime::{
 use youth_state::{AppId, StateLimits, StateLocation, StateStore, repair_usage, verify_file};
 use youth_tree::NodeId;
 
+mod project_commands;
+
 /// Inspection and test surface for the Youth runtime.
 #[derive(Debug, Parser)]
 #[command(name = "youth", version, about)]
@@ -25,6 +27,41 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create the proven Rust Tally project in a new directory.
+    New {
+        destination: PathBuf,
+        #[arg(long)]
+        id: AppId,
+    },
+    /// Diagnose the local Youth development environment.
+    Doctor {
+        /// Also create and present a native smoke window.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Validate the current external project and development component.
+    Check,
+    /// Build and atomically publish a validated component to `dist`.
+    Build {
+        #[arg(long)]
+        release: bool,
+    },
+    /// Run all semantic `tests/*.youth-test` files headlessly.
+    Test,
+    /// Rebuild and restart the current project when its inputs change.
+    Dev {
+        /// Exercise the supervisor without native presentation.
+        #[arg(long, hide = true)]
+        headless_supervisor: bool,
+    },
+    #[command(name = "__dev-child", hide = true)]
+    DevChild {
+        component: PathBuf,
+        #[arg(long)]
+        app_id: AppId,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check that a component loads and exports the Youth world. Does not mount.
     Validate { component: PathBuf },
     /// Mount a component and print its initial canonical tree.
@@ -69,6 +106,9 @@ enum Command {
         window_width: u32,
         #[arg(long, default_value_t = 360)]
         window_height: u32,
+        /// Accept an internal orderly-shutdown signal on stdin.
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Inspect or maintain host-owned application state.
     State {
@@ -123,6 +163,7 @@ fn main() -> ExitCode {
     init_tracing();
     let command = Cli::parse().command;
     let result = match command {
+        Command::Doctor { full } => project_commands::doctor(full),
         Command::Run {
             component,
             app_id,
@@ -130,6 +171,7 @@ fn main() -> ExitCode {
             ephemeral,
             window_width,
             window_height,
+            supervised,
         } => run_desktop(
             component,
             app_id,
@@ -137,6 +179,7 @@ fn main() -> ExitCode {
             ephemeral,
             window_width,
             window_height,
+            supervised,
         ),
         command => tokio::runtime::Runtime::new()
             .map_err(|error| CliError::Message(format!("failed to start CLI runtime: {error}")))
@@ -163,6 +206,18 @@ fn init_tracing() {
 
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
+        Command::New { destination, id } => project_commands::new_project(&destination, &id)?,
+        Command::Check => project_commands::check_project()?,
+        Command::Build { release } => project_commands::build_project(release)?,
+        Command::Test => project_commands::test_project().await?,
+        Command::Dev {
+            headless_supervisor,
+        } => project_commands::dev_project(headless_supervisor).await?,
+        Command::DevChild {
+            component,
+            app_id,
+            state_dir,
+        } => project_commands::headless_dev_child(component, app_id, state_dir).await?,
         Command::Validate { component } => {
             let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
@@ -244,7 +299,9 @@ async fn run(command: Command) -> Result<(), CliError> {
             }
         }
         Command::State { command } => run_state_command(command)?,
-        Command::Run { .. } => unreachable!("run is dispatched on the process main thread"),
+        Command::Run { .. } | Command::Doctor { .. } => {
+            unreachable!("main-thread command was already dispatched")
+        }
     }
     Ok(())
 }
@@ -256,6 +313,7 @@ fn run_desktop(
     ephemeral: bool,
     width: u32,
     height: u32,
+    supervised: bool,
 ) -> Result<(), CliError> {
     let state = if ephemeral {
         StateLocation::Memory
@@ -270,7 +328,7 @@ fn run_desktop(
         };
         StateLocation::File(root.join(app_id.as_str()).join("state.sqlite3"))
     };
-    youth_desktop::run(DesktopOptions {
+    let options = DesktopOptions {
         config: youth_runtime::YouthAppConfig {
             component_path: component,
             app_id,
@@ -279,7 +337,12 @@ fn run_desktop(
         },
         width,
         height,
-    })
+    };
+    if supervised {
+        youth_desktop::run_with_shutdown(options)
+    } else {
+        youth_desktop::run(options)
+    }
     .map_err(CliError::Desktop)
 }
 

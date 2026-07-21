@@ -2623,6 +2623,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd_cesu8"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2915,6 +2925,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -4312,12 +4323,16 @@ dependencies = [
  "clap",
  "directories",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "toml",
  "tracing-subscriber",
  "youth-desktop",
+ "youth-project",
  "youth-runtime",
  "youth-state",
+ "youth-test",
  "youth-tree",
 ]
 
@@ -4405,9 +4420,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-project"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
+ "walkdir",
+ "youth-state",
+]
+
+[[package]]
 name = "youth-runtime"
 version = "0.0.1"
 dependencies = [
+ "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -4416,8 +4445,23 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "youth-sdk",
  "youth-state",
  "youth-tree",
+]
+
+[[package]]
+name = "youth-sdk"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-sdk-tally"
+version = "0.0.1"
+dependencies = [
+ "youth-sdk",
 ]
 
 [[package]]
@@ -4428,6 +4472,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
+]
+
+[[package]]
+name = "youth-test"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "youth-runtime",
+ "youth-sdk",
+ "youth-state",
+ "youth-tree",
 ]
 
 [[package]]

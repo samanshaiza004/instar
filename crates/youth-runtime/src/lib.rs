@@ -12,6 +12,7 @@ mod engine;
 mod error;
 mod host;
 mod limits;
+mod profile;
 mod wire;
 mod worker;
 
@@ -20,6 +21,10 @@ pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
 pub use host::{AppFault, AppInspection, AppLifecycle, TurnReceipt, YouthApp, component_imports};
 pub use limits::{CallBudget, RuntimeLimits};
+pub use profile::{
+    APPLICATION_PROTOCOL, APPLICATION_WORLD, ComponentValidation, ComponentValidationError,
+    PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, validate_component,
+};
 pub use worker::YouthAppHandle;
 pub use youth_state::{GuestCallPhase, StateLimits, StateSummary, StateValue, TurnStateMetrics};
 // Public because they are the associated `Error` type of the fallible

@@ -1,0 +1,175 @@
+use std::cell::RefCell;
+use std::marker::PhantomData;
+
+use super::{
+    Application, Error, ErrorKind, EventContext, Events, FlatNodeData, FlatTree, ViewContext,
+};
+
+#[doc(hidden)]
+pub mod bindings {
+    wit_bindgen::generate!({
+        generate_all,
+        pub_export_macro: true,
+        default_bindings_module: "youth_sdk::component::bindings",
+        world: "application",
+        path: "wit",
+    });
+}
+
+use bindings::exports::youth::app::lifecycle::Guest;
+use bindings::youth::app::ui;
+
+#[derive(Default)]
+struct LifecycleState {
+    mounted: bool,
+    revision: u64,
+    tree: Option<FlatTree>,
+}
+
+thread_local! {
+    static STATE: RefCell<LifecycleState> = RefCell::new(LifecycleState::default());
+}
+
+pub struct Adapter<A>(PhantomData<A>);
+
+impl<A: Application> Guest for Adapter<A> {
+    fn mount() -> std::result::Result<ui::TreeSnapshot, ui::AppError> {
+        with_state(|state| {
+            if state.mounted {
+                return Err(Error::invalid_state());
+            }
+            let tree = A::view(&ViewContext)?.flatten()?;
+            let snapshot = snapshot(&tree, 0);
+            state.mounted = true;
+            state.revision = 0;
+            state.tree = Some(tree);
+            Ok(snapshot)
+        })
+        .map_err(wire_error)
+    }
+
+    fn handle(events: ui::EventBatch) -> std::result::Result<ui::PatchBatch, ui::AppError> {
+        with_state(|state| {
+            if !state.mounted || events.tree_revision != state.revision {
+                return Err(Error::invalid_state());
+            }
+            let processed_through = events.events.last().map_or(0, |event| event.sequence);
+            let events = Events {
+                activated: events
+                    .events
+                    .into_iter()
+                    .map(|event| match event.kind {
+                        ui::EventKind::Activate(id) => id,
+                    })
+                    .collect(),
+            };
+            let update = A::handle(&mut EventContext, &events)?;
+            let tree = state.tree.as_mut().ok_or_else(Error::invalid_state)?;
+            tree.apply(&update)?;
+            let base = state.revision;
+            let next = if update.operations.is_empty() {
+                base
+            } else {
+                base.checked_add(1).ok_or_else(Error::internal)?
+            };
+            let patches = update.operations.into_iter().map(wire_patch).collect();
+            state.revision = next;
+            Ok(ui::PatchBatch {
+                base_tree_revision: base,
+                next_tree_revision: next,
+                processed_through,
+                patches,
+            })
+        })
+        .map_err(wire_error)
+    }
+
+    fn resync() -> std::result::Result<ui::TreeSnapshot, ui::AppError> {
+        with_state(|state| {
+            if !state.mounted {
+                return Err(Error::invalid_state());
+            }
+            let tree = A::view(&ViewContext)?.flatten()?;
+            let snapshot = snapshot(&tree, state.revision);
+            state.tree = Some(tree);
+            Ok(snapshot)
+        })
+        .map_err(wire_error)
+    }
+}
+
+fn with_state<T>(
+    operation: impl FnOnce(&mut LifecycleState) -> super::Result<T>,
+) -> super::Result<T> {
+    STATE.with(|state| {
+        let mut state = state.try_borrow_mut().map_err(|_| Error::internal())?;
+        operation(&mut state)
+    })
+}
+
+fn snapshot(tree: &FlatTree, revision: u64) -> ui::TreeSnapshot {
+    ui::TreeSnapshot {
+        revision,
+        root: tree.root,
+        nodes: tree
+            .nodes
+            .iter()
+            .map(|node| ui::Node {
+                id: node.id,
+                data: match &node.data {
+                    FlatNodeData::Root => ui::NodeData::Root,
+                    FlatNodeData::Box { enabled } => {
+                        ui::NodeData::Box(ui::BoxData { enabled: *enabled })
+                    }
+                    FlatNodeData::Text { value } => ui::NodeData::Text(ui::TextData {
+                        value: value.clone(),
+                    }),
+                    FlatNodeData::Button { label, enabled } => {
+                        ui::NodeData::Button(ui::ButtonData {
+                            label: label.clone(),
+                            enabled: *enabled,
+                        })
+                    }
+                },
+                children: node.children.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn wire_patch(operation: super::UpdateOperation) -> ui::Patch {
+    match operation {
+        super::UpdateOperation::Text(key, value) => ui::Patch::SetText(ui::SetText {
+            id: key.id(),
+            value,
+        }),
+        super::UpdateOperation::Label(key, value) => ui::Patch::SetLabel(ui::SetLabel {
+            id: key.id(),
+            value,
+        }),
+        super::UpdateOperation::Enabled(key, enabled) => ui::Patch::SetEnabled(ui::SetEnabled {
+            id: key.id(),
+            value: enabled,
+        }),
+    }
+}
+
+fn wire_error(error: Error) -> ui::AppError {
+    let code = match error.kind() {
+        ErrorKind::InvalidState => ui::AppErrorCode::InvalidState,
+        ErrorKind::RejectedEvent => ui::AppErrorCode::RejectedEvent,
+        ErrorKind::Internal => ui::AppErrorCode::Internal,
+    };
+    ui::AppError {
+        code,
+        message: error.message,
+    }
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __export_adapter {
+    ($adapter:ident) => {
+        $crate::component::bindings::export!($adapter);
+    };
+}

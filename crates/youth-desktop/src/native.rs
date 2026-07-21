@@ -35,6 +35,7 @@ enum NativeEvent {
     Mounted(YouthAppHandle, TreeSnapshot),
     Runtime(DesktopEvent),
     StartupFault(RuntimeErrorCategory),
+    Shutdown,
 }
 
 enum Mode {
@@ -62,17 +63,31 @@ pub fn run(options: DesktopOptions) -> Result<(), DesktopError> {
         Mode::Application(Some(Box::new(options.config))),
         options.width,
         options.height,
+        false,
+    )
+}
+
+/// Runs an application and accepts an orderly shutdown byte on stdin.
+pub fn run_with_shutdown(options: DesktopOptions) -> Result<(), DesktopError> {
+    run_mode(
+        Mode::Application(Some(Box::new(options.config))),
+        options.width,
+        options.height,
+        true,
     )
 }
 
 pub fn window_smoke() -> Result<(), DesktopError> {
-    run_mode(Mode::Smoke, 320, 180)
+    run_mode(Mode::Smoke, 320, 180, false)
 }
 
-fn run_mode(mode: Mode, width: u32, height: u32) -> Result<(), DesktopError> {
+fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result<(), DesktopError> {
     let event_loop = EventLoop::<NativeEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    if stdin_shutdown {
+        watch_shutdown(proxy.clone());
+    }
     let mut app = NativeApp {
         mode,
         initial_size: (width, height),
@@ -122,6 +137,12 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 self.create_window(event_loop, "Youth fault");
             }
             NativeEvent::Runtime(event) => self.runtime_event(event, event_loop),
+            NativeEvent::Shutdown => {
+                if let Some(controller) = &self.controller {
+                    let _ = controller.send(ControllerCommand::Stop);
+                }
+                event_loop.exit();
+            }
         }
     }
 
@@ -195,6 +216,19 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
             _ => {}
         }
     }
+}
+
+fn watch_shutdown(proxy: EventLoopProxy<NativeEvent>) {
+    let _ = std::thread::Builder::new()
+        .name("youth-desktop-shutdown".to_owned())
+        .spawn(move || {
+            use std::io::Read;
+
+            let mut byte = [0_u8; 1];
+            if std::io::stdin().read(&mut byte).is_ok() {
+                let _ = proxy.send_event(NativeEvent::Shutdown);
+            }
+        });
 }
 
 impl NativeApp {

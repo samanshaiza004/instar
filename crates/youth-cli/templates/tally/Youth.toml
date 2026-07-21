@@ -1,0 +1,12 @@
+[app]
+id = "{{app_id}}"
+name = "{{display_name}}"
+protocol = "0.0.2"
+
+[build]
+language = "rust"
+package = "{{package}}"
+target = "wasm32-wasip2"
+
+[development]
+state = ".youth/state"

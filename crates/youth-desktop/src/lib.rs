@@ -17,5 +17,5 @@ pub use geometry::{
     LogicalSize, RendererMirror, hit_test, layout,
 };
 pub use input::{InputChange, PointerState};
-pub use native::{DesktopError, DesktopOptions, run, window_smoke};
+pub use native::{DesktopError, DesktopOptions, run, run_with_shutdown, window_smoke};
 pub use raster::{FrameBuffer, Palette, RasterError, RenderState, frame_hash, render};
