@@ -188,6 +188,7 @@ pub fn render(
     state: &RenderState<'_>,
     palette: Palette,
 ) -> Result<FrameBuffer, RasterError> {
+    let _span = tracing::info_span!("desktop.render", revision = tree.revision()).entered();
     if !scale_factor.is_finite() || scale_factor <= 0.0 {
         return Err(RasterError::InvalidScale);
     }

@@ -330,11 +330,22 @@ impl YouthApp {
         let turn_id = Some(0);
         let span = info_span!(
             "app.mount",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = 0_u64,
+            call_phase = "mount",
+            event_count = 0_u64,
+            base_revision = 0_u64,
+            next_revision = 0_u64,
+            patch_count = 0_u64,
             fuel_before = self.limits.mount.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.mount_inner(turn_id));
@@ -385,8 +396,10 @@ impl YouthApp {
         });
         let span = info_span!(
             "app.turn",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = sequence,
+            call_phase = "handle",
             event_count = 1_u64,
             first_event_sequence = sequence,
             last_event_sequence = sequence,
@@ -396,6 +409,11 @@ impl YouthApp {
             fuel_before = self.limits.handle.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.activate_inner(node, sequence, base_revision));
@@ -445,6 +463,7 @@ impl YouthApp {
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
+                self.record_state_metrics("rolled_back");
                 return if recoverable {
                     Err(error)
                 } else {
@@ -526,12 +545,14 @@ impl YouthApp {
 
         let state_writes = self.store.data().state.metrics().writes;
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after patch validation", turn_id)
                     .with_source(source),
             );
             return Err(self.enter_fault(error));
         }
+        self.record_state_metrics("committed");
         self.tree = Some(staged_tree);
         let elapsed = started.elapsed();
 
@@ -566,8 +587,10 @@ impl YouthApp {
         let turn_id = self.last_event_sequence;
         let span = info_span!(
             "app.resync",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = turn_id.unwrap_or(0),
+            call_phase = "resync",
             event_count = 0_u64,
             first_event_sequence = self.last_event_sequence.unwrap_or(0),
             last_event_sequence = self.last_event_sequence.unwrap_or(0),
@@ -577,6 +600,11 @@ impl YouthApp {
             fuel_before = self.limits.resync.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.resync_inner(base_revision, turn_id));
@@ -611,6 +639,7 @@ impl YouthApp {
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
                 let _ = self.store.data_mut().state.rollback();
+                self.record_state_metrics("rolled_back");
                 return Err(error);
             }
         };
@@ -664,6 +693,7 @@ impl YouthApp {
             );
             return Err(self.enter_fault(error));
         }
+        self.record_state_metrics("read_only");
         self.tree = Some(tree);
         Ok(snapshot)
     }
@@ -785,12 +815,14 @@ impl YouthApp {
         };
         let snapshot = tree.to_snapshot();
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after mount validation", turn_id)
                     .with_source(source),
             );
             return Err(self.enter_fault(error));
         }
+        self.record_state_metrics("committed");
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
         Ok(snapshot)
@@ -853,7 +885,17 @@ impl YouthApp {
 
     fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
         let _ = self.store.data_mut().state.rollback();
+        self.record_state_metrics("rolled_back");
         self.enter_fault(error)
+    }
+
+    fn record_state_metrics(&self, result: &'static str) {
+        let metrics = self.store.data().state.metrics();
+        tracing::Span::current().record("state_call_count", u64::from(metrics.calls));
+        tracing::Span::current().record("state_write_count", u64::from(metrics.writes));
+        tracing::Span::current().record("state_bytes_before", metrics.bytes_before);
+        tracing::Span::current().record("state_bytes_after", metrics.bytes_after);
+        tracing::Span::current().record("transaction_result", result);
     }
 
     fn record_call_metrics(&self, elapsed: std::time::Duration) {
@@ -898,6 +940,7 @@ impl YouthApp {
         self.lifecycle = AppLifecycle::Faulted;
         let span = info_span!(
             "app.fault",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             category = ?error.category(),
             turn_id = error.context().turn_id.unwrap_or(0),

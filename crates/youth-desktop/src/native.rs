@@ -38,7 +38,7 @@ enum NativeEvent {
 }
 
 enum Mode {
-    Application(Option<YouthAppConfig>),
+    Application(Option<Box<YouthAppConfig>>),
     Smoke,
 }
 
@@ -59,7 +59,7 @@ struct NativeApp {
 
 pub fn run(options: DesktopOptions) -> Result<(), DesktopError> {
     run_mode(
-        Mode::Application(Some(options.config)),
+        Mode::Application(Some(Box::new(options.config))),
         options.width,
         options.height,
     )
@@ -96,7 +96,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
         match &mut self.mode {
             Mode::Application(config) => {
                 if let Some(config) = config.take() {
-                    bootstrap(config, self.proxy.clone());
+                    bootstrap(*config, self.proxy.clone());
                 }
             }
             Mode::Smoke if self.window.is_none() => {
@@ -183,10 +183,10 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                             self.pointer.release_primary(layout)
                         }),
                 };
-                if let Some(node) = change.activation {
-                    if let Some(controller) = &self.controller {
-                        let _ = controller.send(ControllerCommand::Activate(node));
-                    }
+                if let Some(node) = change.activation
+                    && let Some(controller) = &self.controller
+                {
+                    let _ = controller.send(ControllerCommand::Activate(node));
                 }
                 if change.redraw {
                     window.request_redraw();
@@ -261,7 +261,10 @@ impl NativeApp {
                 }
                 self.relayout();
             }
-            DesktopEvent::Resynced(snapshot) => self.install_snapshot(snapshot),
+            DesktopEvent::Resynced(snapshot) => {
+                let _span = tracing::info_span!("desktop.resync").entered();
+                self.install_snapshot(snapshot);
+            }
             DesktopEvent::AppRejected(_) => {}
             DesktopEvent::AppFaulted(error) => {
                 self.fault = Some(category_name(error.category).to_owned());
@@ -292,6 +295,7 @@ impl NativeApp {
     }
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
+        let _span = tracing::info_span!("desktop.present").entered();
         let (Some(window), Some(surface), Some(mirror), Some(layout)) =
             (&self.window, &mut self.surface, &self.mirror, &self.layout)
         else {
@@ -343,26 +347,31 @@ impl NativeApp {
 fn bootstrap(config: YouthAppConfig, proxy: EventLoopProxy<NativeEvent>) {
     let _ = std::thread::Builder::new()
         .name("youth-desktop-bootstrap".to_owned())
-        .spawn(move || match YouthAppHandle::spawn(config) {
-            Ok(handle) => {
-                let runtime = tokio::runtime::Builder::new_current_thread().build();
-                match runtime {
-                    Ok(runtime) => match runtime.block_on(handle.mount()) {
-                        Ok(snapshot) => {
-                            let _ = proxy.send_event(NativeEvent::Mounted(handle, snapshot));
+        .spawn(move || {
+            let _span = tracing::info_span!("desktop.mount").entered();
+            match YouthAppHandle::spawn(config) {
+                Ok(handle) => {
+                    let runtime = tokio::runtime::Builder::new_current_thread().build();
+                    match runtime {
+                        Ok(runtime) => match runtime.block_on(handle.mount()) {
+                            Ok(snapshot) => {
+                                let _ = proxy.send_event(NativeEvent::Mounted(handle, snapshot));
+                            }
+                            Err(error) => {
+                                let _ =
+                                    proxy.send_event(NativeEvent::StartupFault(error.category()));
+                            }
+                        },
+                        Err(_) => {
+                            let _ = proxy.send_event(NativeEvent::StartupFault(
+                                RuntimeErrorCategory::Internal,
+                            ));
                         }
-                        Err(error) => {
-                            let _ = proxy.send_event(NativeEvent::StartupFault(error.category()));
-                        }
-                    },
-                    Err(_) => {
-                        let _ = proxy
-                            .send_event(NativeEvent::StartupFault(RuntimeErrorCategory::Internal));
                     }
                 }
-            }
-            Err(error) => {
-                let _ = proxy.send_event(NativeEvent::StartupFault(error.category()));
+                Err(error) => {
+                    let _ = proxy.send_event(NativeEvent::StartupFault(error.category()));
+                }
             }
         });
 }

@@ -117,6 +117,7 @@ impl RendererMirror {
 }
 
 pub fn layout(tree: &Tree, viewport: LogicalSize) -> Result<LayoutSnapshot, GeometryError> {
+    let _span = tracing::info_span!("desktop.layout", revision = tree.revision()).entered();
     LogicalSize::new(viewport.width, viewport.height)?;
     let mut snapshot = LayoutSnapshot {
         tree_revision: tree.revision(),
@@ -158,6 +159,8 @@ pub fn layout(tree: &Tree, viewport: LogicalSize) -> Result<LayoutSnapshot, Geom
 }
 
 pub fn hit_test(snapshot: &LayoutSnapshot, point: LogicalPoint) -> Option<NodeId> {
+    let _span =
+        tracing::info_span!("desktop.hit_test", revision = snapshot.tree_revision).entered();
     if !point.x.is_finite() || !point.y.is_finite() {
         return None;
     }

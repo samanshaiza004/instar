@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "sync"] }
+tracing = "0.1.44"
 softbuffer = "0.4.8"
 winit = "=0.30.12"
 youth-runtime = { path = "../youth-runtime" }

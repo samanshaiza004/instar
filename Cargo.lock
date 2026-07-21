@@ -4335,6 +4335,7 @@ dependencies = [
  "softbuffer",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "winit",
  "youth-runtime",
  "youth-tree",
@@ -4426,6 +4427,7 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

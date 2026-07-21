@@ -154,6 +154,11 @@ impl std::fmt::Debug for StateStore {
 
 impl StateStore {
     pub fn open(location: StateLocation, limits: StateLimits) -> Result<Self, StateError> {
+        let location_kind = match &location {
+            StateLocation::Memory => "memory",
+            StateLocation::File(_) => "file",
+        };
+        let _span = tracing::info_span!("state.open", location = location_kind).entered();
         let (connection, initialize) = match &location {
             StateLocation::Memory => (Connection::open_in_memory()?, true),
             StateLocation::File(path) => {
@@ -203,6 +208,7 @@ impl StateStore {
     }
 
     pub fn begin(&mut self, phase: GuestCallPhase) -> Result<(), StateError> {
+        let _span = tracing::info_span!("state.begin", phase = ?phase).entered();
         if self.transaction_active {
             return Err(StateError::TransactionActive);
         }
@@ -227,6 +233,7 @@ impl StateStore {
     }
 
     pub fn commit(&mut self) -> Result<TurnStateMetrics, StateError> {
+        let _span = tracing::info_span!("state.commit").entered();
         self.require_transaction()?;
         if self.phase == GuestCallPhase::Resync {
             return Err(StateError::ReadOnly);
@@ -247,6 +254,7 @@ impl StateStore {
     }
 
     pub fn rollback(&mut self) -> Result<TurnStateMetrics, StateError> {
+        let _span = tracing::info_span!("state.rollback").entered();
         self.require_transaction()?;
         self.connection.execute_batch("ROLLBACK")?;
         self.finish(false);
@@ -254,6 +262,7 @@ impl StateStore {
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<StateValue>, StateError> {
+        let _span = tracing::info_span!("state.get").entered();
         self.attempt_call()?;
         self.require_transaction()?;
         self.validate_key(key)?;
@@ -261,6 +270,7 @@ impl StateStore {
     }
 
     pub fn set(&mut self, key: &str, value: StateValue) -> Result<(), StateError> {
+        let _span = tracing::info_span!("state.set").entered();
         self.attempt_call()?;
         self.require_writable()?;
         self.validate_key(key)?;
@@ -320,6 +330,7 @@ impl StateStore {
     }
 
     pub fn delete(&mut self, key: &str) -> Result<bool, StateError> {
+        let _span = tracing::info_span!("state.delete").entered();
         self.attempt_call()?;
         self.require_writable()?;
         self.validate_key(key)?;
@@ -440,6 +451,9 @@ impl StateStore {
 
     fn finish(&mut self, committed: bool) {
         self.metrics.committed = committed;
+        if !committed {
+            self.metrics.bytes_after = self.metrics.bytes_before;
+        }
         self.phase = GuestCallPhase::Idle;
         self.transaction_active = false;
     }
