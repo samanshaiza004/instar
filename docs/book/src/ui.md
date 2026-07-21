@@ -1,25 +1,42 @@
 # UI guide
 
-DP0 supports one root containing column boxes, text, and buttons. The SDK
+DP1 supports one root containing column, row, and equal-track grid boxes,
+text, and buttons. The SDK
 assigns anonymous root and container IDs deterministically in the lower half
 of the ID space. `node!("name")` creates an app-global stable ID in the upper
 half.
 
 ```rust
-Tree::root(BoxNode::column([
-    Text::new(node!("count"), "Count: 0"),
-    Button::new(node!("increment"), "Increment"),
+Tree::root(Column::new([
+    Text::new(node!("display"), "42").align(TextAlign::End),
+    Row::new([
+        Button::command(command!("clear"), "C").shortcut(Shortcut::Escape),
+        Button::command(command!("backspace"), "Backspace")
+            .shortcut(Shortcut::Backspace),
+    ]),
+    Grid::columns(2, [
+        Button::command(command!("one"), "1").shortcut(Shortcut::Character('1')),
+        Button::command(command!("equals"), "=").shortcut(Shortcut::Enter),
+    ]),
 ]))
 ```
 
 Handle an activation by returning the smallest supported semantic update:
 
 ```rust
-if events.activated(node!("increment")) {
-    return Ok(Update::new().set_text(node!("count"), "Count: 1"));
+if events.commanded(command!("equals")) {
+    return Ok(Update::new().set_text(node!("display"), "42"));
 }
 Ok(Update::unchanged())
 ```
 
-Names are exact UTF-8 and app-global. Duplicate names and symbolic-ID
-collisions are errors. A button under a disabled box cannot be activated.
+Node and command names are exact UTF-8 and app-global, but use separate typed
+ID domains. Duplicate names, commands, shortcuts, and collisions are errors.
+A button under a disabled box cannot be activated.
+
+Focus and key interpretation are host-owned. Tab traverses enabled buttons in
+semantic preorder without wrapping; arrows stay within the nearest applicable
+row, column, or grid. Space activates focus. Enter uses the declared default
+command or focused button, while Escape and Backspace use their declared
+commands. The guest receives the same semantic activation as a mouse click,
+never a platform keyboard event.
