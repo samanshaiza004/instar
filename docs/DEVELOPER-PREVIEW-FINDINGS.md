@@ -60,6 +60,8 @@ There are no open findings at this checkpoint.
   plumbing. Tally `2f2f5a7` builds from that exact Git revision with no path
   dependency. SDK unit tests, component validation, runtime persistence, and
   restart/resync integration tests pass.
+  Tally `5191d0d` then aligns every tracked project file byte-for-byte with the
+  parameter-resolved generator template.
 
 ### DP0-F002 — Symbolic-ID prefix notation was ambiguous
 

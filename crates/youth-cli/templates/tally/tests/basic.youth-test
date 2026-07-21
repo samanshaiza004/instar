@@ -3,6 +3,5 @@ expect text count "Count: 0"
 
 activate increment
 expect text count "Count: 1"
-
 restart
 expect text count "Count: 1"
