@@ -17,8 +17,6 @@ use crate::{
     CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits, StateLocation, YouthAppConfig,
 };
 
-const APPLICATION_WORLD: &str = "youth:app/application@0.0.2";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppLifecycle {
     Loaded,
@@ -726,7 +724,7 @@ impl YouthApp {
             state_phase: self.store.data().state.phase(),
             state_metrics: self.store.data().state.metrics(),
             lifecycle: self.lifecycle,
-            world: APPLICATION_WORLD.to_owned(),
+            world: crate::APPLICATION_WORLD.to_owned(),
             current_revision: tree.map(youth_tree::Tree::revision),
             next_event_sequence: self.last_event_sequence.unwrap_or(0).checked_add(1),
             last_event_sequence: self.last_event_sequence,

@@ -9,6 +9,7 @@ description = "Youth host runtime: Wasmtime engine, component loading, WIT bindi
 test-support = ["youth-state/test-support"]
 
 [dependencies]
+sha2 = "0.10.9"
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "sync", "macros", "rt-multi-thread"] }
 tracing = "0.1.44"
