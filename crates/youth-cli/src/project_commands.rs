@@ -2,9 +2,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use youth_project::{CLI_VERSION, Project, SUPPORTED_PROTOCOL};
 use youth_state::AppId;
 
@@ -307,6 +309,221 @@ pub async fn test_project() -> Result<(), CliError> {
     Ok(())
 }
 
+pub async fn dev_project(headless: bool) -> Result<(), CliError> {
+    let (mut project, _) = build_and_validate(false)?;
+    let mut child = Some(spawn_dev_child(&project, headless)?);
+    let mut observed = watch_fingerprint(project.root())?;
+    let mut changed_at = None;
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    println!("dev: watching {}", project.root().display());
+
+    loop {
+        tokio::select! {
+            result = &mut shutdown => {
+                result.map_err(|error| message(format!("failed to listen for Ctrl-C: {error}")))?;
+                if let Some(mut running) = child.take() {
+                    stop_child(&mut running).await?;
+                }
+                println!("dev: stopped");
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                if child
+                    .as_mut()
+                    .is_some_and(|running| running.try_wait().ok().flatten().is_some())
+                {
+                    child = None;
+                    println!("dev: application window closed; still watching");
+                }
+                let current = watch_fingerprint(project.root())?;
+                if current != observed {
+                    observed = current;
+                    changed_at = Some(Instant::now());
+                    continue;
+                }
+                if !changed_at.is_some_and(|changed| changed.elapsed() >= Duration::from_millis(300)) {
+                    continue;
+                }
+
+                println!("dev: rebuilding");
+                match build_and_validate(false) {
+                    Ok((rebuilt, _)) => {
+                        let after_build = watch_fingerprint(rebuilt.root())?;
+                        if after_build != observed {
+                            observed = after_build;
+                            changed_at = Some(Instant::now());
+                            println!("dev: more changes queued");
+                            project = rebuilt;
+                            continue;
+                        }
+                        if let Some(mut running) = child.take() {
+                            stop_child(&mut running).await?;
+                        }
+                        child = Some(spawn_dev_child(&rebuilt, headless)?);
+                        project = rebuilt;
+                        changed_at = None;
+                        println!("dev: restarted");
+                    }
+                    Err(error) => {
+                        eprintln!("dev: rebuild failed; retaining the last valid application\n{error}");
+                        changed_at = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_dev_child(project: &Project, headless: bool) -> Result<Child, CliError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        message(format!(
+            "could not locate the current Youth executable: {error}"
+        ))
+    })?;
+    let mut command = Command::new(executable);
+    command.arg(if headless { "__dev-child" } else { "run" });
+    command
+        .arg(project.cargo_component(false))
+        .arg("--app-id")
+        .arg(project.app_id.as_str())
+        .arg("--state-dir")
+        .arg(project.state_root())
+        .current_dir(project.root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if !headless {
+        command.arg("--supervised");
+    }
+    command
+        .spawn()
+        .map_err(|error| message(format!("could not start Youth application: {error}")))
+}
+
+pub async fn headless_dev_child(
+    component: PathBuf,
+    app_id: AppId,
+    state_root: PathBuf,
+) -> Result<(), CliError> {
+    let app = youth_runtime::YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
+        component_path: component,
+        state: youth_state::StateLocation::File(
+            state_root.join(app_id.as_str()).join("state.sqlite3"),
+        ),
+        app_id,
+        limits: youth_runtime::RuntimeLimits::default(),
+    })
+    .map_err(CliError::Runtime)?;
+    app.mount().await.map_err(CliError::Runtime)?;
+    println!("dev child: mounted");
+    tokio::task::spawn_blocking(|| {
+        use std::io::Read;
+
+        let mut byte = [0_u8; 1];
+        std::io::stdin().read(&mut byte)
+    })
+    .await
+    .map_err(|error| message(format!("shutdown reader failed: {error}")))?
+    .map_err(|error| message(format!("shutdown input failed: {error}")))?;
+    app.stop().await.map_err(CliError::Runtime)
+}
+
+async fn stop_child(child: &mut Child) -> Result<(), CliError> {
+    if child
+        .try_wait()
+        .map_err(|error| message(error.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if let Some(mut input) = child.stdin.take() {
+        input
+            .write_all(b"shutdown\n")
+            .and_then(|()| input.flush())
+            .map_err(|error| message(format!("could not signal application shutdown: {error}")))?;
+    }
+    for _ in 0..40 {
+        if child
+            .try_wait()
+            .map_err(|error| message(error.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    child
+        .kill()
+        .map_err(|error| message(format!("could not stop application after timeout: {error}")))?;
+    child
+        .wait()
+        .map_err(|error| message(format!("could not reap stopped application: {error}")))?;
+    Ok(())
+}
+
+fn watch_fingerprint(root: &Path) -> Result<[u8; 32], CliError> {
+    let mut paths = Vec::new();
+    for file in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "Youth.toml",
+        "Youth.lock",
+        "rust-toolchain.toml",
+    ] {
+        let path = root.join(file);
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    for directory in ["src", ".cargo", "wit"] {
+        collect_regular_files(&root.join(directory), &mut paths)?;
+    }
+    paths.sort();
+    let mut digest = Sha256::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| message(format!("invalid watched path: {error}")))?
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let bytes = fs::read(&path).map_err(|error| io(&path, error))?;
+        digest.update((relative.len() as u64).to_be_bytes());
+        digest.update(relative.as_bytes());
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn collect_regular_files(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), CliError> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).map_err(|error| io(directory, error))? {
+        let entry = entry.map_err(|error| io(directory, error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| io(&entry.path(), error))?;
+        if file_type.is_symlink() {
+            return Err(message(format!(
+                "watched project inputs must not be symlinks: {}",
+                entry.path().display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_regular_files(&entry.path(), paths)?;
+        } else if file_type.is_file() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
 fn build_and_validate(
     release: bool,
 ) -> Result<(Project, youth_runtime::ComponentValidation), CliError> {
@@ -549,5 +766,25 @@ mod tests {
             fs::read_to_string(destination.join("owned.txt")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn watcher_tracks_inputs_and_ignores_build_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("Cargo.toml"), "initial").unwrap();
+        fs::write(root.join("src/lib.rs"), "initial").unwrap();
+        fs::write(root.join("target/output"), "one").unwrap();
+        let initial = watch_fingerprint(root).unwrap();
+
+        fs::write(root.join("target/output"), "two").unwrap();
+        fs::write(root.join("dist/output"), "two").unwrap();
+        assert_eq!(watch_fingerprint(root).unwrap(), initial);
+
+        fs::write(root.join("src/lib.rs"), "changed").unwrap();
+        assert_ne!(watch_fingerprint(root).unwrap(), initial);
     }
 }

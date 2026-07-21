@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::process::{Command, Output};
 use tempfile::tempdir;
 
@@ -143,6 +145,44 @@ fn explicit_headless_state_persists_and_maintenance_prints_no_values() {
         "--yes",
     ]);
     assert_success(&reset);
+}
+
+#[test]
+fn supervised_headless_child_mounts_and_stops_from_stdin() {
+    let component = counter_component();
+    let directory = tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_youth"))
+        .args([
+            "__dev-child",
+            path_str(&component),
+            "--app-id",
+            "dev.youth.supervisor-test",
+            "--state-dir",
+            path_str(directory.path()),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("headless child starts");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"shutdown\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "dev child: mounted\n"
+    );
+    assert!(
+        directory
+            .path()
+            .join("dev.youth.supervisor-test/state.sqlite3")
+            .is_file()
+    );
 }
 
 fn youth<const N: usize>(args: [&str; N]) -> Output {
