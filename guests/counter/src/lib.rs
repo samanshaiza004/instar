@@ -1,7 +1,6 @@
 //! Counter guest: exports the `youth:app/application` world.
 //!
-//! In-memory count is intentionally disposable; restarting the
-//! component resets it.
+//! The host-owned state store is authoritative for the count.
 
 // Component export symbols only link on the WASIp2 target; host-target
 // builds of the workspace compile this crate as empty. This is
@@ -12,6 +11,7 @@
 use std::cell::RefCell;
 
 wit_bindgen::generate!({
+    generate_all,
     world: "application",
     path: "../../wit/youth-app",
 });
@@ -21,6 +21,7 @@ use youth::app::ui::{
     AppError, AppErrorCode, BoxData, ButtonData, EventBatch, EventKind, Node, NodeData, Patch,
     PatchBatch, SetText, TextData, TreeSnapshot,
 };
+use youth::state::store;
 
 const ROOT_ID: u64 = 1;
 const BOX_ID: u64 = 2;
@@ -29,7 +30,6 @@ const BUTTON_ID: u64 = 4;
 
 struct State {
     mounted: bool,
-    count: u64,
     revision: u64,
 }
 
@@ -37,7 +37,6 @@ thread_local! {
     static STATE: RefCell<State> = const {
         RefCell::new(State {
             mounted: false,
-            count: 0,
             revision: 0,
         })
     };
@@ -47,13 +46,22 @@ struct Counter;
 
 impl Guest for Counter {
     fn mount() -> Result<TreeSnapshot, AppError> {
+        let count = match store::get("count").map_err(|_| error(AppErrorCode::InvalidState))? {
+            Some(store::Value::Integer(value)) if value >= 0 => value,
+            Some(_) => return Err(error(AppErrorCode::InvalidState)),
+            None => {
+                store::set("count", &store::Value::Integer(0))
+                    .map_err(|_| error(AppErrorCode::InvalidState))?;
+                0
+            }
+        };
         with_state(|state| {
             if state.mounted {
                 return Err(error(AppErrorCode::InvalidState));
             }
 
             state.mounted = true;
-            Ok(snapshot(state))
+            Ok(snapshot(state, count))
         })
     }
 
@@ -81,9 +89,10 @@ impl Guest for Counter {
                 });
             }
 
-            let increment = events.events.len() as u64;
-            let next_count = state
-                .count
+            let count = read_count()?;
+            let increment =
+                i64::try_from(events.events.len()).map_err(|_| error(AppErrorCode::Internal))?;
+            let next_count = count
                 .checked_add(increment)
                 .ok_or_else(|| error(AppErrorCode::Internal))?;
             let next_revision = events
@@ -91,7 +100,8 @@ impl Guest for Counter {
                 .checked_add(1)
                 .ok_or_else(|| error(AppErrorCode::Internal))?;
 
-            state.count = next_count;
+            store::set("count", &store::Value::Integer(next_count))
+                .map_err(|_| error(AppErrorCode::InvalidState))?;
             state.revision = next_revision;
 
             Ok(PatchBatch {
@@ -107,12 +117,13 @@ impl Guest for Counter {
     }
 
     fn resync() -> Result<TreeSnapshot, AppError> {
+        let count = read_count()?;
         with_state(|state| {
             if !state.mounted {
                 return Err(error(AppErrorCode::InvalidState));
             }
 
-            Ok(snapshot(state))
+            Ok(snapshot(state, count))
         })
     }
 }
@@ -126,7 +137,14 @@ fn with_state<T>(operation: impl FnOnce(&mut State) -> Result<T, AppError>) -> R
     })
 }
 
-fn snapshot(state: &State) -> TreeSnapshot {
+fn read_count() -> Result<i64, AppError> {
+    match store::get("count").map_err(|_| error(AppErrorCode::InvalidState))? {
+        Some(store::Value::Integer(value)) if value >= 0 => Ok(value),
+        _ => Err(error(AppErrorCode::InvalidState)),
+    }
+}
+
+fn snapshot(state: &State, count: i64) -> TreeSnapshot {
     TreeSnapshot {
         revision: state.revision,
         root: ROOT_ID,
@@ -144,7 +162,7 @@ fn snapshot(state: &State) -> TreeSnapshot {
             Node {
                 id: TEXT_ID,
                 data: NodeData::Text(TextData {
-                    value: count_text(state.count),
+                    value: count_text(count),
                 }),
                 children: Vec::new(),
             },
@@ -160,7 +178,7 @@ fn snapshot(state: &State) -> TreeSnapshot {
     }
 }
 
-fn count_text(count: u64) -> String {
+fn count_text(count: i64) -> String {
     format!("Count: {count}")
 }
 

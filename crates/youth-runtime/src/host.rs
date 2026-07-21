@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tracing::info_span;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -13,9 +13,11 @@ use crate::engine::deadline_ticks;
 use crate::error::ErrorContext;
 use crate::wire::from_guest::{self, WireErrorKind};
 use crate::wire::to_guest::{self, HostEvent};
-use crate::{CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits};
+use crate::{
+    CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits, StateLocation, YouthAppConfig,
+};
 
-const APPLICATION_WORLD: &str = "youth:app/application@0.0.1";
+const APPLICATION_WORLD: &str = "youth:app/application@0.0.2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppLifecycle {
@@ -40,10 +42,15 @@ impl fmt::Display for AppLifecycle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnReceipt {
     pub turn_id: u64,
+    pub first_event_sequence: u64,
+    pub processed_through: u64,
     pub event_sequence: u64,
     pub base_revision: u64,
     pub next_revision: u64,
+    pub patch_batch: youth_tree::PatchBatch,
     pub patch_count: usize,
+    pub state_writes: u32,
+    pub elapsed: std::time::Duration,
     pub committed: bool,
 }
 
@@ -57,6 +64,12 @@ pub struct AppFault {
 /// A synchronous snapshot of host-owned application state.
 #[derive(Clone, Debug)]
 pub struct AppInspection {
+    pub app_id: String,
+    pub state_location: &'static str,
+    pub state_summary: Option<youth_state::StateSummary>,
+    pub state_transaction_active: bool,
+    pub state_phase: youth_state::GuestCallPhase,
+    pub state_metrics: youth_state::TurnStateMetrics,
     pub lifecycle: AppLifecycle,
     pub world: String,
     pub current_revision: Option<u64>,
@@ -103,6 +116,7 @@ struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     limiter: MemoryLimiter,
+    state: youth_state::StateStore,
 }
 
 impl WasiView for HostState {
@@ -114,9 +128,94 @@ impl WasiView for HostState {
     }
 }
 
+impl crate::bindings::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::youth::state::store::Value>,
+        crate::bindings::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value))
+            .map_err(to_wire_state_error)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value(value))
+            .map_err(to_wire_state_error)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error)
+    }
+}
+
+fn to_wire_state_value(
+    value: youth_state::StateValue,
+) -> crate::bindings::youth::state::store::Value {
+    use crate::bindings::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value(
+    value: crate::bindings::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error(
+    error: youth_state::StateError,
+) -> crate::bindings::youth::state::store::StateError {
+    use crate::bindings::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
 /// One synchronous, single-owner Youth component instance.
 pub struct YouthApp {
     component_id: String,
+    app_id: youth_state::AppId,
     limits: RuntimeLimits,
     store: Store<HostState>,
     bindings: Application,
@@ -146,25 +245,27 @@ impl fmt::Debug for YouthApp {
 
 impl YouthApp {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
-        Self::load_with_limits(path, RuntimeLimits::default())
+        Self::load_config(YouthAppConfig::ephemeral(path))
     }
 
     pub fn load_with_limits(
         path: impl AsRef<Path>,
         limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::load_with_engine(path, limits, crate::shared_engine())
+        let mut config = YouthAppConfig::ephemeral(path);
+        config.limits = limits;
+        Self::load_config(config)
     }
 
-    fn load_with_engine(
-        path: impl AsRef<Path>,
-        limits: RuntimeLimits,
-        engine: &Engine,
-    ) -> Result<Self, RuntimeError> {
-        let path = path.as_ref();
+    pub fn load_config(config: YouthAppConfig) -> Result<Self, RuntimeError> {
+        Self::load_with_engine(config, crate::shared_engine())
+    }
+
+    fn load_with_engine(config: YouthAppConfig, engine: &Engine) -> Result<Self, RuntimeError> {
+        let path = config.component_path.as_path();
         let component_id = component_identity(path);
         let load_span = info_span!("component.load", component_id = %component_id);
-        let bytes = load_span.in_scope(|| read_component(path, &component_id, &limits))?;
+        let bytes = load_span.in_scope(|| read_component(path, &component_id, &config.limits))?;
 
         let compile_span = info_span!("component.compile", component_id = %component_id);
         let component = compile_span.in_scope(|| {
@@ -182,7 +283,16 @@ impl YouthApp {
         })?;
 
         let instantiate_span = info_span!("component.instantiate", component_id = %component_id);
-        instantiate_span.in_scope(|| instantiate(engine, component, component_id, limits))
+        instantiate_span.in_scope(|| {
+            instantiate(
+                engine,
+                component,
+                component_id,
+                config.app_id,
+                config.state,
+                config.limits,
+            )
+        })
     }
 
     #[must_use]
@@ -195,15 +305,47 @@ impl YouthApp {
         self.tree.as_ref()
     }
 
+    pub fn snapshot(&self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
+        self.tree
+            .as_ref()
+            .filter(|_| self.lifecycle == AppLifecycle::Mounted)
+            .map(youth_tree::Tree::to_snapshot)
+            .ok_or_else(|| {
+                RuntimeError::InvalidLifecycle(self.context(
+                    format!(
+                        "snapshot is not available while the app is {}",
+                        self.lifecycle
+                    ),
+                    None,
+                ))
+            })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_state_commit(&mut self) {
+        self.store.data_mut().state.fail_next_commit();
+    }
+
     pub fn mount(&mut self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         let turn_id = Some(0);
         let span = info_span!(
             "app.mount",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = 0_u64,
+            call_phase = "mount",
+            event_count = 0_u64,
+            base_revision = 0_u64,
+            next_revision = 0_u64,
+            patch_count = 0_u64,
             fuel_before = self.limits.mount.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.mount_inner(turn_id));
@@ -237,16 +379,27 @@ impl YouthApp {
             .revision();
         self.last_turn = Some(TurnReceipt {
             turn_id: sequence,
+            first_event_sequence: sequence,
+            processed_through: sequence,
             event_sequence: sequence,
             base_revision,
             next_revision: base_revision,
+            patch_batch: youth_tree::PatchBatch {
+                base_revision,
+                next_revision: base_revision,
+                patches: Vec::new(),
+            },
             patch_count: 0,
+            state_writes: 0,
+            elapsed: std::time::Duration::ZERO,
             committed: false,
         });
         let span = info_span!(
             "app.turn",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = sequence,
+            call_phase = "handle",
             event_count = 1_u64,
             first_event_sequence = sequence,
             last_event_sequence = sequence,
@@ -256,6 +409,11 @@ impl YouthApp {
             fuel_before = self.limits.handle.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.activate_inner(node, sequence, base_revision));
@@ -271,9 +429,15 @@ impl YouthApp {
     ) -> Result<TurnReceipt, RuntimeError> {
         let turn_id = Some(sequence);
         self.prepare_call(self.limits.handle, "handle", turn_id)?;
+        let mut staged_tree = self
+            .tree
+            .as_ref()
+            .expect("mounted applications retain a tree")
+            .clone();
         let events =
             to_guest::event_batch(base_revision, &[HostEvent { sequence, node }], &self.limits)
                 .map_err(|message| RuntimeError::Internal(self.context(message, turn_id)))?;
+        self.begin_state(youth_state::GuestCallPhase::Handle, turn_id)?;
 
         let started = std::time::Instant::now();
         let guest_result = self
@@ -286,15 +450,25 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "handling events");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_batch = match guest_result {
             Ok(batch) => batch,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "handle"),
-                ));
+                let writes = self.store.data().state.metrics().writes;
+                let recoverable = error.code
+                    == crate::bindings::youth::app::ui::AppErrorCode::RejectedEvent
+                    && writes == 0;
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
+                let _ = self.store.data_mut().state.rollback();
+                self.record_state_metrics("rolled_back");
+                return if recoverable {
+                    Err(error)
+                } else {
+                    Err(self.enter_fault(error))
+                };
             }
         };
         if wire_batch.processed_through != sequence {
@@ -305,7 +479,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
         let batch = match from_guest::patch_batch(wire_batch, &self.limits) {
             Ok(batch) => batch,
@@ -319,7 +493,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidPatchBatch(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if batch.base_revision != base_revision {
@@ -330,7 +504,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
 
         let next_revision = batch.next_revision;
@@ -338,6 +512,7 @@ impl YouthApp {
         if let Some(receipt) = &mut self.last_turn {
             receipt.next_revision = next_revision;
             receipt.patch_count = patch_count;
+            receipt.patch_batch = batch.clone();
         }
         tracing::Span::current().record("next_revision", next_revision);
         tracing::Span::current().record("patch_count", patch_count as u64);
@@ -349,12 +524,8 @@ impl YouthApp {
             next_revision,
             patch_count = patch_count as u64,
         );
-        let apply_result = apply_span.in_scope(|| {
-            self.tree
-                .as_mut()
-                .expect("mounted applications retain a tree")
-                .apply(batch, &self.limits.tree)
-        });
+        let apply_result =
+            apply_span.in_scope(|| staged_tree.apply(batch.clone(), &self.limits.tree));
         if let Err(source) = apply_result {
             let revision_error = matches!(
                 source,
@@ -369,15 +540,33 @@ impl YouthApp {
             } else {
                 RuntimeError::InvalidPatchBatch(context)
             };
+            return Err(self.rollback_and_fault(error));
+        }
+
+        let state_writes = self.store.data().state.metrics().writes;
+        if let Err(source) = self.store.data_mut().state.commit() {
+            self.record_state_metrics("commit_failed");
+            let error = RuntimeError::StateCommitFailed(
+                self.context("state commit failed after patch validation", turn_id)
+                    .with_source(source),
+            );
             return Err(self.enter_fault(error));
         }
+        self.record_state_metrics("committed");
+        self.tree = Some(staged_tree);
+        let elapsed = started.elapsed();
 
         let receipt = TurnReceipt {
             turn_id: sequence,
+            first_event_sequence: sequence,
+            processed_through: sequence,
             event_sequence: sequence,
             base_revision,
             next_revision,
+            patch_batch: batch,
             patch_count,
+            state_writes,
+            elapsed,
             committed: true,
         };
         self.last_turn = Some(receipt.clone());
@@ -398,8 +587,10 @@ impl YouthApp {
         let turn_id = self.last_event_sequence;
         let span = info_span!(
             "app.resync",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             turn_id = turn_id.unwrap_or(0),
+            call_phase = "resync",
             event_count = 0_u64,
             first_event_sequence = self.last_event_sequence.unwrap_or(0),
             last_event_sequence = self.last_event_sequence.unwrap_or(0),
@@ -409,6 +600,11 @@ impl YouthApp {
             fuel_before = self.limits.resync.fuel,
             fuel_after = tracing::field::Empty,
             elapsed_microseconds = tracing::field::Empty,
+            state_call_count = tracing::field::Empty,
+            state_write_count = tracing::field::Empty,
+            state_bytes_before = tracing::field::Empty,
+            state_bytes_after = tracing::field::Empty,
+            transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
         let result = span.in_scope(|| self.resync_inner(base_revision, turn_id));
@@ -422,6 +618,7 @@ impl YouthApp {
         turn_id: Option<u64>,
     ) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         self.prepare_call(self.limits.resync, "resync", turn_id)?;
+        self.begin_state(youth_state::GuestCallPhase::Resync, turn_id)?;
         let started = std::time::Instant::now();
         let guest_result = self
             .bindings
@@ -433,15 +630,17 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "resynchronizing");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_snapshot = match guest_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "resync"),
-                ));
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
+                let _ = self.store.data_mut().state.rollback();
+                self.record_state_metrics("rolled_back");
+                return Err(error);
             }
         };
         let snapshot = match from_guest::tree_snapshot(wire_snapshot, &self.limits) {
@@ -456,7 +655,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidSnapshot(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if snapshot.revision != live_revision {
@@ -467,7 +666,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
         let validation_span = info_span!(
             "tree.validate",
@@ -483,10 +682,18 @@ impl YouthApp {
                     self.context("guest returned an invalid resync tree", turn_id)
                         .with_source(source),
                 );
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let snapshot = tree.to_snapshot();
+        if let Err(source) = self.store.data_mut().state.rollback() {
+            let error = RuntimeError::StateUnavailable(
+                self.context("read-only resync transaction could not close", turn_id)
+                    .with_source(source),
+            );
+            return Err(self.enter_fault(error));
+        }
+        self.record_state_metrics("read_only");
         self.tree = Some(tree);
         Ok(snapshot)
     }
@@ -509,6 +716,15 @@ impl YouthApp {
     pub fn inspect(&self) -> AppInspection {
         let tree = self.tree.as_ref();
         AppInspection {
+            app_id: self.app_id.to_string(),
+            state_location: match self.store.data().state.location() {
+                StateLocation::Memory => "memory",
+                StateLocation::File(_) => "file",
+            },
+            state_summary: self.store.data().state.summary().ok(),
+            state_transaction_active: self.store.data().state.transaction_active(),
+            state_phase: self.store.data().state.phase(),
+            state_metrics: self.store.data().state.metrics(),
             lifecycle: self.lifecycle,
             world: APPLICATION_WORLD.to_owned(),
             current_revision: tree.map(youth_tree::Tree::revision),
@@ -533,6 +749,7 @@ impl YouthApp {
             )));
         }
         self.prepare_call(self.limits.mount, "mount", turn_id)?;
+        self.begin_state(youth_state::GuestCallPhase::Mount, turn_id)?;
 
         let started = std::time::Instant::now();
         let guest_result = self
@@ -545,15 +762,15 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "mounting");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_snapshot = match guest_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "mount"),
-                ));
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "mount"));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let snapshot = match from_guest::tree_snapshot(wire_snapshot, &self.limits) {
@@ -568,7 +785,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidSnapshot(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if snapshot.revision != 0 {
@@ -579,7 +796,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
 
         let validation_span =
@@ -594,9 +811,18 @@ impl YouthApp {
             });
         let tree = match tree {
             Ok(tree) => tree,
-            Err(error) => return Err(self.enter_fault(error)),
+            Err(error) => return Err(self.rollback_and_fault(error)),
         };
         let snapshot = tree.to_snapshot();
+        if let Err(source) = self.store.data_mut().state.commit() {
+            self.record_state_metrics("commit_failed");
+            let error = RuntimeError::StateCommitFailed(
+                self.context("state commit failed after mount validation", turn_id)
+                    .with_source(source),
+            );
+            return Err(self.enter_fault(error));
+        }
+        self.record_state_metrics("committed");
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
         Ok(snapshot)
@@ -643,6 +869,35 @@ impl YouthApp {
         Ok(())
     }
 
+    fn begin_state(
+        &mut self,
+        phase: youth_state::GuestCallPhase,
+        turn_id: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        self.store.data_mut().state.begin(phase).map_err(|source| {
+            let error = RuntimeError::StateUnavailable(
+                self.context("state transaction could not begin", turn_id)
+                    .with_source(source),
+            );
+            self.enter_fault(error)
+        })
+    }
+
+    fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
+        let _ = self.store.data_mut().state.rollback();
+        self.record_state_metrics("rolled_back");
+        self.enter_fault(error)
+    }
+
+    fn record_state_metrics(&self, result: &'static str) {
+        let metrics = self.store.data().state.metrics();
+        tracing::Span::current().record("state_call_count", u64::from(metrics.calls));
+        tracing::Span::current().record("state_write_count", u64::from(metrics.writes));
+        tracing::Span::current().record("state_bytes_before", metrics.bytes_before);
+        tracing::Span::current().record("state_bytes_after", metrics.bytes_after);
+        tracing::Span::current().record("transaction_result", result);
+    }
+
     fn record_call_metrics(&self, elapsed: std::time::Duration) {
         tracing::Span::current().record("elapsed_microseconds", elapsed.as_micros() as u64);
         if let Ok(fuel_after) = self.store.get_fuel() {
@@ -685,6 +940,7 @@ impl YouthApp {
         self.lifecycle = AppLifecycle::Faulted;
         let span = info_span!(
             "app.fault",
+            app_id = %self.app_id,
             component_id = %self.component_id,
             category = ?error.category(),
             turn_id = error.context().turn_id.unwrap_or(0),
@@ -702,8 +958,22 @@ fn instantiate(
     engine: &Engine,
     component: Component,
     component_id: String,
+    app_id: youth_state::AppId,
+    state_location: StateLocation,
     limits: RuntimeLimits,
 ) -> Result<YouthApp, RuntimeError> {
+    let state_store =
+        youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
+            RuntimeError::StateUnavailable(
+                ErrorContext::new(
+                    "application state could not be opened",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        })?;
     let mut linker = Linker::<HostState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|source| {
         RuntimeError::LinkFailure(
@@ -716,6 +986,19 @@ fn instantiate(
             .with_source(source),
         )
     })?;
+    Application::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |state| state).map_err(
+        |source| {
+            RuntimeError::LinkFailure(
+                ErrorContext::new(
+                    "failed to configure Youth state imports",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        },
+    )?;
     let pre = linker.instantiate_pre(&component).map_err(|source| {
         RuntimeError::LinkFailure(
             ErrorContext::new(
@@ -730,7 +1013,7 @@ fn instantiate(
     let pre = ApplicationPre::new(pre).map_err(|source| {
         RuntimeError::UnsupportedWorld(
             ErrorContext::new(
-                "component does not export youth:app/application@0.0.1",
+                "component does not export youth:app/application@0.0.2",
                 &component_id,
                 AppLifecycle::Loaded,
                 None,
@@ -747,6 +1030,7 @@ fn instantiate(
             max_table_elements: limits.max_table_elements,
             limit_hit: false,
         },
+        state: state_store,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);
@@ -783,6 +1067,7 @@ fn instantiate(
     })?;
     Ok(YouthApp {
         component_id,
+        app_id,
         limits,
         store,
         bindings,

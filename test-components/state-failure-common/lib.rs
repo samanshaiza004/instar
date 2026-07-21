@@ -1,4 +1,4 @@
-//! Containment fixture that returns more patches than the protocol allows.
+//! Shared source for state-write rollback fixtures.
 
 #![cfg(all(target_os = "wasi", target_env = "p2"))]
 
@@ -11,30 +11,47 @@ wit_bindgen::generate!({
 use exports::youth::app::lifecycle::Guest;
 use youth::app::ui::{
     AppError, AppErrorCode, BoxData, ButtonData, EventBatch, Node, NodeData, Patch, PatchBatch,
-    SetEnabled, TextData, TreeSnapshot,
+    SetText, TextData, TreeSnapshot,
 };
+use youth::state::store;
 
-struct OversizedPatch;
+struct StateFailure;
 
-impl Guest for OversizedPatch {
+impl Guest for StateFailure {
     fn mount() -> Result<TreeSnapshot, AppError> {
         Ok(snapshot())
     }
 
     fn handle(events: EventBatch) -> Result<PatchBatch, AppError> {
-        let patches = (0..10_001)
-            .map(|_| Patch::SetEnabled(SetEnabled { id: 2, value: true }))
-            .collect();
-        Ok(PatchBatch {
-            base_tree_revision: events.tree_revision,
-            next_tree_revision: events.tree_revision.saturating_add(1),
-            processed_through: events.events.last().map_or(0, |event| event.sequence),
-            patches,
-        })
+        store::set("count", &store::Value::Integer(2)).map_err(|_| error())?;
+        let processed_through = events.events.last().map_or(0, |event| event.sequence);
+        match env!("CARGO_PKG_NAME") {
+            "youth-trap-after-state-write" => panic!("intentional trap after state write"),
+            "youth-invalid-patch-after-state-write" => Ok(PatchBatch {
+                base_tree_revision: events.tree_revision,
+                next_tree_revision: events.tree_revision + 1,
+                processed_through,
+                patches: vec![Patch::SetText(SetText {
+                    id: 4,
+                    value: String::from("wrong kind"),
+                })],
+            }),
+            "youth-bad-revision-after-state-write" => Ok(PatchBatch {
+                base_tree_revision: events.tree_revision,
+                next_tree_revision: events.tree_revision + 2,
+                processed_through,
+                patches: Vec::new(),
+            }),
+            "youth-app-error-after-state-write" => Err(AppError {
+                code: AppErrorCode::RejectedEvent,
+                message: None,
+            }),
+            _ => unreachable!(),
+        }
     }
 
     fn resync() -> Result<TreeSnapshot, AppError> {
-        Err(error())
+        Ok(snapshot())
     }
 }
 
@@ -56,7 +73,7 @@ fn snapshot() -> TreeSnapshot {
             Node {
                 id: 3,
                 data: NodeData::Text(TextData {
-                    value: String::from("Count: 0"),
+                    value: String::from("Count: 1"),
                 }),
                 children: Vec::new(),
             },
@@ -79,4 +96,4 @@ const fn error() -> AppError {
     }
 }
 
-export!(OversizedPatch);
+export!(StateFailure);

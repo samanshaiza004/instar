@@ -34,6 +34,10 @@ jobs:
           -p youth-invalid-sequence
           -p youth-oversized-snapshot
           -p youth-oversized-patch
+          -p youth-trap-after-state-write
+          -p youth-invalid-patch-after-state-write
+          -p youth-bad-revision-after-state-write
+          -p youth-app-error-after-state-write
           --target wasm32-wasip2 --release
       - name: Record SHA-256
         id: hash
@@ -55,6 +59,10 @@ jobs:
             target/wasm32-wasip2/release/youth_invalid_sequence.wasm
             target/wasm32-wasip2/release/youth_oversized_snapshot.wasm
             target/wasm32-wasip2/release/youth_oversized_patch.wasm
+            target/wasm32-wasip2/release/youth_trap_after_state_write.wasm
+            target/wasm32-wasip2/release/youth_invalid_patch_after_state_write.wasm
+            target/wasm32-wasip2/release/youth_bad_revision_after_state_write.wasm
+            target/wasm32-wasip2/release/youth_app_error_after_state_write.wasm
             counter.sha256
           if-no-files-found: error
 
@@ -73,6 +81,9 @@ jobs:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@wasm-tools
+      - name: Install Linux window dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
       - uses: actions/download-artifact@v4
         with:
           name: counter-wasm
@@ -96,6 +107,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Transaction commit-failure tests
+        run: cargo test -p youth-runtime --features test-support --test transactional_state
+      - name: Deterministic framebuffer fixture
+        run: cargo test -p youth-desktop raster::tests::raw_frame_fixtures_are_deterministic
       - name: Cross-platform canonical snapshot gate
         shell: pwsh
         run: |
@@ -139,3 +154,11 @@ jobs:
           Write-Host "canonical snapshot SHA-256: $actualHash"
       - name: Build (release)
         run: cargo build --workspace --release
+      - name: Desktop release build
+        run: cargo build -p youth-desktop --release
+      - name: Native window smoke (Ubuntu/Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo run -p youth-desktop -- --window-smoke
+      - name: Native window smoke (hosted desktop)
+        if: runner.os != 'Linux'
+        run: cargo run -p youth-desktop -- --window-smoke

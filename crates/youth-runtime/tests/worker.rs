@@ -12,7 +12,7 @@ fn id(value: u64) -> NodeId {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_hundred_concurrent_callers_are_serialized_without_loss() {
-    let app = YouthAppHandle::spawn(counter_component()).expect("worker starts");
+    let app = YouthAppHandle::spawn_ephemeral(counter_component()).expect("worker starts");
     app.mount().await.expect("mount succeeds");
 
     let mut calls = Vec::new();

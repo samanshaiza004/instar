@@ -1,4 +1,4 @@
-# Youth Rust Guest Profile 0.0.1
+# Youth Rust Guest Profile 0.0.2
 
 This document records what a Youth guest component is allowed to import,
 and why the current Rust guest imports more than `youth:*`.
@@ -24,7 +24,8 @@ is budgeted rather than left implicit.
 
 ```text
 Required:
-  youth:app/*
+  youth:app/ui
+  youth:state/store
 
 Permitted inert WASIp2 imports:
   wasi:cli/environment          wasi:cli/terminal-input

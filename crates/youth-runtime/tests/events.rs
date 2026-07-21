@@ -146,7 +146,7 @@ fn inspect_reports_mounted_tree_metrics_and_last_turn() {
     let inspection = app.inspect();
 
     assert_eq!(inspection.lifecycle, AppLifecycle::Mounted);
-    assert_eq!(inspection.world, "youth:app/application@0.0.1");
+    assert_eq!(inspection.world, "youth:app/application@0.0.2");
     assert_eq!(inspection.current_revision, Some(1));
     assert_eq!(inspection.node_count, 4);
     assert_eq!(inspection.depth, 3);
