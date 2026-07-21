@@ -1,4 +1,4 @@
-//! Youth Rust Guest Profile 0.0.1 — the guest import budget.
+//! Youth Rust Guest Profile 0.0.2 — the guest import budget.
 //!
 //! Youth's WASI context is closed, so these imports are inert: the host
 //! decides what they return. They remain a real linking and compatibility
@@ -11,7 +11,7 @@ use common::counter_component;
 use youth_runtime::component_imports;
 
 /// Interfaces the Youth application contract itself requires.
-const REQUIRED: &[&str] = &["youth:app/ui"];
+const REQUIRED: &[&str] = &["youth:app/ui", "youth:state/store"];
 
 /// Inert WASIp2 interfaces the Rust standard library pulls in on
 /// `wasm32-wasip2`. Permitted, but budgeted: adding to this list is a

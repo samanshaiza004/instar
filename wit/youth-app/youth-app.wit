@@ -1,4 +1,4 @@
-package youth:app@0.0.1;
+package youth:app@0.0.2;
 
 interface ui {
     type node-id = u64;
@@ -137,5 +137,6 @@ interface lifecycle {
 }
 
 world application {
+    import youth:state/store@0.0.1;
     export lifecycle;
 }

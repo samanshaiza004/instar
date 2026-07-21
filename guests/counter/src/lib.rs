@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 
 wit_bindgen::generate!({
+    generate_all,
     world: "application",
     path: "../../wit/youth-app",
 });
@@ -21,6 +22,7 @@ use youth::app::ui::{
     AppError, AppErrorCode, BoxData, ButtonData, EventBatch, EventKind, Node, NodeData, Patch,
     PatchBatch, SetText, TextData, TreeSnapshot,
 };
+use youth::state::store;
 
 const ROOT_ID: u64 = 1;
 const BOX_ID: u64 = 2;
@@ -47,6 +49,9 @@ struct Counter;
 
 impl Guest for Counter {
     fn mount() -> Result<TreeSnapshot, AppError> {
+        // Keeps the required state import in the protocol artifact until the
+        // durable counter lands in the transactional-runtime commits.
+        let _ = store::get("__protocol_probe");
         with_state(|state| {
             if state.mounted {
                 return Err(error(AppErrorCode::InvalidState));

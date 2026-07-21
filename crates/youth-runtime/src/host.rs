@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tracing::info_span;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -15,7 +15,7 @@ use crate::wire::from_guest::{self, WireErrorKind};
 use crate::wire::to_guest::{self, HostEvent};
 use crate::{CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits};
 
-const APPLICATION_WORLD: &str = "youth:app/application@0.0.1";
+const APPLICATION_WORLD: &str = "youth:app/application@0.0.2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppLifecycle {
@@ -111,6 +111,42 @@ impl WasiView for HostState {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+impl crate::bindings::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        _key: String,
+    ) -> Result<
+        Option<crate::bindings::youth::state::store::Value>,
+        crate::bindings::youth::state::store::StateError,
+    > {
+        Ok(None)
+    }
+
+    fn set(
+        &mut self,
+        _key: String,
+        _value: crate::bindings::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::youth::state::store::StateError> {
+        Err(state_unavailable())
+    }
+
+    fn delete(
+        &mut self,
+        _key: String,
+    ) -> Result<bool, crate::bindings::youth::state::store::StateError> {
+        Err(state_unavailable())
+    }
+}
+
+fn state_unavailable() -> crate::bindings::youth::state::store::StateError {
+    crate::bindings::youth::state::store::StateError {
+        code: crate::bindings::youth::state::store::ErrorCode::Unavailable,
+        message: None,
     }
 }
 
@@ -716,6 +752,19 @@ fn instantiate(
             .with_source(source),
         )
     })?;
+    Application::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |state| state).map_err(
+        |source| {
+            RuntimeError::LinkFailure(
+                ErrorContext::new(
+                    "failed to configure Youth state imports",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        },
+    )?;
     let pre = linker.instantiate_pre(&component).map_err(|source| {
         RuntimeError::LinkFailure(
             ErrorContext::new(
@@ -730,7 +779,7 @@ fn instantiate(
     let pre = ApplicationPre::new(pre).map_err(|source| {
         RuntimeError::UnsupportedWorld(
             ErrorContext::new(
-                "component does not export youth:app/application@0.0.1",
+                "component does not export youth:app/application@0.0.2",
                 &component_id,
                 AppLifecycle::Loaded,
                 None,

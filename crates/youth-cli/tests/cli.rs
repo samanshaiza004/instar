@@ -20,7 +20,7 @@ fn mount_output_is_exact() {
         String::from_utf8(output.stdout).unwrap(),
         format!(
             "component: youth_counter.wasm\n\
-             world: youth:app/application@0.0.1\n\
+             world: youth:app/application@0.0.2\n\
              lifecycle: mounted\n\
              revision: 0\n\
              nodes: 4\n\

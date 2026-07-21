@@ -3,6 +3,7 @@
 #![cfg(all(target_os = "wasi", target_env = "p2"))]
 
 wit_bindgen::generate!({
+    generate_all,
     world: "application",
     path: "../../wit/youth-app",
 });

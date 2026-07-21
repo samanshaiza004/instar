@@ -29,7 +29,7 @@ See [docs/MILESTONE-0.md](docs/MILESTONE-0.md) for the full specification.
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app/` | The `youth:app@0.0.1` WIT contract (single source of truth) |
+| `wit/youth-app/` | The `youth:app@0.0.2` and `youth:state@0.0.1` WIT contracts |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker |
 | `crates/youth-cli` | `youth` CLI: validate, mount, activate, script, inspect |
