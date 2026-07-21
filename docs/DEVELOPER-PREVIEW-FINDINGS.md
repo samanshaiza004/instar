@@ -16,6 +16,8 @@ There are no open findings at this checkpoint.
 | DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
 | DP0-F003 | A shallow template copy omitted nested WIT | Addressed | Hash and generate the complete recursive snapshot |
 | DP0-F004 | Supervisor proof should not depend on presentation | Addressed | Run process tests headlessly and native smoke separately |
+| DP0-F005 | Generated artifact names follow the destination | Addressed | Generate CI fixtures into the documented `tally` directory |
+| DP0-F006 | CI evidence must not pollute or exhaust the workspace | Addressed | Use runner-temporary evidence, one feature-complete test build, and reduced debug artifacts |
 
 ## Finding template
 
@@ -132,3 +134,54 @@ There are no open findings at this checkpoint.
   protocol or public guest API.
 - **Resolution:** Watch-input unit tests, cross-platform headless-child tests,
   the manual valid/invalid/recovery exercise, and split CI gates cover it.
+
+### DP0-F005 — Generated artifact names follow the destination
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** Generated Tally
+- **Workflow stage:** Ubuntu source-edit and restart E2E
+- **Platform:** Ubuntu x86-64 GitHub-hosted runner
+- **Local path:** `$RUNNER_TEMP/youth-external-tally`
+- **Commit:** `ci: make developer preview gates deterministic`
+- **Evidence:** `youth new` correctly derives the Cargo package from the
+  destination basename. CI generated `youth-external-tally`, producing
+  `youth_external_tally.wasm`, while the later E2E invoked the nonexistent
+  `target/wasm32-wasip2/debug/tally.wasm` and failed before presentation.
+- **Developer impact:** Scripts that guess a component name independently of
+  the project contract can fail even though `youth check`, `test`, and `build`
+  all succeed.
+- **Decision:** Make the external CI fixture mirror the documented workflow by
+  generating a directory whose basename is exactly `tally`.
+- **Tooling implication:** Project-oriented commands remain the authority for
+  package resolution; direct artifact access in narrow integration tests must
+  use a fixture with an intentionally fixed package name.
+- **Resolution:** The external workflow and Ubuntu E2E now share
+  `$RUNNER_TEMP/youth-external/tally`, locking the expected `tally.wasm` name.
+
+### DP0-F006 — CI evidence must not pollute or exhaust the workspace
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** Youth host matrix
+- **Workflow stage:** Canonical snapshots, test failpoints, release builds, and
+  final clean-tree verification
+- **Platform:** Ubuntu, Windows, and macOS GitHub-hosted runners
+- **Local path:** Youth workspace and `$RUNNER_TEMP`
+- **Commit:** `ci: make developer preview gates deterministic`
+- **Evidence:** The canonical snapshot gate wrote `three-clicks.actual` and
+  `three-clicks.expected` into the repository, making the final clean-tree gate
+  fail on every host. A separate feature-enabled transaction test build and a
+  second desktop release invocation also duplicated large Wasmtime artifacts;
+  one Ubuntu run reported disk exhaustion while compiling them.
+- **Developer impact:** Valid code can appear broken when evidence files leak
+  into source control scope or redundant compiler profiles exceed hosted-runner
+  storage.
+- **Decision:** Write transient evidence beneath `RUNNER_TEMP`, run the full
+  workspace test suite once with transaction failpoints enabled, remove the
+  redundant desktop release invocation, disable incremental compilation, and
+  omit debug information from CI dev/test artifacts.
+- **Tooling implication:** CI gates should share compiler profiles and treat
+  workspace cleanliness and resource use as explicit correctness constraints.
+- **Resolution:** The workflow now prints clean-tree diagnostics, keeps
+  canonical hash inputs outside the checkout, and reduces duplicate artifacts.

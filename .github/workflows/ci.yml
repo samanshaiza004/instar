@@ -2,10 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   # Build the guest component once; every host job consumes these exact bytes.
@@ -107,14 +111,12 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
+      - name: Test, including transaction failpoints
+        run: cargo test --workspace --features youth-runtime/test-support
       - name: SDK documentation and doctests
         run: cargo doc -p youth-sdk --no-deps && cargo test -p youth-sdk --doc
       - name: Developer guide
         run: mdbook build docs/book
-      - name: Transaction commit-failure tests
-        run: cargo test -p youth-runtime --features test-support --test transactional_state
       - name: Deterministic framebuffer fixture
         run: cargo test -p youth-desktop raster::tests::raw_frame_fixtures_are_deterministic
       - name: Cross-platform canonical snapshot gate
@@ -150,18 +152,18 @@ jobs:
             throw "canonical snapshot differs from tests/fixtures/three-clicks.expected"
           }
           $utf8 = [Text.UTF8Encoding]::new($false)
-          [IO.File]::WriteAllText("three-clicks.actual", $stdout, $utf8)
-          [IO.File]::WriteAllText("three-clicks.expected", $expected, $utf8)
-          $actualHash = (Get-FileHash three-clicks.actual -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expectedHash = (Get-FileHash three-clicks.expected -Algorithm SHA256).Hash.ToLowerInvariant()
+          $actualPath = Join-Path $env:RUNNER_TEMP "three-clicks.actual"
+          $expectedPath = Join-Path $env:RUNNER_TEMP "three-clicks.expected"
+          [IO.File]::WriteAllText($actualPath, $stdout, $utf8)
+          [IO.File]::WriteAllText($expectedPath, $expected, $utf8)
+          $actualHash = (Get-FileHash $actualPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = (Get-FileHash $expectedPath -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne $expectedHash) {
             throw "canonical snapshot SHA-256 mismatch: expected $expectedHash, got $actualHash"
           }
           Write-Host "canonical snapshot SHA-256: $actualHash"
       - name: Build (release)
         run: cargo build --workspace --release
-      - name: Desktop release build
-        run: cargo build -p youth-desktop --release
       - name: Native doctor smoke (Ubuntu/Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo run --quiet -p youth-cli --release -- doctor --full
@@ -173,7 +175,9 @@ jobs:
         run: |
           $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
           $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
-          $external = Join-Path $env:RUNNER_TEMP "youth-external-tally"
+          $externalRoot = Join-Path $env:RUNNER_TEMP "youth-external"
+          New-Item -ItemType Directory -Force -Path $externalRoot | Out-Null
+          $external = Join-Path $externalRoot "tally"
           & $cli doctor
           if ($LASTEXITCODE -ne 0) { throw "youth doctor failed" }
           & $cli new $external --id dev.saman.ci-tally
@@ -198,7 +202,7 @@ jobs:
         run: |
           set -euo pipefail
           cli="$PWD/target/release/youth"
-          external="$RUNNER_TEMP/youth-external-tally"
+          external="$RUNNER_TEMP/youth-external/tally"
           cd "$external"
           "$cli" activate target/wasm32-wasip2/debug/tally.wasm \
             --node 15700045616422714228 \
@@ -223,4 +227,6 @@ jobs:
             --app-id dev.saman.ci-tally --state-dir .youth/state | grep 'Count: 1'
       - name: Clean tracked tree
         shell: bash
-        run: test -z "$(git status --short)"
+        run: |
+          git status --short
+          test -z "$(git status --short)"
