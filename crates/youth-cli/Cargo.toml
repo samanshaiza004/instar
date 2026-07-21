@@ -11,9 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+directories = "6.0.0"
 serde_json = "1.0.150"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 youth-runtime = { path = "../youth-runtime" }
 youth-state = { path = "../youth-state" }
 youth-tree = { path = "../youth-tree" }
+youth-desktop = { path = "../youth-desktop" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

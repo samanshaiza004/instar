@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use tempfile::tempdir;
 
 const MOUNTED_TREE: &str =
     "root #1\n└── box #2\n    ├── text #3 \"Count: 0\"\n    └── button #4 \"Increment\"\n";
@@ -60,6 +61,88 @@ fn script_output_equals_committed_fixture() {
         include_str!("../../../tests/fixtures/three-clicks.expected")
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn explicit_headless_state_persists_and_maintenance_prints_no_values() {
+    let component = counter_component();
+    let directory = tempdir().unwrap();
+    let root = path_str(directory.path());
+    let activated = youth([
+        "activate",
+        path_str(&component),
+        "--node",
+        "4",
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+    ]);
+    assert_success(&activated);
+
+    let mounted = youth([
+        "mount",
+        path_str(&component),
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+    ]);
+    assert_success(&mounted);
+    assert!(
+        String::from_utf8(mounted.stdout)
+            .unwrap()
+            .contains("Count: 1")
+    );
+
+    let inspected = youth([
+        "state",
+        "inspect",
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+    ]);
+    assert_success(&inspected);
+    assert_eq!(
+        String::from_utf8(inspected.stdout).unwrap(),
+        "app: dev.youth.counter\nschema: 1\nkeys: 1\nbytes: 45\n"
+    );
+
+    let verified = youth([
+        "state",
+        "verify",
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+    ]);
+    assert_success(&verified);
+    let verification = String::from_utf8(verified.stdout).unwrap();
+    assert!(verification.contains("integrity: ok"));
+    assert!(verification.contains("usage: ok"));
+    assert!(!verification.contains("Count: 1"));
+
+    let refused = youth([
+        "state",
+        "reset",
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+    ]);
+    assert!(!refused.status.success());
+
+    let reset = youth([
+        "state",
+        "reset",
+        "--app-id",
+        "dev.youth.counter",
+        "--state-dir",
+        root,
+        "--yes",
+    ]);
+    assert_success(&reset);
 }
 
 fn youth<const N: usize>(args: [&str; N]) -> Output {
