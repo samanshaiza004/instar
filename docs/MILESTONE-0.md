@@ -580,6 +580,7 @@ memory, or memory64 for Milestone 0.
 ```text
 Maximum component file:       32 MiB
 Maximum guest linear memory: 128 MiB
+Maximum table elements:       1,000,000
 Maximum nodes:               10,000
 Maximum tree depth:              64
 Maximum children per node:    4,096
@@ -606,7 +607,9 @@ epoch deadlines provide a wall-clock failsafe.
 **Memory limits.** Implement a `ResourceLimiter`. Do not rely on it alone:
 resource limiting covers guest instances, memories, and tables, but not every
 host allocation. Youth must also validate list/string sizes and limit
-guest-to-host transfer.
+guest-to-host transfer. Configure Wasmtime's component hostcall fuel for the
+per-call transfer ceiling so canonical ABI lifting is bounded before the
+runtime's structural wire validation runs.
 
 ## 14. WASI profile
 

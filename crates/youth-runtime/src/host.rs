@@ -71,6 +71,7 @@ pub struct AppInspection {
 
 struct MemoryLimiter {
     maximum: usize,
+    max_table_elements: usize,
     limit_hit: bool,
 }
 
@@ -89,10 +90,12 @@ impl ResourceLimiter for MemoryLimiter {
     fn table_growing(
         &mut self,
         _current: usize,
-        _desired: usize,
+        desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(true)
+        let allowed = desired <= self.max_table_elements;
+        self.limit_hit |= !allowed;
+        Ok(allowed)
     }
 }
 
@@ -282,13 +285,7 @@ impl YouthApp {
         let guest_result = match guest_result {
             Ok(result) => result,
             Err(source) => {
-                let error = self.classify_guest_failure(
-                    source,
-                    elapsed,
-                    turn_id,
-                    "handling events",
-                    self.limits.handle,
-                );
+                let error = self.classify_guest_failure(source, turn_id, "handling events");
                 return Err(self.enter_fault(error));
             }
         };
@@ -435,13 +432,7 @@ impl YouthApp {
         let guest_result = match guest_result {
             Ok(result) => result,
             Err(source) => {
-                let error = self.classify_guest_failure(
-                    source,
-                    elapsed,
-                    turn_id,
-                    "resynchronizing",
-                    self.limits.resync,
-                );
+                let error = self.classify_guest_failure(source, turn_id, "resynchronizing");
                 return Err(self.enter_fault(error));
             }
         };
@@ -553,13 +544,7 @@ impl YouthApp {
         let guest_result = match guest_result {
             Ok(result) => result,
             Err(source) => {
-                let error = self.classify_guest_failure(
-                    source,
-                    elapsed,
-                    turn_id,
-                    "mounting",
-                    self.limits.mount,
-                );
+                let error = self.classify_guest_failure(source, turn_id, "mounting");
                 return Err(self.enter_fault(error));
             }
         };
@@ -650,6 +635,8 @@ impl YouthApp {
             )
         })?;
         self.store
+            .set_hostcall_fuel(self.limits.max_guest_to_host_transfer);
+        self.store
             .set_epoch_deadline(deadline_ticks(budget.deadline));
         self.store.epoch_deadline_trap();
         self.store.data_mut().limiter.limit_hit = false;
@@ -666,19 +653,24 @@ impl YouthApp {
     fn classify_guest_failure(
         &self,
         source: wasmtime::Error,
-        elapsed: std::time::Duration,
         turn_id: Option<u64>,
         operation: &str,
-        budget: CallBudget,
     ) -> RuntimeError {
+        let trap = source.downcast_ref::<wasmtime::Trap>().copied();
+        let hostcall_fuel_exhausted = source
+            .root_cause()
+            .to_string()
+            .contains("fuel allocated for hostcalls has been exhausted");
         let context = self
             .context(format!("guest trapped while {operation}"), turn_id)
             .with_source(source);
         if self.store.data().limiter.limit_hit {
             RuntimeError::MemoryLimitExceeded(context)
-        } else if self.store.get_fuel().is_ok_and(|fuel| fuel == 0) {
+        } else if hostcall_fuel_exhausted {
+            RuntimeError::TransferLimitExceeded(context)
+        } else if trap == Some(wasmtime::Trap::OutOfFuel) {
             RuntimeError::FuelExhausted(context)
-        } else if elapsed >= budget.deadline {
+        } else if trap == Some(wasmtime::Trap::Interrupt) {
             RuntimeError::DeadlineExceeded(context)
         } else {
             RuntimeError::GuestTrap(context)
@@ -752,6 +744,7 @@ fn instantiate(
         wasi: WasiCtxBuilder::new().build(),
         limiter: MemoryLimiter {
             maximum: limits.max_linear_memory,
+            max_table_elements: limits.max_table_elements,
             limit_hit: false,
         },
     };
@@ -762,6 +755,7 @@ fn instantiate(
     // Wasmtime adds the delta to the current epoch and would overflow.
     store.set_epoch_deadline(deadline_ticks(limits.mount.deadline));
     store.epoch_deadline_trap();
+    store.set_hostcall_fuel(limits.max_guest_to_host_transfer);
     store.set_fuel(limits.mount.fuel).map_err(|source| {
         RuntimeError::Internal(
             ErrorContext::new(
@@ -911,4 +905,22 @@ fn component_identity(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| PathBuf::from(path).display().to_string(), String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_growth_is_bounded_and_recorded_as_a_resource_limit() {
+        let mut limiter = MemoryLimiter {
+            maximum: 1024,
+            max_table_elements: 4,
+            limit_hit: false,
+        };
+
+        assert!(limiter.table_growing(0, 4, None).unwrap());
+        assert!(!limiter.table_growing(4, 5, None).unwrap());
+        assert!(limiter.limit_hit);
+    }
 }

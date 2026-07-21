@@ -11,6 +11,10 @@ members = [
     "test-components/invalid-patch",
     "test-components/infinite-loop",
     "test-components/memory-bomb",
+    "test-components/invalid-revision",
+    "test-components/invalid-sequence",
+    "test-components/oversized-snapshot",
+    "test-components/oversized-patch",
 ]
 
 [workspace.package]

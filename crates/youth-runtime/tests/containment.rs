@@ -95,6 +95,66 @@ fn invalid_patch_faults_without_mutating_the_tree() {
 }
 
 #[test]
+fn impossible_revision_transition_faults_without_mutating_the_tree() {
+    let mut app = YouthApp::load(test_component("youth-invalid-revision"))
+        .expect("invalid-revision component loads");
+    app.mount().expect("fixture mounts validly");
+
+    let error = app
+        .activate(button_id())
+        .expect_err("impossible revision transition is rejected");
+
+    assert_eq!(error.category(), RuntimeErrorCategory::RevisionMismatch);
+    assert_mounted_tree_unchanged(&app);
+    assert_faulted_and_poisoned(&mut app);
+}
+
+#[test]
+fn false_processed_through_faults_without_mutating_the_tree() {
+    let mut app = YouthApp::load(test_component("youth-invalid-sequence"))
+        .expect("invalid-sequence component loads");
+    app.mount().expect("fixture mounts validly");
+
+    let error = app
+        .activate(button_id())
+        .expect_err("false processed-through is rejected");
+
+    assert_eq!(
+        error.category(),
+        RuntimeErrorCategory::EventSequenceViolation
+    );
+    assert_mounted_tree_unchanged(&app);
+    assert_faulted_and_poisoned(&mut app);
+}
+
+#[test]
+fn oversized_snapshot_is_rejected_before_tree_commit() {
+    let mut app = YouthApp::load(test_component("youth-oversized-snapshot"))
+        .expect("oversized-snapshot component loads");
+
+    let error = app.mount().expect_err("oversized snapshot is rejected");
+
+    assert_eq!(error.category(), RuntimeErrorCategory::InvalidSnapshot);
+    assert!(app.tree().is_none());
+    assert_faulted_and_poisoned(&mut app);
+}
+
+#[test]
+fn oversized_patch_list_is_rejected_without_mutating_the_tree() {
+    let mut app = YouthApp::load(test_component("youth-oversized-patch"))
+        .expect("oversized-patch component loads");
+    app.mount().expect("fixture mounts validly");
+
+    let error = app
+        .activate(button_id())
+        .expect_err("oversized patch list is rejected");
+
+    assert_eq!(error.category(), RuntimeErrorCategory::InvalidPatchBatch);
+    assert_mounted_tree_unchanged(&app);
+    assert_faulted_and_poisoned(&mut app);
+}
+
+#[test]
 fn infinite_loop_is_interrupted_quickly_and_tree_is_unchanged() {
     let mut app = YouthApp::load(test_component("youth-infinite-loop"))
         .expect("infinite-loop component loads");

@@ -1,0 +1,12 @@
+[package]
+name = "youth-oversized-patch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth containment fixture that returns too many patches."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

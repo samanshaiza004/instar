@@ -2907,6 +2907,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-invalid-revision"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-invalid-sequence"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-invalid-snapshot"
 version = "0.0.1"
 dependencies = [
@@ -2915,6 +2929,20 @@ dependencies = [
 
 [[package]]
 name = "youth-memory-bomb"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-oversized-patch"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-oversized-snapshot"
 version = "0.0.1"
 dependencies = [
  "wit-bindgen",

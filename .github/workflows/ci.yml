@@ -30,6 +30,10 @@ jobs:
           -p youth-invalid-patch
           -p youth-infinite-loop
           -p youth-memory-bomb
+          -p youth-invalid-revision
+          -p youth-invalid-sequence
+          -p youth-oversized-snapshot
+          -p youth-oversized-patch
           --target wasm32-wasip2 --release
       - name: Record SHA-256
         id: hash
@@ -47,6 +51,10 @@ jobs:
             target/wasm32-wasip2/release/youth_invalid_patch.wasm
             target/wasm32-wasip2/release/youth_infinite_loop.wasm
             target/wasm32-wasip2/release/youth_memory_bomb.wasm
+            target/wasm32-wasip2/release/youth_invalid_revision.wasm
+            target/wasm32-wasip2/release/youth_invalid_sequence.wasm
+            target/wasm32-wasip2/release/youth_oversized_snapshot.wasm
+            target/wasm32-wasip2/release/youth_oversized_patch.wasm
             counter.sha256
           if-no-files-found: error
 
