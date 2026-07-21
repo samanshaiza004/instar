@@ -5,6 +5,7 @@
 pub mod controller;
 pub mod geometry;
 pub mod input;
+pub mod native;
 pub mod raster;
 
 pub use controller::{
@@ -16,4 +17,5 @@ pub use geometry::{
     LogicalSize, RendererMirror, hit_test, layout,
 };
 pub use input::{InputChange, PointerState};
+pub use native::{DesktopError, DesktopOptions, run, window_smoke};
 pub use raster::{FrameBuffer, Palette, RasterError, RenderState, frame_hash, render};
