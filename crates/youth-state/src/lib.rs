@@ -8,6 +8,13 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+mod store;
+
+pub use store::{
+    GuestCallPhase, StateError, StateStore, TurnStateMetrics, Usage, Verification, repair_usage,
+    verify_file,
+};
+
 /// Stable application identity used to select durable state.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AppId(String);
