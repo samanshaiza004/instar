@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use youth_runtime::{
     AppFault, AppInspection, RuntimeError, RuntimeErrorCategory, TurnReceipt, YouthAppHandle,
 };
+use youth_state::{AppId, StateLimits, StateLocation, StateStore, repair_usage, verify_file};
 use youth_tree::NodeId;
 
 /// Inspection and test surface for the Youth runtime.
@@ -41,6 +42,45 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or maintain host-owned application state.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StateCommand {
+    /// Print a state database summary without values.
+    Inspect(StateTarget),
+    /// Clear application state while preserving the schema.
+    Reset {
+        #[command(flatten)]
+        target: StateTarget,
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Verify schema, integrity, typed rows, and derived usage.
+    Verify(StateTarget),
+    /// Repair derived usage after creating an explicit backup.
+    RepairUsage {
+        #[command(flatten)]
+        target: StateTarget,
+        #[arg(long)]
+        backup: PathBuf,
+        /// Confirm the maintenance operation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+struct StateTarget {
+    #[arg(long)]
+    app_id: AppId,
+    #[arg(long)]
+    state_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -135,8 +175,91 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 print_inspection(&inspection);
             }
         }
+        Command::State { command } => run_state_command(command)?,
     }
     Ok(())
+}
+
+fn run_state_command(command: StateCommand) -> Result<(), CliError> {
+    match command {
+        StateCommand::Inspect(target) => {
+            let path = state_path(&target);
+            let store = StateStore::open(StateLocation::File(path), StateLimits::default())
+                .map_err(CliError::State)?;
+            let summary = store.summary().map_err(CliError::State)?;
+            println!("app: {}", target.app_id);
+            println!("schema: {}", summary.schema_version);
+            println!("keys: {}", summary.key_count);
+            println!("bytes: {}", summary.logical_bytes);
+        }
+        StateCommand::Reset { target, yes } => {
+            require_confirmation(yes)?;
+            let path = state_path(&target);
+            let mut store = StateStore::open(StateLocation::File(path), StateLimits::default())
+                .map_err(CliError::State)?;
+            store.reset().map_err(CliError::State)?;
+            println!("reset: {}", target.app_id);
+        }
+        StateCommand::Verify(target) => {
+            let verification = verify_file(&state_path(&target)).map_err(CliError::State)?;
+            println!("app: {}", target.app_id);
+            println!("schema: {}", verification.schema_version);
+            println!(
+                "integrity: {}",
+                if verification.integrity_ok {
+                    "ok"
+                } else {
+                    "failed"
+                }
+            );
+            println!(
+                "usage: {}",
+                if verification.usage_matches() {
+                    "ok"
+                } else {
+                    "mismatch"
+                }
+            );
+            println!("stored keys: {}", verification.stored.key_count);
+            println!("computed keys: {}", verification.computed.key_count);
+            println!("stored bytes: {}", verification.stored.logical_bytes);
+            println!("computed bytes: {}", verification.computed.logical_bytes);
+            if !verification.integrity_ok || !verification.usage_matches() {
+                return Err(CliError::Message("state verification failed".to_owned()));
+            }
+        }
+        StateCommand::RepairUsage {
+            target,
+            backup,
+            yes,
+        } => {
+            require_confirmation(yes)?;
+            let verification =
+                repair_usage(&state_path(&target), &backup).map_err(CliError::State)?;
+            println!("repaired: {}", target.app_id);
+            println!("backup: {}", backup.display());
+            println!("keys: {}", verification.computed.key_count);
+            println!("bytes: {}", verification.computed.logical_bytes);
+        }
+    }
+    Ok(())
+}
+
+fn state_path(target: &StateTarget) -> PathBuf {
+    target
+        .state_dir
+        .join(target.app_id.as_str())
+        .join("state.sqlite3")
+}
+
+fn require_confirmation(yes: bool) -> Result<(), CliError> {
+    if yes {
+        Ok(())
+    } else {
+        Err(CliError::Message(
+            "refusing state maintenance without --yes".to_owned(),
+        ))
+    }
 }
 
 fn print_receipt(receipt: &TurnReceipt, status: &str) {
@@ -312,6 +435,7 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
 #[derive(Debug)]
 enum CliError {
     Runtime(RuntimeError),
+    State(youth_state::StateError),
     Message(String),
 }
 
@@ -324,6 +448,7 @@ impl std::fmt::Display for CliError {
                 category_name(error.category()),
                 error.context()
             ),
+            Self::State(error) => write!(formatter, "state: {error}"),
             Self::Message(message) => formatter.write_str(message),
         }
     }
