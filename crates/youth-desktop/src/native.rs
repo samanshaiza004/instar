@@ -549,3 +549,55 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
         RuntimeErrorCategory::Internal => "internal",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::NativeKey;
+
+    #[test]
+    fn logical_key_normalization_is_exact_and_rejects_compositions() {
+        assert_eq!(
+            logical_key(&Key::Character("7".into())),
+            Some(LogicalKey::Character('7'))
+        );
+        assert_eq!(
+            logical_key(&Key::Character("+".into())),
+            Some(LogicalKey::Character('+'))
+        );
+        assert_eq!(
+            logical_key(&Key::Character(" ".into())),
+            Some(LogicalKey::Space)
+        );
+        assert_eq!(logical_key(&Key::Character("ab".into())), None);
+        assert_eq!(logical_key(&Key::Dead(Some('\u{301}'))), None);
+        assert_eq!(
+            logical_key(&Key::Unidentified(NativeKey::Unidentified)),
+            None
+        );
+    }
+
+    #[test]
+    fn named_keys_cover_focus_default_cancel_and_editing_policy() {
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Enter)),
+            Some(LogicalKey::Enter)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Escape)),
+            Some(LogicalKey::Escape)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Backspace)),
+            Some(LogicalKey::Backspace)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Tab)),
+            Some(LogicalKey::Tab)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::ArrowLeft)),
+            Some(LogicalKey::ArrowLeft)
+        );
+    }
+}

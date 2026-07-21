@@ -8,14 +8,28 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use youth_runtime::{RuntimeLimits, YouthAppConfig, YouthAppHandle};
 use youth_state::{AppId, StateLocation};
-use youth_tree::{NodeData, NodeId, TreeSnapshot};
+use youth_tree::{NodeData, NodeId, Tree, TreeSnapshot};
+
+use youth_interaction::{InteractionState, LogicalKey, Modifiers, SemanticAction};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Mount,
-    Activate { name: String },
+    Activate {
+        name: String,
+    },
     Restart,
-    ExpectText { name: String, expected: String },
+    Key {
+        key: LogicalKey,
+        modifiers: Modifiers,
+    },
+    ExpectText {
+        name: String,
+        expected: String,
+    },
+    ExpectFocus {
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,7 +68,11 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
                 mount_seen = true;
                 mounted = true;
             }
-            Command::Activate { .. } | Command::ExpectText { .. } | Command::Restart => {
+            Command::Activate { .. }
+            | Command::Key { .. }
+            | Command::ExpectText { .. }
+            | Command::ExpectFocus { .. }
+            | Command::Restart => {
                 if !mounted {
                     return Err(diagnostic(
                         path,
@@ -95,6 +113,10 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
             name: name.to_owned(),
         });
     }
+    if let Some(value) = source.strip_prefix("key ") {
+        let (key, modifiers) = parse_key(path, line, source, value)?;
+        return Ok(Command::Key { key, modifiers });
+    }
     if let Some(arguments) = source.strip_prefix("expect text ") {
         let (name, encoded) = arguments.split_once(' ').ok_or_else(|| {
             diagnostic(
@@ -113,12 +135,72 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
             expected,
         });
     }
+    if let Some(name) = source.strip_prefix("expect focus ") {
+        if name == "none" {
+            return Ok(Command::ExpectFocus { name: None });
+        }
+        validate_name(path, line, source, name)?;
+        return Ok(Command::ExpectFocus {
+            name: Some(name.to_owned()),
+        });
+    }
     Err(diagnostic(
         path,
         line,
         source,
-        "unknown command; expected mount, activate, restart, or expect text",
+        "unknown command; expected mount, activate, key, restart, expect text, or expect focus",
     ))
+}
+
+fn parse_key(
+    path: &Path,
+    line: usize,
+    source: &str,
+    value: &str,
+) -> Result<(LogicalKey, Modifiers), TestError> {
+    let named = match value {
+        "enter" => Some((LogicalKey::Enter, Modifiers::default())),
+        "escape" => Some((LogicalKey::Escape, Modifiers::default())),
+        "backspace" => Some((LogicalKey::Backspace, Modifiers::default())),
+        "space" => Some((LogicalKey::Space, Modifiers::default())),
+        "tab" => Some((LogicalKey::Tab, Modifiers::default())),
+        "shift-tab" => Some((
+            LogicalKey::Tab,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        )),
+        "left" => Some((LogicalKey::ArrowLeft, Modifiers::default())),
+        "right" => Some((LogicalKey::ArrowRight, Modifiers::default())),
+        "up" => Some((LogicalKey::ArrowUp, Modifiers::default())),
+        "down" => Some((LogicalKey::ArrowDown, Modifiers::default())),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Ok(named);
+    }
+    let character: String = serde_json::from_str(value).map_err(|error| {
+        diagnostic(
+            path,
+            line,
+            source,
+            &format!("key must be a named key or JSON string: {error}"),
+        )
+    })?;
+    let mut characters = character.chars();
+    let character = characters
+        .next()
+        .filter(|_| characters.next().is_none())
+        .ok_or_else(|| {
+            diagnostic(
+                path,
+                line,
+                source,
+                "character key must contain exactly one Unicode scalar",
+            )
+        })?;
+    Ok((LogicalKey::Character(character), Modifiers::default()))
 }
 
 fn validate_name(path: &Path, line: usize, source: &str, name: &str) -> Result<(), TestError> {
@@ -206,6 +288,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
     let state_file = state.path().join("state.sqlite3");
     let mut app = spawn(component, app_id, &state_file)?;
     let mut snapshot = None;
+    let mut interaction = InteractionState::default();
 
     for located in script.commands {
         match &located.command {
@@ -215,6 +298,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .await
                         .map_err(|error| runtime(path, &located, error))?,
                 );
+                reconcile(&mut interaction, snapshot.as_ref().unwrap());
             }
             Command::Activate { name } => {
                 let node = named_id(name);
@@ -226,6 +310,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .await
                         .map_err(|error| runtime(path, &located, error))?,
                 );
+                reconcile(&mut interaction, snapshot.as_ref().unwrap());
             }
             Command::Restart => {
                 app.stop()
@@ -237,6 +322,23 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .await
                         .map_err(|error| runtime(path, &located, error))?,
                 );
+                interaction = InteractionState::default();
+                reconcile(&mut interaction, snapshot.as_ref().unwrap());
+            }
+            Command::Key { key, modifiers } => {
+                let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
+                let change = interaction.key(&tree, key.clone(), *modifiers, false);
+                if let Some(SemanticAction::Activate(node)) = change.action {
+                    app.activate(node)
+                        .await
+                        .map_err(|error| runtime(path, &located, error))?;
+                    snapshot = Some(
+                        app.snapshot()
+                            .await
+                            .map_err(|error| runtime(path, &located, error))?,
+                    );
+                    reconcile(&mut interaction, snapshot.as_ref().unwrap());
+                }
             }
             Command::ExpectText { name, expected } => {
                 expect_text(
@@ -247,6 +349,20 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                     expected,
                 )?;
             }
+            Command::ExpectFocus { name } => {
+                let expected = name.as_deref().map(named_id);
+                if interaction.focused() != expected {
+                    return Err(TestError::Diagnostic {
+                        path: path.to_path_buf(),
+                        line: located.line,
+                        command: located.source.clone(),
+                        message: format!(
+                            "expected focus {name:?}; observed {:?}",
+                            interaction.focused().map(NodeId::get)
+                        ),
+                    });
+                }
+            }
         }
     }
     app.stop().await.map_err(|error| TestError::Diagnostic {
@@ -256,6 +372,15 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
         message: error.to_string(),
     })?;
     Ok(())
+}
+
+fn normalized_tree(snapshot: &TreeSnapshot) -> Tree {
+    Tree::from_snapshot(snapshot.clone(), &youth_tree::Limits::default())
+        .expect("runtime snapshots are already validated")
+}
+
+fn reconcile(interaction: &mut InteractionState, snapshot: &TreeSnapshot) {
+    interaction.reconcile(&normalized_tree(snapshot));
 }
 
 fn spawn(component: &Path, app_id: &AppId, state_file: &Path) -> Result<YouthAppHandle, TestError> {
@@ -373,6 +498,30 @@ mod tests {
                 expected: "Count: #0\n".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_logical_keys_and_focus_assertions() {
+        let script = parse(
+            Path::new("keyboard.youth-test"),
+            "mount\nkey tab\nexpect focus increment\nkey \"+\"\nkey enter\nexpect focus none\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::Key {
+                key: LogicalKey::Tab,
+                modifiers: Modifiers::default(),
+            }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::Key {
+                key: LogicalKey::Character('+'),
+                modifiers: Modifiers::default(),
+            }
+        );
+        assert!(parse(Path::new("bad.youth-test"), "mount\nkey \"ab\"\n").is_err());
     }
 
     #[test]
