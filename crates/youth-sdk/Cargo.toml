@@ -1,0 +1,10 @@
+[package]
+name = "youth-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guest-facing Rust SDK for Youth applications."
+
+[dependencies]
+wit-bindgen = "0.51.0"
+

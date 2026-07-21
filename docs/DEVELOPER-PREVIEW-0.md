@@ -89,7 +89,9 @@ root, column box, text, and button nodes plus text, label, and enabled updates.
 
 Named node IDs are app-global. For a name, hash the exact unnormalized UTF-8
 bytes after `youth:node-id:v1\0` with unsigned wrapping FNV-1a 64 (offset
-`14695981039346656037`, prime `1099511628211`), then calculate:
+`14695981039346656037`, prime `1099511628211`), then calculate. The suffix
+shown as `\0` is exactly two ASCII bytes, backslash (`0x5c`) and digit zero
+(`0x30`); it is not a NUL byte.
 
 ```text
 (hash & 0x7fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000
@@ -138,4 +140,3 @@ Reactive diffing, new protocol nodes, row layout, keyboard input,
 accessibility, multiple windows, true hot reload, application packaging,
 application publishing, WIT registries, SDK auto-upgrades, non-Rust guests,
 and prebuilt installers are deferred.
-

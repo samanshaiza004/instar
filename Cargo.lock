@@ -4416,8 +4416,23 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "youth-sdk",
  "youth-state",
  "youth-tree",
+]
+
+[[package]]
+name = "youth-sdk"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-sdk-tally"
+version = "0.0.1"
+dependencies = [
+ "youth-sdk",
 ]
 
 [[package]]

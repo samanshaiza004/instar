@@ -9,6 +9,7 @@ automatically authorize new features.
 | ID | Summary | Status | Tooling implication |
 | --- | --- | --- | --- |
 | DP0-F001 | A guest currently owns all protocol plumbing | Open | Extract `youth-sdk` from the external Tally experience |
+| DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
 
 ## Finding template
 
@@ -50,3 +51,22 @@ automatically authorize new features.
   revisions, acknowledgements, typed state, builders, and wire conversion.
 - **Resolution:** Pending Gate A external Tally and SDK tests.
 
+### DP0-F002 — Symbolic-ID prefix notation was ambiguous
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** SDK reference tests
+- **Workflow stage:** Symbolic node ID implementation
+- **Platform:** Platform-independent
+- **Local path:** `crates/youth-sdk/src/lib.rs`
+- **Commit:** `uncommitted`
+- **Evidence:** The notation `youth:node-id:v1\0` can mean a NUL escape in
+  source code or the literal ASCII bytes backslash and zero. The approved
+  canonical vectors correspond to the literal two-byte suffix.
+- **Developer impact:** SDK implementations in different languages could map
+  the same symbolic name to different wire IDs.
+- **Decision:** The canonical vectors are authoritative. The domain suffix is
+  byte `0x5c` followed by byte `0x30`, and the contract now says so explicitly.
+- **Tooling implication:** Every SDK and host-side test runner must run the same
+  three canonical vectors.
+- **Resolution:** SDK unit tests lock `count`, `increment`, and `café`.
