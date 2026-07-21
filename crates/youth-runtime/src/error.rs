@@ -22,6 +22,8 @@ pub enum RuntimeErrorCategory {
     InvalidPatchBatch,
     RevisionMismatch,
     EventSequenceViolation,
+    StateUnavailable,
+    StateCommitFailed,
     WorkerStopped,
     Internal,
 }
@@ -132,6 +134,8 @@ runtime_errors!(
     InvalidPatchBatch,
     RevisionMismatch,
     EventSequenceViolation,
+    StateUnavailable,
+    StateCommitFailed,
     WorkerStopped,
     Internal,
 );

@@ -111,6 +111,17 @@ pub enum StateError {
     BackupExists,
 }
 
+impl StateError {
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    }
+}
+
 impl From<rusqlite::Error> for StateError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Database(error)

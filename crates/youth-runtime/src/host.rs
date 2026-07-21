@@ -13,7 +13,9 @@ use crate::engine::deadline_ticks;
 use crate::error::ErrorContext;
 use crate::wire::from_guest::{self, WireErrorKind};
 use crate::wire::to_guest::{self, HostEvent};
-use crate::{CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits};
+use crate::{
+    CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits, StateLocation, YouthAppConfig,
+};
 
 const APPLICATION_WORLD: &str = "youth:app/application@0.0.2";
 
@@ -57,6 +59,12 @@ pub struct AppFault {
 /// A synchronous snapshot of host-owned application state.
 #[derive(Clone, Debug)]
 pub struct AppInspection {
+    pub app_id: String,
+    pub state_location: &'static str,
+    pub state_summary: Option<youth_state::StateSummary>,
+    pub state_transaction_active: bool,
+    pub state_phase: youth_state::GuestCallPhase,
+    pub state_metrics: youth_state::TurnStateMetrics,
     pub lifecycle: AppLifecycle,
     pub world: String,
     pub current_revision: Option<u64>,
@@ -103,6 +111,7 @@ struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     limiter: MemoryLimiter,
+    state: youth_state::StateStore,
 }
 
 impl WasiView for HostState {
@@ -119,33 +128,80 @@ impl crate::bindings::youth::app::ui::Host for HostState {}
 impl crate::bindings::youth::state::store::Host for HostState {
     fn get(
         &mut self,
-        _key: String,
+        key: String,
     ) -> Result<
         Option<crate::bindings::youth::state::store::Value>,
         crate::bindings::youth::state::store::StateError,
     > {
-        Ok(None)
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value))
+            .map_err(to_wire_state_error)
     }
 
     fn set(
         &mut self,
-        _key: String,
-        _value: crate::bindings::youth::state::store::Value,
+        key: String,
+        value: crate::bindings::youth::state::store::Value,
     ) -> Result<(), crate::bindings::youth::state::store::StateError> {
-        Err(state_unavailable())
+        self.state
+            .set(&key, from_wire_state_value(value))
+            .map_err(to_wire_state_error)
     }
 
     fn delete(
         &mut self,
-        _key: String,
+        key: String,
     ) -> Result<bool, crate::bindings::youth::state::store::StateError> {
-        Err(state_unavailable())
+        self.state.delete(&key).map_err(to_wire_state_error)
     }
 }
 
-fn state_unavailable() -> crate::bindings::youth::state::store::StateError {
+fn to_wire_state_value(
+    value: youth_state::StateValue,
+) -> crate::bindings::youth::state::store::Value {
+    use crate::bindings::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value(
+    value: crate::bindings::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error(
+    error: youth_state::StateError,
+) -> crate::bindings::youth::state::store::StateError {
+    use crate::bindings::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::BackupExists => ErrorCode::Internal,
+    };
     crate::bindings::youth::state::store::StateError {
-        code: crate::bindings::youth::state::store::ErrorCode::Unavailable,
+        code,
         message: None,
     }
 }
@@ -153,6 +209,7 @@ fn state_unavailable() -> crate::bindings::youth::state::store::StateError {
 /// One synchronous, single-owner Youth component instance.
 pub struct YouthApp {
     component_id: String,
+    app_id: youth_state::AppId,
     limits: RuntimeLimits,
     store: Store<HostState>,
     bindings: Application,
@@ -182,25 +239,27 @@ impl fmt::Debug for YouthApp {
 
 impl YouthApp {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
-        Self::load_with_limits(path, RuntimeLimits::default())
+        Self::load_config(YouthAppConfig::ephemeral(path))
     }
 
     pub fn load_with_limits(
         path: impl AsRef<Path>,
         limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::load_with_engine(path, limits, crate::shared_engine())
+        let mut config = YouthAppConfig::ephemeral(path);
+        config.limits = limits;
+        Self::load_config(config)
     }
 
-    fn load_with_engine(
-        path: impl AsRef<Path>,
-        limits: RuntimeLimits,
-        engine: &Engine,
-    ) -> Result<Self, RuntimeError> {
-        let path = path.as_ref();
+    pub fn load_config(config: YouthAppConfig) -> Result<Self, RuntimeError> {
+        Self::load_with_engine(config, crate::shared_engine())
+    }
+
+    fn load_with_engine(config: YouthAppConfig, engine: &Engine) -> Result<Self, RuntimeError> {
+        let path = config.component_path.as_path();
         let component_id = component_identity(path);
         let load_span = info_span!("component.load", component_id = %component_id);
-        let bytes = load_span.in_scope(|| read_component(path, &component_id, &limits))?;
+        let bytes = load_span.in_scope(|| read_component(path, &component_id, &config.limits))?;
 
         let compile_span = info_span!("component.compile", component_id = %component_id);
         let component = compile_span.in_scope(|| {
@@ -218,7 +277,16 @@ impl YouthApp {
         })?;
 
         let instantiate_span = info_span!("component.instantiate", component_id = %component_id);
-        instantiate_span.in_scope(|| instantiate(engine, component, component_id, limits))
+        instantiate_span.in_scope(|| {
+            instantiate(
+                engine,
+                component,
+                component_id,
+                config.app_id,
+                config.state,
+                config.limits,
+            )
+        })
     }
 
     #[must_use]
@@ -229,6 +297,22 @@ impl YouthApp {
     #[must_use]
     pub fn tree(&self) -> Option<&youth_tree::Tree> {
         self.tree.as_ref()
+    }
+
+    pub fn snapshot(&self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
+        self.tree
+            .as_ref()
+            .filter(|_| self.lifecycle == AppLifecycle::Mounted)
+            .map(youth_tree::Tree::to_snapshot)
+            .ok_or_else(|| {
+                RuntimeError::InvalidLifecycle(self.context(
+                    format!(
+                        "snapshot is not available while the app is {}",
+                        self.lifecycle
+                    ),
+                    None,
+                ))
+            })
     }
 
     pub fn mount(&mut self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
@@ -545,6 +629,15 @@ impl YouthApp {
     pub fn inspect(&self) -> AppInspection {
         let tree = self.tree.as_ref();
         AppInspection {
+            app_id: self.app_id.to_string(),
+            state_location: match self.store.data().state.location() {
+                StateLocation::Memory => "memory",
+                StateLocation::File(_) => "file",
+            },
+            state_summary: self.store.data().state.summary().ok(),
+            state_transaction_active: self.store.data().state.transaction_active(),
+            state_phase: self.store.data().state.phase(),
+            state_metrics: self.store.data().state.metrics(),
             lifecycle: self.lifecycle,
             world: APPLICATION_WORLD.to_owned(),
             current_revision: tree.map(youth_tree::Tree::revision),
@@ -738,8 +831,22 @@ fn instantiate(
     engine: &Engine,
     component: Component,
     component_id: String,
+    app_id: youth_state::AppId,
+    state_location: StateLocation,
     limits: RuntimeLimits,
 ) -> Result<YouthApp, RuntimeError> {
+    let state_store =
+        youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
+            RuntimeError::StateUnavailable(
+                ErrorContext::new(
+                    "application state could not be opened",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        })?;
     let mut linker = Linker::<HostState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|source| {
         RuntimeError::LinkFailure(
@@ -796,6 +903,7 @@ fn instantiate(
             max_table_elements: limits.max_table_elements,
             limit_hit: false,
         },
+        state: state_store,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);
@@ -832,6 +940,7 @@ fn instantiate(
     })?;
     Ok(YouthApp {
         component_id,
+        app_id,
         limits,
         store,
         bindings,

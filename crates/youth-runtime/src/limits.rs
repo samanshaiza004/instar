@@ -20,6 +20,7 @@ pub struct RuntimeLimits {
     pub mount: CallBudget,
     pub handle: CallBudget,
     pub resync: CallBudget,
+    pub state: youth_state::StateLimits,
 }
 
 impl Default for RuntimeLimits {
@@ -44,6 +45,7 @@ impl Default for RuntimeLimits {
                 fuel: 100_000_000,
                 deadline: Duration::from_millis(500),
             },
+            state: youth_state::StateLimits::default(),
         }
     }
 }

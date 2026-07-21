@@ -12,6 +12,7 @@ tracing = "0.1.44"
 wasmtime = "46"
 wasmtime-wasi = "46"
 youth-tree = { path = "../youth-tree" }
+youth-state = { path = "../youth-state" }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"

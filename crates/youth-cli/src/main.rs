@@ -108,7 +108,7 @@ fn init_tracing() {
 async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Validate { component } => {
-            let app = YouthAppHandle::spawn(&component).map_err(CliError::Runtime)?;
+            let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             println!(
                 "validated: {} ({})",
@@ -117,7 +117,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             );
         }
         Command::Mount { component } => {
-            let app = YouthAppHandle::spawn(&component).map_err(CliError::Runtime)?;
+            let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             println!("component: {}", component_name(&component));
@@ -131,7 +131,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Activate { component, node } => {
             let node = parse_node_id(node)?;
-            let app = YouthAppHandle::spawn(&component).map_err(CliError::Runtime)?;
+            let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             app.mount().await.map_err(CliError::Runtime)?;
             match app.activate(node).await {
                 Ok(receipt) => {
@@ -157,7 +157,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Script { component, events } => {
             let nodes = read_script(&events)?;
-            let app = YouthAppHandle::spawn(&component).map_err(CliError::Runtime)?;
+            let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             app.mount().await.map_err(CliError::Runtime)?;
             for node in nodes {
                 app.activate(node).await.map_err(CliError::Runtime)?;
@@ -166,7 +166,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             print!("{}", inspection.canonical_tree);
         }
         Command::Inspect { component, json } => {
-            let app = YouthAppHandle::spawn(&component).map_err(CliError::Runtime)?;
+            let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             if json {
@@ -427,6 +427,8 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
         RuntimeErrorCategory::InvalidPatchBatch => "invalid_patch_batch",
         RuntimeErrorCategory::RevisionMismatch => "revision_mismatch",
         RuntimeErrorCategory::EventSequenceViolation => "event_sequence_violation",
+        RuntimeErrorCategory::StateUnavailable => "state_unavailable",
+        RuntimeErrorCategory::StateCommitFailed => "state_commit_failed",
         RuntimeErrorCategory::WorkerStopped => "worker_stopped",
         RuntimeErrorCategory::Internal => "internal",
     }
