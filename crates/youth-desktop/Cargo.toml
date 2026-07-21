@@ -18,4 +18,5 @@ tracing = "0.1.44"
 softbuffer = "0.4.8"
 winit = "=0.30.12"
 youth-runtime = { path = "../youth-runtime" }
+youth-interaction = { path = "../youth-interaction" }
 youth-tree = { path = "../youth-tree" }

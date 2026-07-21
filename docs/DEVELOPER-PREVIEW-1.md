@@ -119,6 +119,12 @@ youth:command-id:v1\0<exact UTF-8 name>
 Both use the DP0 unsigned wrapping FNV-1a procedure and upper-half mask. Each
 domain has published cross-language vectors.
 
+| Command input | Decimal ID | Hex ID |
+| --- | ---: | --- |
+| `clear` | `17571583584959868711` | `0xf3dace2c1a9e2f27` |
+| `digit-7` | `10973116907478218231` | `0x984857b0751275f7` |
+| `equals` | `17167869189710651467` | `0xee4086119b13a04b` |
+
 DP1 commands are view-backed:
 
 - One command binds to exactly one button.

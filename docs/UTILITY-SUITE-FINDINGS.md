@@ -8,21 +8,22 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 
 | App | Repository | Findings prefix | Status |
 | --- | --- | --- | --- |
-| Calculator | `/Users/keina/dev/youth-calculator` until publication | `CALC-F` | Gate A complete |
+| Calculator | `/Users/keina/dev/youth-calculator` until publication | `CALC-F` | Gate B in progress |
 
 ## Open findings
 
 | ID | Summary | Owner | Next decision |
 | --- | --- | --- | --- |
-| CALC-F001 | Protocol `0.0.2` cannot express calculator presentation or keyboard intent | Calculator / Youth | Add only the layout, alignment, and logical-shortcut semantics proved by app commit `e971316` |
+| CALC-F002 | Command binding and canonical state calls are repetitive | Calculator / Youth | Resolve view-backed commands in the SDK; retain explicit typed durable state |
 
 ## Accepted evidence
 
 | ID | App commit | Observation | Platform conclusion |
 | --- | --- | --- | --- |
-| CALC-F001 | `e971316` | A correct, persistent calculator becomes one vertical sequence of nineteen controls | Layout and alignment intent must cross protocol; exact geometry remains host policy |
+| CALC-F001 | `e971316`; `utility-calculator-gate-b-layout` | A correct, persistent calculator becomes one vertical sequence of nineteen controls | Addressed by bounded row/grid/alignment/shortcut semantics in protocol `0.0.3`; exact geometry remains host policy |
 | CALC-F002 | `e971316` | View IDs and activation matching repeat for every command; canonical model persistence expands into typed calls | View-backed command identity belongs in the SDK; structured state remains unproven |
 | CALC-F003 | `e971316` | Calculator source contains no generated bindings, numeric node IDs, revisions, acknowledgements, or patches | Preserve the DP0 SDK boundary through protocol `0.0.3` |
+| CALC-F004 | `utility-calculator-gate-b-layout` | Supporting `0.0.2` and `0.0.3` directly in presentation would duplicate policy and destabilize old fixtures | Both worlds normalize at the runtime boundary; tree, interaction, and renderer code are version-independent |
 
 ## Finding requirements
 

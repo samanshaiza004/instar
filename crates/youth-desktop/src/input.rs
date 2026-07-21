@@ -78,6 +78,16 @@ impl PointerState {
             activation: None,
         }
     }
+
+    pub fn deactivate_window(&mut self) -> InputChange {
+        let redraw = self.armed.is_some() || self.pressed;
+        self.armed = None;
+        self.pressed = false;
+        InputChange {
+            redraw,
+            activation: None,
+        }
+    }
 }
 
 #[cfg(test)]

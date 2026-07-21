@@ -304,9 +304,16 @@ fn describe(observed: Option<&NodeData>) -> String {
     match observed {
         None => "no semantic node".into(),
         Some(NodeData::Root) => "root node".into(),
-        Some(NodeData::Box { enabled }) => format!("box(enabled={enabled})"),
-        Some(NodeData::Text { value }) => format!("text({value:?})"),
-        Some(NodeData::Button { label, enabled }) => {
+        Some(NodeData::Box { enabled }) => format!("column(enabled={enabled})"),
+        Some(NodeData::Row { enabled }) => format!("row(enabled={enabled})"),
+        Some(NodeData::Grid { columns, enabled }) => {
+            format!("grid(columns={columns}, enabled={enabled})")
+        }
+        Some(NodeData::Text { value }) | Some(NodeData::AlignedText { value, .. }) => {
+            format!("text({value:?})")
+        }
+        Some(NodeData::Button { label, enabled })
+        | Some(NodeData::ShortcutButton { label, enabled, .. }) => {
             format!("button(label={label:?}, enabled={enabled})")
         }
     }

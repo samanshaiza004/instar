@@ -4352,6 +4352,7 @@ dependencies = [
  "tokio",
  "tracing",
  "winit",
+ "youth-interaction",
  "youth-runtime",
  "youth-tree",
 ]
@@ -4361,6 +4362,13 @@ name = "youth-infinite-loop"
 version = "0.0.1"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "youth-interaction"
+version = "0.0.1"
+dependencies = [
+ "youth-tree",
 ]
 
 [[package]]
@@ -4452,7 +4460,7 @@ dependencies = [
 
 [[package]]
 name = "youth-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]

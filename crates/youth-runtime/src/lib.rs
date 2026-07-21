@@ -23,7 +23,8 @@ pub use host::{AppFault, AppInspection, AppLifecycle, TurnReceipt, YouthApp, com
 pub use limits::{CallBudget, RuntimeLimits};
 pub use profile::{
     APPLICATION_PROTOCOL, APPLICATION_WORLD, ComponentValidation, ComponentValidationError,
-    PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, validate_component,
+    PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, SUPPORTED_APPLICATION_PROTOCOLS,
+    validate_component,
 };
 pub use worker::YouthAppHandle;
 pub use youth_state::{GuestCallPhase, StateLimits, StateSummary, StateValue, TurnStateMetrics};

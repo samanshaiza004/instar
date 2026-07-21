@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{RuntimeError, YouthAppHandle, component_imports};
+use crate::{RuntimeError, YouthApp, component_imports};
 
-pub const APPLICATION_PROTOCOL: &str = "0.0.2";
-pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.2";
+pub const APPLICATION_PROTOCOL: &str = "0.0.3";
+pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.3";
+pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &["0.0.2", APPLICATION_PROTOCOL];
 
 pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui", "youth:state/store"];
 
@@ -32,7 +33,7 @@ pub const PERMITTED_GUEST_IMPORTS: &[&str] = &[
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentValidation {
-    pub world: &'static str,
+    pub world: String,
     pub size: u64,
     pub sha256: String,
     pub imports: Vec<String>,
@@ -50,12 +51,14 @@ pub fn validate_component(
     let imports = component_imports(path)?;
     validate_imports(&imports)?;
 
-    // Spawning performs Wasmtime component compilation and exact host linking.
-    // Dropping the sole command sender lets the isolated worker stop immediately.
-    drop(YouthAppHandle::spawn_ephemeral(path)?);
+    // Loading performs Wasmtime component compilation and exact host linking. It
+    // also identifies the actual supported world so callers never infer a
+    // component's protocol from the current template version.
+    let app = YouthApp::load(path)?;
+    let world = app.inspect().world;
 
     Ok(ComponentValidation {
-        world: APPLICATION_WORLD,
+        world,
         size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         sha256: format!("{:x}", Sha256::digest(&bytes)),
         imports,

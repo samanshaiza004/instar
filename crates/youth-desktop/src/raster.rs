@@ -1,5 +1,5 @@
 use thiserror::Error;
-use youth_tree::{NodeData, NodeId, Tree};
+use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
 
 use crate::geometry::{LayoutSnapshot, LogicalRect};
 
@@ -15,6 +15,7 @@ pub struct Palette {
     pub button_pressed: u32,
     pub button_disabled: u32,
     pub border: u32,
+    pub focus: u32,
     pub fault_background: u32,
     pub fault_text: u32,
 }
@@ -30,6 +31,7 @@ impl Default for Palette {
             button_pressed: 0x0028_50aa,
             button_disabled: 0x0054_5862,
             border: 0x0095_a4c7,
+            focus: 0x00ff_c857,
             fault_background: 0x0048_1820,
             fault_text: 0x00ff_d5d9,
         }
@@ -40,6 +42,7 @@ impl Default for Palette {
 pub struct RenderState<'a> {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
+    pub focused: Option<NodeId>,
     pub fault_category: Option<&'a str>,
 }
 
@@ -204,7 +207,7 @@ pub fn render(
         let rect = physical_rect(node.bounds, scale_factor, physical_width, physical_height);
         match &semantic.data {
             NodeData::Root => {}
-            NodeData::Box { .. } => {
+            NodeData::Box { .. } | NodeData::Row { .. } | NodeData::Grid { .. } => {
                 frame.fill(rect, palette.container);
                 frame.border(rect, palette.border);
             }
@@ -217,7 +220,24 @@ pub fn render(
                     scale_factor.round() as u32,
                 );
             }
-            NodeData::Button { label, .. } => {
+            NodeData::AlignedText { value, alignment } => {
+                let glyph_scale = scale_factor.round().max(1.0) as u32;
+                let text_width = u32::try_from(value.chars().count())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(8)
+                    .saturating_mul(glyph_scale);
+                let text_x = match alignment {
+                    TextAlignment::Start => rect.x,
+                    TextAlignment::Center => rect
+                        .x
+                        .saturating_add(rect.width.saturating_sub(text_width) / 2),
+                    TextAlignment::End => {
+                        rect.x.saturating_add(rect.width.saturating_sub(text_width))
+                    }
+                };
+                frame.text(text_x, rect.y, value, palette.text, glyph_scale);
+            }
+            NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
                 let color = if !node.effective_enabled {
                     palette.button_disabled
                 } else if state.pressed == Some(*id) {
@@ -229,6 +249,17 @@ pub fn render(
                 };
                 frame.fill(rect, color);
                 frame.border(rect, palette.border);
+                if state.focused == Some(*id) && rect.width > 4 && rect.height > 4 {
+                    frame.border(
+                        PixelRect {
+                            x: rect.x + 2,
+                            y: rect.y + 2,
+                            width: rect.width - 4,
+                            height: rect.height - 4,
+                        },
+                        palette.focus,
+                    );
+                }
                 let inset_x = (12.0 * scale_factor).floor().max(0.0) as u32;
                 let inset_y = (8.0 * scale_factor).floor().max(0.0) as u32;
                 frame.text(
@@ -407,7 +438,21 @@ mod tests {
             &RenderState {
                 hovered: Some(id(4)),
                 pressed: Some(id(4)),
+                focused: None,
                 fault_category: None,
+            },
+            palette,
+        )
+        .unwrap();
+        let focused = render(
+            &tree,
+            &layout,
+            320,
+            180,
+            1.0,
+            &RenderState {
+                focused: Some(id(4)),
+                ..RenderState::default()
             },
             palette,
         )
@@ -430,12 +475,14 @@ mod tests {
                 frame_hash(&normal),
                 frame_hash(&hover),
                 frame_hash(&pressed),
+                frame_hash(&focused),
                 frame_hash(&fault)
             ],
             [
                 17_820_981_758_339_064_687,
                 14_595_224_954_947_096_910,
                 10_747_383_323_860_802_854,
+                6_712_044_220_356_763_811,
                 10_205_311_049_527_053_737,
             ]
         );
