@@ -662,6 +662,7 @@ impl YouthApp {
             )));
         }
         self.prepare_call(self.limits.mount, "mount", turn_id)?;
+        self.begin_state(youth_state::GuestCallPhase::Mount, turn_id)?;
 
         let started = std::time::Instant::now();
         let guest_result = self
@@ -674,15 +675,15 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "mounting");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_snapshot = match guest_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "mount"),
-                ));
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "mount"));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let snapshot = match from_guest::tree_snapshot(wire_snapshot, &self.limits) {
@@ -697,7 +698,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidSnapshot(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if snapshot.revision != 0 {
@@ -708,7 +709,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
 
         let validation_span =
@@ -723,9 +724,16 @@ impl YouthApp {
             });
         let tree = match tree {
             Ok(tree) => tree,
-            Err(error) => return Err(self.enter_fault(error)),
+            Err(error) => return Err(self.rollback_and_fault(error)),
         };
         let snapshot = tree.to_snapshot();
+        if let Err(source) = self.store.data_mut().state.commit() {
+            let error = RuntimeError::StateCommitFailed(
+                self.context("state commit failed after mount validation", turn_id)
+                    .with_source(source),
+            );
+            return Err(self.enter_fault(error));
+        }
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
         Ok(snapshot)
@@ -770,6 +778,25 @@ impl YouthApp {
         self.store.epoch_deadline_trap();
         self.store.data_mut().limiter.limit_hit = false;
         Ok(())
+    }
+
+    fn begin_state(
+        &mut self,
+        phase: youth_state::GuestCallPhase,
+        turn_id: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        self.store.data_mut().state.begin(phase).map_err(|source| {
+            let error = RuntimeError::StateUnavailable(
+                self.context("state transaction could not begin", turn_id)
+                    .with_source(source),
+            );
+            self.enter_fault(error)
+        })
+    }
+
+    fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
+        let _ = self.store.data_mut().state.rollback();
+        self.enter_fault(error)
     }
 
     fn record_call_metrics(&self, elapsed: std::time::Duration) {
