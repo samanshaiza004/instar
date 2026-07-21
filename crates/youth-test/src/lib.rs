@@ -287,7 +287,7 @@ fn expect_text(
     let id = named_id(name);
     let node = snapshot.nodes.iter().find(|node| node.id == id);
     match node.map(|node| &node.data) {
-        Some(NodeData::Text { value }) if value == expected => Ok(()),
+        Some(data) if data.text_value().is_some_and(|value| value == expected) => Ok(()),
         observed => Err(TestError::Diagnostic {
             path: path.to_path_buf(),
             line: located.line,

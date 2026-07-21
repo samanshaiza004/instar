@@ -27,4 +27,3 @@ interface store {
     set: func(key: string, value: value) -> result<_, state-error>;
     delete: func(key: string) -> result<bool, state-error>;
 }
-

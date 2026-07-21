@@ -166,4 +166,3 @@ world application {
     import youth:state/store@0.0.1;
     export lifecycle;
 }
-

@@ -895,9 +895,9 @@ mod state {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandKey, Error, ErrorKind, EventContext, Events,
-        Grid, NodeKey, Result, Row, Shortcut, Text, TextAlign, Tree, Update, ViewContext, command,
-        node,
+        Application, BoxNode, Button, Column, CommandKey, Element, Error, ErrorKind, EventContext,
+        Events, Grid, NodeKey, Result, Row, Shortcut, Text, TextAlign, Tree, Update, ViewContext,
+        command, node,
     };
 }
 

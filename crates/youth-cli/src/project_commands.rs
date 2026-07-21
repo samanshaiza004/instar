@@ -102,6 +102,7 @@ fn write_template(
             fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
         }
         let rendered = template
+            .replace("youth-template-app", package)
             .replace("{{package}}", package)
             .replace("{{display_name}}", display_name)
             .replace("{{app_id}}", app_id.as_str());

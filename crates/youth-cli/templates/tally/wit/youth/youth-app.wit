@@ -1,21 +1,47 @@
-package youth:app@0.0.2;
+package youth:app@0.0.3;
 
 interface ui {
     type node-id = u64;
     type tree-revision = u64;
     type event-sequence = u64;
 
+    record grid-layout {
+        columns: u8,
+    }
+
+    variant box-layout {
+        column,
+        row,
+        grid(grid-layout),
+    }
+
+    enum text-alignment {
+        start,
+        center,
+        end,
+    }
+
+    variant shortcut-key {
+        character(string),
+        enter,
+        escape,
+        backspace,
+    }
+
     record box-data {
         enabled: bool,
+        layout: box-layout,
     }
 
     record text-data {
         value: string,
+        alignment: text-alignment,
     }
 
     record button-data {
         label: string,
         enabled: bool,
+        shortcuts: list<shortcut-key>,
     }
 
     variant node-data {

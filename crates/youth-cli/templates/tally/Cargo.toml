@@ -1,5 +1,5 @@
 [package]
-name = "{{package}}"
+name = "youth-template-app"
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-youth-sdk = { git = "https://github.com/samanshaiza004/youth", rev = "c5e2b0f2b96746e2251e8d9e0da440a3f7b7e46a" }
+youth-sdk = { git = "https://github.com/samanshaiza004/youth", rev = "490467149c11883662ad07432f2075efd05eb8b3" }
 
 [profile.release]
 lto = true

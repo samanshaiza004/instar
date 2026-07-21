@@ -24,6 +24,8 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | CALC-F002 | `e971316` | View IDs and activation matching repeat for every command; canonical model persistence expands into typed calls | View-backed command identity belongs in the SDK; structured state remains unproven |
 | CALC-F003 | `e971316` | Calculator source contains no generated bindings, numeric node IDs, revisions, acknowledgements, or patches | Preserve the DP0 SDK boundary through protocol `0.0.3` |
 | CALC-F004 | `utility-calculator-gate-b-layout` | Supporting `0.0.2` and `0.0.3` directly in presentation would duplicate policy and destabilize old fixtures | Both worlds normalize at the runtime boundary; tree, interaction, and renderer code are version-independent |
+| CALC-F005 | External `youth test` on the first aligned display | The test runner matched the compact `Text` representation instead of the semantic text role | Assertions now use normalized text accessors, so alignment does not change test meaning |
+| CALC-F006 | Fresh Cargo resolution of the Git-pinned SDK | An invalid package-name placeholder in the embedded template produced a noisy repository-discovery diagnostic | Reviewable templates must remain valid source artifacts; generation now replaces a valid sentinel and the template directory is excluded from the workspace |
 
 ## Finding requirements
 
