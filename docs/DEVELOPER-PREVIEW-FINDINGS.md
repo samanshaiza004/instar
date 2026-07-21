@@ -8,7 +8,7 @@ automatically authorize new features.
 
 | ID | Summary | Status | Tooling implication |
 | --- | --- | --- | --- |
-| DP0-F001 | A guest currently owns all protocol plumbing | Open | Extract `youth-sdk` from the external Tally experience |
+| DP0-F001 | A guest currently owns all protocol plumbing | Addressed | `youth-sdk` owns bindings, lifecycle, state, and wire conversion |
 | DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
 
 ## Finding template
@@ -32,13 +32,13 @@ automatically authorize new features.
 
 ### DP0-F001 — A guest currently owns all protocol plumbing
 
-- **Status:** Open
+- **Status:** Addressed
 - **Observed:** 2026-07-21
 - **Application:** Milestone 1 counter, before external Tally
 - **Workflow stage:** Manual guest authoring
 - **Platform:** Platform-independent source inspection
-- **Local path:** `guests/counter/src/lib.rs`
-- **Commit:** `599fb93`
+- **Local path:** `/Users/keina/dev/youth-tally`
+- **Commit:** Tally `74ccae5`; Youth `c5e2b0f`; migrated Tally `2f2f5a7`
 - **Evidence:** The guest invokes `wit_bindgen::generate!`, imports generated
   modules, assigns raw `u64` node IDs, tracks mount and revision state, creates
   wire snapshots and patch batches, acknowledges event sequences, converts
@@ -49,7 +49,11 @@ automatically authorize new features.
   minimum explicit SDK API from observed friction.
 - **Tooling implication:** `youth-sdk` must own bindings, exports, lifecycle,
   revisions, acknowledgements, typed state, builders, and wire conversion.
-- **Resolution:** Pending Gate A external Tally and SDK tests.
+- **Resolution:** The standalone repository first proved the raw component at
+  `74ccae5`, then `youth-sdk` commit `c5e2b0f` replaced 190 lines of app-owned
+  plumbing. Tally `2f2f5a7` builds from that exact Git revision with no path
+  dependency. SDK unit tests, component validation, runtime persistence, and
+  restart/resync integration tests pass.
 
 ### DP0-F002 — Symbolic-ID prefix notation was ambiguous
 
@@ -59,7 +63,7 @@ automatically authorize new features.
 - **Workflow stage:** Symbolic node ID implementation
 - **Platform:** Platform-independent
 - **Local path:** `crates/youth-sdk/src/lib.rs`
-- **Commit:** `uncommitted`
+- **Commit:** `c5e2b0f`
 - **Evidence:** The notation `youth:node-id:v1\0` can mean a NUL escape in
   source code or the literal ASCII bytes backslash and zero. The approved
   canonical vectors correspond to the literal two-byte suffix.
