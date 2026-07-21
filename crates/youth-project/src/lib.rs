@@ -23,7 +23,7 @@ pub const SDK_REVISION: &str = "c5e2b0f2b96746e2251e8d9e0da440a3f7b7e46a";
 pub const TEMPLATE_VERSION: u32 = 1;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TEMPLATE_WIT_SHA256: &str =
-    "71ddf56e68c9fada51c9dbe39878e520a1afe77637a8b9081d1074fe597545d7";
+    "71ca278ff0dbf618dcb9ad174e0843f9c397cbe38742b1aec262689b913d4e3c";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]

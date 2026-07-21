@@ -33,6 +33,10 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
         "wit/youth/youth-app.wit",
         include_str!("../templates/tally/wit/youth/youth-app.wit"),
     ),
+    (
+        "wit/youth/deps/youth-state/store.wit",
+        include_str!("../templates/tally/wit/youth/deps/youth-state/store.wit"),
+    ),
 ];
 
 pub fn new_project(destination: &Path, app_id: &AppId) -> Result<(), CliError> {
@@ -407,6 +411,12 @@ mod tests {
         fs::write(
             root.join("youth-app.wit"),
             include_str!("../templates/tally/wit/youth/youth-app.wit"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("deps/youth-state")).unwrap();
+        fs::write(
+            root.join("deps/youth-state/store.wit"),
+            include_str!("../templates/tally/wit/youth/deps/youth-state/store.wit"),
         )
         .unwrap();
         assert_eq!(

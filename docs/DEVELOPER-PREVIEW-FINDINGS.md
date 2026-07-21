@@ -14,7 +14,7 @@ There are no open findings at this checkpoint.
 | --- | --- | --- | --- |
 | DP0-F001 | A guest currently owns all protocol plumbing | Addressed | `youth-sdk` owns bindings, lifecycle, state, and wire conversion |
 | DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
-| DP0-F003 | WIT tree digest root was implicit | Addressed | Hash normalized paths relative to `wit/youth` |
+| DP0-F003 | A shallow template copy omitted nested WIT | Addressed | Hash and generate the complete recursive snapshot |
 
 ## Finding template
 
@@ -80,7 +80,7 @@ There are no open findings at this checkpoint.
   three canonical vectors.
 - **Resolution:** SDK unit tests lock `count`, `increment`, and `café`.
 
-### DP0-F003 — WIT tree digest root was implicit
+### DP0-F003 — A shallow template copy omitted nested WIT
 
 - **Status:** Addressed
 - **Observed:** 2026-07-21
@@ -88,16 +88,19 @@ There are no open findings at this checkpoint.
 - **Workflow stage:** `youth check`
 - **Platform:** macOS aarch64
 - **Local path:** `/Users/keina/dev/youth-tally`
-- **Commit:** Tally `3a6ec3e`; Youth project/CLI implementation in Gate B
-- **Evidence:** The first manually recorded digest did not reproduce once the
-  specified length-delimited algorithm was implemented in shared code. The
-  missing detail was which directory anchors each normalized relative path.
-- **Developer impact:** Independently implemented tools could reject an
-  otherwise identical WIT snapshot.
-- **Decision:** Relative paths begin immediately below `wit/youth`; the Tally
-  snapshot therefore hashes `youth-app.wit`. Its portable digest is
-  `71ddf56e68c9fada51c9dbe39878e520a1afe77637a8b9081d1074fe597545d7`.
+- **Commit:** Tally `3a6ec3e` (superseded correction); Youth Gate B follow-up
+- **Evidence:** An initial file listing capped at depth four found
+  `wit/youth/youth-app.wit` but omitted the deeper
+  `wit/youth/deps/youth-state/store.wit`. A generated snapshot containing only
+  the application WIT produced a different digest and was not the complete
+  inspectable contract.
+- **Developer impact:** A generated project could pass Rust compilation through
+  SDK-owned bindings while shipping an incomplete language-neutral snapshot.
+- **Decision:** Generation includes every recursive regular file below
+  `wit/youth`. The complete Tally snapshot retains the original digest
+  `71ca278ff0dbf618dcb9ad174e0843f9c397cbe38742b1aec262689b913d4e3c`.
 - **Tooling implication:** All commands call `youth-project::hash_wit_tree`;
   no command assembles the digest independently.
-- **Resolution:** SDK/project hash tests and generated-project lock validation
-  reproduce the digest, while content and path mutations change it.
+- **Resolution:** The embedded template includes the nested state WIT and its
+  test materializes both files before checking the locked digest. Project hash
+  tests still prove that content and path mutations change it.
