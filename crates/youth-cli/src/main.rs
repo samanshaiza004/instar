@@ -15,6 +15,8 @@ use youth_runtime::{
 use youth_state::{AppId, StateLimits, StateLocation, StateStore, repair_usage, verify_file};
 use youth_tree::NodeId;
 
+mod project_commands;
+
 /// Inspection and test surface for the Youth runtime.
 #[derive(Debug, Parser)]
 #[command(name = "youth", version, about)]
@@ -25,6 +27,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create the proven Rust Tally project in a new directory.
+    New {
+        destination: PathBuf,
+        #[arg(long)]
+        id: AppId,
+    },
+    /// Diagnose the local Youth development environment.
+    Doctor {
+        /// Also create and present a native smoke window.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Validate the current external project and development component.
+    Check,
     /// Check that a component loads and exports the Youth world. Does not mount.
     Validate { component: PathBuf },
     /// Mount a component and print its initial canonical tree.
@@ -123,6 +139,7 @@ fn main() -> ExitCode {
     init_tracing();
     let command = Cli::parse().command;
     let result = match command {
+        Command::Doctor { full } => project_commands::doctor(full),
         Command::Run {
             component,
             app_id,
@@ -163,6 +180,8 @@ fn init_tracing() {
 
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
+        Command::New { destination, id } => project_commands::new_project(&destination, &id)?,
+        Command::Check => project_commands::check_project()?,
         Command::Validate { component } => {
             let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
@@ -244,7 +263,9 @@ async fn run(command: Command) -> Result<(), CliError> {
             }
         }
         Command::State { command } => run_state_command(command)?,
-        Command::Run { .. } => unreachable!("run is dispatched on the process main thread"),
+        Command::Run { .. } | Command::Doctor { .. } => {
+            unreachable!("main-thread command was already dispatched")
+        }
     }
     Ok(())
 }

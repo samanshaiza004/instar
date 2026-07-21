@@ -6,10 +6,15 @@ automatically authorize new features.
 
 ## Open findings
 
+There are no open findings at this checkpoint.
+
+## Findings index
+
 | ID | Summary | Status | Tooling implication |
 | --- | --- | --- | --- |
 | DP0-F001 | A guest currently owns all protocol plumbing | Addressed | `youth-sdk` owns bindings, lifecycle, state, and wire conversion |
 | DP0-F002 | Symbolic-ID prefix notation was ambiguous | Addressed | Lock exact bytes through canonical vectors in every SDK |
+| DP0-F003 | WIT tree digest root was implicit | Addressed | Hash normalized paths relative to `wit/youth` |
 
 ## Finding template
 
@@ -74,3 +79,25 @@ automatically authorize new features.
 - **Tooling implication:** Every SDK and host-side test runner must run the same
   three canonical vectors.
 - **Resolution:** SDK unit tests lock `count`, `increment`, and `café`.
+
+### DP0-F003 — WIT tree digest root was implicit
+
+- **Status:** Addressed
+- **Observed:** 2026-07-21
+- **Application:** Tally
+- **Workflow stage:** `youth check`
+- **Platform:** macOS aarch64
+- **Local path:** `/Users/keina/dev/youth-tally`
+- **Commit:** Tally `3a6ec3e`; Youth project/CLI implementation in Gate B
+- **Evidence:** The first manually recorded digest did not reproduce once the
+  specified length-delimited algorithm was implemented in shared code. The
+  missing detail was which directory anchors each normalized relative path.
+- **Developer impact:** Independently implemented tools could reject an
+  otherwise identical WIT snapshot.
+- **Decision:** Relative paths begin immediately below `wit/youth`; the Tally
+  snapshot therefore hashes `youth-app.wit`. Its portable digest is
+  `71ddf56e68c9fada51c9dbe39878e520a1afe77637a8b9081d1074fe597545d7`.
+- **Tooling implication:** All commands call `youth-project::hash_wit_tree`;
+  no command assembles the digest independently.
+- **Resolution:** SDK/project hash tests and generated-project lock validation
+  reproduce the digest, while content and path mutations change it.

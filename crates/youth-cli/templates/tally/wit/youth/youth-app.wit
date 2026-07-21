@@ -1,0 +1,142 @@
+package youth:app@0.0.2;
+
+interface ui {
+    type node-id = u64;
+    type tree-revision = u64;
+    type event-sequence = u64;
+
+    record box-data {
+        enabled: bool,
+    }
+
+    record text-data {
+        value: string,
+    }
+
+    record button-data {
+        label: string,
+        enabled: bool,
+    }
+
+    variant node-data {
+        root,
+        box(box-data),
+        text(text-data),
+        button(button-data),
+    }
+
+    record node {
+        id: node-id,
+        data: node-data,
+        children: list<node-id>,
+    }
+
+    record tree-snapshot {
+        revision: tree-revision,
+        root: node-id,
+        nodes: list<node>,
+    }
+
+    record create-node {
+        value: node,
+    }
+
+    record delete-node {
+        id: node-id,
+    }
+
+    record set-text {
+        id: node-id,
+        value: string,
+    }
+
+    record set-label {
+        id: node-id,
+        value: string,
+    }
+
+    record set-enabled {
+        id: node-id,
+        value: bool,
+    }
+
+    record insert-child {
+        parent: node-id,
+        index: u32,
+        child: node-id,
+    }
+
+    record remove-child {
+        parent: node-id,
+        index: u32,
+        expected-child: node-id,
+    }
+
+    record move-child {
+        parent: node-id,
+        from-index: u32,
+        to-index: u32,
+        expected-child: node-id,
+    }
+
+    variant patch {
+        create(create-node),
+        delete(delete-node),
+        set-text(set-text),
+        set-label(set-label),
+        set-enabled(set-enabled),
+        insert-child(insert-child),
+        remove-child(remove-child),
+        move-child(move-child),
+    }
+
+    variant event-kind {
+        activate(node-id),
+    }
+
+    record event {
+        sequence: event-sequence,
+        kind: event-kind,
+    }
+
+    record event-batch {
+        tree-revision: tree-revision,
+        events: list<event>,
+    }
+
+    record patch-batch {
+        base-tree-revision: tree-revision,
+        next-tree-revision: tree-revision,
+        processed-through: event-sequence,
+        patches: list<patch>,
+    }
+
+    enum app-error-code {
+        invalid-state,
+        rejected-event,
+        internal,
+    }
+
+    record app-error {
+        code: app-error-code,
+        message: option<string>,
+    }
+}
+
+interface lifecycle {
+    use ui.{
+        tree-snapshot,
+        event-batch,
+        patch-batch,
+        app-error,
+    };
+
+    mount: func() -> result<tree-snapshot, app-error>;
+    handle: func(events: event-batch) -> result<patch-batch, app-error>;
+    resync: func() -> result<tree-snapshot, app-error>;
+}
+
+world application {
+    import youth:state/store@0.0.1;
+    export lifecycle;
+}

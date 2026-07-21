@@ -74,7 +74,7 @@ lock upgrade.
 The WIT digest visits every regular file below `wit/youth` in sorted,
 normalized relative-path order. Each file contributes a big-endian `u32` path
 length, the UTF-8 path, a big-endian `u64` content length, and its exact bytes.
-Symlinks are invalid.
+Paths are relative to `wit/youth` itself; symlinks are invalid.
 
 The SDK's internal WIT is the sole source for Rust bindings and export
 plumbing. The project-vendored WIT is an inspectable, language-neutral contract
