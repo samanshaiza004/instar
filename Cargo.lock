@@ -2963,6 +2963,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-state"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "youth-trap-on-handle"
 version = "0.0.1"
 dependencies = [

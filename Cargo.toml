@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/youth-tree",
+    "crates/youth-state",
     "crates/youth-runtime",
     "crates/youth-cli",
     "guests/counter",
