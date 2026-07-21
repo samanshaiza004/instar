@@ -42,10 +42,15 @@ impl fmt::Display for AppLifecycle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnReceipt {
     pub turn_id: u64,
+    pub first_event_sequence: u64,
+    pub processed_through: u64,
     pub event_sequence: u64,
     pub base_revision: u64,
     pub next_revision: u64,
+    pub patch_batch: youth_tree::PatchBatch,
     pub patch_count: usize,
+    pub state_writes: u32,
+    pub elapsed: std::time::Duration,
     pub committed: bool,
 }
 
@@ -357,10 +362,19 @@ impl YouthApp {
             .revision();
         self.last_turn = Some(TurnReceipt {
             turn_id: sequence,
+            first_event_sequence: sequence,
+            processed_through: sequence,
             event_sequence: sequence,
             base_revision,
             next_revision: base_revision,
+            patch_batch: youth_tree::PatchBatch {
+                base_revision,
+                next_revision: base_revision,
+                patches: Vec::new(),
+            },
             patch_count: 0,
+            state_writes: 0,
+            elapsed: std::time::Duration::ZERO,
             committed: false,
         });
         let span = info_span!(
@@ -391,9 +405,15 @@ impl YouthApp {
     ) -> Result<TurnReceipt, RuntimeError> {
         let turn_id = Some(sequence);
         self.prepare_call(self.limits.handle, "handle", turn_id)?;
+        let mut staged_tree = self
+            .tree
+            .as_ref()
+            .expect("mounted applications retain a tree")
+            .clone();
         let events =
             to_guest::event_batch(base_revision, &[HostEvent { sequence, node }], &self.limits)
                 .map_err(|message| RuntimeError::Internal(self.context(message, turn_id)))?;
+        self.begin_state(youth_state::GuestCallPhase::Handle, turn_id)?;
 
         let started = std::time::Instant::now();
         let guest_result = self
@@ -406,15 +426,24 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "handling events");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_batch = match guest_result {
             Ok(batch) => batch,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "handle"),
-                ));
+                let writes = self.store.data().state.metrics().writes;
+                let recoverable = error.code
+                    == crate::bindings::youth::app::ui::AppErrorCode::RejectedEvent
+                    && writes == 0;
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
+                let _ = self.store.data_mut().state.rollback();
+                return if recoverable {
+                    Err(error)
+                } else {
+                    Err(self.enter_fault(error))
+                };
             }
         };
         if wire_batch.processed_through != sequence {
@@ -425,7 +454,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
         let batch = match from_guest::patch_batch(wire_batch, &self.limits) {
             Ok(batch) => batch,
@@ -439,7 +468,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidPatchBatch(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if batch.base_revision != base_revision {
@@ -450,7 +479,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
 
         let next_revision = batch.next_revision;
@@ -458,6 +487,7 @@ impl YouthApp {
         if let Some(receipt) = &mut self.last_turn {
             receipt.next_revision = next_revision;
             receipt.patch_count = patch_count;
+            receipt.patch_batch = batch.clone();
         }
         tracing::Span::current().record("next_revision", next_revision);
         tracing::Span::current().record("patch_count", patch_count as u64);
@@ -469,12 +499,8 @@ impl YouthApp {
             next_revision,
             patch_count = patch_count as u64,
         );
-        let apply_result = apply_span.in_scope(|| {
-            self.tree
-                .as_mut()
-                .expect("mounted applications retain a tree")
-                .apply(batch, &self.limits.tree)
-        });
+        let apply_result =
+            apply_span.in_scope(|| staged_tree.apply(batch.clone(), &self.limits.tree));
         if let Err(source) = apply_result {
             let revision_error = matches!(
                 source,
@@ -489,15 +515,31 @@ impl YouthApp {
             } else {
                 RuntimeError::InvalidPatchBatch(context)
             };
+            return Err(self.rollback_and_fault(error));
+        }
+
+        let state_writes = self.store.data().state.metrics().writes;
+        if let Err(source) = self.store.data_mut().state.commit() {
+            let error = RuntimeError::StateCommitFailed(
+                self.context("state commit failed after patch validation", turn_id)
+                    .with_source(source),
+            );
             return Err(self.enter_fault(error));
         }
+        self.tree = Some(staged_tree);
+        let elapsed = started.elapsed();
 
         let receipt = TurnReceipt {
             turn_id: sequence,
+            first_event_sequence: sequence,
+            processed_through: sequence,
             event_sequence: sequence,
             base_revision,
             next_revision,
+            patch_batch: batch,
             patch_count,
+            state_writes,
+            elapsed,
             committed: true,
         };
         self.last_turn = Some(receipt.clone());
@@ -542,6 +584,7 @@ impl YouthApp {
         turn_id: Option<u64>,
     ) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         self.prepare_call(self.limits.resync, "resync", turn_id)?;
+        self.begin_state(youth_state::GuestCallPhase::Resync, turn_id)?;
         let started = std::time::Instant::now();
         let guest_result = self
             .bindings
@@ -553,15 +596,16 @@ impl YouthApp {
             Ok(result) => result,
             Err(source) => {
                 let error = self.classify_guest_failure(source, turn_id, "resynchronizing");
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let wire_snapshot = match guest_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return Err(RuntimeError::GuestRejected(
-                    self.guest_error_context(error, turn_id, "resync"),
-                ));
+                let error =
+                    RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
+                let _ = self.store.data_mut().state.rollback();
+                return Err(error);
             }
         };
         let snapshot = match from_guest::tree_snapshot(wire_snapshot, &self.limits) {
@@ -576,7 +620,7 @@ impl YouthApp {
                 } else {
                     RuntimeError::InvalidSnapshot(context)
                 };
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         if snapshot.revision != live_revision {
@@ -587,7 +631,7 @@ impl YouthApp {
                 ),
                 turn_id,
             ));
-            return Err(self.enter_fault(error));
+            return Err(self.rollback_and_fault(error));
         }
         let validation_span = info_span!(
             "tree.validate",
@@ -603,10 +647,17 @@ impl YouthApp {
                     self.context("guest returned an invalid resync tree", turn_id)
                         .with_source(source),
                 );
-                return Err(self.enter_fault(error));
+                return Err(self.rollback_and_fault(error));
             }
         };
         let snapshot = tree.to_snapshot();
+        if let Err(source) = self.store.data_mut().state.rollback() {
+            let error = RuntimeError::StateUnavailable(
+                self.context("read-only resync transaction could not close", turn_id)
+                    .with_source(source),
+            );
+            return Err(self.enter_fault(error));
+        }
         self.tree = Some(tree);
         Ok(snapshot)
     }
