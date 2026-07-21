@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Youth host runtime: Wasmtime engine, component loading, WIT bindings, closed WASI context, serialized app worker."
 
+[features]
+test-support = ["youth-state/test-support"]
+
 [dependencies]
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "sync", "macros", "rt-multi-thread"] }

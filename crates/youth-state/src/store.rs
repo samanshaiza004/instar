@@ -109,6 +109,8 @@ pub enum StateError {
     NoTransaction,
     #[error("backup destination already exists")]
     BackupExists,
+    #[error("state commit failed at an injected test failpoint")]
+    InjectedCommitFailure,
 }
 
 impl StateError {
@@ -135,6 +137,8 @@ pub struct StateStore {
     phase: GuestCallPhase,
     transaction_active: bool,
     metrics: TurnStateMetrics,
+    #[cfg(feature = "test-support")]
+    fail_next_commit: bool,
 }
 
 impl std::fmt::Debug for StateStore {
@@ -173,6 +177,8 @@ impl StateStore {
             phase: GuestCallPhase::Idle,
             transaction_active: false,
             metrics: TurnStateMetrics::default(),
+            #[cfg(feature = "test-support")]
+            fail_next_commit: false,
         })
     }
 
@@ -224,6 +230,12 @@ impl StateStore {
         self.require_transaction()?;
         if self.phase == GuestCallPhase::Resync {
             return Err(StateError::ReadOnly);
+        }
+        #[cfg(feature = "test-support")]
+        if std::mem::take(&mut self.fail_next_commit) {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            self.finish(false);
+            return Err(StateError::InjectedCommitFailure);
         }
         if let Err(error) = self.connection.execute_batch("COMMIT") {
             let _ = self.connection.execute_batch("ROLLBACK");
@@ -358,6 +370,11 @@ impl StateStore {
             let _ = self.connection.execute_batch("ROLLBACK");
         }
         result
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_commit(&mut self) {
+        self.fail_next_commit = true;
     }
 
     fn attempt_call(&mut self) -> Result<(), StateError> {

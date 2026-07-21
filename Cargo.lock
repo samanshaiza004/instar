@@ -2916,6 +2916,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-app-error-after-state-write"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-bad-revision-after-state-write"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-cli"
 version = "0.0.1"
 dependencies = [
@@ -2944,6 +2958,13 @@ dependencies = [
 
 [[package]]
 name = "youth-invalid-patch"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-invalid-patch-after-state-write"
 version = "0.0.1"
 dependencies = [
  "wit-bindgen",
@@ -3014,6 +3035,13 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "youth-trap-after-state-write"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
 ]
 
 [[package]]

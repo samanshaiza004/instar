@@ -203,7 +203,8 @@ fn to_wire_state_error(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
-        | youth_state::StateError::BackupExists => ErrorCode::Internal,
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
     crate::bindings::youth::state::store::StateError {
         code,
@@ -318,6 +319,11 @@ impl YouthApp {
                     None,
                 ))
             })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_state_commit(&mut self) {
+        self.store.data_mut().state.fail_next_commit();
     }
 
     pub fn mount(&mut self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {

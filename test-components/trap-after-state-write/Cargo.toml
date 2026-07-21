@@ -1,0 +1,12 @@
+[package]
+name = "youth-trap-after-state-write"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "../state-failure-common/lib.rs"
+
+[dependencies]
+wit-bindgen = "0.51.0"

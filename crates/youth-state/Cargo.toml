@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 thiserror = "2.0.18"

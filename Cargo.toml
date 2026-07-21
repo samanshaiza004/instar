@@ -16,6 +16,10 @@ members = [
     "test-components/invalid-sequence",
     "test-components/oversized-snapshot",
     "test-components/oversized-patch",
+    "test-components/trap-after-state-write",
+    "test-components/invalid-patch-after-state-write",
+    "test-components/bad-revision-after-state-write",
+    "test-components/app-error-after-state-write",
 ]
 
 [workspace.package]
