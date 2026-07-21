@@ -15,5 +15,6 @@ youth-tree = { path = "../youth-tree" }
 youth-state = { path = "../youth-state" }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tracing-subscriber = "0.3.23"
 wat = "1.253.0"
