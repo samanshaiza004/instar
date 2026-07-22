@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'codex/**']
   pull_request:
 
 env:
@@ -194,6 +194,52 @@ jobs:
             if (Select-String -Path Cargo.toml -Pattern 'path\s*=') {
               throw "generated Cargo.toml contains a local path dependency"
             }
+          } finally {
+            Pop-Location
+          }
+      - name: External calculator workflow
+        shell: pwsh
+        env:
+          CALCULATOR_COMMIT: b4767fc15bb3c5f6a28aa144e71f413e49d1f553
+        run: |
+          $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
+          $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
+          $calculator = Join-Path $env:RUNNER_TEMP "youth-calculator"
+          git clone --quiet https://github.com/samanshaiza004/youth-calculator.git $calculator
+          git -C $calculator checkout --quiet $env:CALCULATOR_COMMIT
+          $checkedOut = (git -C $calculator rev-parse HEAD).Trim()
+          if ($checkedOut -ne $env:CALCULATOR_COMMIT) {
+            throw "calculator revision mismatch: expected $env:CALCULATOR_COMMIT, got $checkedOut"
+          }
+          Push-Location $calculator
+          try {
+            & $cli check
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth check failed" }
+            & $cli test
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth test failed" }
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth build --release failed" }
+            $component = Join-Path $calculator "dist/dev.saman.calculator.wasm"
+            if (-not (Test-Path $component -PathType Leaf)) {
+              throw "calculator release component was not produced"
+            }
+            & wasm-tools validate $component
+            if ($LASTEXITCODE -ne 0) { throw "calculator component validation failed" }
+            if (Select-String -Path Cargo.toml -Pattern 'path\s*=') {
+              throw "calculator Cargo.toml contains a local path dependency"
+            }
+            $forbidden = 'wit_bindgen|wasmtime|PatchBatch|acknowledg|numeric wire|revision|component export'
+            $source = Get-ChildItem src -Recurse -File -Filter *.rs
+            if ($source | Select-String -Pattern $forbidden) {
+              throw "calculator source contains raw Youth runtime or WIT concepts"
+            }
+            $lock = Get-Content Youth.lock -Raw
+            if ($lock -notmatch 'sdk-revision\s*=\s*"8696bd97ebc4f1d34b9f632e5992dd1882b724de"') {
+              throw "calculator Youth.lock does not pin the certified SDK revision"
+            }
+            Write-Host "calculator certified revision: $checkedOut"
+            Write-Host "calculator component bytes: $((Get-Item $component).Length)"
+            Write-Host "calculator component SHA-256: $((Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant())"
           } finally {
             Pop-Location
           }
