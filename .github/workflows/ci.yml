@@ -309,7 +309,7 @@ jobs:
           set -euo pipefail
           mapfile -t files < <(find calculator-identities -type f -name '*.txt' -print | sort)
           test "${#files[@]}" -eq 3
-          mapfile -t hashes < <(cat "${files[@]}" | tr -d '\r' | sed '/^$/d' | sort -u)
+          mapfile -t hashes < <(for file in "${files[@]}"; do tr -d '\r\n' < "$file"; printf '\n'; done | sort -u)
           test "${#hashes[@]}" -eq 1
           [[ "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]]
           echo "calculator component SHA-256 is identical on all hosts: ${hashes[0]}"
