@@ -206,7 +206,7 @@ jobs:
       - name: External calculator workflow
         shell: pwsh
         env:
-          CALCULATOR_COMMIT: b4767fc15bb3c5f6a28aa144e71f413e49d1f553
+          CALCULATOR_COMMIT: fe962a0a3f8a7476e9e3e928fc8992e7aaaea9e5
         run: |
           $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
           $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
