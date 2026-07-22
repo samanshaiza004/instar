@@ -136,6 +136,10 @@ DP1 commands are view-backed:
 
 The SDK may derive a private backing node identity from a command, but public
 types and validation never equate command identity with node identity.
+This one-command-to-one-button cardinality is a DP1 validation rule, not a
+permanent identity contract. The separate domains leave room for a future
+command to have zero or multiple presentations such as a menu item, command
+palette entry, accessibility action, or automation endpoint.
 
 ## Focus and interaction policy
 
