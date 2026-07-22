@@ -237,12 +237,21 @@ jobs:
             if ($lock -notmatch 'sdk-revision\s*=\s*"8696bd97ebc4f1d34b9f632e5992dd1882b724de"') {
               throw "calculator Youth.lock does not pin the certified SDK revision"
             }
+            $calculatorHash = (Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant()
+            $metadata = Join-Path $env:RUNNER_TEMP "calculator-sha-$env:RUNNER_OS.txt"
+            Set-Content -Path $metadata -Value $calculatorHash -NoNewline
             Write-Host "calculator certified revision: $checkedOut"
             Write-Host "calculator component bytes: $((Get-Item $component).Length)"
-            Write-Host "calculator component SHA-256: $((Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant())"
+            Write-Host "calculator component SHA-256: $calculatorHash"
           } finally {
             Pop-Location
           }
+      - name: Upload calculator identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: calculator-sha-${{ runner.os }}
+          path: ${{ runner.temp }}/calculator-sha-${{ runner.os }}.txt
+          if-no-files-found: error
       - name: Ubuntu full dev restart E2E
         if: runner.os == 'Linux'
         shell: bash
@@ -277,3 +286,24 @@ jobs:
         run: |
           git status --short
           test -z "$(git status --short)"
+
+  calculator-cross-platform:
+    needs: host
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download calculator identities
+        uses: actions/download-artifact@v4
+        with:
+          pattern: calculator-sha-*
+          path: calculator-identities
+          merge-multiple: true
+      - name: Require one calculator component identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find calculator-identities -type f -name '*.txt' -print | sort)
+          test "${#files[@]}" -eq 3
+          mapfile -t hashes < <(cat "${files[@]}" | tr -d '\r' | sed '/^$/d' | sort -u)
+          test "${#hashes[@]}" -eq 1
+          [[ "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]]
+          echo "calculator component SHA-256 is identical on all hosts: ${hashes[0]}"
