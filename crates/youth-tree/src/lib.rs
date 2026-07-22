@@ -209,7 +209,7 @@ impl Default for Limits {
             max_grid_columns: 16,
             max_shortcuts_per_button: 4,
             max_shortcuts_per_tree: 256,
-            max_shortcut_character_bytes: 16,
+            max_shortcut_character_bytes: 4,
         }
     }
 }
@@ -1114,6 +1114,8 @@ mod tests {
 
     #[test]
     fn invalid_grid_and_shortcut_contracts_are_rejected() {
+        assert_eq!(Limits::default().max_shortcut_character_bytes, 4);
+
         let invalid_grid = validate(snapshot(
             1,
             vec![
@@ -1181,6 +1183,23 @@ mod tests {
             multiple_scalars,
             Err(ValidationError::InvalidShortcutCharacter { .. })
         ));
+
+        let four_byte_scalar = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "Abacus".into(),
+                        enabled: true,
+                        shortcuts: vec![ShortcutKey::Character("🧮".into())],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(four_byte_scalar.is_ok());
     }
 
     #[test]

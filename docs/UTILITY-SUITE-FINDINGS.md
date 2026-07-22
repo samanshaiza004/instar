@@ -15,7 +15,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | ID | Category | Summary | Owner | Next decision |
 | --- | --- | --- | --- | --- |
 | CALC-F002 | Platform discovery | Command binding and canonical state calls are repetitive | Calculator / Youth | Resolve view-backed commands in the SDK; retain explicit typed durable state |
-| CALC-F009 | Platform discovery | Manual display patches create a convergence obligation with fresh `view` output | Calculator / Youth | Gather evidence from more dynamic applications before choosing explicit patches, SDK diffing, or reactive dependencies |
+| CALC-F009 | Platform discovery | Explicit updates can diverge from reconstructed view output | Calculator / Youth | Gather evidence from more dynamic applications before choosing explicit patches, SDK diffing, or reactive dependencies |
 
 ## Accepted evidence
 
@@ -28,8 +28,8 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | CALC-F005 | Tooling defect | `ba5f00c` external `youth test` on the first aligned display | The test runner matched the compact `Text` representation instead of the semantic text role | Assertions now use normalized text accessors, so alignment does not change test meaning |
 | CALC-F006 | Tooling defect | `ba5f00c` fresh Cargo resolution of the Git-pinned SDK | An invalid package-name placeholder in the embedded template produced a noisy repository-discovery diagnostic | Reviewable templates must remain valid source artifacts; generation now replaces a valid sentinel and the template directory is excluded from the workspace |
 | CALC-F007 | Platform discovery | `8ef8e40` calculator keyboard acceptance test | Node activation alone could not prove host-owned focus and shortcut policy through the real runtime | The narrow test DSL now drives logical keys and asserts semantic focus without exposing native key codes or sending keyboard events to the guest |
-| CALC-F008 | Platform discovery | `8ef8e40` native calculator presentation on macOS | The provisional renderer displayed unsupported ASCII punctuation (`+`, `/`, `*`, `.`, `=`) as `?` | Addressed with deterministic coverage for all printable ASCII; broader Unicode text remains a separate pre-editor requirement |
-| CALC-F009 | Platform discovery | `8ef8e40` `view`, `handle`, and restart test | One shared formatter prevents duplicated display logic, but the app still names the affected node and must keep its patch convergent with a reconstructed view | Retain explicit patches for DP1; collect evidence before selecting SDK tree diffing or reactive dependencies |
+| CALC-F008 | Platform discovery | `8ef8e40` native calculator presentation; Youth `2761e35` | The provisional renderer displayed unsupported ASCII punctuation (`+`, `/`, `*`, `.`, `=`) as `?` | Addressed with deterministic coverage for all printable ASCII and representative raster fixtures; broader Unicode text remains a separate pre-editor requirement |
+| CALC-F009 | Platform discovery | `8ef8e40` `view`, `handle`, and restart test | One shared formatter prevents duplicated display logic, but the app still names the affected node and its patch can diverge from a reconstructed view | Convergence is an intended invariant but is not generally enforced; retain explicit patches for DP1 and collect evidence before selecting SDK tree diffing or reactive dependencies |
 
 ## Classification
 

@@ -12,8 +12,21 @@ Missing state is normal; Tally treats a missing `count` as zero. State writes
 and semantic updates commit as one host transaction. Restarting `youth dev`
 keeps the project state root from `[development].state`.
 
-State is typed and quota-limited. Administrative commands inspect counts and
-logical bytes without printing values:
+State is typed and quota-limited. Logical usage for each committed entry is:
+
+```text
+UTF-8 key bytes + encoded value bytes + 32 bytes fixed overhead
+```
+
+Booleans use one encoded byte, integers use eight, and text and blobs use their
+byte lengths. Default limits are 16 MiB total logical state, 16,384 keys, 256
+bytes per key, 1 MiB per text or blob value, 1,024 valid write attempts per
+turn, and 4,096 state calls per turn. Logical usage is not the SQLite file
+size: pages, indices, journal files, unused allocation, and other database
+storage do not consume application quota.
+
+Administrative commands inspect counts and logical bytes without printing
+values:
 
 ```bash
 youth state inspect --app-id dev.saman.tally --state-dir .youth/state
@@ -22,6 +35,10 @@ youth state verify --app-id dev.saman.tally --state-dir .youth/state
 
 Runtime opening fails closed on corruption or usage mismatch. Offline usage
 repair requires confirmation and an explicit nonexistent backup destination.
+It recalculates Youth's accounting metadata only. It does not reinterpret,
+migrate, complete, or repair application-owned values. A partially present or
+otherwise invalid application model remains an application error even when the
+database and its quota metadata are structurally sound.
 
 ## Recommended explicit persistence pattern
 
@@ -31,9 +48,16 @@ view and event handler should not independently interpret storage keys.
 
 ```rust
 fn load(state: StateReader) -> Result<Model> {
-    let mode = state.text("mode")?.unwrap_or_else(|| "ready".into());
-    let value = state.integer("value")?.unwrap_or(0);
-    Model::from_stored(mode, value)
+    let mode = state.text("mode")?;
+    let value = state.integer("value")?;
+
+    match (mode, value) {
+        (None, None) => Ok(Model::initial()),
+        (Some(mode), Some(value)) => Model::from_stored(&mode, value)
+            .map_err(|error| Error::invalid_state().with_message(error.to_string())),
+        _ => Err(Error::invalid_state()
+            .with_message("model state is only partially present")),
+    }
 }
 
 fn save(state: StateWriter, model: &Model) -> Result<()> {
@@ -62,3 +86,16 @@ This pattern is intentionally explicit. Youth does not yet choose between a
 derived typed record, one encoded document, scoped keys, or generated state
 bindings; those options have different migration, quota, and partial-update
 semantics and need evidence from more than one application.
+
+## Application schema evolution
+
+Youth DP1 does not provide application-state migrations. Persisted key names,
+value types, and encodings are part of the application's durable format. An
+incompatible preview change requires an explicit application migration, a
+documented state reset, or a new storage identity; it must not silently
+reinterpret old values.
+
+For a multi-field model, storing an application-owned schema marker such as
+`model-schema-version = 1` can make incompatible state detectable. The marker
+does not create a platform migration system: the application still owns its
+format, validation, and any transition between versions.
