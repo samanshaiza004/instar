@@ -8,7 +8,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 
 | App | Repository | Findings prefix | Status |
 | --- | --- | --- | --- |
-| Calculator | `/Users/keina/dev/youth-calculator` until publication | `CALC-F` | Gate C complete |
+| Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D release candidate; CI certification in progress |
 
 ## Open findings
 

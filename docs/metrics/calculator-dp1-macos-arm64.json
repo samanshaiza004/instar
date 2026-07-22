@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "youth_commit": "c80244eb67f16341675c230e5790ef210feab2cd",
+    "sdk_revision": "8696bd97ebc4f1d34b9f632e5992dd1882b724de",
+    "calculator_commit": "b4767fc15bb3c5f6a28aa144e71f413e49d1f553",
+    "rust_version": "1.97.1",
+    "wasmtime_version": "46.0.1",
+    "os": "macOS 26.5.2",
+    "architecture": "arm64",
+    "cpu": "Apple Silicon",
+    "runner_type": "local",
+    "build_profile": "release",
+    "wasmtime_cache_state": "warm",
+    "component_sha256": "9ea0c22b89a7121c41d595fac10170871bb865fafa96f8df6222ee0eb08e2bd4"
+  },
+  "artifacts": {
+    "debug_component_bytes": 5605214,
+    "release_component_bytes": 124589,
+    "host_executable_bytes": 24834560,
+    "host_install_prefix_bytes": 24834560
+  },
+  "measurements": {
+    "source_install": { "milliseconds": 619000, "samples": 1 },
+    "new_to_first_window": { "milliseconds": 1790, "samples": 1 },
+    "cold_start": {
+      "cold_cache": { "milliseconds": 1790, "samples": 1 },
+      "warm_cache": { "milliseconds": 770, "samples": 1 },
+      "stages": {
+        "load": { "milliseconds": 120, "samples": 1 },
+        "compile": { "milliseconds": 0, "samples": 1 },
+        "instantiate": { "milliseconds": 180, "samples": 1 },
+        "mount": { "milliseconds": 110, "samples": 1 },
+        "layout": { "milliseconds": 20, "samples": 1 },
+        "first_present": { "milliseconds": 1790, "samples": 1 }
+      }
+    },
+    "memory": {
+      "headless_rss_bytes": { "one": 85040000, "two": 0, "four": 0 },
+      "headless_marginal_bytes": 0,
+      "desktop_rss_bytes": 85040000
+    },
+    "idle": {
+      "window_seconds": 2,
+      "cpu_seconds": 0,
+      "guest_calls": 0,
+      "redraws": 0
+    },
+    "runtime_turn": { "samples": 1, "p50": 165, "p95": 165, "p99": 165, "unit": "milliseconds" },
+    "presentation": { "samples": 1, "p50": 20, "p95": 20, "p99": 20, "unit": "milliseconds" },
+    "logical_wire": {
+      "inbound_bytes_per_event": { "samples": 1, "p50": 0, "p95": 0, "p99": 0, "unit": "bytes" },
+      "outbound_bytes_per_event": { "samples": 1, "p50": 0, "p95": 0, "p99": 0, "unit": "bytes" }
+    },
+    "state_commit": { "samples": 1, "p50": 0, "p95": 0, "p99": 0, "unit": "milliseconds" },
+    "crash_recovery": {
+      "last_committed_revision_restored": true,
+      "uncommitted_turn_rolled_back": true,
+      "recovery_milliseconds": 770
+    },
+    "cross_platform": {
+      "identical_sha256": true,
+      "validate": true,
+      "mount": true,
+      "commands": true,
+      "persistence": true,
+      "native_smoke": true
+    },
+    "raw_wit_concepts": 0,
+    "accessibility": {
+      "required_controls": 19,
+      "native_projected_controls": 0,
+      "completeness_percent": 0
+    }
+  }
+}

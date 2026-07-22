@@ -232,6 +232,12 @@ identity, zero idle guest calls, transactional recovery, and zero raw-WIT
 concepts in app source are immediate hard gates. Numeric regression budgets
 begin only after two comparable releases.
 
+The first release baseline is recorded in
+`docs/metrics/calculator-dp1-macos-arm64.json`, with its limitations and
+interpretation in the accompanying Markdown summary. Publication and
+cross-platform identity become authoritative only when the Gate D CI run is
+green; until then this document remains an active release candidate.
+
 ## Checkpoints
 
 1. `utility-calculator-gate-a-app-proof` — calculator model and DP0
