@@ -164,7 +164,13 @@ jobs:
           }
           Write-Host "canonical snapshot SHA-256: $actualHash"
       - name: Build (release)
-        run: cargo build --workspace --release
+        run: |
+          # The CLI embeds reviewable template files. Clear cached package
+          # artifacts so a restored target directory cannot retain an older
+          # embedded WIT hash across branch commits.
+          cargo clean -p youth-cli
+          cargo clean -p youth-project
+          cargo build --workspace --release
       - name: Native doctor smoke (Ubuntu/Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo run --quiet -p youth-cli --release -- doctor --full
