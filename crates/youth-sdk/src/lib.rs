@@ -41,16 +41,27 @@ const FNV_PRIME: u64 = 1_099_511_628_211;
 // The suffix is the two ASCII bytes `\\` (0x5c) and `0` (0x30), not NUL.
 // This spelling is locked by the public cross-language test vectors.
 const NAMED_DOMAIN: &[u8] = b"youth:node-id:v1\\0";
+const COMMAND_DOMAIN: &[u8] = b"youth:command-id:v1\\0";
 const NAMED_BIT: u64 = 0x8000_0000_0000_0000;
 const VALUE_MASK: u64 = 0x7fff_ffff_ffff_ffff;
 
 /// Calculates the stable, app-global wire ID for an exact UTF-8 node name.
 #[must_use]
 pub const fn named_node_id(name: &str) -> u64 {
+    named_id(NAMED_DOMAIN, name)
+}
+
+/// Calculates the stable, app-global command ID for an exact UTF-8 name.
+#[must_use]
+pub const fn named_command_id(name: &str) -> u64 {
+    named_id(COMMAND_DOMAIN, name)
+}
+
+const fn named_id(domain: &[u8], name: &str) -> u64 {
     let mut hash = FNV_OFFSET;
     let mut index = 0;
-    while index < NAMED_DOMAIN.len() {
-        hash ^= NAMED_DOMAIN[index] as u64;
+    while index < domain.len() {
+        hash ^= domain[index] as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
         index += 1;
     }
@@ -104,6 +115,71 @@ macro_rules! node {
         const KEY: $crate::NodeKey = $crate::NodeKey::new($name);
         KEY
     }};
+}
+
+/// A symbolic command name with an identity domain distinct from node IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CommandKey {
+    name: &'static str,
+    id: u64,
+}
+
+impl CommandKey {
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            id: named_command_id(name),
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
+
+/// Creates a stable, app-global symbolic command key.
+#[macro_export]
+macro_rules! command {
+    ($name:literal) => {{
+        const KEY: $crate::CommandKey = $crate::CommandKey::new($name);
+        KEY
+    }};
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextAlign {
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Shortcut {
+    Character(char),
+    Enter,
+    Escape,
+    Backspace,
+}
+
+impl Shortcut {
+    #[must_use]
+    pub const fn character(value: char) -> Self {
+        Self::Character(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Layout {
+    Column,
+    Row,
+    Grid(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +253,7 @@ pub struct Text;
 struct TextElement {
     key: NodeKey,
     value: String,
+    alignment: TextAlign,
 }
 
 impl Text {
@@ -187,6 +264,7 @@ impl Text {
             kind: ElementKind::Text(TextElement {
                 key,
                 value: value.into(),
+                alignment: TextAlign::Start,
             }),
         }
     }
@@ -200,6 +278,8 @@ struct ButtonElement {
     key: NodeKey,
     label: String,
     enabled: bool,
+    command: Option<CommandKey>,
+    shortcuts: Vec<Shortcut>,
 }
 
 impl Button {
@@ -211,6 +291,21 @@ impl Button {
                 key,
                 label: label.into(),
                 enabled: true,
+                command: None,
+                shortcuts: Vec::new(),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn command(key: CommandKey, label: impl Into<String>) -> Element {
+        Element {
+            kind: ElementKind::Button(ButtonElement {
+                key: NodeKey::new(key.name()),
+                label: label.into(),
+                enabled: true,
+                command: Some(key),
+                shortcuts: Vec::new(),
             }),
         }
     }
@@ -223,6 +318,7 @@ pub struct BoxNode;
 struct BoxElement {
     children: Vec<Element>,
     enabled: bool,
+    layout: Layout,
 }
 
 impl BoxNode {
@@ -232,6 +328,51 @@ impl BoxNode {
             kind: ElementKind::Box(BoxElement {
                 children: children.into_iter().collect(),
                 enabled: true,
+                layout: Layout::Column,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Column;
+
+impl Column {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(children: impl IntoIterator<Item = Element>) -> Element {
+        BoxNode::column(children)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Row;
+
+impl Row {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(children: impl IntoIterator<Item = Element>) -> Element {
+        Element {
+            kind: ElementKind::Box(BoxElement {
+                children: children.into_iter().collect(),
+                enabled: true,
+                layout: Layout::Row,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Grid;
+
+impl Grid {
+    #[must_use]
+    pub fn columns(columns: u8, children: impl IntoIterator<Item = Element>) -> Element {
+        Element {
+            kind: ElementKind::Box(BoxElement {
+                children: children.into_iter().collect(),
+                enabled: true,
+                layout: Layout::Grid(columns),
             }),
         }
     }
@@ -259,6 +400,22 @@ impl Element {
         }
         self
     }
+
+    #[must_use]
+    pub fn align(mut self, alignment: TextAlign) -> Self {
+        if let ElementKind::Text(value) = &mut self.kind {
+            value.alignment = alignment;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn shortcut(mut self, shortcut: Shortcut) -> Self {
+        if let ElementKind::Button(value) = &mut self.kind {
+            value.shortcuts.push(shortcut);
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +439,7 @@ impl Tree {
                 children: Vec::new(),
             }],
             names: BTreeMap::new(),
+            commands: BTreeMap::new(),
             ids: BTreeSet::from([1]),
         };
         let child = builder.push(&self.child)?;
@@ -296,12 +454,18 @@ impl Tree {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Events {
     activated: Vec<u64>,
+    commanded: Vec<u64>,
 }
 
 impl Events {
     #[must_use]
     pub fn activated(&self, key: NodeKey) -> bool {
         self.activated.contains(&key.id())
+    }
+
+    #[must_use]
+    pub fn commanded(&self, key: CommandKey) -> bool {
+        self.commanded.contains(&key.id())
     }
 }
 
@@ -442,9 +606,20 @@ pub trait Application {
 #[cfg_attr(not(all(target_os = "wasi", target_env = "p2")), allow(dead_code))]
 enum FlatNodeData {
     Root,
-    Box { enabled: bool },
-    Text { value: String },
-    Button { label: String, enabled: bool },
+    Box {
+        enabled: bool,
+        layout: Layout,
+    },
+    Text {
+        value: String,
+        alignment: TextAlign,
+    },
+    Button {
+        label: String,
+        enabled: bool,
+        command: Option<CommandKey>,
+        shortcuts: Vec<Shortcut>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -479,7 +654,7 @@ impl FlatTree {
                 return Err(Error::invalid_state().with_message("an update names an unknown node"));
             };
             match (operation, &mut node.data) {
-                (UpdateOperation::Text(_, value), FlatNodeData::Text { value: current }) => {
+                (UpdateOperation::Text(_, value), FlatNodeData::Text { value: current, .. }) => {
                     current.clone_from(value);
                 }
                 (UpdateOperation::Label(_, value), FlatNodeData::Button { label, .. }) => {
@@ -489,7 +664,10 @@ impl FlatTree {
                     UpdateOperation::Enabled(_, enabled),
                     FlatNodeData::Button { enabled: value, .. },
                 )
-                | (UpdateOperation::Enabled(_, enabled), FlatNodeData::Box { enabled: value }) => {
+                | (
+                    UpdateOperation::Enabled(_, enabled),
+                    FlatNodeData::Box { enabled: value, .. },
+                ) => {
                     *value = *enabled;
                 }
                 _ => {
@@ -507,6 +685,7 @@ struct FlatTreeBuilder {
     next_anonymous: u64,
     nodes: Vec<FlatNode>,
     names: BTreeMap<u64, &'static str>,
+    commands: BTreeMap<u64, &'static str>,
     ids: BTreeSet<u64>,
 }
 
@@ -521,6 +700,7 @@ impl FlatTreeBuilder {
                     id,
                     data: FlatNodeData::Box {
                         enabled: value.enabled,
+                        layout: value.layout,
                     },
                     children: Vec::new(),
                 });
@@ -536,18 +716,35 @@ impl FlatTreeBuilder {
                     id,
                     data: FlatNodeData::Text {
                         value: value.value.clone(),
+                        alignment: value.alignment,
                     },
                     children: Vec::new(),
                 });
                 Ok(id)
             }
             ElementKind::Button(value) => {
+                if value.shortcuts.len() > 4 {
+                    return Err(Error::invalid_state()
+                        .with_message("a button declares more than four shortcuts"));
+                }
+                if let Some(command) = value.command
+                    && let Some(existing) = self.commands.insert(command.id(), command.name())
+                {
+                    let message = if existing == command.name() {
+                        "a command is bound more than once"
+                    } else {
+                        "two symbolic command names collide"
+                    };
+                    return Err(Error::invalid_state().with_message(message));
+                }
                 let id = self.allocate_named(value.key)?;
                 self.nodes.push(FlatNode {
                     id,
                     data: FlatNodeData::Button {
                         label: value.label.clone(),
                         enabled: value.enabled,
+                        command: value.command,
+                        shortcuts: value.shortcuts.clone(),
                     },
                     children: Vec::new(),
                 });
@@ -698,8 +895,9 @@ mod state {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Error, ErrorKind, EventContext, Events, NodeKey, Result,
-        Text, Tree, Update, ViewContext, node,
+        Application, BoxNode, Button, Column, CommandKey, Element, Error, ErrorKind, EventContext,
+        Events, Grid, NodeKey, Result, Row, Shortcut, Text, TextAlign, Tree, Update, ViewContext,
+        command, node,
     };
 }
 
@@ -735,6 +933,73 @@ mod tests {
         assert_eq!(named_node_id("count"), 0xf700_b2fe_97f6_53d6);
         assert_eq!(named_node_id("increment"), 0xd9e1_c44e_444d_fb74);
         assert_eq!(named_node_id("café"), 0xcab8_7ecf_2aee_1d93);
+    }
+
+    #[test]
+    fn command_id_vectors_are_stable_and_use_a_distinct_domain() {
+        assert_eq!(named_command_id("clear"), 0xf3da_ce2c_1a9e_2f27);
+        assert_eq!(named_command_id("digit-7"), 0x9848_57b0_7512_75f7);
+        assert_eq!(named_command_id("equals"), 0xee40_8611_9b13_a04b);
+        assert_ne!(named_command_id("equals"), named_node_id("equals"));
+    }
+
+    #[test]
+    fn rich_layout_and_command_bindings_flatten_without_wire_details() {
+        let tree = Tree::root(Column::new([
+            Text::new(node!("display"), "42").align(TextAlign::End),
+            Row::new([
+                Button::command(command!("clear"), "C").shortcut(Shortcut::Escape),
+                Button::command(command!("backspace"), "⌫").shortcut(Shortcut::Backspace),
+            ]),
+            Grid::columns(
+                2,
+                [
+                    Button::command(command!("digit-7"), "7").shortcut(Shortcut::Character('7')),
+                    Button::command(command!("equals"), "=").shortcut(Shortcut::Enter),
+                ],
+            ),
+        ]));
+        let flat = tree.flatten().expect("rich tree is valid");
+        assert!(matches!(
+            flat.nodes[2].data,
+            FlatNodeData::Text {
+                alignment: TextAlign::End,
+                ..
+            }
+        ));
+        assert!(flat.nodes.iter().any(|node| matches!(
+            node.data,
+            FlatNodeData::Box {
+                layout: Layout::Row,
+                ..
+            }
+        )));
+        assert!(flat.nodes.iter().any(|node| matches!(
+            node.data,
+            FlatNodeData::Box {
+                layout: Layout::Grid(2),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn duplicate_command_bindings_and_excess_shortcuts_are_rejected() {
+        let duplicate = Tree::root(Row::new([
+            Button::command(command!("clear"), "C"),
+            Button::command(command!("clear"), "Clear"),
+        ]));
+        assert!(duplicate.flatten().is_err());
+
+        let excess = Tree::root(
+            Button::new(node!("many"), "Many")
+                .shortcut(Shortcut::Character('1'))
+                .shortcut(Shortcut::Character('2'))
+                .shortcut(Shortcut::Character('3'))
+                .shortcut(Shortcut::Character('4'))
+                .shortcut(Shortcut::Character('5')),
+        );
+        assert!(excess.flatten().is_err());
     }
 
     #[test]

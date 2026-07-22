@@ -19,3 +19,6 @@ pub use geometry::{
 pub use input::{InputChange, PointerState};
 pub use native::{DesktopError, DesktopOptions, run, run_with_shutdown, window_smoke};
 pub use raster::{FrameBuffer, Palette, RasterError, RenderState, frame_hash, render};
+pub use youth_interaction::{
+    InteractionChange, InteractionSnapshot, InteractionState, LogicalKey, Modifiers, SemanticAction,
+};

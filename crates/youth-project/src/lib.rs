@@ -15,15 +15,15 @@ use youth_state::AppId;
 
 pub const MANIFEST_NAME: &str = "Youth.toml";
 pub const LOCK_NAME: &str = "Youth.lock";
-pub const SUPPORTED_PROTOCOL: &str = "0.0.2";
+pub const SUPPORTED_PROTOCOL: &str = "0.0.3";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "c5e2b0f2b96746e2251e8d9e0da440a3f7b7e46a";
-pub const TEMPLATE_VERSION: u32 = 1;
+pub const SDK_REVISION: &str = "8696bd97ebc4f1d34b9f632e5992dd1882b724de";
+pub const TEMPLATE_VERSION: u32 = 2;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TEMPLATE_WIT_SHA256: &str =
-    "71ca278ff0dbf618dcb9ad174e0843f9c397cbe38742b1aec262689b913d4e3c";
+    "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -392,7 +392,7 @@ mod tests {
 
     use super::*;
 
-    const WIT: &str = "package youth:app@0.0.2;\n";
+    const WIT: &str = "package youth:app@0.0.3;\n";
 
     fn fixture() -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -405,7 +405,7 @@ mod tests {
             r#"[app]
 id = "dev.saman.tally"
 name = "Tally"
-protocol = "0.0.2"
+protocol = "0.0.3"
 
 [build]
 language = "rust"
@@ -421,12 +421,12 @@ state = ".youth/state"
             root.join(LOCK_NAME),
             format!(
                 r#"lock-version = 1
-protocol = "0.0.2"
+protocol = "0.0.3"
 sdk-source = "{SDK_SOURCE}"
 sdk-revision = "{SDK_REVISION}"
 wit-sha256 = "{hash}"
 cli-version = "{CLI_VERSION}"
-template-version = 1
+template-version = 2
 "#
             ),
         )

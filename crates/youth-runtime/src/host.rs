@@ -8,11 +8,10 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::bindings::{Application, ApplicationPre};
+use crate::bindings::{ApplicationBindings, GuestError, GuestErrorCode, ProtocolVersion};
 use crate::engine::deadline_ticks;
 use crate::error::ErrorContext;
 use crate::wire::from_guest::{self, WireErrorKind};
-use crate::wire::to_guest::{self, HostEvent};
 use crate::{
     CallBudget, RuntimeError, RuntimeErrorCategory, RuntimeLimits, StateLocation, YouthAppConfig,
 };
@@ -110,7 +109,7 @@ impl ResourceLimiter for MemoryLimiter {
     }
 }
 
-struct HostState {
+pub(crate) struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     limiter: MemoryLimiter,
@@ -126,44 +125,44 @@ impl WasiView for HostState {
     }
 }
 
-impl crate::bindings::youth::app::ui::Host for HostState {}
+impl crate::bindings::v002::youth::app::ui::Host for HostState {}
 
-impl crate::bindings::youth::state::store::Host for HostState {
+impl crate::bindings::v002::youth::state::store::Host for HostState {
     fn get(
         &mut self,
         key: String,
     ) -> Result<
-        Option<crate::bindings::youth::state::store::Value>,
-        crate::bindings::youth::state::store::StateError,
+        Option<crate::bindings::v002::youth::state::store::Value>,
+        crate::bindings::v002::youth::state::store::StateError,
     > {
         self.state
             .get(&key)
-            .map(|value| value.map(to_wire_state_value))
-            .map_err(to_wire_state_error)
+            .map(|value| value.map(to_wire_state_value_v002))
+            .map_err(to_wire_state_error_v002)
     }
 
     fn set(
         &mut self,
         key: String,
-        value: crate::bindings::youth::state::store::Value,
-    ) -> Result<(), crate::bindings::youth::state::store::StateError> {
+        value: crate::bindings::v002::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v002::youth::state::store::StateError> {
         self.state
-            .set(&key, from_wire_state_value(value))
-            .map_err(to_wire_state_error)
+            .set(&key, from_wire_state_value_v002(value))
+            .map_err(to_wire_state_error_v002)
     }
 
     fn delete(
         &mut self,
         key: String,
-    ) -> Result<bool, crate::bindings::youth::state::store::StateError> {
-        self.state.delete(&key).map_err(to_wire_state_error)
+    ) -> Result<bool, crate::bindings::v002::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v002)
     }
 }
 
-fn to_wire_state_value(
+fn to_wire_state_value_v002(
     value: youth_state::StateValue,
-) -> crate::bindings::youth::state::store::Value {
-    use crate::bindings::youth::state::store::Value;
+) -> crate::bindings::v002::youth::state::store::Value {
+    use crate::bindings::v002::youth::state::store::Value;
     match value {
         youth_state::StateValue::Boolean(value) => Value::Boolean(value),
         youth_state::StateValue::Integer(value) => Value::Integer(value),
@@ -172,10 +171,10 @@ fn to_wire_state_value(
     }
 }
 
-fn from_wire_state_value(
-    value: crate::bindings::youth::state::store::Value,
+fn from_wire_state_value_v002(
+    value: crate::bindings::v002::youth::state::store::Value,
 ) -> youth_state::StateValue {
-    use crate::bindings::youth::state::store::Value;
+    use crate::bindings::v002::youth::state::store::Value;
     match value {
         Value::Boolean(value) => youth_state::StateValue::Boolean(value),
         Value::Integer(value) => youth_state::StateValue::Integer(value),
@@ -184,10 +183,10 @@ fn from_wire_state_value(
     }
 }
 
-fn to_wire_state_error(
+fn to_wire_state_error_v002(
     error: youth_state::StateError,
-) -> crate::bindings::youth::state::store::StateError {
-    use crate::bindings::youth::state::store::ErrorCode;
+) -> crate::bindings::v002::youth::state::store::StateError {
+    use crate::bindings::v002::youth::state::store::ErrorCode;
     let code = match error {
         youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
         youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
@@ -204,7 +203,91 @@ fn to_wire_state_error(
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
-    crate::bindings::youth::state::store::StateError {
+    crate::bindings::v002::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+impl crate::bindings::v003::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v003::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v003::youth::state::store::Value>,
+        crate::bindings::v003::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v003))
+            .map_err(to_wire_state_error_v003)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v003::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v003::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v003(value))
+            .map_err(to_wire_state_error_v003)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v003::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v003)
+    }
+}
+
+fn to_wire_state_value_v003(
+    value: youth_state::StateValue,
+) -> crate::bindings::v003::youth::state::store::Value {
+    use crate::bindings::v003::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v003(
+    value: crate::bindings::v003::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v003::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v003(
+    error: youth_state::StateError,
+) -> crate::bindings::v003::youth::state::store::StateError {
+    use crate::bindings::v003::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v003::youth::state::store::StateError {
         code,
         message: None,
     }
@@ -216,7 +299,7 @@ pub struct YouthApp {
     app_id: youth_state::AppId,
     limits: RuntimeLimits,
     store: Store<HostState>,
-    bindings: Application,
+    bindings: ApplicationBindings,
     tree: Option<youth_tree::Tree>,
     lifecycle: AppLifecycle,
     last_event_sequence: Option<u64>,
@@ -432,16 +515,18 @@ impl YouthApp {
             .as_ref()
             .expect("mounted applications retain a tree")
             .clone();
-        let events =
-            to_guest::event_batch(base_revision, &[HostEvent { sequence, node }], &self.limits)
-                .map_err(|message| RuntimeError::Internal(self.context(message, turn_id)))?;
+        if self.limits.max_event_batch == 0 {
+            return Err(RuntimeError::Internal(
+                self.context("event batch exceeds the configured limit", turn_id),
+            ));
+        }
+        let events = [(sequence, node.get())];
         self.begin_state(youth_state::GuestCallPhase::Handle, turn_id)?;
 
         let started = std::time::Instant::now();
         let guest_result = self
             .bindings
-            .youth_app_lifecycle()
-            .call_handle(&mut self.store, &events);
+            .call_handle(&mut self.store, base_revision, &events);
         let elapsed = started.elapsed();
         self.record_call_metrics(elapsed);
         let guest_result = match guest_result {
@@ -455,9 +540,7 @@ impl YouthApp {
             Ok(batch) => batch,
             Err(error) => {
                 let writes = self.store.data().state.metrics().writes;
-                let recoverable = error.code
-                    == crate::bindings::youth::app::ui::AppErrorCode::RejectedEvent
-                    && writes == 0;
+                let recoverable = error.code == GuestErrorCode::RejectedEvent && writes == 0;
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
@@ -469,11 +552,11 @@ impl YouthApp {
                 };
             }
         };
-        if wire_batch.processed_through != sequence {
+        if wire_batch.processed_through() != sequence {
             let error = RuntimeError::EventSequenceViolation(self.context(
                 format!(
                     "guest processed through event {}, but the last event sent was {sequence}",
-                    wire_batch.processed_through
+                    wire_batch.processed_through()
                 ),
                 turn_id,
             ));
@@ -618,10 +701,7 @@ impl YouthApp {
         self.prepare_call(self.limits.resync, "resync", turn_id)?;
         self.begin_state(youth_state::GuestCallPhase::Resync, turn_id)?;
         let started = std::time::Instant::now();
-        let guest_result = self
-            .bindings
-            .youth_app_lifecycle()
-            .call_resync(&mut self.store);
+        let guest_result = self.bindings.call_resync(&mut self.store);
         let elapsed = started.elapsed();
         self.record_call_metrics(elapsed);
         let guest_result = match guest_result {
@@ -724,7 +804,7 @@ impl YouthApp {
             state_phase: self.store.data().state.phase(),
             state_metrics: self.store.data().state.metrics(),
             lifecycle: self.lifecycle,
-            world: crate::APPLICATION_WORLD.to_owned(),
+            world: self.bindings.version().world().to_owned(),
             current_revision: tree.map(youth_tree::Tree::revision),
             next_event_sequence: self.last_event_sequence.unwrap_or(0).checked_add(1),
             last_event_sequence: self.last_event_sequence,
@@ -750,10 +830,7 @@ impl YouthApp {
         self.begin_state(youth_state::GuestCallPhase::Mount, turn_id)?;
 
         let started = std::time::Instant::now();
-        let guest_result = self
-            .bindings
-            .youth_app_lifecycle()
-            .call_mount(&mut self.store);
+        let guest_result = self.bindings.call_mount(&mut self.store);
         let elapsed = started.elapsed();
         self.record_call_metrics(elapsed);
         let guest_result = match guest_result {
@@ -828,7 +905,7 @@ impl YouthApp {
 
     fn guest_error_context(
         &self,
-        error: crate::bindings::youth::app::ui::AppError,
+        error: GuestError,
         turn_id: Option<u64>,
         operation: &str,
     ) -> ErrorContext {
@@ -960,6 +1037,14 @@ fn instantiate(
     state_location: StateLocation,
     limits: RuntimeLimits,
 ) -> Result<YouthApp, RuntimeError> {
+    let protocol = detect_protocol(engine, &component).ok_or_else(|| {
+        RuntimeError::UnsupportedWorld(ErrorContext::new(
+            "component does not export a supported Youth application world",
+            &component_id,
+            AppLifecycle::Loaded,
+            None,
+        ))
+    })?;
     let state_store =
         youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
             RuntimeError::StateUnavailable(
@@ -972,54 +1057,6 @@ fn instantiate(
                 .with_source(source),
             )
         })?;
-    let mut linker = Linker::<HostState>::new(engine);
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|source| {
-        RuntimeError::LinkFailure(
-            ErrorContext::new(
-                "failed to configure closed WASIp2 imports",
-                &component_id,
-                AppLifecycle::Loaded,
-                None,
-            )
-            .with_source(source),
-        )
-    })?;
-    Application::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |state| state).map_err(
-        |source| {
-            RuntimeError::LinkFailure(
-                ErrorContext::new(
-                    "failed to configure Youth state imports",
-                    &component_id,
-                    AppLifecycle::Loaded,
-                    None,
-                )
-                .with_source(source),
-            )
-        },
-    )?;
-    let pre = linker.instantiate_pre(&component).map_err(|source| {
-        RuntimeError::LinkFailure(
-            ErrorContext::new(
-                "component imports are incompatible with the Youth host",
-                &component_id,
-                AppLifecycle::Loaded,
-                None,
-            )
-            .with_source(source),
-        )
-    })?;
-    let pre = ApplicationPre::new(pre).map_err(|source| {
-        RuntimeError::UnsupportedWorld(
-            ErrorContext::new(
-                "component does not export youth:app/application@0.0.2",
-                &component_id,
-                AppLifecycle::Loaded,
-                None,
-            )
-            .with_source(source),
-        )
-    })?;
-
     let state = HostState {
         table: ResourceTable::new(),
         wasi: WasiCtxBuilder::new().build(),
@@ -1049,20 +1086,44 @@ fn instantiate(
             .with_source(source),
         )
     })?;
-    let bindings = pre.instantiate(&mut store).map_err(|source| {
-        let context = ErrorContext::new(
-            "component instantiation failed",
-            &component_id,
-            AppLifecycle::Loaded,
-            None,
-        )
-        .with_source(source);
-        if store.data().limiter.limit_hit {
-            RuntimeError::MemoryLimitExceeded(context)
-        } else {
-            RuntimeError::InstantiationFailure(context)
+    let bindings = match protocol {
+        ProtocolVersion::V002 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v002::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v002::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V002(value)
         }
-    })?;
+        ProtocolVersion::V003 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v003::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v003::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V003(value)
+        }
+    };
     Ok(YouthApp {
         component_id,
         app_id,
@@ -1075,6 +1136,95 @@ fn instantiate(
         last_turn: None,
         fault: None,
     })
+}
+
+fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVersion> {
+    let component_type = component.component_type();
+    let exports = component_type.exports(engine);
+    let mut v002 = false;
+    let mut v003 = false;
+    for (name, _) in exports {
+        v002 |= name == "youth:app/lifecycle@0.0.2";
+        v003 |= name == "youth:app/lifecycle@0.0.3";
+    }
+    match (v002, v003) {
+        (false, true) => Some(ProtocolVersion::V003),
+        (true, false) => Some(ProtocolVersion::V002),
+        _ => None,
+    }
+}
+
+fn configure_wasi(linker: &mut Linker<HostState>, component_id: &str) -> Result<(), RuntimeError> {
+    wasmtime_wasi::p2::add_to_linker_sync(linker).map_err(|source| {
+        RuntimeError::LinkFailure(
+            ErrorContext::new(
+                "failed to configure closed WASIp2 imports",
+                component_id,
+                AppLifecycle::Loaded,
+                None,
+            )
+            .with_source(source),
+        )
+    })
+}
+
+fn link_configuration_error(component_id: &str, source: wasmtime::Error) -> RuntimeError {
+    RuntimeError::LinkFailure(
+        ErrorContext::new(
+            "failed to configure Youth state imports",
+            component_id,
+            AppLifecycle::Loaded,
+            None,
+        )
+        .with_source(source),
+    )
+}
+
+fn link_error(component_id: &str, source: wasmtime::Error) -> RuntimeError {
+    RuntimeError::LinkFailure(
+        ErrorContext::new(
+            "component imports are incompatible with the Youth host",
+            component_id,
+            AppLifecycle::Loaded,
+            None,
+        )
+        .with_source(source),
+    )
+}
+
+fn unsupported_world_error(
+    component_id: &str,
+    protocol: ProtocolVersion,
+    source: wasmtime::Error,
+) -> RuntimeError {
+    RuntimeError::UnsupportedWorld(
+        ErrorContext::new(
+            format!("component does not export {}", protocol.world()),
+            component_id,
+            AppLifecycle::Loaded,
+            None,
+        )
+        .with_source(source),
+    )
+}
+
+fn instantiation_error(
+    component_id: &str,
+    store: &Store<HostState>,
+    source: wasmtime::Error,
+) -> RuntimeError {
+    let context = ErrorContext::new(
+        "component instantiation failed",
+        component_id,
+        AppLifecycle::Loaded,
+        None,
+    )
+    .with_source(source);
+    if store.data().limiter.limit_hit {
+        RuntimeError::MemoryLimitExceeded(context)
+    } else {
+        RuntimeError::InstantiationFailure(context)
+    }
 }
 
 /// Lists the interfaces a component imports, sorted and deduplicated.

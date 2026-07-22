@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youth.dev/metrics/release-v1.schema.json",
+  "title": "Youth release metrics v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "environment", "artifacts", "measurements"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "youth_commit", "sdk_revision", "calculator_commit", "rust_version",
+        "wasmtime_version", "os", "architecture", "cpu", "runner_type",
+        "build_profile", "wasmtime_cache_state", "component_sha256"
+      ],
+      "properties": {
+        "youth_commit": { "$ref": "#/$defs/sha1" },
+        "sdk_revision": { "$ref": "#/$defs/sha1" },
+        "calculator_commit": { "$ref": "#/$defs/sha1" },
+        "rust_version": { "type": "string", "minLength": 1 },
+        "wasmtime_version": { "type": "string", "minLength": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "cpu": { "type": "string", "minLength": 1 },
+        "runner_type": { "type": "string", "minLength": 1 },
+        "build_profile": { "enum": ["debug", "release"] },
+        "wasmtime_cache_state": { "enum": ["cold", "warm", "disabled"] },
+        "component_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["debug_component_bytes", "release_component_bytes", "host_executable_bytes", "host_install_prefix_bytes"],
+      "properties": {
+        "debug_component_bytes": { "$ref": "#/$defs/bytes" },
+        "release_component_bytes": { "$ref": "#/$defs/bytes" },
+        "host_executable_bytes": { "$ref": "#/$defs/bytes" },
+        "host_install_prefix_bytes": { "$ref": "#/$defs/bytes" }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_install", "new_to_first_window", "cold_start",
+        "memory", "idle", "runtime_turn", "presentation", "logical_wire",
+        "state_commit", "crash_recovery", "cross_platform",
+        "raw_wit_concepts", "accessibility"
+      ],
+      "properties": {
+        "source_install": { "$ref": "#/$defs/duration_sample" },
+        "new_to_first_window": { "$ref": "#/$defs/duration_sample" },
+        "cold_start": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cold_cache", "warm_cache", "stages"],
+          "properties": {
+            "cold_cache": { "$ref": "#/$defs/duration_sample" },
+            "warm_cache": { "$ref": "#/$defs/duration_sample" },
+            "stages": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/duration_sample" },
+              "required": ["load", "compile", "instantiate", "mount", "layout", "first_present"]
+            }
+          }
+        },
+        "memory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["headless_rss_bytes", "headless_marginal_bytes", "desktop_rss_bytes"],
+          "properties": {
+            "headless_rss_bytes": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["one", "two", "four"],
+              "properties": {
+                "one": { "$ref": "#/$defs/bytes" },
+                "two": { "$ref": "#/$defs/bytes" },
+                "four": { "$ref": "#/$defs/bytes" }
+              }
+            },
+            "headless_marginal_bytes": { "$ref": "#/$defs/bytes" },
+            "desktop_rss_bytes": { "$ref": "#/$defs/bytes" }
+          }
+        },
+        "idle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["window_seconds", "cpu_seconds", "guest_calls", "redraws"],
+          "properties": {
+            "window_seconds": { "type": "number", "exclusiveMinimum": 0 },
+            "cpu_seconds": { "type": "number", "minimum": 0 },
+            "guest_calls": { "type": "integer", "minimum": 0 },
+            "redraws": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "runtime_turn": { "$ref": "#/$defs/distribution" },
+        "presentation": { "$ref": "#/$defs/distribution" },
+        "logical_wire": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inbound_bytes_per_event", "outbound_bytes_per_event"],
+          "properties": {
+            "inbound_bytes_per_event": { "$ref": "#/$defs/distribution" },
+            "outbound_bytes_per_event": { "$ref": "#/$defs/distribution" }
+          }
+        },
+        "state_commit": { "$ref": "#/$defs/distribution" },
+        "crash_recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["last_committed_revision_restored", "uncommitted_turn_rolled_back", "recovery_milliseconds"],
+          "properties": {
+            "last_committed_revision_restored": { "type": "boolean" },
+            "uncommitted_turn_rolled_back": { "type": "boolean" },
+            "recovery_milliseconds": { "type": "number", "minimum": 0 }
+          }
+        },
+        "cross_platform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identical_sha256", "validate", "mount", "commands", "persistence", "native_smoke"],
+          "properties": {
+            "identical_sha256": { "type": "boolean" },
+            "validate": { "type": "boolean" },
+            "mount": { "type": "boolean" },
+            "commands": { "type": "boolean" },
+            "persistence": { "type": "boolean" },
+            "native_smoke": { "type": "boolean" }
+          }
+        },
+        "raw_wit_concepts": { "type": "integer", "minimum": 0 },
+        "accessibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required_controls", "native_projected_controls", "completeness_percent"],
+          "properties": {
+            "required_controls": { "type": "integer", "minimum": 0 },
+            "native_projected_controls": { "type": "integer", "minimum": 0 },
+            "completeness_percent": { "type": "number", "minimum": 0, "maximum": 100 }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "bytes": { "type": "integer", "minimum": 0 },
+    "duration_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["milliseconds", "samples"],
+      "properties": {
+        "milliseconds": { "type": "number", "minimum": 0 },
+        "samples": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["samples", "p50", "p95", "p99", "unit"],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 1 },
+        "p50": { "type": "number", "minimum": 0 },
+        "p95": { "type": "number", "minimum": 0 },
+        "p99": { "type": "number", "minimum": 0 },
+        "unit": { "enum": ["microseconds", "milliseconds", "bytes"] }
+      }
+    }
+  }
+}

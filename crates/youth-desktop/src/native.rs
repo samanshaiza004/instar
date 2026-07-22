@@ -7,11 +7,13 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize as WinitLogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::{
-    Controller, ControllerCommand, DesktopEvent, LogicalPoint, LogicalSize, Palette, PointerState,
-    RenderState, RendererMirror, layout, render,
+    Controller, ControllerCommand, DesktopEvent, InteractionState, LogicalKey, LogicalPoint,
+    LogicalSize, Modifiers, Palette, PointerState, RenderState, RendererMirror, SemanticAction,
+    layout, render,
 };
 use youth_runtime::{RuntimeErrorCategory, YouthAppConfig, YouthAppHandle};
 use youth_tree::{Node, NodeData, NodeId, TreeSnapshot};
@@ -53,6 +55,8 @@ struct NativeApp {
     mirror: Option<RendererMirror>,
     layout: Option<crate::LayoutSnapshot>,
     pointer: PointerState,
+    interaction: InteractionState,
+    modifiers: ModifiersState,
     controller: Option<Controller>,
     fault: Option<String>,
     smoke_presented: bool,
@@ -98,6 +102,8 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         mirror: None,
         layout: None,
         pointer: PointerState::default(),
+        interaction: InteractionState::default(),
+        modifiers: ModifiersState::empty(),
         controller: None,
         fault: None,
         smoke_presented: false,
@@ -196,7 +202,16 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 ..
             } if self.fault.is_none() => {
                 let change = match state {
-                    ElementState::Pressed => self.pointer.press_primary(),
+                    ElementState::Pressed => {
+                        let change = self.pointer.press_primary();
+                        if let (Some(mirror), Some(armed)) = (&self.mirror, self.pointer.armed) {
+                            let focus = self.interaction.focus_pointer_target(mirror.tree(), armed);
+                            if focus.redraw {
+                                window.request_redraw();
+                            }
+                        }
+                        change
+                    }
                     ElementState::Released => self
                         .layout
                         .as_ref()
@@ -212,6 +227,34 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 if change.redraw {
                     window.request_redraw();
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } if self.fault.is_none() => {
+                let Some(key) = logical_key(&event.logical_key) else {
+                    return;
+                };
+                let Some(mirror) = &self.mirror else {
+                    return;
+                };
+                if event.state == ElementState::Pressed {
+                    let change = self.interaction.key(
+                        mirror.tree(),
+                        key,
+                        modifiers(self.modifiers),
+                        event.repeat,
+                    );
+                    if let Some(SemanticAction::Activate(node)) = change.action
+                        && let Some(controller) = &self.controller
+                    {
+                        let _ = controller.send(ControllerCommand::Activate(node));
+                    }
+                    if change.redraw || change.action.is_some() {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Focused(false) if self.pointer.deactivate_window().redraw => {
+                window.request_redraw();
             }
             _ => {}
         }
@@ -326,6 +369,9 @@ impl NativeApp {
         if let Some(layout) = &self.layout {
             self.pointer.reconcile_layout(layout);
         }
+        if let Some(mirror) = &self.mirror {
+            self.interaction.reconcile(mirror.tree());
+        }
     }
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
@@ -344,6 +390,7 @@ impl NativeApp {
         let state = RenderState {
             hovered: self.pointer.hovered,
             pressed: self.pointer.pressed.then_some(self.pointer.armed).flatten(),
+            focused: self.interaction.focused(),
             fault_category: self.fault.as_deref(),
         };
         let Ok(frame) = render(
@@ -375,6 +422,39 @@ impl NativeApp {
             self.smoke_presented = true;
             event_loop.exit();
         }
+    }
+}
+
+fn modifiers(state: ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: state.shift_key(),
+        control: state.control_key(),
+        alt: state.alt_key(),
+        super_key: state.super_key(),
+    }
+}
+
+fn logical_key(key: &Key) -> Option<LogicalKey> {
+    match key {
+        Key::Character(value) => {
+            let mut characters = value.chars();
+            let character = characters.next()?;
+            characters.next().is_none().then_some(if character == ' ' {
+                LogicalKey::Space
+            } else {
+                LogicalKey::Character(character)
+            })
+        }
+        Key::Named(NamedKey::Enter) => Some(LogicalKey::Enter),
+        Key::Named(NamedKey::Escape) => Some(LogicalKey::Escape),
+        Key::Named(NamedKey::Backspace) => Some(LogicalKey::Backspace),
+        Key::Named(NamedKey::Space) => Some(LogicalKey::Space),
+        Key::Named(NamedKey::Tab) => Some(LogicalKey::Tab),
+        Key::Named(NamedKey::ArrowLeft) => Some(LogicalKey::ArrowLeft),
+        Key::Named(NamedKey::ArrowRight) => Some(LogicalKey::ArrowRight),
+        Key::Named(NamedKey::ArrowUp) => Some(LogicalKey::ArrowUp),
+        Key::Named(NamedKey::ArrowDown) => Some(LogicalKey::ArrowDown),
+        Key::Named(_) | Key::Dead(_) | Key::Unidentified(_) => None,
     }
 }
 
@@ -467,5 +547,57 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
         RuntimeErrorCategory::StateCommitFailed => "state_commit_failed",
         RuntimeErrorCategory::WorkerStopped => "worker_stopped",
         RuntimeErrorCategory::Internal => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::NativeKey;
+
+    #[test]
+    fn logical_key_normalization_is_exact_and_rejects_compositions() {
+        assert_eq!(
+            logical_key(&Key::Character("7".into())),
+            Some(LogicalKey::Character('7'))
+        );
+        assert_eq!(
+            logical_key(&Key::Character("+".into())),
+            Some(LogicalKey::Character('+'))
+        );
+        assert_eq!(
+            logical_key(&Key::Character(" ".into())),
+            Some(LogicalKey::Space)
+        );
+        assert_eq!(logical_key(&Key::Character("ab".into())), None);
+        assert_eq!(logical_key(&Key::Dead(Some('\u{301}'))), None);
+        assert_eq!(
+            logical_key(&Key::Unidentified(NativeKey::Unidentified)),
+            None
+        );
+    }
+
+    #[test]
+    fn named_keys_cover_focus_default_cancel_and_editing_policy() {
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Enter)),
+            Some(LogicalKey::Enter)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Escape)),
+            Some(LogicalKey::Escape)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Backspace)),
+            Some(LogicalKey::Backspace)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Tab)),
+            Some(LogicalKey::Tab)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::ArrowLeft)),
+            Some(LogicalKey::ArrowLeft)
+        );
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use thiserror::Error;
-use youth_tree::{NodeData, NodeId, PatchBatch, Tree, TreeSnapshot};
+use youth_tree::{BoxLayout, NodeData, NodeId, PatchBatch, Tree, TreeSnapshot};
 
 pub const OUTER_MARGIN: f64 = 24.0;
 pub const BOX_PADDING: f64 = 16.0;
@@ -147,10 +147,10 @@ pub fn layout(tree: &Tree, viewport: LogicalSize) -> Result<LayoutSnapshot, Geom
         place(
             tree,
             *child,
-            OUTER_MARGIN,
-            y,
+            LogicalPoint { x: OUTER_MARGIN, y },
             size.width.min((viewport.width - OUTER_MARGIN).max(0.0)),
             true,
+            false,
             &mut snapshot,
         )?;
         y += size.height + CHILD_GAP;
@@ -180,49 +180,87 @@ fn measure(tree: &Tree, id: NodeId) -> Result<LogicalSize, GeometryError> {
             width: 0.0,
             height: 0.0,
         }),
-        NodeData::Text { value } => Ok(LogicalSize {
+        NodeData::Text { value } | NodeData::AlignedText { value, .. } => Ok(LogicalSize {
             width: value.chars().count() as f64 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
         }),
-        NodeData::Button { label, .. } => Ok(LogicalSize {
-            width: (label.chars().count() as f64 * GLYPH_WIDTH + BUTTON_HORIZONTAL_PADDING * 2.0)
-                .max(BUTTON_MIN_WIDTH),
-            height: (GLYPH_HEIGHT + BUTTON_VERTICAL_PADDING * 2.0).max(BUTTON_MIN_HEIGHT),
-        }),
-        NodeData::Box { .. } => {
-            let mut width: f64 = 0.0;
-            let mut height = BOX_PADDING * 2.0;
-            for (index, child) in node.children.iter().enumerate() {
-                let child = measure(tree, *child)?;
-                width = width.max(child.width);
-                height += child.height;
-                if index + 1 < node.children.len() {
-                    height += CHILD_GAP;
-                }
-            }
+        NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
             Ok(LogicalSize {
-                width: width + BOX_PADDING * 2.0,
-                height,
+                width: (label.chars().count() as f64 * GLYPH_WIDTH
+                    + BUTTON_HORIZONTAL_PADDING * 2.0)
+                    .max(BUTTON_MIN_WIDTH),
+                height: (GLYPH_HEIGHT + BUTTON_VERTICAL_PADDING * 2.0).max(BUTTON_MIN_HEIGHT),
             })
         }
+        NodeData::Box { .. } | NodeData::Row { .. } | NodeData::Grid { .. } => {
+            measure_container(tree, node.children.as_slice(), node.data.box_layout())
+        }
     }
+}
+
+fn measure_container(
+    tree: &Tree,
+    children: &[NodeId],
+    layout: Option<BoxLayout>,
+) -> Result<LogicalSize, GeometryError> {
+    let sizes = children
+        .iter()
+        .map(|child| measure(tree, *child))
+        .collect::<Result<Vec<_>, _>>()?;
+    let gaps = |count: usize| CHILD_GAP * count.saturating_sub(1) as f64;
+    let (width, height) = match layout.unwrap_or(BoxLayout::Column) {
+        BoxLayout::Column => (
+            sizes.iter().map(|size| size.width).fold(0.0, f64::max),
+            sizes.iter().map(|size| size.height).sum::<f64>() + gaps(sizes.len()),
+        ),
+        BoxLayout::Row => (
+            sizes.iter().map(|size| size.width).sum::<f64>() + gaps(sizes.len()),
+            sizes.iter().map(|size| size.height).fold(0.0, f64::max),
+        ),
+        BoxLayout::Grid { columns } => {
+            let columns = usize::from(columns);
+            let mut column_widths = vec![0.0_f64; columns];
+            let mut row_heights = vec![0.0_f64; sizes.len().div_ceil(columns)];
+            for (index, size) in sizes.iter().enumerate() {
+                column_widths[index % columns] = column_widths[index % columns].max(size.width);
+                row_heights[index / columns] = row_heights[index / columns].max(size.height);
+            }
+            (
+                column_widths.iter().sum::<f64>() + gaps(column_widths.len()),
+                row_heights.iter().sum::<f64>() + gaps(row_heights.len()),
+            )
+        }
+    };
+    Ok(LogicalSize {
+        width: width + BOX_PADDING * 2.0,
+        height: height + BOX_PADDING * 2.0,
+    })
 }
 
 fn place(
     tree: &Tree,
     id: NodeId,
-    x: f64,
-    y: f64,
+    origin: LogicalPoint,
     available_width: f64,
     ancestor_enabled: bool,
+    stretch_width: bool,
     snapshot: &mut LayoutSnapshot,
 ) -> Result<LogicalSize, GeometryError> {
+    let LogicalPoint { x, y } = origin;
     let node = tree.node(id).ok_or(GeometryError::MissingNode)?;
     let measured = measure(tree, id)?;
-    let width = measured.width.min(available_width.max(0.0));
+    let width = if stretch_width {
+        available_width.max(0.0)
+    } else {
+        measured.width.min(available_width.max(0.0))
+    };
     let own_enabled = match &node.data {
-        NodeData::Box { enabled } | NodeData::Button { enabled, .. } => *enabled,
-        NodeData::Root | NodeData::Text { .. } => true,
+        NodeData::Box { enabled }
+        | NodeData::Row { enabled }
+        | NodeData::Grid { enabled, .. }
+        | NodeData::Button { enabled, .. }
+        | NodeData::ShortcutButton { enabled, .. } => *enabled,
+        NodeData::Root | NodeData::Text { .. } | NodeData::AlignedText { .. } => true,
     };
     let effective_enabled = ancestor_enabled && own_enabled;
     snapshot.nodes.insert(
@@ -235,7 +273,7 @@ fn place(
                 height: measured.height,
             },
             effective_enabled,
-            interaction: if matches!(node.data, NodeData::Button { .. }) {
+            interaction: if node.data.is_button() {
                 InteractionKind::Button
             } else {
                 InteractionKind::None
@@ -243,21 +281,81 @@ fn place(
         },
     );
     snapshot.hit_order.push(id);
-    if matches!(node.data, NodeData::Box { .. }) {
+    if let Some(box_layout) = node.data.box_layout() {
         let child_x = x + BOX_PADDING;
         let child_width = (width - BOX_PADDING * 2.0).max(0.0);
-        let mut child_y = y + BOX_PADDING;
-        for child in &node.children {
-            let child_size = place(
-                tree,
-                *child,
-                child_x,
-                child_y,
-                child_width,
-                effective_enabled,
-                snapshot,
-            )?;
-            child_y += child_size.height + CHILD_GAP;
+        match box_layout {
+            BoxLayout::Column => {
+                let mut child_y = y + BOX_PADDING;
+                for child in &node.children {
+                    let child_size = place(
+                        tree,
+                        *child,
+                        LogicalPoint {
+                            x: child_x,
+                            y: child_y,
+                        },
+                        child_width,
+                        effective_enabled,
+                        false,
+                        snapshot,
+                    )?;
+                    child_y += child_size.height + CHILD_GAP;
+                }
+            }
+            BoxLayout::Row => {
+                let mut next_x = child_x;
+                for child in &node.children {
+                    let child_size = place(
+                        tree,
+                        *child,
+                        LogicalPoint {
+                            x: next_x,
+                            y: y + BOX_PADDING,
+                        },
+                        (child_x + child_width - next_x).max(0.0),
+                        effective_enabled,
+                        false,
+                        snapshot,
+                    )?;
+                    next_x += child_size.width + CHILD_GAP;
+                }
+            }
+            BoxLayout::Grid { columns } => {
+                let columns = usize::from(columns);
+                let track_width = ((child_width - CHILD_GAP * columns.saturating_sub(1) as f64)
+                    / columns as f64)
+                    .max(0.0);
+                let sizes = node
+                    .children
+                    .iter()
+                    .map(|child| measure(tree, *child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut row_y = y + BOX_PADDING;
+                for row_start in (0..node.children.len()).step_by(columns) {
+                    let row_end = (row_start + columns).min(node.children.len());
+                    let row_height = sizes[row_start..row_end]
+                        .iter()
+                        .map(|size| size.height)
+                        .fold(0.0, f64::max);
+                    for index in row_start..row_end {
+                        let column = index - row_start;
+                        place(
+                            tree,
+                            node.children[index],
+                            LogicalPoint {
+                                x: child_x + column as f64 * (track_width + CHILD_GAP),
+                                y: row_y,
+                            },
+                            track_width,
+                            effective_enabled,
+                            true,
+                            snapshot,
+                        )?;
+                    }
+                    row_y += row_height + CHILD_GAP;
+                }
+            }
         }
     }
     Ok(LogicalSize {
@@ -302,6 +400,82 @@ mod tests {
                         id: id(4),
                         data: NodeData::Button {
                             label: "Increment".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap()
+    }
+
+    fn rich_layout() -> Tree {
+        Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 4,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Box { enabled: true },
+                        children: vec![id(3), id(6)],
+                    },
+                    Node {
+                        id: id(3),
+                        data: NodeData::Row { enabled: true },
+                        children: vec![id(4), id(5)],
+                    },
+                    Node {
+                        id: id(4),
+                        data: NodeData::Button {
+                            label: "A".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    Node {
+                        id: id(5),
+                        data: NodeData::Button {
+                            label: "B".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    Node {
+                        id: id(6),
+                        data: NodeData::Grid {
+                            enabled: true,
+                            columns: 2,
+                        },
+                        children: vec![id(7), id(8), id(9)],
+                    },
+                    Node {
+                        id: id(7),
+                        data: NodeData::Button {
+                            label: "1".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    Node {
+                        id: id(8),
+                        data: NodeData::Button {
+                            label: "2".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    Node {
+                        id: id(9),
+                        data: NodeData::Button {
+                            label: "3".into(),
                             enabled: true,
                         },
                         children: vec![],
@@ -361,5 +535,23 @@ mod tests {
         assert!(LogicalSize::new(f64::NAN, 1.0).is_err());
         assert!(LogicalSize::new(1.0, f64::INFINITY).is_err());
         assert!(LogicalSize::new(-1.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn row_and_grid_geometry_is_deterministic_and_row_major() {
+        let layout = layout(&rich_layout(), LogicalSize::new(640.0, 480.0).unwrap()).unwrap();
+        let first_row = layout.nodes[&id(4)].bounds;
+        let second_row = layout.nodes[&id(5)].bounds;
+        assert_eq!(second_row.x, first_row.x + first_row.width + CHILD_GAP);
+        assert_eq!(second_row.y, first_row.y);
+
+        let first = layout.nodes[&id(7)].bounds;
+        let second = layout.nodes[&id(8)].bounds;
+        let third = layout.nodes[&id(9)].bounds;
+        assert_eq!(first.width, second.width);
+        assert_eq!(second.x, first.x + first.width + CHILD_GAP);
+        assert_eq!(second.y, first.y);
+        assert_eq!(third.x, first.x);
+        assert_eq!(third.y, first.y + BUTTON_MIN_HEIGHT + CHILD_GAP);
     }
 }

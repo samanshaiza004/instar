@@ -4304,21 +4304,21 @@ dependencies = [
 
 [[package]]
 name = "youth-app-error-after-state-write"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-bad-revision-after-state-write"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "directories",
@@ -4338,90 +4338,98 @@ dependencies = [
 
 [[package]]
 name = "youth-counter"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "softbuffer",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
  "winit",
+ "youth-interaction",
  "youth-runtime",
  "youth-tree",
 ]
 
 [[package]]
 name = "youth-infinite-loop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
+name = "youth-interaction"
+version = "0.0.2"
+dependencies = [
+ "youth-tree",
+]
+
+[[package]]
 name = "youth-invalid-patch"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-invalid-patch-after-state-write"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-invalid-revision"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-invalid-sequence"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-invalid-snapshot"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-memory-bomb"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-oversized-patch"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-oversized-snapshot"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-project"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "sha2",
@@ -4434,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "youth-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "sha2",
  "tempfile",
@@ -4452,21 +4460,21 @@ dependencies = [
 
 [[package]]
 name = "youth-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-sdk-tally"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "youth-sdk",
 ]
 
 [[package]]
 name = "youth-state"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -4476,12 +4484,13 @@ dependencies = [
 
 [[package]]
 name = "youth-test"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "youth-interaction",
  "youth-runtime",
  "youth-sdk",
  "youth-state",
@@ -4490,28 +4499,28 @@ dependencies = [
 
 [[package]]
 name = "youth-trap-after-state-write"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-trap-on-handle"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-trap-on-mount"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "wit-bindgen",
 ]
 
 [[package]]
 name = "youth-tree"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "proptest",
  "serde",

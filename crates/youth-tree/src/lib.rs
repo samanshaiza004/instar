@@ -42,13 +42,128 @@ impl fmt::Display for NodeId {
 }
 
 /// The semantic content and behavior of a node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxLayout {
+    Column,
+    Row,
+    Grid { columns: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlignment {
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutKey {
+    Character(String),
+    Enter,
+    Escape,
+    Backspace,
+}
+
+/// The semantic content and behavior of a normalized node.
+///
+/// The compact DP0 variants remain the normalized representation for their
+/// default DP1 attributes. Protocol adapters terminate at this type; layout,
+/// interaction, and rendering never branch on a component protocol version.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeData {
     Root,
-    Box { enabled: bool },
-    Text { value: String },
-    Button { label: String, enabled: bool },
+    Box {
+        enabled: bool,
+    },
+    Row {
+        enabled: bool,
+    },
+    Grid {
+        enabled: bool,
+        columns: u8,
+    },
+    Text {
+        value: String,
+    },
+    AlignedText {
+        value: String,
+        alignment: TextAlignment,
+    },
+    Button {
+        label: String,
+        enabled: bool,
+    },
+    ShortcutButton {
+        label: String,
+        enabled: bool,
+        shortcuts: Vec<ShortcutKey>,
+    },
+}
+
+impl NodeData {
+    #[must_use]
+    pub const fn box_layout(&self) -> Option<BoxLayout> {
+        match self {
+            Self::Box { .. } => Some(BoxLayout::Column),
+            Self::Row { .. } => Some(BoxLayout::Row),
+            Self::Grid { columns, .. } => Some(BoxLayout::Grid { columns: *columns }),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn text_alignment(&self) -> Option<TextAlignment> {
+        match self {
+            Self::Text { .. } => Some(TextAlignment::Start),
+            Self::AlignedText { alignment, .. } => Some(*alignment),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn text_value(&self) -> Option<&str> {
+        match self {
+            Self::Text { value } | Self::AlignedText { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn button_label(&self) -> Option<&str> {
+        match self {
+            Self::Button { label, .. } | Self::ShortcutButton { label, .. } => Some(label),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn shortcuts(&self) -> &[ShortcutKey] {
+        match self {
+            Self::ShortcutButton { shortcuts, .. } => shortcuts,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        match self {
+            Self::Box { enabled }
+            | Self::Row { enabled }
+            | Self::Grid { enabled, .. }
+            | Self::Button { enabled, .. }
+            | Self::ShortcutButton { enabled, .. } => *enabled,
+            Self::Root | Self::Text { .. } | Self::AlignedText { .. } => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_button(&self) -> bool {
+        matches!(self, Self::Button { .. } | Self::ShortcutButton { .. })
+    }
 }
 
 /// A semantic node and its ordered child IDs.
@@ -76,6 +191,10 @@ pub struct Limits {
     pub max_text_len: usize,
     pub max_label_len: usize,
     pub max_patches: usize,
+    pub max_grid_columns: u8,
+    pub max_shortcuts_per_button: usize,
+    pub max_shortcuts_per_tree: usize,
+    pub max_shortcut_character_bytes: usize,
 }
 
 impl Default for Limits {
@@ -87,6 +206,10 @@ impl Default for Limits {
             max_text_len: 64 * 1024,
             max_label_len: 4 * 1024,
             max_patches: 10_000,
+            max_grid_columns: 16,
+            max_shortcuts_per_button: 4,
+            max_shortcuts_per_tree: 256,
+            max_shortcut_character_bytes: 16,
         }
     }
 }
@@ -241,6 +364,24 @@ pub enum ValidationError {
         actual: usize,
         max: usize,
     },
+    #[error("grid node {node} declares {columns} columns; expected 1 through {max}")]
+    InvalidGridColumns { node: NodeId, columns: u8, max: u8 },
+    #[error("button node {node} declares {actual} shortcuts, exceeding the limit of {max}")]
+    TooManyButtonShortcuts {
+        node: NodeId,
+        actual: usize,
+        max: usize,
+    },
+    #[error("tree declares {actual} shortcuts, exceeding the limit of {max}")]
+    TooManyTreeShortcuts { actual: usize, max: usize },
+    #[error("button node {node} has an invalid logical character shortcut")]
+    InvalidShortcutCharacter { node: NodeId },
+    #[error("logical shortcut {shortcut:?} is declared by nodes {first} and {second}")]
+    DuplicateShortcut {
+        shortcut: ShortcutKey,
+        first: NodeId,
+        second: NodeId,
+    },
 }
 
 /// A validated retained semantic tree.
@@ -282,6 +423,8 @@ impl Tree {
             });
         }
 
+        let mut shortcuts = BTreeMap::<ShortcutKey, NodeId>::new();
+        let mut shortcut_count = 0_usize;
         for (&id, node) in &nodes {
             if id != snapshot.root && node.data == NodeData::Root {
                 return Err(ValidationError::NonRootRootData { id });
@@ -294,7 +437,7 @@ impl Tree {
                 });
             }
             match &node.data {
-                NodeData::Text { value } => {
+                NodeData::Text { value } | NodeData::AlignedText { value, .. } => {
                     if !node.children.is_empty() {
                         return Err(ValidationError::LeafWithChildren { node: id });
                     }
@@ -306,7 +449,7 @@ impl Tree {
                         });
                     }
                 }
-                NodeData::Button { label, .. } => {
+                NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
                     if !node.children.is_empty() {
                         return Err(ValidationError::LeafWithChildren { node: id });
                     }
@@ -318,8 +461,46 @@ impl Tree {
                         });
                     }
                 }
-                NodeData::Root | NodeData::Box { .. } => {}
+                NodeData::Root | NodeData::Box { .. } | NodeData::Row { .. } => {}
+                NodeData::Grid { columns, .. } => {
+                    if *columns == 0 || *columns > limits.max_grid_columns {
+                        return Err(ValidationError::InvalidGridColumns {
+                            node: id,
+                            columns: *columns,
+                            max: limits.max_grid_columns,
+                        });
+                    }
+                }
             }
+            if node.data.shortcuts().len() > limits.max_shortcuts_per_button {
+                return Err(ValidationError::TooManyButtonShortcuts {
+                    node: id,
+                    actual: node.data.shortcuts().len(),
+                    max: limits.max_shortcuts_per_button,
+                });
+            }
+            for shortcut in node.data.shortcuts() {
+                shortcut_count = shortcut_count.saturating_add(1);
+                if let ShortcutKey::Character(value) = shortcut
+                    && (value.len() > limits.max_shortcut_character_bytes
+                        || value.chars().count() != 1)
+                {
+                    return Err(ValidationError::InvalidShortcutCharacter { node: id });
+                }
+                if let Some(first) = shortcuts.insert(shortcut.clone(), id) {
+                    return Err(ValidationError::DuplicateShortcut {
+                        shortcut: shortcut.clone(),
+                        first,
+                        second: id,
+                    });
+                }
+            }
+        }
+        if shortcut_count > limits.max_shortcuts_per_tree {
+            return Err(ValidationError::TooManyTreeShortcuts {
+                actual: shortcut_count,
+                max: limits.max_shortcuts_per_tree,
+            });
         }
 
         let mut parents = BTreeMap::new();
@@ -505,20 +686,23 @@ impl Tree {
                     .nodes
                     .get_mut(&id)
                     .ok_or(PatchError::UnknownNode { patch_index, id })?;
-                let NodeData::Text { value: current } = &mut node.data else {
-                    return Err(PatchError::WrongNodeKind { patch_index, id });
-                };
-                *current = value;
+                match &mut node.data {
+                    NodeData::Text { value: current }
+                    | NodeData::AlignedText { value: current, .. } => *current = value,
+                    _ => return Err(PatchError::WrongNodeKind { patch_index, id }),
+                }
             }
             Patch::SetLabel { id, value } => {
                 let node = self
                     .nodes
                     .get_mut(&id)
                     .ok_or(PatchError::UnknownNode { patch_index, id })?;
-                let NodeData::Button { label, .. } = &mut node.data else {
-                    return Err(PatchError::WrongNodeKind { patch_index, id });
-                };
-                *label = value;
+                match &mut node.data {
+                    NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
+                        *label = value
+                    }
+                    _ => return Err(PatchError::WrongNodeKind { patch_index, id }),
+                }
             }
             Patch::SetEnabled { id, value } => {
                 let node = self
@@ -526,10 +710,14 @@ impl Tree {
                     .get_mut(&id)
                     .ok_or(PatchError::UnknownNode { patch_index, id })?;
                 match &mut node.data {
-                    NodeData::Box { enabled } | NodeData::Button { enabled, .. } => {
+                    NodeData::Box { enabled }
+                    | NodeData::Row { enabled }
+                    | NodeData::Grid { enabled, .. }
+                    | NodeData::Button { enabled, .. }
+                    | NodeData::ShortcutButton { enabled, .. } => {
                         *enabled = value;
                     }
-                    NodeData::Root | NodeData::Text { .. } => {
+                    NodeData::Root | NodeData::Text { .. } | NodeData::AlignedText { .. } => {
                         return Err(PatchError::WrongNodeKind { patch_index, id });
                     }
                 }
@@ -757,16 +945,44 @@ fn append_node_description(output: &mut String, node: &Node) {
             }
             return;
         }
-        NodeData::Text { value } => {
+        NodeData::Row { enabled } => {
+            output.push_str("row");
+            output.push_str(" #");
+            output.push_str(&node.id.to_string());
+            if !enabled {
+                output.push_str(" disabled");
+            }
+            return;
+        }
+        NodeData::Grid { enabled, columns } => {
+            output.push_str("grid");
+            output.push_str(" #");
+            output.push_str(&node.id.to_string());
+            output.push_str(" columns=");
+            output.push_str(&columns.to_string());
+            if !enabled {
+                output.push_str(" disabled");
+            }
+            return;
+        }
+        NodeData::Text { value } | NodeData::AlignedText { value, .. } => {
             output.push_str("text");
             output.push_str(" #");
             output.push_str(&node.id.to_string());
             output.push_str(" \"");
             output.extend(value.escape_debug());
             output.push('"');
+            if let NodeData::AlignedText { alignment, .. } = &node.data {
+                output.push_str(" align=");
+                output.push_str(match alignment {
+                    TextAlignment::Start => "start",
+                    TextAlignment::Center => "center",
+                    TextAlignment::End => "end",
+                });
+            }
             return;
         }
-        NodeData::Button { label, enabled } => {
+        NodeData::Button { label, enabled } | NodeData::ShortcutButton { label, enabled, .. } => {
             output.push_str("button");
             output.push_str(" #");
             output.push_str(&node.id.to_string());
@@ -775,6 +991,10 @@ fn append_node_description(output: &mut String, node: &Node) {
             output.push('"');
             if !enabled {
                 output.push_str(" disabled");
+            }
+            if !node.data.shortcuts().is_empty() {
+                output.push_str(" shortcuts=");
+                output.push_str(&format!("{:?}", node.data.shortcuts()));
             }
             return;
         }
@@ -852,6 +1072,115 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(tree.depth(), 3);
+    }
+
+    #[test]
+    fn rich_presentation_nodes_validate_and_canonicalize() {
+        let tree = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::Grid {
+                        enabled: true,
+                        columns: 2,
+                    },
+                    &[3, 4],
+                ),
+                node(
+                    3,
+                    NodeData::AlignedText {
+                        value: "42".into(),
+                        alignment: TextAlignment::End,
+                    },
+                    &[],
+                ),
+                node(
+                    4,
+                    NodeData::ShortcutButton {
+                        label: "=".into(),
+                        enabled: true,
+                        shortcuts: vec![ShortcutKey::Enter],
+                    },
+                    &[],
+                ),
+            ],
+        ))
+        .unwrap();
+        assert!(tree.canonical().contains("grid #2 columns=2"));
+        assert!(tree.canonical().contains("align=end"));
+    }
+
+    #[test]
+    fn invalid_grid_and_shortcut_contracts_are_rejected() {
+        let invalid_grid = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::Grid {
+                        enabled: true,
+                        columns: 0,
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(matches!(
+            invalid_grid,
+            Err(ValidationError::InvalidGridColumns { columns: 0, .. })
+        ));
+
+        let duplicate = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "First".into(),
+                        enabled: true,
+                        shortcuts: vec![ShortcutKey::Character("7".into())],
+                    },
+                    &[],
+                ),
+                node(
+                    3,
+                    NodeData::ShortcutButton {
+                        label: "Second".into(),
+                        enabled: false,
+                        shortcuts: vec![ShortcutKey::Character("7".into())],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(matches!(
+            duplicate,
+            Err(ValidationError::DuplicateShortcut { .. })
+        ));
+
+        let multiple_scalars = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "Bad".into(),
+                        enabled: true,
+                        shortcuts: vec![ShortcutKey::Character("ab".into())],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(matches!(
+            multiple_scalars,
+            Err(ValidationError::InvalidShortcutCharacter { .. })
+        ));
     }
 
     #[test]
@@ -1875,6 +2204,7 @@ mod tests {
                 max_text_len: 32,
                 max_label_len: 32,
                 max_patches: 12,
+                ..Limits::default()
             }
         }
 

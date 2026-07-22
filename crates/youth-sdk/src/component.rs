@@ -54,14 +54,34 @@ impl<A: Application> Guest for Adapter<A> {
                 return Err(Error::invalid_state());
             }
             let processed_through = events.events.last().map_or(0, |event| event.sequence);
-            let events = Events {
-                activated: events
-                    .events
-                    .into_iter()
-                    .map(|event| match event.kind {
-                        ui::EventKind::Activate(id) => id,
+            let activated = events
+                .events
+                .into_iter()
+                .map(|event| match event.kind {
+                    ui::EventKind::Activate(id) => id,
+                })
+                .collect::<Vec<_>>();
+            let tree = state.tree.as_ref().ok_or_else(Error::invalid_state)?;
+            let commanded = activated
+                .iter()
+                .filter_map(|id| {
+                    tree.nodes.iter().find_map(|node| {
+                        if node.id != *id {
+                            return None;
+                        }
+                        match node.data {
+                            FlatNodeData::Button {
+                                command: Some(command),
+                                ..
+                            } => Some(command.id()),
+                            _ => None,
+                        }
                     })
-                    .collect(),
+                })
+                .collect();
+            let events = Events {
+                activated,
+                commanded,
             };
             let update = A::handle(&mut EventContext, &events)?;
             let tree = state.tree.as_mut().ok_or_else(Error::invalid_state)?;
@@ -118,22 +138,47 @@ fn snapshot(tree: &FlatTree, revision: u64) -> ui::TreeSnapshot {
                 id: node.id,
                 data: match &node.data {
                     FlatNodeData::Root => ui::NodeData::Root,
-                    FlatNodeData::Box { enabled } => {
-                        ui::NodeData::Box(ui::BoxData { enabled: *enabled })
-                    }
-                    FlatNodeData::Text { value } => ui::NodeData::Text(ui::TextData {
-                        value: value.clone(),
+                    FlatNodeData::Box { enabled, layout } => ui::NodeData::Box(ui::BoxData {
+                        enabled: *enabled,
+                        layout: match layout {
+                            super::Layout::Column => ui::BoxLayout::Column,
+                            super::Layout::Row => ui::BoxLayout::Row,
+                            super::Layout::Grid(columns) => {
+                                ui::BoxLayout::Grid(ui::GridLayout { columns: *columns })
+                            }
+                        },
                     }),
-                    FlatNodeData::Button { label, enabled } => {
-                        ui::NodeData::Button(ui::ButtonData {
-                            label: label.clone(),
-                            enabled: *enabled,
-                        })
-                    }
+                    FlatNodeData::Text { value, alignment } => ui::NodeData::Text(ui::TextData {
+                        value: value.clone(),
+                        alignment: match alignment {
+                            super::TextAlign::Start => ui::TextAlignment::Start,
+                            super::TextAlign::Center => ui::TextAlignment::Center,
+                            super::TextAlign::End => ui::TextAlignment::End,
+                        },
+                    }),
+                    FlatNodeData::Button {
+                        label,
+                        enabled,
+                        shortcuts,
+                        ..
+                    } => ui::NodeData::Button(ui::ButtonData {
+                        label: label.clone(),
+                        enabled: *enabled,
+                        shortcuts: shortcuts.iter().copied().map(wire_shortcut).collect(),
+                    }),
                 },
                 children: node.children.clone(),
             })
             .collect(),
+    }
+}
+
+fn wire_shortcut(shortcut: super::Shortcut) -> ui::ShortcutKey {
+    match shortcut {
+        super::Shortcut::Character(value) => ui::ShortcutKey::Character(value.to_string()),
+        super::Shortcut::Enter => ui::ShortcutKey::Enter,
+        super::Shortcut::Escape => ui::ShortcutKey::Escape,
+        super::Shortcut::Backspace => ui::ShortcutKey::Backspace,
     }
 }
 

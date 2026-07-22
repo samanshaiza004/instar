@@ -7,4 +7,3 @@ description = "Guest-facing Rust SDK for Youth applications."
 
 [dependencies]
 wit-bindgen = "0.51.0"
-

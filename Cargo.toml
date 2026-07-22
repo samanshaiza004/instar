@@ -7,6 +7,7 @@ members = [
     "crates/youth-project",
     "crates/youth-test",
     "crates/youth-runtime",
+    "crates/youth-interaction",
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",
@@ -26,9 +27,10 @@ members = [
     "test-components/bad-revision-after-state-write",
     "test-components/app-error-after-state-write",
 ]
+exclude = ["crates/youth-cli/templates/tally"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 

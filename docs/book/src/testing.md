@@ -19,3 +19,21 @@ and escaping; `#` begins a comment outside a string.
 `youth test` builds and validates the component once, runs files in lexical
 order, and reports the file, line, command, expected value, and observed
 semantic node on failure. It never opens a desktop window.
+
+DP1 tests may drive the host interaction layer without native scan codes:
+
+```text
+mount
+expect focus none
+key tab
+expect focus clear
+key "7"
+key "+"
+key enter
+expect focus equals
+```
+
+Named keys are `enter`, `escape`, `backspace`, `space`, `tab`, `shift-tab`,
+`left`, `right`, `up`, and `down`. Character keys are one-scalar JSON strings.
+These commands exercise host focus and shortcut policy; the component still
+receives only semantic button activation.

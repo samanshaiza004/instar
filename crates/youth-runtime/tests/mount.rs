@@ -9,6 +9,7 @@ use youth_runtime::{AppLifecycle, RuntimeErrorCategory, RuntimeLimits, YouthApp}
 fn loads_and_instantiates_the_counter_component() {
     let app = YouthApp::load(counter_component()).expect("counter component loads");
     assert_eq!(app.lifecycle(), AppLifecycle::Loaded);
+    assert_eq!(app.inspect().world, "youth:app/application@0.0.2");
     assert!(app.tree().is_none(), "no tree exists before mount");
 }
 

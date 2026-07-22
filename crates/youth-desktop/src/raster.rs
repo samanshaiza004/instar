@@ -1,5 +1,5 @@
 use thiserror::Error;
-use youth_tree::{NodeData, NodeId, Tree};
+use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
 
 use crate::geometry::{LayoutSnapshot, LogicalRect};
 
@@ -15,6 +15,7 @@ pub struct Palette {
     pub button_pressed: u32,
     pub button_disabled: u32,
     pub border: u32,
+    pub focus: u32,
     pub fault_background: u32,
     pub fault_text: u32,
 }
@@ -30,6 +31,7 @@ impl Default for Palette {
             button_pressed: 0x0028_50aa,
             button_disabled: 0x0054_5862,
             border: 0x0095_a4c7,
+            focus: 0x00ff_c857,
             fault_background: 0x0048_1820,
             fault_text: 0x00ff_d5d9,
         }
@@ -40,6 +42,7 @@ impl Default for Palette {
 pub struct RenderState<'a> {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
+    pub focused: Option<NodeId>,
     pub fault_category: Option<&'a str>,
 }
 
@@ -204,7 +207,7 @@ pub fn render(
         let rect = physical_rect(node.bounds, scale_factor, physical_width, physical_height);
         match &semantic.data {
             NodeData::Root => {}
-            NodeData::Box { .. } => {
+            NodeData::Box { .. } | NodeData::Row { .. } | NodeData::Grid { .. } => {
                 frame.fill(rect, palette.container);
                 frame.border(rect, palette.border);
             }
@@ -217,7 +220,24 @@ pub fn render(
                     scale_factor.round() as u32,
                 );
             }
-            NodeData::Button { label, .. } => {
+            NodeData::AlignedText { value, alignment } => {
+                let glyph_scale = scale_factor.round().max(1.0) as u32;
+                let text_width = u32::try_from(value.chars().count())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(8)
+                    .saturating_mul(glyph_scale);
+                let text_x = match alignment {
+                    TextAlignment::Start => rect.x,
+                    TextAlignment::Center => rect
+                        .x
+                        .saturating_add(rect.width.saturating_sub(text_width) / 2),
+                    TextAlignment::End => {
+                        rect.x.saturating_add(rect.width.saturating_sub(text_width))
+                    }
+                };
+                frame.text(text_x, rect.y, value, palette.text, glyph_scale);
+            }
+            NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
                 let color = if !node.effective_enabled {
                     palette.button_disabled
                 } else if state.pressed == Some(*id) {
@@ -229,6 +249,17 @@ pub fn render(
                 };
                 frame.fill(rect, color);
                 frame.border(rect, palette.border);
+                if state.focused == Some(*id) && rect.width > 4 && rect.height > 4 {
+                    frame.border(
+                        PixelRect {
+                            x: rect.x + 2,
+                            y: rect.y + 2,
+                            width: rect.width - 4,
+                            height: rect.height - 4,
+                        },
+                        palette.focus,
+                    );
+                }
                 let inset_x = (12.0 * scale_factor).floor().max(0.0) as u32;
                 let inset_y = (8.0 * scale_factor).floor().max(0.0) as u32;
                 frame.text(
@@ -276,49 +307,116 @@ fn physical_rect(rect: LogicalRect, scale: f64, width: u32, height: u32) -> Pixe
     }
 }
 
+const FIRST_PRINTABLE_ASCII: u32 = 0x20;
+const LAST_PRINTABLE_ASCII: u32 = 0x7e;
+const MISSING_GLYPH: [u8; 7] = [31, 17, 2, 4, 4, 0, 4];
+
+// Provisional deterministic 5x7 glyphs for U+0020 through U+007E. Each row
+// uses its low five bits, with the most significant of those bits on the left.
+const PRINTABLE_ASCII_GLYPHS: [[u8; 7]; 95] = [
+    [0, 0, 0, 0, 0, 0, 0],        // space
+    [4, 4, 4, 4, 4, 0, 4],        // !
+    [10, 10, 10, 0, 0, 0, 0],     // "
+    [10, 31, 10, 10, 31, 10, 0],  // #
+    [4, 15, 20, 14, 5, 30, 4],    // $
+    [24, 25, 2, 4, 8, 19, 3],     // %
+    [12, 18, 20, 8, 21, 18, 13],  // &
+    [4, 4, 8, 0, 0, 0, 0],        // '
+    [2, 4, 8, 8, 8, 4, 2],        // (
+    [8, 4, 2, 2, 2, 4, 8],        // )
+    [0, 21, 14, 31, 14, 21, 0],   // *
+    [0, 4, 4, 31, 4, 4, 0],       // +
+    [0, 0, 0, 0, 4, 4, 8],        // ,
+    [0, 0, 0, 31, 0, 0, 0],       // -
+    [0, 0, 0, 0, 0, 12, 12],      // .
+    [1, 2, 2, 4, 8, 8, 16],       // /
+    [14, 17, 19, 21, 25, 17, 14], // 0
+    [4, 12, 4, 4, 4, 4, 14],      // 1
+    [14, 17, 1, 2, 4, 8, 31],     // 2
+    [30, 1, 1, 14, 1, 1, 30],     // 3
+    [2, 6, 10, 18, 31, 2, 2],     // 4
+    [31, 16, 16, 30, 1, 1, 30],   // 5
+    [14, 16, 16, 30, 17, 17, 14], // 6
+    [31, 1, 2, 4, 8, 8, 8],       // 7
+    [14, 17, 17, 14, 17, 17, 14], // 8
+    [14, 17, 17, 15, 1, 1, 14],   // 9
+    [0, 4, 4, 0, 4, 4, 0],        // :
+    [0, 4, 4, 0, 4, 4, 8],        // ;
+    [2, 4, 8, 16, 8, 4, 2],       // <
+    [0, 31, 0, 31, 0, 0, 0],      // =
+    [8, 4, 2, 1, 2, 4, 8],        // >
+    [14, 17, 1, 2, 4, 0, 4],      // ?
+    [14, 17, 23, 21, 23, 16, 14], // @
+    [14, 17, 17, 31, 17, 17, 17], // A
+    [30, 17, 17, 30, 17, 17, 30], // B
+    [14, 17, 16, 16, 16, 17, 14], // C
+    [30, 17, 17, 17, 17, 17, 30], // D
+    [31, 16, 16, 30, 16, 16, 31], // E
+    [31, 16, 16, 30, 16, 16, 16], // F
+    [14, 17, 16, 23, 17, 17, 15], // G
+    [17, 17, 17, 31, 17, 17, 17], // H
+    [14, 4, 4, 4, 4, 4, 14],      // I
+    [7, 2, 2, 2, 18, 18, 12],     // J
+    [17, 18, 20, 24, 20, 18, 17], // K
+    [16, 16, 16, 16, 16, 16, 31], // L
+    [17, 27, 21, 21, 17, 17, 17], // M
+    [17, 25, 21, 19, 17, 17, 17], // N
+    [14, 17, 17, 17, 17, 17, 14], // O
+    [30, 17, 17, 30, 16, 16, 16], // P
+    [14, 17, 17, 17, 21, 18, 13], // Q
+    [30, 17, 17, 30, 20, 18, 17], // R
+    [15, 16, 16, 14, 1, 1, 30],   // S
+    [31, 4, 4, 4, 4, 4, 4],       // T
+    [17, 17, 17, 17, 17, 17, 14], // U
+    [17, 17, 17, 17, 17, 10, 4],  // V
+    [17, 17, 17, 21, 21, 21, 10], // W
+    [17, 17, 10, 4, 10, 17, 17],  // X
+    [17, 17, 10, 4, 4, 4, 4],     // Y
+    [31, 1, 2, 4, 8, 16, 31],     // Z
+    [14, 8, 8, 8, 8, 8, 14],      // [
+    [16, 8, 8, 4, 2, 2, 1],       // backslash
+    [14, 2, 2, 2, 2, 2, 14],      // ]
+    [4, 10, 17, 0, 0, 0, 0],      // ^
+    [0, 0, 0, 0, 0, 0, 31],       // _
+    [8, 4, 2, 0, 0, 0, 0],        // `
+    [0, 0, 14, 1, 15, 17, 15],    // a
+    [16, 16, 30, 17, 17, 17, 30], // b
+    [0, 0, 14, 16, 16, 17, 14],   // c
+    [1, 1, 15, 17, 17, 17, 15],   // d
+    [0, 0, 14, 17, 31, 16, 14],   // e
+    [6, 9, 8, 28, 8, 8, 8],       // f
+    [0, 0, 15, 17, 15, 1, 14],    // g
+    [16, 16, 30, 17, 17, 17, 17], // h
+    [4, 0, 12, 4, 4, 4, 14],      // i
+    [2, 0, 6, 2, 2, 18, 12],      // j
+    [16, 16, 18, 20, 24, 20, 18], // k
+    [12, 4, 4, 4, 4, 4, 14],      // l
+    [0, 0, 26, 21, 21, 21, 21],   // m
+    [0, 0, 30, 17, 17, 17, 17],   // n
+    [0, 0, 14, 17, 17, 17, 14],   // o
+    [0, 0, 30, 17, 30, 16, 16],   // p
+    [0, 0, 15, 17, 15, 1, 1],     // q
+    [0, 0, 22, 25, 16, 16, 16],   // r
+    [0, 0, 15, 16, 14, 1, 30],    // s
+    [8, 8, 28, 8, 8, 9, 6],       // t
+    [0, 0, 17, 17, 17, 19, 13],   // u
+    [0, 0, 17, 17, 17, 10, 4],    // v
+    [0, 0, 17, 17, 21, 21, 10],   // w
+    [0, 0, 17, 10, 4, 10, 17],    // x
+    [0, 0, 17, 17, 15, 1, 14],    // y
+    [0, 0, 31, 2, 4, 8, 31],      // z
+    [2, 4, 4, 8, 4, 4, 2],        // {
+    [4, 4, 4, 4, 4, 4, 4],        // |
+    [8, 4, 4, 2, 4, 4, 8],        // }
+    [0, 0, 9, 22, 0, 0, 0],       // ~
+];
+
 fn glyph_rows(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
-        'A' => [14, 17, 17, 31, 17, 17, 17],
-        'B' => [30, 17, 17, 30, 17, 17, 30],
-        'C' => [14, 17, 16, 16, 16, 17, 14],
-        'D' => [30, 17, 17, 17, 17, 17, 30],
-        'E' => [31, 16, 16, 30, 16, 16, 31],
-        'F' => [31, 16, 16, 30, 16, 16, 16],
-        'G' => [14, 17, 16, 23, 17, 17, 15],
-        'H' => [17, 17, 17, 31, 17, 17, 17],
-        'I' => [14, 4, 4, 4, 4, 4, 14],
-        'J' => [7, 2, 2, 2, 18, 18, 12],
-        'K' => [17, 18, 20, 24, 20, 18, 17],
-        'L' => [16, 16, 16, 16, 16, 16, 31],
-        'M' => [17, 27, 21, 21, 17, 17, 17],
-        'N' => [17, 25, 21, 19, 17, 17, 17],
-        'O' => [14, 17, 17, 17, 17, 17, 14],
-        'P' => [30, 17, 17, 30, 16, 16, 16],
-        'Q' => [14, 17, 17, 17, 21, 18, 13],
-        'R' => [30, 17, 17, 30, 20, 18, 17],
-        'S' => [15, 16, 16, 14, 1, 1, 30],
-        'T' => [31, 4, 4, 4, 4, 4, 4],
-        'U' => [17, 17, 17, 17, 17, 17, 14],
-        'V' => [17, 17, 17, 17, 17, 10, 4],
-        'W' => [17, 17, 17, 21, 21, 21, 10],
-        'X' => [17, 17, 10, 4, 10, 17, 17],
-        'Y' => [17, 17, 10, 4, 4, 4, 4],
-        'Z' => [31, 1, 2, 4, 8, 16, 31],
-        '0' => [14, 17, 19, 21, 25, 17, 14],
-        '1' => [4, 12, 4, 4, 4, 4, 14],
-        '2' => [14, 17, 1, 2, 4, 8, 31],
-        '3' => [30, 1, 1, 14, 1, 1, 30],
-        '4' => [2, 6, 10, 18, 31, 2, 2],
-        '5' => [31, 16, 16, 30, 1, 1, 30],
-        '6' => [14, 16, 16, 30, 17, 17, 14],
-        '7' => [31, 1, 2, 4, 8, 8, 8],
-        '8' => [14, 17, 17, 14, 17, 17, 14],
-        '9' => [14, 17, 17, 15, 1, 1, 14],
-        ':' => [0, 4, 4, 0, 4, 4, 0],
-        '-' => [0, 0, 0, 31, 0, 0, 0],
-        '_' => [0, 0, 0, 0, 0, 0, 31],
-        ' ' => [0; 7],
-        _ => [31, 17, 2, 4, 4, 0, 4],
+    let codepoint = u32::from(character);
+    if (FIRST_PRINTABLE_ASCII..=LAST_PRINTABLE_ASCII).contains(&codepoint) {
+        PRINTABLE_ASCII_GLYPHS[(codepoint - FIRST_PRINTABLE_ASCII) as usize]
+    } else {
+        MISSING_GLYPH
     }
 }
 
@@ -407,7 +505,21 @@ mod tests {
             &RenderState {
                 hovered: Some(id(4)),
                 pressed: Some(id(4)),
+                focused: None,
                 fault_category: None,
+            },
+            palette,
+        )
+        .unwrap();
+        let focused = render(
+            &tree,
+            &layout,
+            320,
+            180,
+            1.0,
+            &RenderState {
+                focused: Some(id(4)),
+                ..RenderState::default()
             },
             palette,
         )
@@ -430,15 +542,39 @@ mod tests {
                 frame_hash(&normal),
                 frame_hash(&hover),
                 frame_hash(&pressed),
+                frame_hash(&focused),
                 frame_hash(&fault)
             ],
             [
-                17_820_981_758_339_064_687,
-                14_595_224_954_947_096_910,
-                10_747_383_323_860_802_854,
-                10_205_311_049_527_053_737,
+                2_337_801_063_811_903_698,
+                16_375_953_899_127_657_034,
+                3_619_998_415_868_681_374,
+                4_262_902_459_279_915_530,
+                10_375_799_425_807_607_732,
             ]
         );
+    }
+
+    #[test]
+    fn printable_ascii_font_is_complete_and_representative_pixels_are_stable() {
+        for byte in 0x20_u8..=0x7e {
+            assert_ne!(
+                glyph_rows(char::from(byte)),
+                MISSING_GLYPH,
+                "printable ASCII byte 0x{byte:02x} used the missing glyph"
+            );
+        }
+
+        assert_eq!(glyph_rows('+'), [0, 4, 4, 31, 4, 4, 0]);
+        assert_eq!(glyph_rows('/'), [1, 2, 2, 4, 8, 8, 16]);
+        assert_eq!(glyph_rows('*'), [0, 21, 14, 31, 14, 21, 0]);
+        assert_eq!(glyph_rows('.'), [0, 0, 0, 0, 0, 12, 12]);
+        assert_eq!(glyph_rows('='), [0, 31, 0, 31, 0, 0, 0]);
+
+        let mut frame = FrameBuffer::new(224, 7).unwrap();
+        frame.clear(0);
+        frame.text(0, 0, "+/- * . = % @ [] {} ~ AaZz", u32::MAX, 1);
+        assert_eq!(frame_hash(&frame), 2_309_453_928_318_357_117);
     }
 
     #[test]

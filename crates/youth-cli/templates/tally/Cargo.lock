@@ -188,7 +188,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "{{package}}"
+name = "youth-template-app"
 version = "0.0.1"
 dependencies = [
  "youth-sdk",
@@ -331,8 +331,8 @@ dependencies = [
 
 [[package]]
 name = "youth-sdk"
-version = "0.0.1"
-source = "git+https://github.com/samanshaiza004/youth?rev=c5e2b0f2b96746e2251e8d9e0da440a3f7b7e46a#c5e2b0f2b96746e2251e8d9e0da440a3f7b7e46a"
+version = "0.0.2"
+source = "git+https://github.com/samanshaiza004/youth?rev=8696bd97ebc4f1d34b9f632e5992dd1882b724de#8696bd97ebc4f1d34b9f632e5992dd1882b724de"
 dependencies = [
  "wit-bindgen",
 ]
