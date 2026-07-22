@@ -15,6 +15,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | ID | Summary | Owner | Next decision |
 | --- | --- | --- | --- |
 | CALC-F002 | Command binding and canonical state calls are repetitive | Calculator / Youth | Resolve view-backed commands in the SDK; retain explicit typed durable state |
+| CALC-F008 | The provisional debug font replaces common calculator punctuation with `?` | Youth desktop | Expand renderer glyph coverage or adopt a deterministic font implementation; no protocol change |
 
 ## Accepted evidence
 
@@ -27,6 +28,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | CALC-F005 | `ba5f00c` external `youth test` on the first aligned display | The test runner matched the compact `Text` representation instead of the semantic text role | Assertions now use normalized text accessors, so alignment does not change test meaning |
 | CALC-F006 | `ba5f00c` fresh Cargo resolution of the Git-pinned SDK | An invalid package-name placeholder in the embedded template produced a noisy repository-discovery diagnostic | Reviewable templates must remain valid source artifacts; generation now replaces a valid sentinel and the template directory is excluded from the workspace |
 | CALC-F007 | `8ef8e40` calculator keyboard acceptance test | Node activation alone could not prove host-owned focus and shortcut policy through the real runtime | The narrow test DSL now drives logical keys and asserts semantic focus without exposing native key codes or sending keyboard events to the guest |
+| CALC-F008 | `8ef8e40` native calculator presentation on macOS | The provisional renderer displays unsupported ASCII punctuation (`+`, `/`, `*`, `.`, `=`) as `?` | This is renderer/font coverage and host policy, not an application, SDK, WIT, or protocol deficiency |
 
 ## Finding requirements
 
