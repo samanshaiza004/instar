@@ -293,6 +293,125 @@ fn to_wire_state_error_v003(
     }
 }
 
+impl crate::bindings::v004::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v004::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v004::youth::state::store::Value>,
+        crate::bindings::v004::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v004))
+            .map_err(to_wire_state_error_v004)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v004::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v004::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v004(value))
+            .map_err(to_wire_state_error_v004)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v004::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v004)
+    }
+}
+
+fn to_wire_state_value_v004(
+    value: youth_state::StateValue,
+) -> crate::bindings::v004::youth::state::store::Value {
+    use crate::bindings::v004::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v004(
+    value: crate::bindings::v004::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v004::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v004(
+    error: youth_state::StateError,
+) -> crate::bindings::v004::youth::state::store::StateError {
+    use crate::bindings::v004::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v004::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+// B-2 replaces this stub with durable storage.
+impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
+    fn schedule_after(
+        &mut self,
+        _millis: u64,
+        _options: crate::bindings::v004::youth::time::scheduler::ScheduleOptions,
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+    }
+
+    fn pause(
+        &mut self,
+        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+    }
+
+    fn resume(
+        &mut self,
+        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+    }
+
+    fn cancel(
+        &mut self,
+        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+    }
+}
+
 /// One synchronous, single-owner Youth component instance.
 pub struct YouthApp {
     component_id: String,
@@ -1123,6 +1242,24 @@ fn instantiate(
                 .map_err(|source| instantiation_error(&component_id, &store, source))?;
             ApplicationBindings::V003(value)
         }
+        ProtocolVersion::V004 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v004::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v004::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V004(value)
+        }
     };
     Ok(YouthApp {
         component_id,
@@ -1143,13 +1280,16 @@ fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVer
     let exports = component_type.exports(engine);
     let mut v002 = false;
     let mut v003 = false;
+    let mut v004 = false;
     for (name, _) in exports {
         v002 |= name == "youth:app/lifecycle@0.0.2";
         v003 |= name == "youth:app/lifecycle@0.0.3";
+        v004 |= name == "youth:app/lifecycle@0.0.4";
     }
-    match (v002, v003) {
-        (false, true) => Some(ProtocolVersion::V003),
-        (true, false) => Some(ProtocolVersion::V002),
+    match (v002, v003, v004) {
+        (false, false, true) => Some(ProtocolVersion::V004),
+        (false, true, false) => Some(ProtocolVersion::V003),
+        (true, false, false) => Some(ProtocolVersion::V002),
         _ => None,
     }
 }

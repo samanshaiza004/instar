@@ -12,6 +12,7 @@ members = [
     "crates/youth-cli",
     "guests/counter",
     "test-components/sdk-tally",
+    "test-components/time-stub",
     "test-components/trap-on-mount",
     "test-components/trap-on-handle",
     "test-components/invalid-snapshot",

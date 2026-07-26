@@ -4498,6 +4498,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-time-stub"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-trap-after-state-write"
 version = "0.0.2"
 dependencies = [
