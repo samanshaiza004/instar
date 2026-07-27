@@ -79,6 +79,21 @@ schedules for an app that is not running.
 This is the first schema change since `SCHEMA_VERSION = 1` and introduces
 Youth's first migration path.
 
+### D2 correction — `pause`/`resume` must return the new schedule
+
+Found while wiring the Timer to real schedules (2026-07-27), before any
+external consumer had adopted `youth:time@0.0.1`, so patched in place
+rather than versioned: `schedule_pause`/`schedule_resume` in
+`youth-state` already compute and return a full `ScheduleRecord` carrying
+the new generation, but the WIT signatures were `pause: func(value:
+schedule) -> result<_, schedule-error-code>` and the equivalent for
+`resume` — the new generation was computed, then discarded before
+crossing back to the guest. A guest that paused a schedule had no way to
+learn the generation it would need to resume with, and would be rejected
+by the host's own stale-generation check on the very next call. `pause`
+and `resume` now return `result<schedule, schedule-error-code>`, exactly
+like `schedule-after`.
+
 ### D2 — Schedule identity and generation are host-issued
 
 Per `TIMER-F008`, a guest-invented counter cannot be trusted to reject a wake the

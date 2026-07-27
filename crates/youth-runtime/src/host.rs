@@ -461,16 +461,16 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
                 now_epoch_millis,
             },
         ));
-        Ok(crate::bindings::v004::youth::time::scheduler::Schedule {
-            id: record.id,
-            generation: record.generation,
-        })
+        Ok(to_wire_schedule_v004(&record))
     }
 
     fn pause(
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
-    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
         let now_epoch_millis = self.deadline_clock.now_epoch_millis();
         let previous = self
             .state
@@ -483,6 +483,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .state
             .schedule_pause(now_epoch_millis, value.id, value.generation)
             .map_err(to_wire_schedule_error_v004)?;
+        let wire_paused = to_wire_schedule_v004(&paused);
         self.staged_schedule_outputs.extend(youth_state::transition(
             youth_state::SchedulerInput::Pause {
                 app_id: self.state.app_id().clone(),
@@ -490,13 +491,16 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
                 paused,
             },
         ));
-        Ok(())
+        Ok(wire_paused)
     }
 
     fn resume(
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
-    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
         let now_epoch_millis = self.deadline_clock.now_epoch_millis();
         let previous = self
             .state
@@ -509,6 +513,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .state
             .schedule_resume(now_epoch_millis, value.id, value.generation)
             .map_err(to_wire_schedule_error_v004)?;
+        let wire_resumed = to_wire_schedule_v004(&resumed);
         self.staged_schedule_outputs.extend(youth_state::transition(
             youth_state::SchedulerInput::Resume {
                 app_id: self.state.app_id().clone(),
@@ -517,7 +522,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
                 now_epoch_millis,
             },
         ));
-        Ok(())
+        Ok(wire_resumed)
     }
 
     fn cancel(
@@ -547,6 +552,15 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             },
         ));
         Ok(())
+    }
+}
+
+fn to_wire_schedule_v004(
+    record: &youth_state::ScheduleRecord,
+) -> crate::bindings::v004::youth::time::scheduler::Schedule {
+    crate::bindings::v004::youth::time::scheduler::Schedule {
+        id: record.id,
+        generation: record.generation,
     }
 }
 

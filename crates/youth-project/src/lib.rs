@@ -26,7 +26,7 @@ pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// WIT digest used by the default generated-project profile.
 pub const TEMPLATE_WIT_SHA256: &str =
-    "7eac97f41fc43c09059738fc05a2eb8e9fcc9f09d782d3605f5bc9553ff45fc3";
+    "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
@@ -50,7 +50,7 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
     },
     ContractProfile {
         protocol: "0.0.4",
-        wit_sha256: "7eac97f41fc43c09059738fc05a2eb8e9fcc9f09d782d3605f5bc9553ff45fc3",
+        wit_sha256: "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad",
         template_version: 3,
         sdk_revision: SDK_REVISION,
     },

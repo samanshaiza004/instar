@@ -710,11 +710,11 @@ impl TimeScheduler {
         time::schedule_after(millis, options)
     }
 
-    pub fn pause(self, schedule: Schedule) -> Result<()> {
+    pub fn pause(self, schedule: Schedule) -> Result<Schedule> {
         time::pause(schedule)
     }
 
-    pub fn resume(self, schedule: Schedule) -> Result<()> {
+    pub fn resume(self, schedule: Schedule) -> Result<Schedule> {
         time::resume(schedule)
     }
 
@@ -1123,19 +1123,20 @@ mod time {
             }),
         };
         scheduler::schedule_after(millis, &options)
-            .map(|value| Schedule {
-                id: value.id,
-                generation: value.generation,
-            })
+            .map(from_wire_schedule)
             .map_err(map_error)
     }
 
-    pub fn pause(value: Schedule) -> Result<()> {
-        scheduler::pause(wire_schedule(value)).map_err(map_error)
+    pub fn pause(value: Schedule) -> Result<Schedule> {
+        scheduler::pause(wire_schedule(value))
+            .map(from_wire_schedule)
+            .map_err(map_error)
     }
 
-    pub fn resume(value: Schedule) -> Result<()> {
-        scheduler::resume(wire_schedule(value)).map_err(map_error)
+    pub fn resume(value: Schedule) -> Result<Schedule> {
+        scheduler::resume(wire_schedule(value))
+            .map(from_wire_schedule)
+            .map_err(map_error)
     }
 
     pub fn cancel(value: Schedule) -> Result<()> {
@@ -1144,6 +1145,13 @@ mod time {
 
     const fn wire_schedule(value: Schedule) -> scheduler::Schedule {
         scheduler::Schedule {
+            id: value.id,
+            generation: value.generation,
+        }
+    }
+
+    const fn from_wire_schedule(value: scheduler::Schedule) -> Schedule {
+        Schedule {
             id: value.id,
             generation: value.generation,
         }
@@ -1175,11 +1183,11 @@ mod time {
         unavailable()
     }
 
-    pub fn pause(_value: Schedule) -> Result<()> {
+    pub fn pause(_value: Schedule) -> Result<Schedule> {
         unavailable()
     }
 
-    pub fn resume(_value: Schedule) -> Result<()> {
+    pub fn resume(_value: Schedule) -> Result<Schedule> {
         unavailable()
     }
 

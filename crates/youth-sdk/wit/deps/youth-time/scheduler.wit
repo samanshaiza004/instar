@@ -30,7 +30,7 @@ interface scheduler {
 
     schedule-after: func(millis: u64, options: schedule-options)
         -> result<schedule, schedule-error-code>;
-    pause: func(value: schedule) -> result<_, schedule-error-code>;
-    resume: func(value: schedule) -> result<_, schedule-error-code>;
+    pause: func(value: schedule) -> result<schedule, schedule-error-code>;
+    resume: func(value: schedule) -> result<schedule, schedule-error-code>;
     cancel: func(value: schedule) -> result<_, schedule-error-code>;
 }
