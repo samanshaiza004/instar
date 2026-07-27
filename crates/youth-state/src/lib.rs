@@ -14,8 +14,9 @@ mod time;
 
 pub use scheduler::{SchedulerInput, SchedulerOutput, WakeToken, transition};
 pub use store::{
-    GuestCallPhase, PendingDelivery, ScheduleRecord, ScheduleStatus, StateError, StateStore,
-    TurnStateMetrics, Usage, Verification, repair_usage, verify_file,
+    DeliveryProtocol, ElapsedReason, GuestCallPhase, PendingDelivery, ScheduleRecord,
+    ScheduleStatus, StateError, StateStore, TurnStateMetrics, Usage, Verification, repair_usage,
+    verify_file,
 };
 pub use time::{
     DeadlineClock, SystemDeadlineClock, SystemWakeDriver, VirtualDeadlineClock, VirtualWakeDriver,

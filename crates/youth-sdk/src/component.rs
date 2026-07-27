@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 
 use super::{
-    Application, Error, ErrorKind, EventContext, Events, FlatNodeData, FlatTree, ViewContext,
+    Application, ElapsedReason, Error, ErrorKind, Event, EventContext, Events, FlatNodeData,
+    FlatTree, IncomingEvent, ViewContext, decode_incoming_events,
 };
 
 #[doc(hidden)]
@@ -53,30 +54,19 @@ impl<A: Application> Guest for Adapter<A> {
             if !state.mounted || events.tree_revision != state.revision {
                 return Err(Error::invalid_state());
             }
+            let incoming = events.events.iter().map(decode_event).collect::<Vec<_>>();
+            let decoded = decode_incoming_events(incoming)?;
             let processed_through = events.events.last().map_or(0, |event| event.sequence);
-            // B-4 MUST revisit this. Protocol 0.0.4 can carry
-            // `schedule-elapsed`, but `Application` has no way to surface one
-            // yet, so it is dropped here. That is safe only while the host
-            // never sends one: `processed_through` above is computed from the
-            // last event of any kind, so a dropped elapsed event would still
-            // be acknowledged, and at-least-once delivery would consider it
-            // delivered even though the application never observed it.
-            // Adding host-initiated delivery without extending `Events` would
-            // therefore lose events silently.
-            let activated = events
-                .events
-                .into_iter()
-                .filter_map(|event| match event.kind {
-                    ui::EventKind::Activate(id) => Some(id),
-                    ui::EventKind::ScheduleElapsed(_) => None,
-                })
-                .collect::<Vec<_>>();
             let tree = state.tree.as_ref().ok_or_else(Error::invalid_state)?;
-            let commanded = activated
+            let commanded = decoded
                 .iter()
+                .filter_map(|event| match event {
+                    Event::Activated(id) => Some(*id),
+                    Event::ScheduleElapsed { .. } => None,
+                })
                 .filter_map(|id| {
                     tree.nodes.iter().find_map(|node| {
-                        if node.id != *id {
+                        if node.id != id {
                             return None;
                         }
                         match node.data {
@@ -90,7 +80,7 @@ impl<A: Application> Guest for Adapter<A> {
                 })
                 .collect();
             let events = Events {
-                activated,
+                events: decoded,
                 commanded,
             };
             let update = A::handle(&mut EventContext, &events)?;
@@ -125,6 +115,20 @@ impl<A: Application> Guest for Adapter<A> {
             Ok(snapshot)
         })
         .map_err(wire_error)
+    }
+}
+
+fn decode_event(event: &ui::Event) -> IncomingEvent {
+    match &event.kind {
+        ui::EventKind::Activate(id) => IncomingEvent::Activated(*id),
+        ui::EventKind::ScheduleElapsed(elapsed) => IncomingEvent::ScheduleElapsed {
+            schedule: elapsed.id,
+            generation: elapsed.generation,
+            reason: match elapsed.reason {
+                ui::ElapsedReason::Deadline => ElapsedReason::Deadline,
+                ui::ElapsedReason::RecoveredOverdue => ElapsedReason::RecoveredOverdue,
+            },
+        },
     }
 }
 

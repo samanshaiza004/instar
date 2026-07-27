@@ -10,7 +10,9 @@ use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::clocks::HostMonotonicClock;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::bindings::{ApplicationBindings, GuestError, GuestErrorCode, ProtocolVersion};
+use crate::bindings::{
+    ApplicationBindings, GuestError, GuestErrorCode, HostEvent, ProtocolVersion,
+};
 use crate::engine::deadline_ticks;
 use crate::error::ErrorContext;
 use crate::wire::from_guest::{self, WireErrorKind};
@@ -707,7 +709,7 @@ impl YouthApp {
             if outputs.iter().any(|output| {
                 matches!(
                     output,
-                    youth_state::SchedulerOutput::QueueElapsedDelivery(_)
+                    youth_state::SchedulerOutput::QueueElapsedDelivery { .. }
                 )
             }) {
                 WakeDisposition::DeliveryQueued
@@ -825,17 +827,74 @@ impl YouthApp {
             transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
-        let result = span.in_scope(|| self.activate_inner(node, sequence, base_revision));
+        let event = HostEvent::Activate {
+            sequence,
+            node: node.get(),
+        };
+        let result = span.in_scope(|| self.handle_inner(event, None, base_revision));
         span.record("result", if result.is_ok() { "ok" } else { "error" });
         result
     }
 
-    fn activate_inner(
+    /// Delivers the oldest durable elapsed event, if one exists.
+    ///
+    /// This method is intentionally synchronous and explicit. It does not
+    /// arrange a wake or retry itself.
+    pub fn deliver_next_pending(&mut self) -> Result<Option<TurnReceipt>, RuntimeError> {
+        if self.lifecycle != AppLifecycle::Mounted {
+            return Err(RuntimeError::InvalidLifecycle(self.context(
+                format!(
+                    "pending delivery is not allowed while the app is {}",
+                    self.lifecycle
+                ),
+                None,
+            )));
+        }
+        let Some(delivery) = self.pending_deliveries()?.into_iter().next() else {
+            return Ok(None);
+        };
+        if delivery.required_protocol == youth_state::DeliveryProtocol::V004
+            && self.bindings.version() != ProtocolVersion::V004
+        {
+            let error = RuntimeError::UnsupportedWorld(self.context(
+                format!(
+                    "pending schedule delivery requires protocol 0.0.4, but the loaded component exports {}",
+                    self.bindings.version().world()
+                ),
+                None,
+            ));
+            return Err(self.enter_fault(error));
+        }
+        let sequence = self
+            .last_event_sequence
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(self.context("event sequence space is exhausted", None))
+            })?;
+        self.last_event_sequence = Some(sequence);
+        let base_revision = self
+            .tree
+            .as_ref()
+            .expect("mounted applications retain a tree")
+            .revision();
+        let event = HostEvent::ScheduleElapsed {
+            sequence,
+            schedule: delivery.schedule_id,
+            generation: delivery.generation,
+            reason: delivery.reason,
+        };
+        let result = self.handle_inner(event, Some(delivery), base_revision);
+        result.map(Some)
+    }
+
+    fn handle_inner(
         &mut self,
-        node: youth_tree::NodeId,
-        sequence: u64,
+        event: HostEvent,
+        delivery: Option<youth_state::PendingDelivery>,
         base_revision: u64,
     ) -> Result<TurnReceipt, RuntimeError> {
+        let sequence = event.sequence();
         let turn_id = Some(sequence);
         self.prepare_call(self.limits.handle, "handle", turn_id)?;
         let mut staged_tree = self
@@ -848,7 +907,7 @@ impl YouthApp {
                 self.context("event batch exceeds the configured limit", turn_id),
             ));
         }
-        let events = [(sequence, node.get())];
+        let events = [event];
         self.begin_state(youth_state::GuestCallPhase::Handle, turn_id)?;
 
         let started = std::time::Instant::now();
@@ -868,7 +927,9 @@ impl YouthApp {
             Ok(batch) => batch,
             Err(error) => {
                 let writes = self.store.data().state.metrics().writes;
-                let recoverable = error.code == GuestErrorCode::RejectedEvent && writes == 0;
+                let recoverable = delivery.is_none()
+                    && error.code == GuestErrorCode::RejectedEvent
+                    && writes == 0;
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
@@ -954,6 +1015,22 @@ impl YouthApp {
         }
 
         let state_writes = self.store.data().state.metrics().writes;
+        if let Some(delivery) = delivery
+            && let Err(source) = self
+                .store
+                .data_mut()
+                .state
+                .acknowledge_pending_delivery(delivery)
+        {
+            let error = RuntimeError::StateUnavailable(
+                self.context(
+                    "pending schedule delivery could not be acknowledged in its turn",
+                    turn_id,
+                )
+                .with_source(source),
+            );
+            return Err(self.rollback_and_fault(error));
+        }
         if let Err(source) = self.store.data_mut().state.commit() {
             self.store.data_mut().discard_staged_schedule_outputs();
             self.record_state_metrics("commit_failed");

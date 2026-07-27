@@ -42,6 +42,28 @@ pub(crate) enum ApplicationBindings {
     V004(v004::Application),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostEvent {
+    Activate {
+        sequence: u64,
+        node: u64,
+    },
+    ScheduleElapsed {
+        sequence: u64,
+        schedule: u64,
+        generation: u64,
+        reason: youth_state::ElapsedReason,
+    },
+}
+
+impl HostEvent {
+    pub(crate) const fn sequence(self) -> u64 {
+        match self {
+            Self::Activate { sequence, .. } | Self::ScheduleElapsed { sequence, .. } => sequence,
+        }
+    }
+}
+
 impl ApplicationBindings {
     pub(crate) const fn version(&self) -> ProtocolVersion {
         match self {
@@ -93,19 +115,14 @@ impl ApplicationBindings {
         &self,
         store: &mut wasmtime::Store<crate::host::HostState>,
         revision: u64,
-        events: &[(u64, u64)],
+        events: &[HostEvent],
     ) -> wasmtime::Result<Result<RawPatchBatch, GuestError>> {
         match self {
             Self::V002(bindings) => {
+                let events = activation_events_v002(events)?;
                 let events = v002::youth::app::ui::EventBatch {
                     tree_revision: revision,
-                    events: events
-                        .iter()
-                        .map(|(sequence, node)| v002::youth::app::ui::Event {
-                            sequence: *sequence,
-                            kind: v002::youth::app::ui::EventKind::Activate(*node),
-                        })
-                        .collect(),
+                    events,
                 };
                 bindings
                     .youth_app_lifecycle()
@@ -117,15 +134,10 @@ impl ApplicationBindings {
                     })
             }
             Self::V003(bindings) => {
+                let events = activation_events_v003(events)?;
                 let events = v003::youth::app::ui::EventBatch {
                     tree_revision: revision,
-                    events: events
-                        .iter()
-                        .map(|(sequence, node)| v003::youth::app::ui::Event {
-                            sequence: *sequence,
-                            kind: v003::youth::app::ui::EventKind::Activate(*node),
-                        })
-                        .collect(),
+                    events,
                 };
                 bindings
                     .youth_app_lifecycle()
@@ -141,9 +153,32 @@ impl ApplicationBindings {
                     tree_revision: revision,
                     events: events
                         .iter()
-                        .map(|(sequence, node)| v004::youth::app::ui::Event {
-                            sequence: *sequence,
-                            kind: v004::youth::app::ui::EventKind::Activate(*node),
+                        .map(|event| v004::youth::app::ui::Event {
+                            sequence: event.sequence(),
+                            kind: match *event {
+                                HostEvent::Activate { node, .. } => {
+                                    v004::youth::app::ui::EventKind::Activate(node)
+                                }
+                                HostEvent::ScheduleElapsed {
+                                    schedule,
+                                    generation,
+                                    reason,
+                                    ..
+                                } => v004::youth::app::ui::EventKind::ScheduleElapsed(
+                                    v004::youth::app::ui::ElapsedSchedule {
+                                        id: schedule,
+                                        generation,
+                                        reason: match reason {
+                                            youth_state::ElapsedReason::Deadline => {
+                                                v004::youth::app::ui::ElapsedReason::Deadline
+                                            }
+                                            youth_state::ElapsedReason::RecoveredOverdue => {
+                                                v004::youth::app::ui::ElapsedReason::RecoveredOverdue
+                                            }
+                                        },
+                                    },
+                                ),
+                            },
                         })
                         .collect(),
                 };
@@ -196,6 +231,40 @@ impl ApplicationBindings {
             }
         }
     }
+}
+
+fn activation_events_v002(
+    events: &[HostEvent],
+) -> wasmtime::Result<Vec<v002::youth::app::ui::Event>> {
+    events
+        .iter()
+        .map(|event| match *event {
+            HostEvent::Activate { sequence, node } => Ok(v002::youth::app::ui::Event {
+                sequence,
+                kind: v002::youth::app::ui::EventKind::Activate(node),
+            }),
+            HostEvent::ScheduleElapsed { .. } => Err(wasmtime::Error::msg(
+                "protocol 0.0.2 cannot represent schedule-elapsed events",
+            )),
+        })
+        .collect()
+}
+
+fn activation_events_v003(
+    events: &[HostEvent],
+) -> wasmtime::Result<Vec<v003::youth::app::ui::Event>> {
+    events
+        .iter()
+        .map(|event| match *event {
+            HostEvent::Activate { sequence, node } => Ok(v003::youth::app::ui::Event {
+                sequence,
+                kind: v003::youth::app::ui::EventKind::Activate(node),
+            }),
+            HostEvent::ScheduleElapsed { .. } => Err(wasmtime::Error::msg(
+                "protocol 0.0.3 cannot represent schedule-elapsed events",
+            )),
+        })
+        .collect()
 }
 
 pub(crate) enum RawTreeSnapshot {

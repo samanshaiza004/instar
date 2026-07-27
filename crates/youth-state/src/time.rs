@@ -220,7 +220,7 @@ pub fn execute_wake_outputs(driver: &dyn WakeDriver, outputs: &[crate::Scheduler
             crate::SchedulerOutput::ArmWake { token, delay } => driver.arm(*token, *delay),
             crate::SchedulerOutput::CancelWake(token) => driver.cancel(*token),
             crate::SchedulerOutput::PersistMutation(_)
-            | crate::SchedulerOutput::QueueElapsedDelivery(_)
+            | crate::SchedulerOutput::QueueElapsedDelivery { .. }
             | crate::SchedulerOutput::DiscardStaleWake(_) => {}
         }
     }

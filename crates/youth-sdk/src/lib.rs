@@ -452,21 +452,113 @@ impl Tree {
     }
 }
 
+pub type NodeId = u64;
+pub type ScheduleId = u64;
+pub type Generation = u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElapsedReason {
+    Deadline,
+    RecoveredOverdue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    Activated(NodeId),
+    ScheduleElapsed {
+        schedule: ScheduleId,
+        generation: Generation,
+        reason: ElapsedReason,
+    },
+}
+
+#[cfg(any(test, all(target_os = "wasi", target_env = "p2")))]
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IncomingEvent {
+    Activated(NodeId),
+    ScheduleElapsed {
+        schedule: ScheduleId,
+        generation: Generation,
+        reason: ElapsedReason,
+    },
+    #[cfg(test)]
+    Unsupported,
+}
+
+#[cfg(any(test, all(target_os = "wasi", target_env = "p2")))]
+pub(crate) fn decode_incoming_events(
+    incoming: impl IntoIterator<Item = IncomingEvent>,
+) -> Result<Vec<Event>> {
+    incoming
+        .into_iter()
+        .map(|event| match event {
+            IncomingEvent::Activated(id) if id != 0 => Ok(Event::Activated(id)),
+            IncomingEvent::Activated(_) => {
+                Err(Error::invalid_state().with_message("event contains an invalid node ID"))
+            }
+            IncomingEvent::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            } if schedule != 0 && generation != 0 => Ok(Event::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            }),
+            IncomingEvent::ScheduleElapsed { .. } => {
+                Err(Error::invalid_state()
+                    .with_message("event contains an invalid schedule identity"))
+            }
+            #[cfg(test)]
+            IncomingEvent::Unsupported => {
+                Err(Error::invalid_state().with_message("event kind is not supported by this SDK"))
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Events {
-    activated: Vec<u64>,
+    events: Vec<Event>,
     commanded: Vec<u64>,
 }
 
 impl Events {
     #[must_use]
     pub fn activated(&self, key: NodeKey) -> bool {
-        self.activated.contains(&key.id())
+        self.events
+            .iter()
+            .any(|event| matches!(event, Event::Activated(id) if *id == key.id()))
     }
 
     #[must_use]
     pub fn commanded(&self, key: CommandKey) -> bool {
         self.commanded.contains(&key.id())
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Event> {
+        self.events.iter()
+    }
+
+    pub fn elapsed(&self) -> impl Iterator<Item = (ScheduleId, Generation, ElapsedReason)> + '_ {
+        self.events.iter().filter_map(|event| match event {
+            Event::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            } => Some((*schedule, *generation, *reason)),
+            Event::Activated(_) => None,
+        })
+    }
+}
+
+impl<'a> IntoIterator for &'a Events {
+    type Item = &'a Event;
+    type IntoIter = std::slice::Iter<'a, Event>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.iter()
     }
 }
 
@@ -1094,9 +1186,10 @@ mod time {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandKey, Element, Error, ErrorKind, EventContext,
-        Events, Grid, NodeKey, Notification, Result, Row, Schedule, ScheduleOptions, Shortcut,
-        Text, TextAlign, TimeScheduler, Tree, Update, ViewContext, command, node,
+        Application, BoxNode, Button, Column, CommandKey, ElapsedReason, Element, Error, ErrorKind,
+        Event, EventContext, Events, Generation, Grid, NodeId, NodeKey, Notification, Result, Row,
+        Schedule, ScheduleId, ScheduleOptions, Shortcut, Text, TextAlign, TimeScheduler, Tree,
+        Update, ViewContext, command, node,
     };
 }
 
@@ -1253,5 +1346,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unsupported_event_does_not_invoke_application_or_advance_acknowledgement() {
+        let mut application_invoked = false;
+        let mut processed_through = 0;
+        let decoded = decode_incoming_events([IncomingEvent::Unsupported]);
+        if decoded.is_ok() {
+            application_invoked = true;
+            processed_through = 9;
+        }
+        assert!(decoded.is_err());
+        assert!(!application_invoked);
+        assert_eq!(processed_through, 0);
     }
 }

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::{ScheduleRecord, ScheduleStatus};
+use crate::{ElapsedReason, ScheduleRecord, ScheduleStatus};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WakeToken {
@@ -72,9 +72,15 @@ pub enum SchedulerInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchedulerOutput {
     PersistMutation(ScheduleRecord),
-    ArmWake { token: WakeToken, delay: Duration },
+    ArmWake {
+        token: WakeToken,
+        delay: Duration,
+    },
     CancelWake(WakeToken),
-    QueueElapsedDelivery(WakeToken),
+    QueueElapsedDelivery {
+        token: WakeToken,
+        reason: ElapsedReason,
+    },
     DiscardStaleWake(WakeToken),
 }
 
@@ -84,7 +90,7 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
         SchedulerInput::Create {
             record,
             now_epoch_millis,
-        } => arm_or_queue(record, now_epoch_millis, false),
+        } => arm_or_queue(record, now_epoch_millis, false, ElapsedReason::Deadline),
         SchedulerInput::Pause { previous, paused } => vec![
             SchedulerOutput::PersistMutation(paused),
             SchedulerOutput::CancelWake(WakeToken::from(&previous)),
@@ -95,7 +101,12 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
             now_epoch_millis,
         } => {
             let mut outputs = vec![SchedulerOutput::CancelWake(WakeToken::from(&previous))];
-            outputs.extend(arm_or_queue(resumed, now_epoch_millis, false));
+            outputs.extend(arm_or_queue(
+                resumed,
+                now_epoch_millis,
+                false,
+                ElapsedReason::Deadline,
+            ));
             outputs
         }
         SchedulerInput::Cancel {
@@ -117,12 +128,22 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
             record,
             now_epoch_millis,
             delivery_pending,
-        }
-        | SchedulerInput::ProcessOpened {
+        } => arm_or_queue(
             record,
             now_epoch_millis,
             delivery_pending,
-        } => arm_or_queue(record, now_epoch_millis, delivery_pending),
+            ElapsedReason::Deadline,
+        ),
+        SchedulerInput::ProcessOpened {
+            record,
+            now_epoch_millis,
+            delivery_pending,
+        } => arm_or_queue(
+            record,
+            now_epoch_millis,
+            delivery_pending,
+            ElapsedReason::RecoveredOverdue,
+        ),
         SchedulerInput::WakeReceived {
             token,
             authoritative,
@@ -141,7 +162,7 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
             {
                 vec![SchedulerOutput::DiscardStaleWake(token)]
             } else {
-                due_outputs(record)
+                due_outputs(record, ElapsedReason::Deadline)
             }
         }
     }
@@ -151,6 +172,7 @@ fn arm_or_queue(
     record: ScheduleRecord,
     now_epoch_millis: u64,
     delivery_pending: bool,
+    reason: ElapsedReason,
 ) -> Vec<SchedulerOutput> {
     if record.status != ScheduleStatus::Running {
         return Vec::new();
@@ -162,7 +184,7 @@ fn arm_or_queue(
         if delivery_pending {
             Vec::new()
         } else {
-            due_outputs(record)
+            due_outputs(record, reason)
         }
     } else {
         vec![SchedulerOutput::ArmWake {
@@ -172,13 +194,13 @@ fn arm_or_queue(
     }
 }
 
-fn due_outputs(mut record: ScheduleRecord) -> Vec<SchedulerOutput> {
+fn due_outputs(mut record: ScheduleRecord, reason: ElapsedReason) -> Vec<SchedulerOutput> {
     let token = WakeToken::from(&record);
     record.status = ScheduleStatus::Due;
     vec![
         SchedulerOutput::PersistMutation(record),
         SchedulerOutput::CancelWake(token),
-        SchedulerOutput::QueueElapsedDelivery(token),
+        SchedulerOutput::QueueElapsedDelivery { token, reason },
     ]
 }
 
@@ -197,6 +219,7 @@ mod tests {
             duration_millis: deadline_millis - 100,
             remaining_millis: None,
             notification: None,
+            required_protocol: crate::DeliveryProtocol::V004,
         }
     }
 
@@ -246,7 +269,7 @@ mod tests {
         assert_eq!(
             outputs
                 .iter()
-                .filter(|output| matches!(output, SchedulerOutput::QueueElapsedDelivery(_)))
+                .filter(|output| { matches!(output, SchedulerOutput::QueueElapsedDelivery { .. }) })
                 .count(),
             1
         );

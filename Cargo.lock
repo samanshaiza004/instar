@@ -4358,6 +4358,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-elapsed-invalid-patch"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-elapsed-trap"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-infinite-loop"
 version = "0.0.2"
 dependencies = [
@@ -4477,6 +4491,13 @@ name = "youth-sdk"
 version = "0.0.2"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "youth-sdk-elapsed"
+version = "0.0.2"
+dependencies = [
+ "youth-sdk",
 ]
 
 [[package]]
