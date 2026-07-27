@@ -33,6 +33,12 @@ pub struct ContractProfile {
     pub protocol: &'static str,
     pub wit_sha256: &'static str,
     pub template_version: u32,
+    /// The SDK revision this contract was released against. This travels
+    /// with the profile rather than being a single global constant: an
+    /// application pinned to an earlier released contract must keep
+    /// validating after the CLI moves on, exactly as it must for the
+    /// protocol and WIT hash.
+    pub sdk_revision: &'static str,
 }
 
 pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
@@ -40,11 +46,13 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         protocol: "0.0.3",
         wit_sha256: "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928",
         template_version: 2,
+        sdk_revision: "8696bd97ebc4f1d34b9f632e5992dd1882b724de",
     },
     ContractProfile {
         protocol: "0.0.4",
         wit_sha256: "7eac97f41fc43c09059738fc05a2eb8e9fcc9f09d782d3605f5bc9553ff45fc3",
         template_version: 3,
+        sdk_revision: SDK_REVISION,
     },
 ];
 
@@ -223,14 +231,18 @@ fn validate_lock(manifest: &Manifest, lock: &Lock) -> Result<(), ProjectError> {
     if lock.protocol != profile.protocol
         || lock.wit_sha256 != profile.wit_sha256
         || lock.template_version != profile.template_version
+        || lock.sdk_revision != profile.sdk_revision
     {
         return Err(ProjectError::Contract(format!(
-            "lock contract fields do not match the {:?} profile: expected protocol {:?}, wit-sha256 {:?}, and template-version {}; profile fields cannot be mixed",
-            profile.protocol, profile.protocol, profile.wit_sha256, profile.template_version,
+            "lock contract fields do not match the {:?} profile: expected protocol {:?}, wit-sha256 {:?}, template-version {}, and sdk-revision {:?}; profile fields cannot be mixed",
+            profile.protocol,
+            profile.protocol,
+            profile.wit_sha256,
+            profile.template_version,
+            profile.sdk_revision,
         )));
     }
     compare("sdk-source", &lock.sdk_source, SDK_SOURCE)?;
-    compare("sdk-revision", &lock.sdk_revision, SDK_REVISION)?;
     compare("cli-version", &lock.cli_version, CLI_VERSION)?;
     if !is_lower_hex(&lock.sdk_revision, 40) {
         return Err(ProjectError::Contract(
@@ -445,6 +457,7 @@ mod tests {
         } else {
             WIT_V004
         };
+        let revision = profile.sdk_revision;
         fs::write(root.join("wit/youth/app.wit"), wit).expect("WIT fixture");
         fs::write(
             root.join(MANIFEST_NAME),
@@ -472,7 +485,7 @@ state = ".youth/state"
                 r#"lock-version = 1
 protocol = "{}"
 sdk-source = "{SDK_SOURCE}"
-sdk-revision = "{SDK_REVISION}"
+sdk-revision = "{revision}"
 wit-sha256 = "{}"
 cli-version = "{CLI_VERSION}"
 template-version = {}
@@ -489,7 +502,7 @@ name = "tally"
 version = "0.0.1"
 
 [dependencies]
-youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{SDK_REVISION}" }}
+youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{revision}" }}
 "#
             ),
         )
@@ -502,7 +515,7 @@ youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{SDK_REVISION}" }}
 [[package]]
 name = "youth-sdk"
 version = "0.0.1"
-source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
+source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
 "#
             ),
         )
