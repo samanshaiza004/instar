@@ -635,6 +635,55 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
         assert!(error.to_string().contains("profile fields cannot be mixed"));
     }
 
+    /// The regression this closes: `sdk_revision` was once a single global
+    /// constant compared independently of `SUPPORTED_PROFILES`, so a lock
+    /// could carry a stale revision under an otherwise-current profile and
+    /// pass. Every field in `ContractProfile` must be validated as one
+    /// tuple, not four independent equalities — this is the case that
+    /// distinguishes the two: only `sdk-revision` disagrees.
+    #[test]
+    fn rejects_a_lock_with_an_sdk_revision_from_a_different_profile() {
+        for (fixture_profile, foreign_revision) in [
+            (SUPPORTED_PROFILES[0], SUPPORTED_PROFILES[1].sdk_revision),
+            (SUPPORTED_PROFILES[1], SUPPORTED_PROFILES[0].sdk_revision),
+        ] {
+            let fixture = fixture(fixture_profile);
+            let lock_path = fixture.path().join(LOCK_NAME);
+            let lock = fs::read_to_string(&lock_path).expect("lock");
+            let mixed = lock.replace(
+                &format!("sdk-revision = \"{}\"", fixture_profile.sdk_revision),
+                &format!("sdk-revision = \"{foreign_revision}\""),
+            );
+            assert_ne!(mixed, lock, "sdk-revision line must have been rewritten");
+            fs::write(&lock_path, mixed).expect("mixed lock");
+            let error = Project::load(fixture.path()).expect_err(&format!(
+                "protocol {:?} with a foreign sdk-revision must fail",
+                fixture_profile.protocol
+            ));
+            assert!(
+                error.to_string().contains("profile fields cannot be mixed"),
+                "protocol {:?}: unexpected error {error}",
+                fixture_profile.protocol
+            );
+        }
+    }
+
+    /// Every published profile's full tuple round-trips, and no two
+    /// profiles accidentally share a field that would let one profile's
+    /// lock validate against another's expectations.
+    #[test]
+    fn published_profiles_have_pairwise_distinct_sdk_revisions() {
+        for (index, profile) in SUPPORTED_PROFILES.iter().enumerate() {
+            for other in &SUPPORTED_PROFILES[index + 1..] {
+                assert_ne!(
+                    profile.sdk_revision, other.sdk_revision,
+                    "profiles {:?} and {:?} must not share an SDK revision",
+                    profile.protocol, other.protocol
+                );
+            }
+        }
+    }
+
     #[test]
     fn v004_profile_hash_matches_the_canonical_tree() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.4");
