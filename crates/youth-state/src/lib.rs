@@ -8,11 +8,18 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+mod scheduler;
 mod store;
+mod time;
 
+pub use scheduler::{SchedulerInput, SchedulerOutput, WakeToken, transition};
 pub use store::{
-    GuestCallPhase, ScheduleRecord, ScheduleStatus, StateError, StateStore, TurnStateMetrics,
-    Usage, Verification, repair_usage, verify_file,
+    GuestCallPhase, PendingDelivery, ScheduleRecord, ScheduleStatus, StateError, StateStore,
+    TurnStateMetrics, Usage, Verification, repair_usage, verify_file,
+};
+pub use time::{
+    DeadlineClock, SystemDeadlineClock, SystemWakeDriver, VirtualDeadlineClock, VirtualWakeDriver,
+    WakeDriver, execute_wake_outputs,
 };
 
 /// Stable application identity used to select durable state.

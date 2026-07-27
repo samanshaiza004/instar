@@ -2,9 +2,16 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use common::{counter_component, test_component};
 use tempfile::tempdir;
-use youth_runtime::{AppId, AppLifecycle, RuntimeLimits, StateLocation, YouthApp, YouthAppConfig};
+use youth_runtime::{
+    AppId, AppLifecycle, RuntimeLimits, RuntimeTimeSeams, ScheduleWake, StateLocation,
+    VirtualDeadlineClock, VirtualGuestMonotonicClock, VirtualWakeDriver, WakeDisposition, YouthApp,
+    YouthAppConfig,
+};
 use youth_state::{GuestCallPhase, StateLimits, StateStore};
 use youth_tree::{NodeData, NodeId};
 
@@ -114,4 +121,80 @@ fn sdk_time_schedule_survives_a_real_runtime_restart_and_is_hidden_from_state_ge
     store.begin(GuestCallPhase::Resync).unwrap();
     assert_eq!(store.get("__schedule_storage_probe").unwrap(), None);
     store.rollback().unwrap();
+}
+
+#[test]
+fn runtime_open_arms_future_schedules_without_invoking_the_guest() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let mut store = StateStore::open(
+        StateLocation::File(database.clone()),
+        StateLimits::default(),
+    )
+    .unwrap();
+    store.begin(GuestCallPhase::Handle).unwrap();
+    let created = store.schedule_create(1_000, 500, None).unwrap();
+    store.commit().unwrap();
+    drop(store);
+
+    let deadline = VirtualDeadlineClock::new(1_000);
+    let wakes = VirtualWakeDriver::default();
+    let mut config = sdk_time_config(&database);
+    config.limits.time = RuntimeTimeSeams {
+        deadline_clock: Arc::new(deadline.clone()),
+        wake_driver: Arc::new(wakes.clone()),
+        guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
+    };
+    let mut app = YouthApp::load_config(config).expect("runtime opens without mounting the guest");
+    assert_eq!(
+        wakes.armed(),
+        vec![(
+            youth_runtime::WakeToken::from(&created),
+            Duration::from_millis(500)
+        )]
+    );
+    assert_eq!(wakes.arm_count(), 1);
+    assert_eq!(app.lifecycle(), AppLifecycle::Loaded);
+    assert!(app.tree().is_none());
+
+    let wrong_app = ScheduleWake {
+        application_id: AppId::parse("dev.youth.someone-else").unwrap(),
+        token: youth_runtime::WakeToken::from(&created),
+    };
+    assert_eq!(
+        app.receive_schedule_wake(&wrong_app).unwrap(),
+        WakeDisposition::Discarded
+    );
+    deadline.advance(Duration::from_millis(500));
+    wakes.advance(Duration::from_millis(500));
+    let wake = ScheduleWake {
+        application_id: AppId::parse("dev.youth.time").unwrap(),
+        token: wakes.take_received().pop().unwrap(),
+    };
+    assert_eq!(
+        app.receive_schedule_wake(&wake).unwrap(),
+        WakeDisposition::DeliveryQueued
+    );
+    assert_eq!(app.pending_deliveries().unwrap().len(), 1);
+    assert_eq!(app.lifecycle(), AppLifecycle::Loaded);
+    assert!(app.tree().is_none());
+}
+
+#[test]
+fn guest_instant_now_uses_only_the_injected_monotonic_clock() {
+    let guest_clock = VirtualGuestMonotonicClock::new(5_000_000_000).with_step(42_000_000);
+    let mut config = YouthAppConfig::ephemeral(test_component("youth-instant-now"));
+    config.limits.time = RuntimeTimeSeams {
+        deadline_clock: Arc::new(VirtualDeadlineClock::new(0)),
+        wake_driver: Arc::new(VirtualWakeDriver::default()),
+        guest_monotonic_clock: Arc::new(guest_clock),
+    };
+    let mut app = YouthApp::load_config(config).expect("instant fixture loads");
+    let snapshot = app.mount().expect("instant fixture mounts");
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .any(|node| { matches!(&node.data, NodeData::Text { value } if value == "42000000") })
+    );
 }

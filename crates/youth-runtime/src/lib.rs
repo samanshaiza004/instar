@@ -16,10 +16,16 @@ mod profile;
 mod wire;
 mod worker;
 
-pub use config::{AppId, StateLocation, YouthAppConfig};
+pub use config::{
+    AppId, GuestMonotonicClock, RuntimeTimeSeams, StateLocation, SystemGuestMonotonicClock,
+    VirtualGuestMonotonicClock, YouthAppConfig,
+};
 pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
-pub use host::{AppFault, AppInspection, AppLifecycle, TurnReceipt, YouthApp, component_imports};
+pub use host::{
+    AppFault, AppInspection, AppLifecycle, ScheduleWake, TurnReceipt, WakeDisposition, YouthApp,
+    component_imports,
+};
 pub use limits::{CallBudget, RuntimeLimits};
 pub use profile::{
     APPLICATION_PROTOCOL, APPLICATION_WORLD, ComponentValidation, ComponentValidationError,
@@ -27,7 +33,11 @@ pub use profile::{
     validate_component,
 };
 pub use worker::YouthAppHandle;
-pub use youth_state::{GuestCallPhase, StateLimits, StateSummary, StateValue, TurnStateMetrics};
+pub use youth_state::{
+    DeadlineClock, GuestCallPhase, PendingDelivery, SchedulerInput, SchedulerOutput, StateLimits,
+    StateSummary, StateValue, SystemDeadlineClock, SystemWakeDriver, TurnStateMetrics,
+    VirtualDeadlineClock, VirtualWakeDriver, WakeDriver, WakeToken,
+};
 // Public because they are the associated `Error` type of the fallible
 // wire conversions into `youth_tree` values (spec section 7).
 pub use wire::from_guest::{WireError, WireErrorKind};

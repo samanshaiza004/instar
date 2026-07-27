@@ -2,10 +2,12 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracing::info_span;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
+use wasmtime_wasi::clocks::HostMonotonicClock;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bindings::{ApplicationBindings, GuestError, GuestErrorCode, ProtocolVersion};
@@ -56,6 +58,18 @@ pub struct TurnReceipt {
 pub struct AppFault {
     pub category: RuntimeErrorCategory,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleWake {
+    pub application_id: youth_state::AppId,
+    pub token: youth_state::WakeToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WakeDisposition {
+    DeliveryQueued,
+    Discarded,
 }
 
 /// A synchronous snapshot of host-owned application state.
@@ -114,6 +128,21 @@ pub(crate) struct HostState {
     wasi: WasiCtx,
     limiter: MemoryLimiter,
     state: youth_state::StateStore,
+    deadline_clock: Arc<dyn youth_state::DeadlineClock>,
+    wake_driver: Arc<dyn youth_state::WakeDriver>,
+    staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
+}
+
+struct GuestClockAdapter(Arc<dyn crate::GuestMonotonicClock>);
+
+impl HostMonotonicClock for GuestClockAdapter {
+    fn resolution(&self) -> u64 {
+        self.0.resolution_nanoseconds()
+    }
+
+    fn now(&self) -> u64 {
+        self.0.now_nanoseconds()
+    }
 }
 
 impl WasiView for HostState {
@@ -122,6 +151,17 @@ impl WasiView for HostState {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+impl HostState {
+    fn apply_committed_schedule_outputs(&mut self) {
+        youth_state::execute_wake_outputs(self.wake_driver.as_ref(), &self.staged_schedule_outputs);
+        self.staged_schedule_outputs.clear();
+    }
+
+    fn discard_staged_schedule_outputs(&mut self) {
+        self.staged_schedule_outputs.clear();
     }
 }
 
@@ -404,50 +444,100 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
         crate::bindings::v004::youth::time::scheduler::Schedule,
         crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
     > {
-        let now_epoch_millis = schedule_host_now_epoch_millis()?;
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
         let notification = options
             .notification
             .map(|notification| (notification.title, notification.body));
-        self.state
+        let record = self
+            .state
             .schedule_create(now_epoch_millis, millis, notification)
-            .map(
-                |record| crate::bindings::v004::youth::time::scheduler::Schedule {
-                    id: record.id,
-                    generation: record.generation,
-                },
-            )
-            .map_err(to_wire_schedule_error_v004)
+            .map_err(to_wire_schedule_error_v004)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Create {
+                record: record.clone(),
+                now_epoch_millis,
+            },
+        ));
+        Ok(crate::bindings::v004::youth::time::scheduler::Schedule {
+            id: record.id,
+            generation: record.generation,
+        })
     }
 
     fn pause(
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        let now_epoch_millis = schedule_host_now_epoch_millis()?;
-        self.state
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let paused = self
+            .state
             .schedule_pause(now_epoch_millis, value.id, value.generation)
-            .map(|_| ())
-            .map_err(to_wire_schedule_error_v004)
+            .map_err(to_wire_schedule_error_v004)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Pause { previous, paused },
+        ));
+        Ok(())
     }
 
     fn resume(
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        let now_epoch_millis = schedule_host_now_epoch_millis()?;
-        self.state
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let resumed = self
+            .state
             .schedule_resume(now_epoch_millis, value.id, value.generation)
-            .map(|_| ())
-            .map_err(to_wire_schedule_error_v004)
+            .map_err(to_wire_schedule_error_v004)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Resume {
+                previous,
+                resumed,
+                now_epoch_millis,
+            },
+        ));
+        Ok(())
     }
 
     fn cancel(
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
         self.state
             .schedule_cancel(value.id, value.generation)
-            .map_err(to_wire_schedule_error_v004)
+            .map_err(to_wire_schedule_error_v004)?;
+        let cancelled = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Internal)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Cancel {
+                previous,
+                cancelled,
+            },
+        ));
+        Ok(())
     }
 }
 
@@ -477,18 +567,6 @@ fn to_wire_schedule_error_v004(
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
     }
-}
-
-// B-3 replaces this temporary wall-clock read with the injected clock seam.
-fn schedule_host_now_epoch_millis()
--> Result<u64, crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-    use crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode;
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ScheduleErrorCode::Internal)
-        .and_then(|duration| {
-            u64::try_from(duration.as_millis()).map_err(|_| ScheduleErrorCode::Internal)
-        })
 }
 
 /// One synchronous, single-owner Youth component instance.
@@ -597,6 +675,58 @@ impl YouthApp {
                     ),
                     None,
                 ))
+            })
+    }
+
+    /// Revalidates a process-local wake against durable state without
+    /// constructing or invoking a guest turn.
+    pub fn receive_schedule_wake(
+        &mut self,
+        wake: &ScheduleWake,
+    ) -> Result<WakeDisposition, RuntimeError> {
+        if wake.application_id != self.app_id {
+            return Ok(WakeDisposition::Discarded);
+        }
+        let now_epoch_millis = self.store.data().deadline_clock.now_epoch_millis();
+        let outputs = self
+            .store
+            .data_mut()
+            .state
+            .receive_wake(wake.token, now_epoch_millis)
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context(
+                        "schedule wake could not be checked against durable state",
+                        None,
+                    )
+                    .with_source(source),
+                )
+            })?;
+        youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        Ok(
+            if outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    youth_state::SchedulerOutput::QueueElapsedDelivery(_)
+                )
+            }) {
+                WakeDisposition::DeliveryQueued
+            } else {
+                WakeDisposition::Discarded
+            },
+        )
+    }
+
+    pub fn pending_deliveries(&self) -> Result<Vec<youth_state::PendingDelivery>, RuntimeError> {
+        self.store
+            .data()
+            .state
+            .pending_deliveries()
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context("pending schedule deliveries could not be read", None)
+                        .with_source(source),
+                )
             })
     }
 
@@ -742,6 +872,7 @@ impl YouthApp {
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
+                self.store.data_mut().discard_staged_schedule_outputs();
                 self.record_state_metrics("rolled_back");
                 return if recoverable {
                     Err(error)
@@ -824,6 +955,7 @@ impl YouthApp {
 
         let state_writes = self.store.data().state.metrics().writes;
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after patch validation", turn_id)
@@ -831,6 +963,7 @@ impl YouthApp {
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().apply_committed_schedule_outputs();
         self.record_state_metrics("committed");
         self.tree = Some(staged_tree);
         let elapsed = started.elapsed();
@@ -915,6 +1048,7 @@ impl YouthApp {
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
                 let _ = self.store.data_mut().state.rollback();
+                self.store.data_mut().discard_staged_schedule_outputs();
                 self.record_state_metrics("rolled_back");
                 return Err(error);
             }
@@ -963,12 +1097,14 @@ impl YouthApp {
         };
         let snapshot = tree.to_snapshot();
         if let Err(source) = self.store.data_mut().state.rollback() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             let error = RuntimeError::StateUnavailable(
                 self.context("read-only resync transaction could not close", turn_id)
                     .with_source(source),
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().discard_staged_schedule_outputs();
         self.record_state_metrics("read_only");
         self.tree = Some(tree);
         Ok(snapshot)
@@ -1088,6 +1224,7 @@ impl YouthApp {
         };
         let snapshot = tree.to_snapshot();
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after mount validation", turn_id)
@@ -1095,6 +1232,7 @@ impl YouthApp {
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().apply_committed_schedule_outputs();
         self.record_state_metrics("committed");
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
@@ -1158,6 +1296,7 @@ impl YouthApp {
 
     fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
         let _ = self.store.data_mut().state.rollback();
+        self.store.data_mut().discard_staged_schedule_outputs();
         self.record_state_metrics("rolled_back");
         self.enter_fault(error)
     }
@@ -1235,6 +1374,9 @@ fn instantiate(
     state_location: StateLocation,
     limits: RuntimeLimits,
 ) -> Result<YouthApp, RuntimeError> {
+    let deadline_clock = Arc::clone(&limits.time.deadline_clock);
+    let wake_driver = Arc::clone(&limits.time.wake_driver);
+    let guest_monotonic_clock = Arc::clone(&limits.time.guest_monotonic_clock);
     let protocol = detect_protocol(engine, &component).ok_or_else(|| {
         RuntimeError::UnsupportedWorld(ErrorContext::new(
             "component does not export a supported Youth application world",
@@ -1243,7 +1385,7 @@ fn instantiate(
             None,
         ))
     })?;
-    let state_store =
+    let mut state_store =
         youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
             RuntimeError::StateUnavailable(
                 ErrorContext::new(
@@ -1255,15 +1397,34 @@ fn instantiate(
                 .with_source(source),
             )
         })?;
+    let scheduler_outputs = state_store
+        .reconcile_overdue(deadline_clock.now_epoch_millis())
+        .map_err(|source| {
+            RuntimeError::StateUnavailable(
+                ErrorContext::new(
+                    "durable schedules could not be reconciled",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        })?;
+    youth_state::execute_wake_outputs(wake_driver.as_ref(), &scheduler_outputs);
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.monotonic_clock(GuestClockAdapter(guest_monotonic_clock));
     let state = HostState {
         table: ResourceTable::new(),
-        wasi: WasiCtxBuilder::new().build(),
+        wasi: wasi.build(),
         limiter: MemoryLimiter {
             maximum: limits.max_linear_memory,
             max_table_elements: limits.max_table_elements,
             limit_hit: false,
         },
         state: state_store,
+        deadline_clock,
+        wake_driver,
+        staged_schedule_outputs: Vec::new(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);

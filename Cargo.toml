@@ -15,6 +15,7 @@ members = [
     "test-components/sdk-tally",
     "test-components/sdk-time",
     "test-components/time-stub",
+    "test-components/instant-now",
     "test-components/trap-on-mount",
     "test-components/trap-on-handle",
     "test-components/invalid-snapshot",

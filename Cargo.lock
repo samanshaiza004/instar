@@ -4365,6 +4365,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-instant-now"
+version = "0.0.2"
+dependencies = [
+ "youth-sdk",
+]
+
+[[package]]
 name = "youth-interaction"
 version = "0.0.2"
 dependencies = [
