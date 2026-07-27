@@ -16,17 +16,17 @@ use youth_state::AppId;
 pub const MANIFEST_NAME: &str = "Youth.toml";
 pub const LOCK_NAME: &str = "Youth.lock";
 /// Default protocol for newly generated projects.
-pub const SUPPORTED_PROTOCOL: &str = "0.0.3";
+pub const SUPPORTED_PROTOCOL: &str = "0.0.4";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "8696bd97ebc4f1d34b9f632e5992dd1882b724de";
+pub const SDK_REVISION: &str = "59aaf92a5893da900ced6fca22075a90a3ec1c93";
 /// Default template version for newly generated projects.
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// WIT digest used by the default generated-project profile.
 pub const TEMPLATE_WIT_SHA256: &str =
-    "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928";
+    "7eac97f41fc43c09059738fc05a2eb8e9fcc9f09d782d3605f5bc9553ff45fc3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
@@ -595,6 +595,19 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
         for profile in SUPPORTED_PROFILES {
             Project::load(fixture(*profile).path()).expect("supported profile loads");
         }
+    }
+
+    #[test]
+    fn generated_project_defaults_select_the_v004_profile() {
+        let default = contract_profile(SUPPORTED_PROTOCOL).expect("default profile");
+        assert_eq!(default.protocol, "0.0.4");
+        assert_eq!(default.wit_sha256, TEMPLATE_WIT_SHA256);
+        assert_eq!(default.template_version, TEMPLATE_VERSION);
+        assert!(
+            SUPPORTED_PROFILES
+                .iter()
+                .any(|profile| profile.protocol == "0.0.3")
+        );
     }
 
     #[test]

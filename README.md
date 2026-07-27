@@ -53,7 +53,7 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app/` | The `youth:app@0.0.2` and `youth:state@0.0.1` WIT contracts |
+| `wit/youth-app-v0.0.4/`, `wit/youth-app-v0.0.3/`, `wit/youth-app/` | The current `youth:app@0.0.4` WIT contract and supported `0.0.3`/`0.0.2` predecessors |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker |

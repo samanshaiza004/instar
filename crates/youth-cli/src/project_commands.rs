@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use youth_project::{CLI_VERSION, Project, SUPPORTED_PROTOCOL};
+use youth_project::{CLI_VERSION, Project, SUPPORTED_PROTOCOL, TEMPLATE_VERSION};
 use youth_state::AppId;
 
 use crate::CliError;
@@ -38,6 +38,10 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
     (
         "wit/youth/deps/youth-state/store.wit",
         include_str!("../templates/tally/wit/youth/deps/youth-state/store.wit"),
+    ),
+    (
+        "wit/youth/deps/youth-time/scheduler.wit",
+        include_str!("../templates/tally/wit/youth/deps/youth-time/scheduler.wit"),
     ),
 ];
 
@@ -162,7 +166,7 @@ fn display_name(name: &str) -> String {
 pub fn doctor(full: bool) -> Result<(), CliError> {
     let required_rust = embedded_toolchain_channel()?;
     println!("Youth CLI: {CLI_VERSION}");
-    println!("template: 1");
+    println!("template: {TEMPLATE_VERSION}");
     println!("protocol: {SUPPORTED_PROTOCOL}");
     probe_tool(
         "cargo",
@@ -721,6 +725,12 @@ mod tests {
         fs::write(
             root.join("deps/youth-state/store.wit"),
             include_str!("../templates/tally/wit/youth/deps/youth-state/store.wit"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("deps/youth-time")).unwrap();
+        fs::write(
+            root.join("deps/youth-time/scheduler.wit"),
+            include_str!("../templates/tally/wit/youth/deps/youth-time/scheduler.wit"),
         )
         .unwrap();
         assert_eq!(
