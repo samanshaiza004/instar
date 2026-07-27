@@ -20,7 +20,7 @@ pub const SUPPORTED_PROTOCOL: &str = "0.0.4";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "59aaf92a5893da900ced6fca22075a90a3ec1c93";
+pub const SDK_REVISION: &str = "4a0bba175e7eb9643a0348a94a6a3efadbdae0e1";
 /// Default template version for newly generated projects.
 pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
