@@ -200,6 +200,12 @@ fn to_wire_state_error_v002(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
@@ -284,6 +290,12 @@ fn to_wire_state_error_v003(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
@@ -368,6 +380,12 @@ fn to_wire_state_error_v004(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
@@ -377,39 +395,100 @@ fn to_wire_state_error_v004(
     }
 }
 
-// B-2 replaces this stub with durable storage.
 impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
     fn schedule_after(
         &mut self,
-        _millis: u64,
-        _options: crate::bindings::v004::youth::time::scheduler::ScheduleOptions,
+        millis: u64,
+        options: crate::bindings::v004::youth::time::scheduler::ScheduleOptions,
     ) -> Result<
         crate::bindings::v004::youth::time::scheduler::Schedule,
         crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
     > {
-        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+        let now_millis = schedule_host_now_millis()?;
+        let notification = options
+            .notification
+            .map(|notification| (notification.title, notification.body));
+        self.state
+            .schedule_create(now_millis, millis, notification)
+            .map(
+                |record| crate::bindings::v004::youth::time::scheduler::Schedule {
+                    id: record.id,
+                    generation: record.generation,
+                },
+            )
+            .map_err(to_wire_schedule_error_v004)
     }
 
     fn pause(
         &mut self,
-        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+        let now_millis = schedule_host_now_millis()?;
+        self.state
+            .schedule_pause(now_millis, value.id, value.generation)
+            .map(|_| ())
+            .map_err(to_wire_schedule_error_v004)
     }
 
     fn resume(
         &mut self,
-        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+        let now_millis = schedule_host_now_millis()?;
+        self.state
+            .schedule_resume(now_millis, value.id, value.generation)
+            .map(|_| ())
+            .map_err(to_wire_schedule_error_v004)
     }
 
     fn cancel(
         &mut self,
-        _value: crate::bindings::v004::youth::time::scheduler::Schedule,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        Err(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Unavailable)
+        self.state
+            .schedule_cancel(value.id, value.generation)
+            .map_err(to_wire_schedule_error_v004)
     }
+}
+
+fn to_wire_schedule_error_v004(
+    error: youth_state::StateError,
+) -> crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode {
+    use crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode;
+    match error {
+        youth_state::StateError::InvalidScheduleDuration => ScheduleErrorCode::InvalidDuration,
+        youth_state::StateError::TooManySchedules => ScheduleErrorCode::TooManySchedules,
+        youth_state::StateError::UnknownSchedule => ScheduleErrorCode::UnknownSchedule,
+        youth_state::StateError::StaleScheduleGeneration => ScheduleErrorCode::StaleGeneration,
+        youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::InvalidScheduleState => ScheduleErrorCode::InvalidState,
+        youth_state::StateError::ReadOnly
+        | youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ScheduleErrorCode::Unavailable,
+        ref error if error.is_busy() => ScheduleErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidKey
+        | youth_state::StateError::InvalidValue
+        | youth_state::StateError::QuotaExceeded
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
+    }
+}
+
+// B-3 replaces this temporary wall-clock read with the injected clock seam.
+fn schedule_host_now_millis()
+-> Result<u64, crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+    use crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ScheduleErrorCode::Internal)
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis()).map_err(|_| ScheduleErrorCode::Internal)
+        })
 }
 
 /// One synchronous, single-owner Youth component instance.

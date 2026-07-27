@@ -1,4 +1,4 @@
-//! SDK-backed fixture that handles the host's scheduling stub without trapping.
+//! SDK-backed fixture that creates a durable schedule through `EventContext::time`.
 
 #![cfg(all(target_os = "wasi", target_env = "p2"))]
 
@@ -22,14 +22,15 @@ impl Application for TimeApp {
         }
         let options =
             ScheduleOptions::new().notification(Notification::new("Youth timer", "Time elapsed"));
-        match context
+        context
             .time()
             .schedule_after(Duration::from_secs(1), options)
-        {
-            Err(_) => Ok(Update::new().set_text(node!("status"), "unavailable")),
-            Ok(_) => Err(Error::internal()
-                .with_message("the Developer Preview 2 scheduling stub unexpectedly succeeded")),
+            .map_err(|_| Error::internal().with_message("schedule creation failed"))?;
+        if context.state().bytes("__schedule_storage_probe")?.is_some() {
+            return Err(Error::internal()
+                .with_message("schedule storage leaked through the state key-value interface"));
         }
+        Ok(Update::new().set_text(node!("status"), "scheduled"))
     }
 }
 

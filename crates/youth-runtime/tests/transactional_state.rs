@@ -97,6 +97,29 @@ fn every_failure_after_state_write_rolls_back_and_faults() {
     }
 }
 
+#[test]
+fn trap_and_invalid_patch_after_schedule_creation_roll_back_the_schedule() {
+    for node in [5, 6] {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("state.sqlite3");
+        let mut app = YouthApp::load_config(fixture_config("youth-time-stub", &database)).unwrap();
+        app.mount().unwrap();
+        assert!(
+            app.activate(NodeId::new(node).unwrap()).is_err(),
+            "fixture node {node}"
+        );
+        assert_eq!(app.lifecycle(), youth_runtime::AppLifecycle::Faulted);
+        drop(app);
+
+        let store =
+            StateStore::open(StateLocation::File(database), StateLimits::default()).unwrap();
+        assert!(
+            store.schedules().unwrap().is_empty(),
+            "fixture node {node} left a schedule after rollback"
+        );
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn injected_commit_failure_retains_old_state_and_tree() {
