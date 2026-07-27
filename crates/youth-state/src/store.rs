@@ -6,7 +6,7 @@ use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::{
-    SchedulerInput, SchedulerOutput, StateLimits, StateLocation, StateSummary, StateValue,
+    AppId, SchedulerInput, SchedulerOutput, StateLimits, StateLocation, StateSummary, StateValue,
     WakeToken, logical_entry_bytes, transition,
 };
 
@@ -317,6 +317,7 @@ impl From<rusqlite::Error> for StateError {
 }
 
 pub struct StateStore {
+    app_id: AppId,
     connection: Connection,
     location: StateLocation,
     limits: StateLimits,
@@ -340,6 +341,18 @@ impl std::fmt::Debug for StateStore {
 
 impl StateStore {
     pub fn open(location: StateLocation, limits: StateLimits) -> Result<Self, StateError> {
+        Self::open_for_app(
+            location,
+            limits,
+            AppId::parse("dev.youth.state").expect("built-in state application ID is valid"),
+        )
+    }
+
+    pub fn open_for_app(
+        location: StateLocation,
+        limits: StateLimits,
+        app_id: AppId,
+    ) -> Result<Self, StateError> {
         let location_kind = match &location {
             StateLocation::Memory => "memory",
             StateLocation::File(_) => "file",
@@ -363,6 +376,7 @@ impl StateStore {
             require_valid(&verify_connection(&connection)?)?;
         }
         Ok(Self {
+            app_id,
             connection,
             location,
             limits,
@@ -372,6 +386,11 @@ impl StateStore {
             #[cfg(feature = "test-support")]
             fail_next_commit: false,
         })
+    }
+
+    #[must_use]
+    pub fn app_id(&self) -> &AppId {
+        &self.app_id
     }
 
     #[must_use]
@@ -862,10 +881,13 @@ impl StateStore {
         now_epoch_millis: u64,
     ) -> Result<Vec<SchedulerOutput>, StateError> {
         self.require_scheduler_idle()?;
+        if token.app_id != self.app_id {
+            return Ok(vec![SchedulerOutput::DiscardStaleWake(token)]);
+        }
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             let authoritative = read_schedule(&self.connection, token.schedule_id)?;
-            let delivery_pending = pending_delivery_exists(&self.connection, token)?;
+            let delivery_pending = pending_delivery_exists(&self.connection, &token)?;
             let outputs = transition(SchedulerInput::WakeReceived {
                 token,
                 authoritative,
@@ -897,11 +919,12 @@ impl StateStore {
         }
         let mut all_outputs = Vec::new();
         for record in records {
-            let token = WakeToken::from(&record);
+            let token = WakeToken::for_record(self.app_id.clone(), &record);
             let outputs = transition(SchedulerInput::ProcessOpened {
+                app_id: self.app_id.clone(),
                 record,
                 now_epoch_millis,
-                delivery_pending: pending_delivery_exists(&self.connection, token)?,
+                delivery_pending: pending_delivery_exists(&self.connection, &token)?,
             });
             apply_scheduler_outputs(&self.connection, &outputs)?;
             all_outputs.extend(outputs);
@@ -1306,7 +1329,7 @@ const fn elapsed_reason_sql(reason: ElapsedReason) -> i64 {
     }
 }
 
-fn pending_delivery_exists(connection: &Connection, token: WakeToken) -> Result<bool, StateError> {
+fn pending_delivery_exists(connection: &Connection, token: &WakeToken) -> Result<bool, StateError> {
     let count: i64 = connection.query_row(
         "SELECT count(*) FROM youth_pending_delivery
          WHERE schedule_id = ?1 AND generation = ?2",
@@ -1920,12 +1943,12 @@ INSERT INTO youth_usage(id, key_count, logical_bytes) VALUES (1, 0, 0);
         store.begin(GuestCallPhase::Handle).unwrap();
         let created = store.schedule_create(1_000, 100, None).unwrap();
         store.commit().unwrap();
-        let token = WakeToken::from(&created);
+        let token = WakeToken::for_record(store.app_id().clone(), &created);
         assert_eq!(
-            store.receive_wake(token, 1_099).unwrap(),
-            vec![SchedulerOutput::DiscardStaleWake(token)]
+            store.receive_wake(token.clone(), 1_099).unwrap(),
+            vec![SchedulerOutput::DiscardStaleWake(token.clone())]
         );
-        let due = store.receive_wake(token, 1_100).unwrap();
+        let due = store.receive_wake(token.clone(), 1_100).unwrap();
         assert_eq!(
             due.iter()
                 .filter(|output| { matches!(output, SchedulerOutput::QueueElapsedDelivery { .. }) })
@@ -1933,7 +1956,7 @@ INSERT INTO youth_usage(id, key_count, logical_bytes) VALUES (1, 0, 0);
             1
         );
         assert_eq!(
-            store.receive_wake(token, 1_100).unwrap(),
+            store.receive_wake(token.clone(), 1_100).unwrap(),
             vec![SchedulerOutput::DiscardStaleWake(token)]
         );
         assert_eq!(store.pending_deliveries().unwrap().len(), 1);

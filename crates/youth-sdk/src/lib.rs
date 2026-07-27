@@ -780,6 +780,10 @@ impl StateWriter {
         StateReader.bytes(key)
     }
 
+    pub fn schedule(self, key: &str) -> Result<Option<Schedule>> {
+        StateReader.schedule(key)
+    }
+
     pub fn set_boolean(self, key: &str, value: bool) -> Result<()> {
         state::set_boolean(key, value)
     }

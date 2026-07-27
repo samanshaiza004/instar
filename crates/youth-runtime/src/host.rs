@@ -456,6 +456,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .map_err(to_wire_schedule_error_v004)?;
         self.staged_schedule_outputs.extend(youth_state::transition(
             youth_state::SchedulerInput::Create {
+                app_id: self.state.app_id().clone(),
                 record: record.clone(),
                 now_epoch_millis,
             },
@@ -483,7 +484,11 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .schedule_pause(now_epoch_millis, value.id, value.generation)
             .map_err(to_wire_schedule_error_v004)?;
         self.staged_schedule_outputs.extend(youth_state::transition(
-            youth_state::SchedulerInput::Pause { previous, paused },
+            youth_state::SchedulerInput::Pause {
+                app_id: self.state.app_id().clone(),
+                previous,
+                paused,
+            },
         ));
         Ok(())
     }
@@ -506,6 +511,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .map_err(to_wire_schedule_error_v004)?;
         self.staged_schedule_outputs.extend(youth_state::transition(
             youth_state::SchedulerInput::Resume {
+                app_id: self.state.app_id().clone(),
                 previous,
                 resumed,
                 now_epoch_millis,
@@ -535,6 +541,7 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
             .ok_or(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Internal)?;
         self.staged_schedule_outputs.extend(youth_state::transition(
             youth_state::SchedulerInput::Cancel {
+                app_id: self.state.app_id().clone(),
                 previous,
                 cancelled,
             },
@@ -617,10 +624,20 @@ impl YouthApp {
     }
 
     pub fn load_config(config: YouthAppConfig) -> Result<Self, RuntimeError> {
-        Self::load_with_engine(config, crate::shared_engine())
+        Self::load_with_engine(config, crate::shared_engine(), true)
     }
 
-    fn load_with_engine(config: YouthAppConfig, engine: &Engine) -> Result<Self, RuntimeError> {
+    pub(crate) fn load_config_deferred_reconcile(
+        config: YouthAppConfig,
+    ) -> Result<Self, RuntimeError> {
+        Self::load_with_engine(config, crate::shared_engine(), false)
+    }
+
+    fn load_with_engine(
+        config: YouthAppConfig,
+        engine: &Engine,
+        reconcile_on_open: bool,
+    ) -> Result<Self, RuntimeError> {
         let path = config.component_path.as_path();
         let component_id = component_identity(path);
         let load_span = info_span!("component.load", component_id = %component_id);
@@ -650,6 +667,7 @@ impl YouthApp {
                 config.app_id,
                 config.state,
                 config.limits,
+                reconcile_on_open,
             )
         })
     }
@@ -694,7 +712,7 @@ impl YouthApp {
             .store
             .data_mut()
             .state
-            .receive_wake(wake.token, now_epoch_millis)
+            .receive_wake(wake.token.clone(), now_epoch_millis)
             .map_err(|source| {
                 RuntimeError::StateUnavailable(
                     self.context(
@@ -730,6 +748,23 @@ impl YouthApp {
                         .with_source(source),
                 )
             })
+    }
+
+    pub(crate) fn reconcile_schedules(&mut self) -> Result<(), RuntimeError> {
+        let now_epoch_millis = self.store.data().deadline_clock.now_epoch_millis();
+        let outputs = self
+            .store
+            .data_mut()
+            .state
+            .reconcile_overdue(now_epoch_millis)
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context("durable schedules could not be reconciled", None)
+                        .with_source(source),
+                )
+            })?;
+        youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        Ok(())
     }
 
     #[cfg(feature = "test-support")]
@@ -1450,6 +1485,7 @@ fn instantiate(
     app_id: youth_state::AppId,
     state_location: StateLocation,
     limits: RuntimeLimits,
+    reconcile_on_open: bool,
 ) -> Result<YouthApp, RuntimeError> {
     let deadline_clock = Arc::clone(&limits.time.deadline_clock);
     let wake_driver = Arc::clone(&limits.time.wake_driver);
@@ -1463,31 +1499,34 @@ fn instantiate(
         ))
     })?;
     let mut state_store =
-        youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
-            RuntimeError::StateUnavailable(
-                ErrorContext::new(
-                    "application state could not be opened",
-                    &component_id,
-                    AppLifecycle::Loaded,
-                    None,
+        youth_state::StateStore::open_for_app(state_location, limits.state, app_id.clone())
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    ErrorContext::new(
+                        "application state could not be opened",
+                        &component_id,
+                        AppLifecycle::Loaded,
+                        None,
+                    )
+                    .with_source(source),
                 )
-                .with_source(source),
-            )
-        })?;
-    let scheduler_outputs = state_store
-        .reconcile_overdue(deadline_clock.now_epoch_millis())
-        .map_err(|source| {
-            RuntimeError::StateUnavailable(
-                ErrorContext::new(
-                    "durable schedules could not be reconciled",
-                    &component_id,
-                    AppLifecycle::Loaded,
-                    None,
+            })?;
+    if reconcile_on_open {
+        let scheduler_outputs = state_store
+            .reconcile_overdue(deadline_clock.now_epoch_millis())
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    ErrorContext::new(
+                        "durable schedules could not be reconciled",
+                        &component_id,
+                        AppLifecycle::Loaded,
+                        None,
+                    )
+                    .with_source(source),
                 )
-                .with_source(source),
-            )
-        })?;
-    youth_state::execute_wake_outputs(wake_driver.as_ref(), &scheduler_outputs);
+            })?;
+        youth_state::execute_wake_outputs(wake_driver.as_ref(), &scheduler_outputs);
+    }
     let mut wasi = WasiCtxBuilder::new();
     wasi.monotonic_clock(GuestClockAdapter(guest_monotonic_clock));
     let state = HostState {

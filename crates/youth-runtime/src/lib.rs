@@ -32,11 +32,13 @@ pub use profile::{
     PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, SUPPORTED_APPLICATION_PROTOCOLS,
     validate_component,
 };
-pub use worker::YouthAppHandle;
+pub use worker::{
+    Generation, RequestId, RuntimeEvent, ScheduleId, TurnOrigin, TurnOutcome, YouthAppHandle,
+};
 pub use youth_state::{
     DeadlineClock, GuestCallPhase, PendingDelivery, SchedulerInput, SchedulerOutput, StateLimits,
     StateSummary, StateValue, SystemDeadlineClock, SystemWakeDriver, TurnStateMetrics,
-    VirtualDeadlineClock, VirtualWakeDriver, WakeDriver, WakeToken,
+    VirtualDeadlineClock, VirtualWakeDriver, WakeDriver, WakeSink, WakeToken,
 };
 // Public because they are the associated `Error` type of the fallible
 // wire conversions into `youth_tree` values (spec section 7).

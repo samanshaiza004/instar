@@ -89,8 +89,13 @@ fn sdk_time_schedule_survives_a_real_runtime_restart_and_is_hidden_from_state_ge
         let button = snapshot
             .nodes
             .iter()
-            .find(|node| matches!(node.data, NodeData::Button { .. }))
-            .expect("fixture has a button")
+            .find(|node| {
+                matches!(
+                    &node.data,
+                    NodeData::Button { label, .. } if label == "Schedule"
+                )
+            })
+            .expect("fixture has a schedule button")
             .id;
         let receipt = app.activate(button).expect("SDK schedule creation commits");
         assert!(receipt.committed);
@@ -149,7 +154,7 @@ fn runtime_open_arms_future_schedules_without_invoking_the_guest() {
     assert_eq!(
         wakes.armed(),
         vec![(
-            youth_runtime::WakeToken::from(&created),
+            youth_runtime::WakeToken::for_record(AppId::parse("dev.youth.time").unwrap(), &created,),
             Duration::from_millis(500)
         )]
     );
@@ -159,7 +164,10 @@ fn runtime_open_arms_future_schedules_without_invoking_the_guest() {
 
     let wrong_app = ScheduleWake {
         application_id: AppId::parse("dev.youth.someone-else").unwrap(),
-        token: youth_runtime::WakeToken::from(&created),
+        token: youth_runtime::WakeToken::for_record(
+            AppId::parse("dev.youth.time").unwrap(),
+            &created,
+        ),
     };
     assert_eq!(
         app.receive_schedule_wake(&wrong_app).unwrap(),
@@ -167,6 +175,8 @@ fn runtime_open_arms_future_schedules_without_invoking_the_guest() {
     );
     deadline.advance(Duration::from_millis(500));
     wakes.advance(Duration::from_millis(500));
+    let token = wakes.due().pop().expect("the virtual wake is due");
+    assert!(wakes.fire(&token));
     let wake = ScheduleWake {
         application_id: AppId::parse("dev.youth.time").unwrap(),
         token: wakes.take_received().pop().unwrap(),

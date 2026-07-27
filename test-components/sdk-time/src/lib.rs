@@ -13,24 +13,35 @@ impl Application for TimeApp {
         Ok(Tree::root(Column::new([
             Text::new(node!("status"), "ready"),
             Button::new(node!("schedule"), "Schedule"),
+            Button::new(node!("cancel"), "Cancel"),
         ])))
     }
 
     fn handle(context: &mut EventContext, events: &Events) -> Result<Update> {
-        if !events.activated(node!("schedule")) {
-            return Ok(Update::unchanged());
+        if events.activated(node!("cancel")) {
+            let schedule = context
+                .state()
+                .schedule("active-schedule")?
+                .ok_or_else(Error::invalid_state)?;
+            context.time().cancel(schedule)?;
+            return Ok(Update::new().set_text(node!("status"), "cancelled"));
         }
-        let options =
-            ScheduleOptions::new().notification(Notification::new("Youth timer", "Time elapsed"));
-        context
-            .time()
-            .schedule_after(Duration::from_secs(1), options)
-            .map_err(|_| Error::internal().with_message("schedule creation failed"))?;
-        if context.state().bytes("__schedule_storage_probe")?.is_some() {
-            return Err(Error::internal()
-                .with_message("schedule storage leaked through the state key-value interface"));
+        if events.activated(node!("schedule")) {
+            let options = ScheduleOptions::new()
+                .notification(Notification::new("Youth timer", "Time elapsed"));
+            let schedule = context
+                .time()
+                .schedule_after(Duration::from_secs(1), options)
+                .map_err(|_| Error::internal().with_message("schedule creation failed"))?;
+            context.state().set_schedule("active-schedule", schedule)?;
+            if context.state().bytes("__schedule_storage_probe")?.is_some() {
+                return Err(Error::internal().with_message(
+                    "schedule storage leaked through the state key-value interface",
+                ));
+            }
+            return Ok(Update::new().set_text(node!("status"), "scheduled"));
         }
-        Ok(Update::new().set_text(node!("status"), "scheduled"))
+        Ok(Update::unchanged())
     }
 }
 

@@ -20,7 +20,7 @@ pub use store::{
 };
 pub use time::{
     DeadlineClock, SystemDeadlineClock, SystemWakeDriver, VirtualDeadlineClock, VirtualWakeDriver,
-    WakeDriver, execute_wake_outputs,
+    WakeDriver, WakeSink, execute_wake_outputs,
 };
 
 /// Stable application identity used to select durable state.

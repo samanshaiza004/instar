@@ -7,48 +7,62 @@
 
 use std::time::Duration;
 
-use crate::{ElapsedReason, ScheduleRecord, ScheduleStatus};
+use crate::{AppId, ElapsedReason, ScheduleRecord, ScheduleStatus};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WakeToken {
+    pub app_id: AppId,
     pub schedule_id: u64,
     pub generation: u64,
 }
 
-impl From<&ScheduleRecord> for WakeToken {
-    fn from(record: &ScheduleRecord) -> Self {
+impl WakeToken {
+    #[must_use]
+    pub fn new(app_id: AppId, schedule_id: u64, generation: u64) -> Self {
         Self {
-            schedule_id: record.id,
-            generation: record.generation,
+            app_id,
+            schedule_id,
+            generation,
         }
+    }
+
+    #[must_use]
+    pub fn for_record(app_id: AppId, record: &ScheduleRecord) -> Self {
+        Self::new(app_id, record.id, record.generation)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchedulerInput {
     Create {
+        app_id: AppId,
         record: ScheduleRecord,
         now_epoch_millis: u64,
     },
     Pause {
+        app_id: AppId,
         previous: ScheduleRecord,
         paused: ScheduleRecord,
     },
     Resume {
+        app_id: AppId,
         previous: ScheduleRecord,
         resumed: ScheduleRecord,
         now_epoch_millis: u64,
     },
     Cancel {
+        app_id: AppId,
         previous: ScheduleRecord,
         cancelled: ScheduleRecord,
     },
     ClockAdvanced {
+        app_id: AppId,
         record: ScheduleRecord,
         now_epoch_millis: u64,
         delivery_pending: bool,
     },
     ProcessOpened {
+        app_id: AppId,
         record: ScheduleRecord,
         now_epoch_millis: u64,
         delivery_pending: bool,
@@ -60,10 +74,12 @@ pub enum SchedulerInput {
         delivery_pending: bool,
     },
     DeliveryCommitted {
+        app_id: AppId,
         due: ScheduleRecord,
         cancelled: ScheduleRecord,
     },
     DeliveryRejected {
+        app_id: AppId,
         due: ScheduleRecord,
         cancelled: ScheduleRecord,
     },
@@ -88,20 +104,36 @@ pub enum SchedulerOutput {
 pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
     match input {
         SchedulerInput::Create {
+            app_id,
             record,
             now_epoch_millis,
-        } => arm_or_queue(record, now_epoch_millis, false, ElapsedReason::Deadline),
-        SchedulerInput::Pause { previous, paused } => vec![
+        } => arm_or_queue(
+            app_id,
+            record,
+            now_epoch_millis,
+            false,
+            ElapsedReason::Deadline,
+        ),
+        SchedulerInput::Pause {
+            app_id,
+            previous,
+            paused,
+        } => vec![
             SchedulerOutput::PersistMutation(paused),
-            SchedulerOutput::CancelWake(WakeToken::from(&previous)),
+            SchedulerOutput::CancelWake(WakeToken::for_record(app_id, &previous)),
         ],
         SchedulerInput::Resume {
+            app_id,
             previous,
             resumed,
             now_epoch_millis,
         } => {
-            let mut outputs = vec![SchedulerOutput::CancelWake(WakeToken::from(&previous))];
+            let mut outputs = vec![SchedulerOutput::CancelWake(WakeToken::for_record(
+                app_id.clone(),
+                &previous,
+            ))];
             outputs.extend(arm_or_queue(
+                app_id,
                 resumed,
                 now_epoch_millis,
                 false,
@@ -110,35 +142,42 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
             outputs
         }
         SchedulerInput::Cancel {
+            app_id,
             previous,
             cancelled,
         }
         | SchedulerInput::DeliveryCommitted {
+            app_id,
             due: previous,
             cancelled,
         }
         | SchedulerInput::DeliveryRejected {
+            app_id,
             due: previous,
             cancelled,
         } => vec![
             SchedulerOutput::PersistMutation(cancelled),
-            SchedulerOutput::CancelWake(WakeToken::from(&previous)),
+            SchedulerOutput::CancelWake(WakeToken::for_record(app_id, &previous)),
         ],
         SchedulerInput::ClockAdvanced {
+            app_id,
             record,
             now_epoch_millis,
             delivery_pending,
         } => arm_or_queue(
+            app_id,
             record,
             now_epoch_millis,
             delivery_pending,
             ElapsedReason::Deadline,
         ),
         SchedulerInput::ProcessOpened {
+            app_id,
             record,
             now_epoch_millis,
             delivery_pending,
         } => arm_or_queue(
+            app_id,
             record,
             now_epoch_millis,
             delivery_pending,
@@ -154,7 +193,8 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
                 return vec![SchedulerOutput::DiscardStaleWake(token)];
             };
             if record.status != ScheduleStatus::Running
-                || WakeToken::from(&record) != token
+                || record.id != token.schedule_id
+                || record.generation != token.generation
                 || record
                     .deadline_millis
                     .is_none_or(|deadline| deadline > now_epoch_millis)
@@ -162,13 +202,14 @@ pub fn transition(input: SchedulerInput) -> Vec<SchedulerOutput> {
             {
                 vec![SchedulerOutput::DiscardStaleWake(token)]
             } else {
-                due_outputs(record, ElapsedReason::Deadline)
+                due_outputs(token.app_id.clone(), record, ElapsedReason::Deadline)
             }
         }
     }
 }
 
 fn arm_or_queue(
+    app_id: AppId,
     record: ScheduleRecord,
     now_epoch_millis: u64,
     delivery_pending: bool,
@@ -184,22 +225,26 @@ fn arm_or_queue(
         if delivery_pending {
             Vec::new()
         } else {
-            due_outputs(record, reason)
+            due_outputs(app_id, record, reason)
         }
     } else {
         vec![SchedulerOutput::ArmWake {
-            token: WakeToken::from(&record),
+            token: WakeToken::for_record(app_id, &record),
             delay: Duration::from_millis(deadline - now_epoch_millis),
         }]
     }
 }
 
-fn due_outputs(mut record: ScheduleRecord, reason: ElapsedReason) -> Vec<SchedulerOutput> {
-    let token = WakeToken::from(&record);
+fn due_outputs(
+    app_id: AppId,
+    mut record: ScheduleRecord,
+    reason: ElapsedReason,
+) -> Vec<SchedulerOutput> {
+    let token = WakeToken::for_record(app_id, &record);
     record.status = ScheduleStatus::Due;
     vec![
         SchedulerOutput::PersistMutation(record),
-        SchedulerOutput::CancelWake(token),
+        SchedulerOutput::CancelWake(token.clone()),
         SchedulerOutput::QueueElapsedDelivery { token, reason },
     ]
 }
@@ -207,6 +252,14 @@ fn due_outputs(mut record: ScheduleRecord, reason: ElapsedReason) -> Vec<Schedul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_id() -> AppId {
+        AppId::parse("dev.youth.scheduler-test").unwrap()
+    }
+
+    fn token(record: &ScheduleRecord) -> WakeToken {
+        WakeToken::for_record(app_id(), record)
+    }
 
     fn running(deadline_millis: u64) -> ScheduleRecord {
         ScheduleRecord {
@@ -226,6 +279,7 @@ mod tests {
     #[test]
     fn future_schedule_arms_exactly_one_wake() {
         let outputs = transition(SchedulerInput::Create {
+            app_id: app_id(),
             record: running(500),
             now_epoch_millis: 100,
         });
@@ -233,6 +287,7 @@ mod tests {
             outputs,
             vec![SchedulerOutput::ArmWake {
                 token: WakeToken {
+                    app_id: app_id(),
                     schedule_id: 7,
                     generation: 3,
                 },
@@ -244,10 +299,10 @@ mod tests {
     #[test]
     fn early_wake_is_discarded() {
         let record = running(500);
-        let token = WakeToken::from(&record);
+        let token = token(&record);
         assert_eq!(
             transition(SchedulerInput::WakeReceived {
-                token,
+                token: token.clone(),
                 authoritative: Some(record),
                 now_epoch_millis: 499,
                 delivery_pending: false,
@@ -259,7 +314,7 @@ mod tests {
     #[test]
     fn due_wake_queues_exactly_one_delivery() {
         let record = running(500);
-        let token = WakeToken::from(&record);
+        let token = token(&record);
         let outputs = transition(SchedulerInput::WakeReceived {
             token,
             authoritative: Some(record),
@@ -285,10 +340,11 @@ mod tests {
         paused.deadline_millis = None;
         paused.remaining_millis = Some(400);
         let pause_outputs = transition(SchedulerInput::Pause {
+            app_id: app_id(),
             previous: previous.clone(),
             paused: paused.clone(),
         });
-        assert!(pause_outputs.contains(&SchedulerOutput::CancelWake(WakeToken::from(&previous))));
+        assert!(pause_outputs.contains(&SchedulerOutput::CancelWake(token(&previous))));
 
         let mut resumed = paused.clone();
         resumed.generation += 1;
@@ -297,12 +353,13 @@ mod tests {
         resumed.deadline_millis = Some(1_400);
         resumed.remaining_millis = None;
         let resume_outputs = transition(SchedulerInput::Resume {
+            app_id: app_id(),
             previous: paused,
             resumed: resumed.clone(),
             now_epoch_millis: 1_000,
         });
         assert!(resume_outputs.contains(&SchedulerOutput::ArmWake {
-            token: WakeToken::from(&resumed),
+            token: token(&resumed),
             delay: Duration::from_millis(400),
         }));
     }
@@ -310,7 +367,7 @@ mod tests {
     #[test]
     fn cancelled_schedule_rejects_an_old_wake() {
         let running = running(500);
-        let old_token = WakeToken::from(&running);
+        let old_token = token(&running);
         let mut cancelled = running;
         cancelled.generation += 1;
         cancelled.status = ScheduleStatus::Cancelled;
@@ -318,7 +375,7 @@ mod tests {
         cancelled.deadline_millis = None;
         assert_eq!(
             transition(SchedulerInput::WakeReceived {
-                token: old_token,
+                token: old_token.clone(),
                 authoritative: Some(cancelled),
                 now_epoch_millis: 1_000,
                 delivery_pending: false,
