@@ -1,11 +1,32 @@
 # Developer Preview 2 — Durable Scheduling
 
-- Status: Proposed
+- Status: **Gate B complete** (platform capability); Gate C in progress (application adoption)
+- Checkpoint: `timer-gate-b-platform`
 - Application protocol: `youth:app@0.0.4`, with runtime compatibility for `0.0.3` and `0.0.2`
 - Capability protocol: `youth:time@0.0.1`
-- State protocol: `youth:state@0.0.1` (schema version 2)
+- State protocol: `youth:state@0.0.1` (schema version 3)
 - Driving application: [Youth Timer](https://github.com/samanshaiza004/youth-timer)
 - Evidence: `TIMER-F001`, `TIMER-F002`, `TIMER-F003`, `TIMER-F006`, `TIMER-F008`, `TIMER-F011`
+
+## Gate status
+
+| Gate | Content | Status |
+| --- | --- | --- |
+| B-1a | `youth:time@0.0.1` WIT, protocol `0.0.4` beside `0.0.3`/`0.0.2` | Complete (`9e45a91`) |
+| B-1b | SDK `context.time()`, contract-profile table | Complete (`a5f5355`) |
+| B-1c | Generated projects emit `0.0.4` against the published SDK | Complete (`afdd34c`) |
+| B-2 | Durable, transaction-bound schedule storage | Complete (`95c983e`) |
+| B-3 | Deadline / wake / guest-clock seams, pure scheduler, reconciliation | Complete (`6d29a50`) |
+| B-4a | Typed elapsed delivery, acknowledgement inside the turn transaction | Complete (`a924c92`) |
+| B-4b | Host-initiated delivery through one worker mailbox, observers | Complete (`97d7b3b`) |
+| C | Timer adopts the capability and deletes its Gate A substitute | In progress |
+
+Gate B proves the **host capability**. The architectural loop is not closed
+until the external Timer removes its manual `Advance` commands and consumes
+`context.time()`, host-issued schedule identity, pause/resume/cancel,
+autonomous `ScheduleElapsed`, overdue recovery, and host-owned countdown
+presentation. Until then `TIMER-F001`, `F002`, `F003`, `F004`, `F007`, and
+`F008` remain open as *application* evidence.
 
 ## Thesis
 
