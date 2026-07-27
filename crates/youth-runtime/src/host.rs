@@ -404,12 +404,12 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
         crate::bindings::v004::youth::time::scheduler::Schedule,
         crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
     > {
-        let now_millis = schedule_host_now_millis()?;
+        let now_epoch_millis = schedule_host_now_epoch_millis()?;
         let notification = options
             .notification
             .map(|notification| (notification.title, notification.body));
         self.state
-            .schedule_create(now_millis, millis, notification)
+            .schedule_create(now_epoch_millis, millis, notification)
             .map(
                 |record| crate::bindings::v004::youth::time::scheduler::Schedule {
                     id: record.id,
@@ -423,9 +423,9 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        let now_millis = schedule_host_now_millis()?;
+        let now_epoch_millis = schedule_host_now_epoch_millis()?;
         self.state
-            .schedule_pause(now_millis, value.id, value.generation)
+            .schedule_pause(now_epoch_millis, value.id, value.generation)
             .map(|_| ())
             .map_err(to_wire_schedule_error_v004)
     }
@@ -434,9 +434,9 @@ impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
         &mut self,
         value: crate::bindings::v004::youth::time::scheduler::Schedule,
     ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
-        let now_millis = schedule_host_now_millis()?;
+        let now_epoch_millis = schedule_host_now_epoch_millis()?;
         self.state
-            .schedule_resume(now_millis, value.id, value.generation)
+            .schedule_resume(now_epoch_millis, value.id, value.generation)
             .map(|_| ())
             .map_err(to_wire_schedule_error_v004)
     }
@@ -480,7 +480,7 @@ fn to_wire_schedule_error_v004(
 }
 
 // B-3 replaces this temporary wall-clock read with the injected clock seam.
-fn schedule_host_now_millis()
+fn schedule_host_now_epoch_millis()
 -> Result<u64, crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
     use crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode;
     std::time::SystemTime::now()

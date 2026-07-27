@@ -68,24 +68,85 @@ construct one. An application's own session counter (the Timer's
 `completed_sessions`) remains guest-owned domain data and must not be conflated
 with a schedule generation.
 
-### D3 — One clock seam drives both the scheduler and the guest's clock
+### D3 — Three separate time concerns, never one ambiguous "clock"
 
-A `Clock` abstraction (`SystemClock`, `VirtualClock`) is introduced and threaded
-through `YouthAppConfig`, which is constructed in exactly four places.
+"Clock" must not become a single abstraction. There are three distinct roles.
+They may share a source in production, but they stay separate interfaces:
 
-Critically, the same seam must back the **guest's** monotonic clock via
-`WasiCtxBuilder::monotonic_clock(..)`. `wasi:clocks/monotonic-clock` cannot
-simply be removed from the import allowlist — Rust `std` links it
-unconditionally, so every existing component imports it and would fail
-validation. Overriding it is both possible and correct: under a virtual clock,
-a guest calling `Instant::now()` observes virtual time, and headless tests become
-genuinely time-hermetic end to end rather than hermetic only up to the SDK
-boundary.
+```text
+DeadlineClock      Determines when a durable deadline becomes due.
+                   MUST be restart-stable, therefore wall/epoch time.
 
-The Wasmtime **epoch** thread is explicitly *not* reused or virtualized. It
-exists to preempt runaway guests, its 10 ms tick has no wall-clock meaning, and
-virtualizing it would invalidate the containment tests that assert an infinite
-loop dies in bounded real time.
+WakeDriver         Efficiently wakes a live process at a deadline.
+                   Process-local only; monotonic sleeping.
+
+Guest WASI clock   Prevents guest libraries observing uncontrolled real
+                   time. Hermeticity only; never a scheduling input.
+```
+
+```rust
+trait DeadlineClock { fn now_epoch_millis(&self) -> u64; }
+trait WakeDriver {
+    fn arm(&self, token: WakeToken, delay: Duration);
+    fn cancel(&self, token: WakeToken);
+}
+```
+
+**A monotonic clock cannot support overdue reconciliation across a process
+restart.** Monotonic readings are meaningless once the process dies, so a
+persisted deadline must be recorded against a restart-stable basis. Production
+therefore uses wall time for durable reconciliation and monotonic sleeping for
+process-local wake efficiency. The parameter carried into storage is named
+`now_epoch_millis` precisely so a later "clock is clock" substitution cannot
+silently turn every persisted deadline into garbage.
+
+**System-clock rollback policy.** If wall time moves backward, an
+already-armed process-local timer must not be silently extended. While the
+process is alive, waking is driven by monotonic sleeping; wall time is consulted
+only for restart and suspend reconciliation.
+
+**The guest's WASI clock is not the scheduling API.** It is overridden via
+`WasiCtxBuilder::monotonic_clock(..)` purely so a dependency calling
+`Instant::now()` cannot introduce nondeterminism. `wasi:clocks/monotonic-clock`
+cannot be removed from the allowlist — Rust `std` links it unconditionally — so
+overriding is the only available control. Two rules are binding: WASI time is
+not the Youth scheduling API, and a guest calling `Instant::now()` must never be
+able to schedule host delivery or derive a durable host deadline. The scheduler
+depends on `DeadlineClock` directly, never on the guest's WASI clock.
+
+The Wasmtime **epoch** thread is a fourth, separate mechanism and is explicitly
+*not* reused or virtualized. It exists to preempt runaway guests, its 10 ms tick
+has no wall-clock meaning, and virtualizing it would invalidate the containment
+tests that assert an infinite loop dies in bounded real time.
+
+### D3a — The scheduler state machine is pure
+
+The state machine stays independent of threads, Tokio, winit, and Wasmtime, so
+virtual-clock tests can drive every transition exhaustively without sleeping.
+
+```text
+status:  running | paused | due | cancelled
+token:   { schedule_id, generation }
+
+inputs:  create, pause, resume, cancel, clock advanced, process opened,
+         wake received, delivery committed, delivery rejected
+outputs: persist mutation, arm wake, cancel wake, queue elapsed delivery,
+         discard stale wake
+```
+
+**Stale-wake rejection happens before any guest turn is constructed.** A wake
+carries application id, schedule id, and generation. On receipt the authoritative
+schedule is re-read from storage — never trusted from an in-memory map, since a
+pause, resume, or cancel may have committed after the wake was armed — and the
+wake is discarded unless the schedule exists, is running, the generation matches,
+the deadline is due, and no delivery is already pending.
+
+**Overdue reconciliation on startup** loads running schedules ordered by deadline
+then creation sequence, compares each against the `DeadlineClock`, transactionally
+converts overdue ones to due, creates at most one pending delivery per generation,
+arms future schedules with the `WakeDriver`, and leaves paused and cancelled
+schedules unarmed. Reconciliation must be **idempotent**: opening the scheduler
+twice must not produce duplicate deliveries.
 
 ### D4 — The project contract accepts a set of protocols
 

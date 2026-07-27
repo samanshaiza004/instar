@@ -443,7 +443,7 @@ impl StateStore {
 
     pub fn schedule_create(
         &mut self,
-        now_millis: u64,
+        now_epoch_millis: u64,
         duration_millis: u64,
         notification: Option<(String, String)>,
     ) -> Result<ScheduleRecord, StateError> {
@@ -476,11 +476,11 @@ impl StateStore {
             .checked_add(1)
             .ok_or(StateError::Corrupt("schedule ID overflow"))?;
         write_next_schedule_id(&self.connection, next_id)?;
-        let deadline_millis = now_millis
+        let deadline_millis = now_epoch_millis
             .checked_add(duration_millis)
             .ok_or(StateError::InvalidScheduleDuration)?;
         let id_sql = to_sql_u64(id, "invalid schedule ID")?;
-        let now_sql = to_sql_u64(now_millis, "invalid schedule time")?;
+        let now_sql = to_sql_u64(now_epoch_millis, "invalid schedule time")?;
         let deadline_sql = to_sql_u64(deadline_millis, "invalid schedule deadline")?;
         let duration_sql = to_sql_u64(duration_millis, "invalid schedule duration")?;
         let (title, body) = notification.as_ref().map_or((None, None), |(title, body)| {
@@ -499,7 +499,7 @@ impl StateStore {
 
     pub fn schedule_pause(
         &mut self,
-        now_millis: u64,
+        now_epoch_millis: u64,
         id: u64,
         generation: u64,
     ) -> Result<ScheduleRecord, StateError> {
@@ -514,7 +514,7 @@ impl StateStore {
         let deadline = current
             .deadline_millis
             .ok_or(StateError::Corrupt("armed schedule has no deadline"))?;
-        let remaining = deadline.saturating_sub(now_millis);
+        let remaining = deadline.saturating_sub(now_epoch_millis);
         let next_generation = generation
             .checked_add(1)
             .ok_or(StateError::Corrupt("schedule generation overflow"))?;
@@ -535,7 +535,7 @@ impl StateStore {
 
     pub fn schedule_resume(
         &mut self,
-        now_millis: u64,
+        now_epoch_millis: u64,
         id: u64,
         generation: u64,
     ) -> Result<ScheduleRecord, StateError> {
@@ -550,7 +550,7 @@ impl StateStore {
         let remaining = current
             .remaining_millis
             .ok_or(StateError::Corrupt("paused schedule has no remainder"))?;
-        let deadline = now_millis
+        let deadline = now_epoch_millis
             .checked_add(remaining)
             .ok_or(StateError::InvalidScheduleDuration)?;
         let next_generation = generation
@@ -563,7 +563,7 @@ impl StateStore {
              WHERE id = ?4",
             params![
                 to_sql_u64(next_generation, "invalid schedule generation")?,
-                to_sql_u64(now_millis, "invalid schedule time")?,
+                to_sql_u64(now_epoch_millis, "invalid schedule time")?,
                 to_sql_u64(deadline, "invalid schedule deadline")?,
                 to_sql_u64(id, "invalid schedule ID")?
             ],
