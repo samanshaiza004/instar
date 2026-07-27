@@ -160,6 +160,117 @@ newly generated projects, mirroring how the runtime already accepts multiple
 protocols. This is a direct consequence of having a second Utility Suite
 application and should be recorded as such.
 
+### D4a — A host stimulus is not an application command
+
+`AppCommand` has meant "someone requested an operation and expects a result."
+A wake is neither. The worker takes a typed envelope over **one FIFO mailbox**
+fed by both sources, so it stays sequential without competing loops or polling:
+
+```rust
+enum WorkerMessage {
+    Request { command: AppCommand, reply: ReplySender },
+    WakeFired(WakeToken),
+    DeliverPending,
+    Shutdown,
+}
+```
+
+Mailbox order *is* the host-observed order, which is what makes
+cancel-vs-wake races deterministic rather than thread-timing dependent. Both
+orderings are specified and tested: cancel-first makes the later wake stale;
+wake-first makes the schedule due and the later cancel observes due state.
+
+### D4b — A wake is a hint, never proof
+
+`WakeToken { app_id, schedule_id, generation }` carries no authority. Before any
+guest turn is constructed the authoritative record is re-read and **all** must
+hold: the schedule exists; its status is appropriate; the generation matches;
+the deadline is genuinely due; a pending delivery exists or is created exactly
+once; that delivery has not already committed; and the loaded component's
+protocol can represent schedule events (D4d). Otherwise the wake is discarded.
+
+### D4c — The SDK decodes fail-closed
+
+Two cases must not be conflated:
+
+```text
+Recognized event the application ignores
+    -> a successful turn may acknowledge it
+
+Event the SDK cannot represent
+    -> do not invoke the application
+    -> do not advance processed-through
+    -> leave the pending delivery durable
+```
+
+The SDK decodes every incoming event *before* constructing `Events`. An
+unsupported or malformed kind returns a wire/compatibility error. Applications
+see events explicitly rather than through a lossy filter:
+
+```rust
+pub enum Event {
+    Activated(NodeId),
+    ScheduleElapsed { schedule: ScheduleId, generation: Generation, reason: ElapsedReason },
+}
+```
+
+Convenience helpers may exist, but the typed event stays iterable so a delivery
+can never become semantically invisible — the failure mode marked in the B-1b
+adapter, where `processed_through` would acknowledge an event the application
+never received.
+
+### D4d — Schedules record the protocol that owns them
+
+A durable schedule outlives the component that created it, so a downgrade is
+reachable: a `0.0.4` Timer arms a schedule, the user later launches an older
+component against the same app id and state root, and the deadline passes.
+Youth must not drop the event nor feed it to a component that cannot decode it.
+Schedule and pending-delivery rows therefore record the protocol/capability
+required to consume them, and the host **fails closed**: the delivery stays
+stored, the older component is never invoked with it, and the incompatibility is
+reported.
+
+### D4e — One committed outcome, one delivery per turn
+
+A committed receipt is produced exactly once and never reconstructed afterward:
+
+```rust
+struct TurnOutcome { origin: TurnOrigin, receipt: TurnReceipt }
+enum TurnOrigin { Requested(RequestId), ScheduleDelivery { schedule, generation } }
+```
+
+Requested turns reply to the requester and may publish; host-initiated turns
+publish only. Observers (desktop, headless tests, CLI) consume one channel
+carrying `TurnCommitted`, `Faulted`, and `SnapshotReplaced`, and see a patch
+**only after commit and tree installation** — never one from a rolled-back
+delivery.
+
+Exactly one pending delivery is consumed per turn, ordered by deadline, then
+creation sequence, then schedule id as a stable tie-break. Batching may be
+designed later from measured evidence.
+
+### D4f — Failure retains, and does not spin
+
+At-least-once must not become a poison-event loop. A delivery that traps or
+produces invalid output faults the instance, retains the pending delivery, and
+performs **no immediate retry in that instance**; redelivery happens after a
+controlled restart or recovery. Bounded backoff is deliberately deferred.
+
+Once a delivery is pending, a `Due` schedule is no longer pausable, resumable,
+or cancellable as though running. A reset creates a new generation and
+transactionally retires any pending delivery belonging to the replaced
+generation. A delivery already committed into an application turn cannot be
+retroactively cancelled.
+
+### D4g — Due detection does not require a guest
+
+Marking a schedule due and making its delivery durable must work with **no live
+instance** — requiring Wasmtime instantiation to notice a deadline would weaken
+the D1 property B-2 established. Guest availability determines only when a
+pending delivery may be *consumed*: with no instance the delivery is retained;
+with one available, transactional delivery is attempted. Whether Youth
+auto-mounts an unloaded application is a separate policy, deferred.
+
 ### D5 — Delivery is at-least-once, acknowledged by commit
 
 A due schedule queues a durable pending delivery. The guest handles it in an
