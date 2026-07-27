@@ -249,6 +249,26 @@ Exactly one pending delivery is consumed per turn, ordered by deadline, then
 creation sequence, then schedule id as a stable tie-break. Batching may be
 designed later from measured evidence.
 
+### D4e1 — Observers are mirrors, never authorities
+
+Publication is a bounded broadcast, so a slow subscriber **can** miss
+outcomes. That is acceptable only because durable state and the runtime's
+retained tree remain authoritative; an observer's local copy never is. The
+recovery rule is binding on every subscriber, including the desktop:
+
+```text
+observer receives lag / discontinuity
+→ discard its local mirror assumptions
+→ request the authoritative runtime snapshot
+→ replace the mirror
+→ continue from the snapshot revision
+```
+
+No subscriber may assume every `TurnOutcome` reaches it, and none may treat a
+missed outcome as a lost change — the change is in committed state regardless.
+This is why publication overflow is survivable rather than a correctness hole,
+and it is the same recovery the renderer already performs on patch mismatch.
+
 ### D4f — Failure retains, and does not spin
 
 At-least-once must not become a poison-event loop. A delivery that traps or
