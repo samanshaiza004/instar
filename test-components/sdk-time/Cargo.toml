@@ -1,0 +1,13 @@
+[package]
+name = "youth-sdk-time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SDK-backed Youth time capability fixture."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { path = "../../crates/youth-sdk" }

@@ -54,11 +54,21 @@ impl<A: Application> Guest for Adapter<A> {
                 return Err(Error::invalid_state());
             }
             let processed_through = events.events.last().map_or(0, |event| event.sequence);
+            // B-4 MUST revisit this. Protocol 0.0.4 can carry
+            // `schedule-elapsed`, but `Application` has no way to surface one
+            // yet, so it is dropped here. That is safe only while the host
+            // never sends one: `processed_through` above is computed from the
+            // last event of any kind, so a dropped elapsed event would still
+            // be acknowledged, and at-least-once delivery would consider it
+            // delivered even though the application never observed it.
+            // Adding host-initiated delivery without extending `Events` would
+            // therefore lose events silently.
             let activated = events
                 .events
                 .into_iter()
-                .map(|event| match event.kind {
-                    ui::EventKind::Activate(id) => id,
+                .filter_map(|event| match event.kind {
+                    ui::EventKind::Activate(id) => Some(id),
+                    ui::EventKind::ScheduleElapsed(_) => None,
                 })
                 .collect::<Vec<_>>();
             let tree = state.tree.as_ref().ok_or_else(Error::invalid_state)?;

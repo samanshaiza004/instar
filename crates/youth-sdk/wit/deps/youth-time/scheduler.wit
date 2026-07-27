@@ -1,0 +1,36 @@
+package youth:time@0.0.1;
+
+interface scheduler {
+    type schedule-id = u64;
+    type generation = u64;
+
+    record schedule {
+        id: schedule-id,
+        generation: generation,
+    }
+
+    record notification {
+        title: string,
+        body: string,
+    }
+
+    record schedule-options {
+        notification: option<notification>,
+    }
+
+    enum schedule-error-code {
+        invalid-duration,
+        too-many-schedules,
+        unknown-schedule,
+        stale-generation,
+        invalid-state,
+        unavailable,
+        internal,
+    }
+
+    schedule-after: func(millis: u64, options: schedule-options)
+        -> result<schedule, schedule-error-code>;
+    pause: func(value: schedule) -> result<_, schedule-error-code>;
+    resume: func(value: schedule) -> result<_, schedule-error-code>;
+    cancel: func(value: schedule) -> result<_, schedule-error-code>;
+}

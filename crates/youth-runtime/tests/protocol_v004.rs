@@ -40,13 +40,49 @@ fn time_stub_observes_unavailable_without_faulting() {
 }
 
 #[test]
-fn v002_counter_and_v003_sdk_tally_still_load_and_mount() {
+fn v002_v003_and_v004_components_coexist() {
     let mut counter = YouthApp::load(counter_component()).expect("v0.0.2 counter loads");
     assert_eq!(counter.inspect().world, "youth:app/application@0.0.2");
     counter.mount().expect("v0.0.2 counter mounts");
 
+    let mut legacy =
+        YouthApp::load(test_component("youth-legacy-v003")).expect("v0.0.3 legacy guest loads");
+    assert_eq!(legacy.inspect().world, "youth:app/application@0.0.3");
+    legacy.mount().expect("v0.0.3 legacy guest mounts");
+
     let mut tally =
-        YouthApp::load(test_component("youth-sdk-tally")).expect("v0.0.3 SDK tally loads");
-    assert_eq!(tally.inspect().world, "youth:app/application@0.0.3");
-    tally.mount().expect("v0.0.3 SDK tally mounts");
+        YouthApp::load(test_component("youth-sdk-tally")).expect("v0.0.4 SDK tally loads");
+    assert_eq!(tally.inspect().world, "youth:app/application@0.0.4");
+    tally.mount().expect("v0.0.4 SDK tally mounts");
+
+    let mut sdk_time =
+        YouthApp::load(test_component("youth-sdk-time")).expect("v0.0.4 SDK time guest loads");
+    assert_eq!(sdk_time.inspect().world, "youth:app/application@0.0.4");
+    sdk_time.mount().expect("v0.0.4 SDK time guest mounts");
+}
+
+#[test]
+fn sdk_time_handles_unavailable_without_faulting() {
+    let mut app =
+        YouthApp::load(test_component("youth-sdk-time")).expect("SDK time component loads");
+    let snapshot = app.mount().expect("SDK time component mounts");
+    let button = snapshot
+        .nodes
+        .iter()
+        .find(|node| matches!(node.data, NodeData::Button { .. }))
+        .expect("fixture has a button")
+        .id;
+
+    let receipt = app
+        .activate(button)
+        .expect("SDK guest handles unavailable scheduling");
+
+    assert!(receipt.committed);
+    assert_eq!(app.lifecycle(), AppLifecycle::Mounted);
+    assert!(app.snapshot().expect("snapshot").nodes.iter().any(|node| {
+        matches!(
+            &node.data,
+            NodeData::Text { value } if value == "unavailable"
+        )
+    }));
 }

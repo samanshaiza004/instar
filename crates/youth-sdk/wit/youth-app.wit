@@ -1,4 +1,4 @@
-package youth:app@0.0.3;
+package youth:app@0.0.4;
 
 interface ui {
     type node-id = u64;
@@ -116,8 +116,20 @@ interface ui {
         move-child(move-child),
     }
 
+    record elapsed-schedule {
+        id: u64,
+        generation: u64,
+        reason: elapsed-reason,
+    }
+
+    enum elapsed-reason {
+        deadline,
+        recovered-overdue,
+    }
+
     variant event-kind {
         activate(node-id),
+        schedule-elapsed(elapsed-schedule),
     }
 
     record event {
@@ -164,6 +176,6 @@ interface lifecycle {
 
 world application {
     import youth:state/store@0.0.1;
+    import youth:time/scheduler@0.0.1;
     export lifecycle;
 }
-

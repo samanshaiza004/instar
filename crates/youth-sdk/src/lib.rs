@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
@@ -523,6 +524,9 @@ impl ViewContext {
     pub const fn state(&self) -> StateReader {
         StateReader
     }
+
+    // Deliberately no `time()` method: rendering a view must remain
+    // side-effect free, while every scheduler operation mutates host state.
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -532,6 +536,98 @@ impl EventContext {
     #[must_use]
     pub const fn state(&mut self) -> StateWriter {
         StateWriter
+    }
+
+    #[must_use]
+    pub const fn time(&mut self) -> TimeScheduler {
+        TimeScheduler
+    }
+}
+
+/// A host-issued schedule identity.
+///
+/// Applications cannot construct this handle. The raw values are exposed only
+/// so an application can persist them; prefer [`StateReader::schedule`] and
+/// [`StateWriter::set_schedule`] for a checked round trip through typed state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Schedule {
+    id: u64,
+    generation: u64,
+}
+
+impl Schedule {
+    /// Returns the host-issued identifier for persistence.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    /// Returns the host-issued generation for persistence.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Notification {
+    title: String,
+    body: String,
+}
+
+impl Notification {
+    #[must_use]
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduleOptions {
+    notification: Option<Notification>,
+}
+
+impl ScheduleOptions {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { notification: None }
+    }
+
+    #[must_use]
+    pub fn notification(mut self, value: Notification) -> Self {
+        self.notification = Some(value);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimeScheduler;
+
+impl TimeScheduler {
+    pub fn schedule_after(self, duration: Duration, options: ScheduleOptions) -> Result<Schedule> {
+        let millis = u64::try_from(duration.as_millis()).map_err(|_| {
+            Error::invalid_state().with_message("schedule duration exceeds u64::MAX milliseconds")
+        })?;
+        if millis < 100 {
+            return Err(Error::invalid_state()
+                .with_message("schedule duration must be at least 100 milliseconds"));
+        }
+        time::schedule_after(millis, options)
+    }
+
+    pub fn pause(self, schedule: Schedule) -> Result<()> {
+        time::pause(schedule)
+    }
+
+    pub fn resume(self, schedule: Schedule) -> Result<()> {
+        time::resume(schedule)
+    }
+
+    pub fn cancel(self, schedule: Schedule) -> Result<()> {
+        time::cancel(schedule)
     }
 }
 
@@ -553,6 +649,22 @@ impl StateReader {
 
     pub fn bytes(self, key: &str) -> Result<Option<Vec<u8>>> {
         state::get_bytes(key)
+    }
+
+    /// Restores a schedule handle previously written by
+    /// [`StateWriter::set_schedule`].
+    pub fn schedule(self, key: &str) -> Result<Option<Schedule>> {
+        let Some(bytes) = self.bytes(key)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| Error::invalid_state().with_message("stored schedule is malformed"))?;
+        let (id, generation) = bytes.split_at(8);
+        Ok(Some(Schedule {
+            id: u64::from_be_bytes(id.try_into().expect("slice has eight bytes")),
+            generation: u64::from_be_bytes(generation.try_into().expect("slice has eight bytes")),
+        }))
     }
 }
 
@@ -590,6 +702,15 @@ impl StateWriter {
 
     pub fn set_bytes(self, key: &str, value: &[u8]) -> Result<()> {
         state::set_bytes(key, value)
+    }
+
+    /// Persists a host-issued schedule handle for
+    /// [`StateReader::schedule`] to restore.
+    pub fn set_schedule(self, key: &str, value: Schedule) -> Result<()> {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&value.id.to_be_bytes());
+        bytes[8..].copy_from_slice(&value.generation.to_be_bytes());
+        self.set_bytes(key, &bytes)
     }
 
     pub fn delete(self, key: &str) -> Result<bool> {
@@ -893,11 +1014,89 @@ mod state {
     }
 }
 
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+mod time {
+    use super::{Error, Result, Schedule, ScheduleOptions};
+    use crate::component::bindings::youth::time::scheduler::{self, ScheduleErrorCode};
+
+    pub fn schedule_after(millis: u64, options: ScheduleOptions) -> Result<Schedule> {
+        let options = scheduler::ScheduleOptions {
+            notification: options.notification.map(|value| scheduler::Notification {
+                title: value.title,
+                body: value.body,
+            }),
+        };
+        scheduler::schedule_after(millis, &options)
+            .map(|value| Schedule {
+                id: value.id,
+                generation: value.generation,
+            })
+            .map_err(map_error)
+    }
+
+    pub fn pause(value: Schedule) -> Result<()> {
+        scheduler::pause(wire_schedule(value)).map_err(map_error)
+    }
+
+    pub fn resume(value: Schedule) -> Result<()> {
+        scheduler::resume(wire_schedule(value)).map_err(map_error)
+    }
+
+    pub fn cancel(value: Schedule) -> Result<()> {
+        scheduler::cancel(wire_schedule(value)).map_err(map_error)
+    }
+
+    const fn wire_schedule(value: Schedule) -> scheduler::Schedule {
+        scheduler::Schedule {
+            id: value.id,
+            generation: value.generation,
+        }
+    }
+
+    fn map_error(error: ScheduleErrorCode) -> Error {
+        let message = match error {
+            ScheduleErrorCode::InvalidDuration => "host rejected the schedule duration",
+            ScheduleErrorCode::TooManySchedules => "host schedule limit reached",
+            ScheduleErrorCode::UnknownSchedule => "host does not recognize the schedule",
+            ScheduleErrorCode::StaleGeneration => "schedule generation is stale",
+            ScheduleErrorCode::InvalidState => "schedule is not valid in its current state",
+            ScheduleErrorCode::Unavailable => "host scheduling is unavailable",
+            ScheduleErrorCode::Internal => return Error::internal(),
+        };
+        Error::invalid_state().with_message(message)
+    }
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+mod time {
+    use super::{Error, Result, Schedule, ScheduleOptions};
+
+    fn unavailable<T>() -> Result<T> {
+        Err(Error::internal().with_message("host time calls require wasm32-wasip2"))
+    }
+
+    pub fn schedule_after(_millis: u64, _options: ScheduleOptions) -> Result<Schedule> {
+        unavailable()
+    }
+
+    pub fn pause(_value: Schedule) -> Result<()> {
+        unavailable()
+    }
+
+    pub fn resume(_value: Schedule) -> Result<()> {
+        unavailable()
+    }
+
+    pub fn cancel(_value: Schedule) -> Result<()> {
+        unavailable()
+    }
+}
+
 pub mod prelude {
     pub use crate::{
         Application, BoxNode, Button, Column, CommandKey, Element, Error, ErrorKind, EventContext,
-        Events, Grid, NodeKey, Result, Row, Shortcut, Text, TextAlign, Tree, Update, ViewContext,
-        command, node,
+        Events, Grid, NodeKey, Notification, Result, Row, Schedule, ScheduleOptions, Shortcut,
+        Text, TextAlign, TimeScheduler, Tree, Update, ViewContext, command, node,
     };
 }
 

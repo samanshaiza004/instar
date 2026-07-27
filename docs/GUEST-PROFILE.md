@@ -27,6 +27,9 @@ Required:
   youth:app/ui
   youth:state/store
 
+Permitted Youth capabilities:
+  youth:time/scheduler          protocol 0.0.4 only
+
 Permitted inert WASIp2 imports:
   wasi:cli/environment          wasi:cli/terminal-input
   wasi:cli/exit                 wasi:cli/terminal-output
@@ -43,8 +46,13 @@ Forbidden:
   wasi:filesystem/*, wasi:sockets/*, and wasi:http/* interface
 ```
 
-`crates/youth-runtime/tests/import_profile.rs` enforces this against the
-built component and fails when a toolchain update widens the surface.
+`youth:time/scheduler` is permitted, but not globally required: protocol 0.0.4
+guests may import it to declare bounded temporal intent, while supported 0.0.2
+and 0.0.3 guests do not have that capability in their application contract.
+
+`crates/youth-runtime/tests/import_profile.rs` enforces this against both the
+0.0.2 counter and a 0.0.4 SDK/time component, and fails when a toolchain update
+widens the surface.
 Interface versions are compared without their `@version` suffix, so a
 WASI patch bump does not read as a new capability; a genuinely new
 interface does.

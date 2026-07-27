@@ -18,9 +18,12 @@ interface store {
         internal,
     }
 
-    record state-error { code: error-code, message: option<string> }
+    record state-error {
+        code: error-code,
+        message: option<string>,
+    }
+
     get: func(key: string) -> result<option<value>, state-error>;
     set: func(key: string, value: value) -> result<_, state-error>;
     delete: func(key: string) -> result<bool, state-error>;
 }
-

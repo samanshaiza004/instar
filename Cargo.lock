@@ -4407,6 +4407,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-legacy-v003"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-memory-bomb"
 version = "0.0.2"
 dependencies = [
@@ -4467,6 +4474,13 @@ dependencies = [
 
 [[package]]
 name = "youth-sdk-tally"
+version = "0.0.2"
+dependencies = [
+ "youth-sdk",
+]
+
+[[package]]
+name = "youth-sdk-time"
 version = "0.0.2"
 dependencies = [
  "youth-sdk",
