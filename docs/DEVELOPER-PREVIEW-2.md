@@ -440,3 +440,142 @@ Calendar alarms, time zones, cron schedules, arbitrary recurring subscriptions,
 guest-visible wall clocks, millisecond animation timers, process-independent
 system alarms, a background daemon, notification actions, and multiple
 simultaneous timers unless implementation evidence demands them.
+
+## Gate C-3: host-owned countdown presentation
+
+Gate B proved the schedule itself — identity, durability, elapsed delivery.
+Gate C-2 wired an application to it. What remained open (`TIMER-F004`) was
+display: a countdown that changes every second cannot be guest-rendered
+without a guest turn per tick, and Youth has no periodic-tick capability —
+deliberately, per the Gate B non-goals above. Gate C-3 closes this the way
+the rest of the platform is shaped: the guest declares temporal *meaning*,
+the host owns the clock read, the formatting cadence, and the repaint.
+
+### D7 — A countdown is a declared reference, not a guest-computed string
+
+A text node's content is either a literal string the guest sets, or a
+reference to a schedule the guest owns, with a precision and a format. The
+host resolves the reference to a display string **at presentation time**,
+not at turn-commit time — the committed tree stores the reference, never a
+computed value, so nothing about the display depends on when the guest last
+ran.
+
+```wit
+record schedule-ref {
+    id: u64,
+    generation: u64,
+}
+
+enum time-precision {
+    seconds,
+}
+
+enum countdown-format {
+    minutes-seconds,
+}
+
+record countdown-data {
+    schedule: schedule-ref,
+    precision: time-precision,
+    format: countdown-format,
+}
+
+variant text-content {
+    literal(string),
+    countdown(countdown-data),
+}
+
+record text-data {
+    content: text-content,
+    alignment: text-alignment,
+}
+```
+
+`set-text`'s value becomes `text-content`, so a guest can retarget a node
+between a literal string and a countdown reference across a mode change
+(Timer's own need: literal `"05:00"` while Idle, `countdown(handle)` while
+Running or Paused) — but a guest can never *supply* the displayed digits for
+a countdown node; only which schedule, at what precision and format.
+
+This is a wire-format change to `text-data`, so it ships as a new protocol
+world, `youth:app@0.0.5`, alongside `0.0.4`/`0.0.3`/`0.0.2` unchanged —
+following the same multi-version dispatch as every prior protocol bump.
+Everything else in the `0.0.4` tree (layout, buttons, patches other than
+`set-text`, events, the `youth:time@0.0.1` import) carries over unchanged.
+
+### D7a — Redraw is presentation-only: no turn, no patch, no `TurnOutcome`
+
+Recomputing a countdown's digits is **not** a guest turn. It does not go
+through the worker mailbox, does not read or write durable state, produces
+no patch, and commits nothing. It is the same category of operation as
+painting a window: the host reads its own already-durable schedule record
+(the same `DeadlineClock`-backed storage Gate B built), formats, and draws.
+A build that routes countdown redraw through `WorkerMessage`, a guest
+`handle` call, or a `TurnOutcome` has misread this design — that path exists
+for `ScheduleElapsed`, which is a distinct, rarer, and genuinely
+guest-meaningful event.
+
+### D7b — Repaint is scheduled at the next display boundary, not on a loop
+
+The host does not poll. Given a running schedule's deadline, the next
+instant the *displayed* value will change is computable exactly (the next
+whole-second boundary of the remaining duration, under D7c's rounding). The
+desktop event loop arms exactly one wake for that instant
+(`ControlFlow::WaitUntil`, replacing the idle `ControlFlow::Wait` in
+`crates/youth-desktop/src/native.rs`) and recomputes on firing, arming the
+next one. A paused schedule's remaining value is frozen and arms no wake at
+all — nothing will change until `resume`, which is a guest-turn boundary
+and repaints on its own.
+
+### D7c — Rounding, due, and unavailable are fixed, not app-configurable
+
+- Running: `display = ceil(remaining_ms / 1000)` seconds, formatted per
+  `countdown-format` — `1.1s → 00:02`, `0.1s → 00:01`, never `00:00` while
+  time genuinely remains.
+- Due (`remaining_ms <= 0`): `00:00`, exactly, whether or not the
+  `ScheduleElapsed` turn has yet been delivered and committed — the display
+  and the durable elapsed event are independent observers of the same
+  deadline, not sequenced against each other.
+- Paused: the host-owned frozen remainder at the moment of `pause`,
+  unrounded-surprises aside identical to the running rounding rule.
+- Missing, cancelled, or generation-stale (the schedule moved on after this
+  tree was installed, e.g. a concurrent `pause`/`resume`/`cancel`): a fixed
+  unavailable glyph (`--:--`), never a stale or fabricated number, and never
+  a render-time error.
+
+### D7d — Reference validity is checked once, at install; staleness after is a display fallback, not a rejection
+
+When a turn's patch batch is applied and about to be installed as the new
+tree, every `countdown(schedule-ref)` it introduces is resolved against
+this application's live schedule store. A reference to an id/generation the
+app does not currently own — fabricated, mistyped, or belonging to another
+app — is rejected as an application error before install, the same
+integrity boundary as a stale-generation `pause`/`resume` call. This is a
+one-time gate at commit time, not a standing invariant the renderer
+re-checks: once installed, a **legitimately-created** reference that later
+goes stale (the schedule elapses, gets cancelled, or its generation moves)
+is D7c's unavailable-display case, not a reason to fail a redraw or force a
+new guest turn. Multiple countdown nodes may reference the same schedule
+with no uniqueness constraint.
+
+### Gate C-3 scope and sequence
+
+| Step | Content |
+| --- | --- |
+| C3-1 | `youth:time`-adjacent WIT: new `youth:app@0.0.5` world with `text-content`/`countdown-data`/`schedule-ref` (D7), `youth-tree` snapshot/patch/canonical-output support for the variant, runtime protocol dispatch and `youth-project` contract profile entry for `0.0.5` |
+| C3-2 | SDK surface (`Countdown` builder, `TimePrecision`, `CountdownFormat`, `Update::set_countdown`), install-time reference validation (D7d) |
+| C3-3 | Pure, host-testable display-resolution function (D7c) decoupled from windowing; `crates/youth-desktop` wiring to `ControlFlow::WaitUntil` (D7b); the decisive virtual-clock test: advancing to one second before due produces zero guest turns, advancing across due produces exactly one autonomous `ScheduleElapsed` turn |
+
+### Definition of done for Gate C-3
+
+- A countdown node's displayed value never requires a guest turn to change.
+- Advancing a virtual clock across many display-boundary seconds produces
+  zero guest turns; crossing the deadline produces exactly one.
+- A paused countdown's display is stable and arms no repaint.
+- A missing/cancelled/stale-generation reference renders `--:--`, never a
+  stale number, a crash, or a rejected redraw.
+- A fabricated or foreign schedule reference is rejected at turn-commit,
+  before install — never silently accepted or silently displayed.
+- `0.0.2`/`0.0.3`/`0.0.4` components continue to load, mount, and run
+  unchanged; their text nodes have no countdown capability and none is
+  implied for them.
