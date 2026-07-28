@@ -163,7 +163,27 @@ fn snapshot(tree: &FlatTree, revision: u64) -> ui::TreeSnapshot {
                         },
                     }),
                     FlatNodeData::Text { value, alignment } => ui::NodeData::Text(ui::TextData {
-                        value: value.clone(),
+                        content: ui::TextContent::Literal(value.clone()),
+                        alignment: match alignment {
+                            super::TextAlign::Start => ui::TextAlignment::Start,
+                            super::TextAlign::Center => ui::TextAlignment::Center,
+                            super::TextAlign::End => ui::TextAlignment::End,
+                        },
+                    }),
+                    FlatNodeData::Countdown {
+                        schedule,
+                        precision,
+                        format,
+                        alignment,
+                    } => ui::NodeData::Text(ui::TextData {
+                        content: ui::TextContent::Countdown(ui::CountdownData {
+                            schedule: ui::ScheduleRef {
+                                id: schedule.id(),
+                                generation: schedule.generation(),
+                            },
+                            precision: wire_precision(*precision),
+                            format: wire_format(*format),
+                        }),
                         alignment: match alignment {
                             super::TextAlign::Start => ui::TextAlignment::Start,
                             super::TextAlign::Center => ui::TextAlignment::Center,
@@ -187,6 +207,18 @@ fn snapshot(tree: &FlatTree, revision: u64) -> ui::TreeSnapshot {
     }
 }
 
+fn wire_precision(precision: super::TimePrecision) -> ui::TimePrecision {
+    match precision {
+        super::TimePrecision::Seconds => ui::TimePrecision::Seconds,
+    }
+}
+
+fn wire_format(format: super::CountdownFormat) -> ui::CountdownFormat {
+    match format {
+        super::CountdownFormat::MinutesSeconds => ui::CountdownFormat::MinutesSeconds,
+    }
+}
+
 fn wire_shortcut(shortcut: super::Shortcut) -> ui::ShortcutKey {
     match shortcut {
         super::Shortcut::Character(value) => ui::ShortcutKey::Character(value.to_string()),
@@ -200,8 +232,21 @@ fn wire_patch(operation: super::UpdateOperation) -> ui::Patch {
     match operation {
         super::UpdateOperation::Text(key, value) => ui::Patch::SetText(ui::SetText {
             id: key.id(),
-            value,
+            value: ui::TextContent::Literal(value),
         }),
+        super::UpdateOperation::Countdown(key, schedule, precision, format) => {
+            ui::Patch::SetText(ui::SetText {
+                id: key.id(),
+                value: ui::TextContent::Countdown(ui::CountdownData {
+                    schedule: ui::ScheduleRef {
+                        id: schedule.id(),
+                        generation: schedule.generation(),
+                    },
+                    precision: wire_precision(precision),
+                    format: wire_format(format),
+                }),
+            })
+        }
         super::UpdateOperation::Label(key, value) => ui::Patch::SetLabel(ui::SetLabel {
             id: key.id(),
             value,

@@ -162,6 +162,16 @@ pub enum TextAlign {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimePrecision {
+    Seconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CountdownFormat {
+    MinutesSeconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shortcut {
     Character(char),
     Enter,
@@ -265,6 +275,34 @@ impl Text {
             kind: ElementKind::Text(TextElement {
                 key,
                 value: value.into(),
+                alignment: TextAlign::Start,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Countdown;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CountdownElement {
+    key: NodeKey,
+    schedule: Schedule,
+    precision: TimePrecision,
+    format: CountdownFormat,
+    alignment: TextAlign,
+}
+
+impl Countdown {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(key: NodeKey, schedule: Schedule) -> Element {
+        Element {
+            kind: ElementKind::Countdown(CountdownElement {
+                key,
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
                 alignment: TextAlign::Start,
             }),
         }
@@ -388,6 +426,7 @@ pub struct Element {
 enum ElementKind {
     Box(BoxElement),
     Text(TextElement),
+    Countdown(CountdownElement),
     Button(ButtonElement),
 }
 
@@ -397,15 +436,17 @@ impl Element {
         match &mut self.kind {
             ElementKind::Box(value) => value.enabled = enabled,
             ElementKind::Button(value) => value.enabled = enabled,
-            ElementKind::Text(_) => {}
+            ElementKind::Text(_) | ElementKind::Countdown(_) => {}
         }
         self
     }
 
     #[must_use]
     pub fn align(mut self, alignment: TextAlign) -> Self {
-        if let ElementKind::Text(value) = &mut self.kind {
-            value.alignment = alignment;
+        match &mut self.kind {
+            ElementKind::Text(value) => value.alignment = alignment,
+            ElementKind::Countdown(value) => value.alignment = alignment,
+            ElementKind::Box(_) | ElementKind::Button(_) => {}
         }
         self
     }
@@ -565,6 +606,7 @@ impl<'a> IntoIterator for &'a Events {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UpdateOperation {
     Text(NodeKey, String),
+    Countdown(NodeKey, Schedule, TimePrecision, CountdownFormat),
     Label(NodeKey, String),
     Enabled(NodeKey, bool),
 }
@@ -591,6 +633,19 @@ impl Update {
     pub fn set_text(mut self, key: NodeKey, value: impl Into<String>) -> Self {
         self.operations
             .push(UpdateOperation::Text(key, value.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn set_countdown(
+        mut self,
+        key: NodeKey,
+        schedule: Schedule,
+        precision: TimePrecision,
+        format: CountdownFormat,
+    ) -> Self {
+        self.operations
+            .push(UpdateOperation::Countdown(key, schedule, precision, format));
         self
     }
 
@@ -831,6 +886,12 @@ enum FlatNodeData {
         value: String,
         alignment: TextAlign,
     },
+    Countdown {
+        schedule: Schedule,
+        precision: TimePrecision,
+        format: CountdownFormat,
+        alignment: TextAlign,
+    },
     Button {
         label: String,
         enabled: bool,
@@ -861,6 +922,7 @@ impl FlatTree {
         for operation in &update.operations {
             let key = match operation {
                 UpdateOperation::Text(key, _)
+                | UpdateOperation::Countdown(key, ..)
                 | UpdateOperation::Label(key, _)
                 | UpdateOperation::Enabled(key, _) => *key,
             };
@@ -870,27 +932,52 @@ impl FlatTree {
             let Some(node) = self.nodes.iter_mut().find(|node| node.id == key.id()) else {
                 return Err(Error::invalid_state().with_message("an update names an unknown node"));
             };
-            match (operation, &mut node.data) {
-                (UpdateOperation::Text(_, value), FlatNodeData::Text { value: current, .. }) => {
-                    current.clone_from(value);
+            match operation {
+                UpdateOperation::Text(_, value) => {
+                    let alignment = match &node.data {
+                        FlatNodeData::Text { alignment, .. }
+                        | FlatNodeData::Countdown { alignment, .. } => *alignment,
+                        _ => {
+                            return Err(Error::invalid_state()
+                                .with_message("an update does not match the named node type"));
+                        }
+                    };
+                    node.data = FlatNodeData::Text {
+                        value: value.clone(),
+                        alignment,
+                    };
                 }
-                (UpdateOperation::Label(_, value), FlatNodeData::Button { label, .. }) => {
-                    label.clone_from(value);
+                UpdateOperation::Countdown(_, schedule, precision, format) => {
+                    let alignment = match &node.data {
+                        FlatNodeData::Text { alignment, .. }
+                        | FlatNodeData::Countdown { alignment, .. } => *alignment,
+                        _ => {
+                            return Err(Error::invalid_state()
+                                .with_message("an update does not match the named node type"));
+                        }
+                    };
+                    node.data = FlatNodeData::Countdown {
+                        schedule: *schedule,
+                        precision: *precision,
+                        format: *format,
+                        alignment,
+                    };
                 }
-                (
-                    UpdateOperation::Enabled(_, enabled),
-                    FlatNodeData::Button { enabled: value, .. },
-                )
-                | (
-                    UpdateOperation::Enabled(_, enabled),
-                    FlatNodeData::Box { enabled: value, .. },
-                ) => {
-                    *value = *enabled;
-                }
-                _ => {
-                    return Err(Error::invalid_state()
-                        .with_message("an update does not match the named node type"));
-                }
+                UpdateOperation::Label(_, value) => match &mut node.data {
+                    FlatNodeData::Button { label, .. } => label.clone_from(value),
+                    _ => {
+                        return Err(Error::invalid_state()
+                            .with_message("an update does not match the named node type"));
+                    }
+                },
+                UpdateOperation::Enabled(_, enabled) => match &mut node.data {
+                    FlatNodeData::Button { enabled: value, .. }
+                    | FlatNodeData::Box { enabled: value, .. } => *value = *enabled,
+                    _ => {
+                        return Err(Error::invalid_state()
+                            .with_message("an update does not match the named node type"));
+                    }
+                },
             }
         }
         Ok(())
@@ -933,6 +1020,20 @@ impl FlatTreeBuilder {
                     id,
                     data: FlatNodeData::Text {
                         value: value.value.clone(),
+                        alignment: value.alignment,
+                    },
+                    children: Vec::new(),
+                });
+                Ok(id)
+            }
+            ElementKind::Countdown(value) => {
+                let id = self.allocate_named(value.key)?;
+                self.nodes.push(FlatNode {
+                    id,
+                    data: FlatNodeData::Countdown {
+                        schedule: value.schedule,
+                        precision: value.precision,
+                        format: value.format,
                         alignment: value.alignment,
                     },
                     children: Vec::new(),
@@ -1198,10 +1299,11 @@ mod time {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandKey, ElapsedReason, Element, Error, ErrorKind,
-        Event, EventContext, Events, Generation, Grid, NodeId, NodeKey, Notification, Result, Row,
-        Schedule, ScheduleId, ScheduleOptions, Shortcut, Text, TextAlign, TimeScheduler, Tree,
-        Update, ViewContext, command, node,
+        Application, BoxNode, Button, Column, CommandKey, Countdown, CountdownFormat,
+        ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events, Generation, Grid,
+        NodeId, NodeKey, Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions,
+        Shortcut, Text, TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext,
+        command, node,
     };
 }
 
@@ -1231,6 +1333,13 @@ pub mod __private {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schedule() -> Schedule {
+        Schedule {
+            id: 17,
+            generation: 3,
+        }
+    }
 
     #[test]
     fn symbolic_id_vectors_are_stable() {
@@ -1285,6 +1394,37 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn countdown_flattens_with_schedule_and_defaults() {
+        let schedule = schedule();
+        let flat = Tree::root(Countdown::new(node!("remaining"), schedule))
+            .flatten()
+            .expect("countdown tree is valid");
+        assert_eq!(
+            flat.nodes[1].data,
+            FlatNodeData::Countdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+                alignment: TextAlign::Start,
+            }
+        );
+    }
+
+    #[test]
+    fn countdown_alignment_flattens_without_wire_details() {
+        let flat = Tree::root(Countdown::new(node!("remaining"), schedule()).align(TextAlign::End))
+            .flatten()
+            .expect("countdown tree is valid");
+        assert!(matches!(
+            flat.nodes[1].data,
+            FlatNodeData::Countdown {
+                alignment: TextAlign::End,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1358,6 +1498,94 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn text_update_retargets_countdown_and_preserves_alignment() {
+        let mut tree =
+            Tree::root(Countdown::new(node!("remaining"), schedule()).align(TextAlign::Center))
+                .flatten()
+                .expect("countdown tree is valid");
+        tree.apply(&Update::new().set_text(node!("remaining"), "05:00"))
+            .expect("countdown can be retargeted to literal text");
+        assert_eq!(
+            tree.nodes[1].data,
+            FlatNodeData::Text {
+                value: "05:00".to_owned(),
+                alignment: TextAlign::Center,
+            }
+        );
+    }
+
+    #[test]
+    fn countdown_update_retargets_text_and_preserves_alignment() {
+        let schedule = schedule();
+        let mut tree = Tree::root(Text::new(node!("remaining"), "05:00").align(TextAlign::End))
+            .flatten()
+            .expect("text tree is valid");
+        tree.apply(&Update::new().set_countdown(
+            node!("remaining"),
+            schedule,
+            TimePrecision::Seconds,
+            CountdownFormat::MinutesSeconds,
+        ))
+        .expect("literal text can be retargeted to a countdown");
+        assert_eq!(
+            tree.nodes[1].data,
+            FlatNodeData::Countdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+                alignment: TextAlign::End,
+            }
+        );
+    }
+
+    #[test]
+    fn text_family_updates_reject_button_targets() {
+        let mut tree = Tree::root(Button::new(node!("start"), "Start"))
+            .flatten()
+            .expect("button tree is valid");
+        let text_error = tree
+            .apply(&Update::new().set_text(node!("start"), "bad"))
+            .expect_err("a button cannot be retargeted to text");
+        assert_eq!(
+            text_error.message.as_deref(),
+            Some("an update does not match the named node type")
+        );
+
+        let countdown_error = tree
+            .apply(&Update::new().set_countdown(
+                node!("start"),
+                schedule(),
+                TimePrecision::Seconds,
+                CountdownFormat::MinutesSeconds,
+            ))
+            .expect_err("a button cannot be retargeted to a countdown");
+        assert_eq!(
+            countdown_error.message.as_deref(),
+            Some("an update does not match the named node type")
+        );
+    }
+
+    #[test]
+    fn countdown_update_participates_in_duplicate_key_rejection() {
+        let mut tree = Tree::root(Text::new(node!("remaining"), "05:00"))
+            .flatten()
+            .expect("text tree is valid");
+        let error = tree
+            .apply(
+                &Update::new()
+                    .set_countdown(
+                        node!("remaining"),
+                        schedule(),
+                        TimePrecision::Seconds,
+                        CountdownFormat::MinutesSeconds,
+                    )
+                    .set_text(node!("remaining"), "04:59"),
+            )
+            .expect_err("a countdown and text update cannot share a key");
+        assert_eq!(error.message.as_deref(), Some("a node is updated twice"));
     }
 
     #[test]
