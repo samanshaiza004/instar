@@ -56,6 +56,17 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
     },
 ];
 
+// 0.0.5's WIT and youth-tree schema landed (commit 38683db), and its runtime
+// dispatch/validation landed alongside this comment, but it is deliberately
+// NOT published as a `ContractProfile` yet: `sdk_revision` must name a real,
+// pushed commit whose SDK Rust builder API actually supports the protocol it
+// claims, and youth-sdk's Countdown builder surface hasn't landed yet. This
+// mirrors the project's own two-commit SDK-revision dance (see git history
+// around commits 4a0bba1/e71a9ec): the profile is added, with its real
+// pushed sdk_revision, only once the SDK side of the capability is complete
+// and pushed. Adding it prematurely with a placeholder or unpushed revision
+// would corrupt the regression matrix this struct exists to keep honest.
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -643,28 +654,30 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
     /// distinguishes the two: only `sdk-revision` disagrees.
     #[test]
     fn rejects_a_lock_with_an_sdk_revision_from_a_different_profile() {
-        for (fixture_profile, foreign_revision) in [
-            (SUPPORTED_PROFILES[0], SUPPORTED_PROFILES[1].sdk_revision),
-            (SUPPORTED_PROFILES[1], SUPPORTED_PROFILES[0].sdk_revision),
-        ] {
-            let fixture = fixture(fixture_profile);
-            let lock_path = fixture.path().join(LOCK_NAME);
-            let lock = fs::read_to_string(&lock_path).expect("lock");
-            let mixed = lock.replace(
-                &format!("sdk-revision = \"{}\"", fixture_profile.sdk_revision),
-                &format!("sdk-revision = \"{foreign_revision}\""),
-            );
-            assert_ne!(mixed, lock, "sdk-revision line must have been rewritten");
-            fs::write(&lock_path, mixed).expect("mixed lock");
-            let error = Project::load(fixture.path()).expect_err(&format!(
-                "protocol {:?} with a foreign sdk-revision must fail",
-                fixture_profile.protocol
-            ));
-            assert!(
-                error.to_string().contains("profile fields cannot be mixed"),
-                "protocol {:?}: unexpected error {error}",
-                fixture_profile.protocol
-            );
+        for fixture_profile in SUPPORTED_PROFILES {
+            for foreign_profile in SUPPORTED_PROFILES {
+                if fixture_profile == foreign_profile {
+                    continue;
+                }
+                let fixture = fixture(*fixture_profile);
+                let lock_path = fixture.path().join(LOCK_NAME);
+                let lock = fs::read_to_string(&lock_path).expect("lock");
+                let mixed = lock.replace(
+                    &format!("sdk-revision = \"{}\"", fixture_profile.sdk_revision),
+                    &format!("sdk-revision = \"{}\"", foreign_profile.sdk_revision),
+                );
+                assert_ne!(mixed, lock, "sdk-revision line must have been rewritten");
+                fs::write(&lock_path, mixed).expect("mixed lock");
+                let error = Project::load(fixture.path()).expect_err(&format!(
+                    "protocol {:?} with a foreign sdk-revision must fail",
+                    fixture_profile.protocol
+                ));
+                assert!(
+                    error.to_string().contains("profile fields cannot be mixed"),
+                    "protocol {:?}: unexpected error {error}",
+                    fixture_profile.protocol
+                );
+            }
         }
     }
 
@@ -690,6 +703,19 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
         assert_eq!(
             hash_wit_tree(root).expect("canonical WIT hash"),
             SUPPORTED_PROFILES[1].wit_sha256
+        );
+    }
+
+    /// 0.0.5 has no published `ContractProfile` yet (see the comment above
+    /// `SUPPORTED_PROFILES`), but its WIT tree's hash is pinned here so a
+    /// future change to that tree is caught before the profile is published,
+    /// not after.
+    #[test]
+    fn v005_wit_tree_hash_is_pinned_ahead_of_publication() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.5");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385"
         );
     }
 }
