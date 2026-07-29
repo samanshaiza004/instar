@@ -331,6 +331,11 @@ fn reconcile_without_guest(config: &YouthAppConfig) -> Result<(), RuntimeError> 
             )
         })?;
     youth_state::execute_wake_outputs(config.limits.time.wake_driver.as_ref(), &outputs);
+    crate::host::dispatch_schedule_notifications(
+        &outputs,
+        config.limits.time.notification_dispatcher.as_ref(),
+        &state,
+    );
     Ok(())
 }
 

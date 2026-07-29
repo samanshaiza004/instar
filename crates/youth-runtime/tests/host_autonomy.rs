@@ -9,9 +9,9 @@ use common::test_component;
 use tempfile::tempdir;
 use tokio::sync::broadcast::error::TryRecvError;
 use youth_runtime::{
-    AppId, AppLifecycle, RuntimeEvent, RuntimeLimits, RuntimeTimeSeams, StateLocation, TurnOrigin,
-    VirtualDeadlineClock, VirtualGuestMonotonicClock, VirtualWakeDriver, WakeToken, YouthAppConfig,
-    YouthAppHandle,
+    AppId, AppLifecycle, RecordingNotificationDispatcher, RuntimeEvent, RuntimeLimits,
+    RuntimeTimeSeams, StateLocation, TurnOrigin, VirtualDeadlineClock, VirtualGuestMonotonicClock,
+    VirtualWakeDriver, WakeToken, YouthAppConfig, YouthAppHandle,
 };
 use youth_state::{GuestCallPhase, ScheduleStatus, StateLimits, StateStore, StateValue};
 use youth_tree::{NodeData, NodeId};
@@ -345,6 +345,68 @@ async fn reconcile_on_open_arms_future_and_queues_overdue_without_a_guest_turn()
     assert_eq!(wakes.armed().len(), 1);
     assert_eq!(wakes.armed()[0].1, Duration::from_millis(150));
     drop(store);
+    app.mount().await.unwrap();
+    app.stop().await.unwrap();
+}
+
+/// `YouthAppHandle::spawn` is the path `.youth-test`'s `restart` and the
+/// real desktop app both use to reopen a closed process. Its overdue
+/// reconciliation runs through `reconcile_without_guest` in `worker.rs`,
+/// a separate code path from `instantiate`'s own `reconcile_on_open`
+/// branch (which `YouthApp::load_config` alone would use) -- both must
+/// dispatch a schedule's notification independently, since this is the
+/// concrete "process was closed, deadline passed, reopening" case Gate
+/// C-4 exists to restore evidence for.
+#[tokio::test]
+async fn worker_spawn_dispatches_notification_for_an_overdue_schedule_on_open() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("state.sqlite3");
+    let deadline = VirtualDeadlineClock::new(START + 150);
+    let wakes = VirtualWakeDriver::default();
+    let notifications = RecordingNotificationDispatcher::default();
+    {
+        let mut store = StateStore::open_for_app(
+            StateLocation::File(database.clone()),
+            StateLimits::default(),
+            app_id(),
+        )
+        .unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store
+            .schedule_create(
+                START,
+                100,
+                Some((
+                    "Reopened overdue".into(),
+                    "Dispatched on worker spawn".into(),
+                )),
+            )
+            .unwrap();
+        store.commit().unwrap();
+    }
+    let config = YouthAppConfig {
+        component_path: test_component("youth-sdk-elapsed"),
+        app_id: app_id(),
+        state: StateLocation::File(database.clone()),
+        limits: RuntimeLimits {
+            time: RuntimeTimeSeams {
+                deadline_clock: Arc::new(deadline.clone()),
+                wake_driver: Arc::new(wakes.clone()),
+                guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
+                notification_dispatcher: Arc::new(notifications.clone()),
+            },
+            ..RuntimeLimits::default()
+        },
+    };
+    let app = YouthAppHandle::spawn(config).unwrap();
+
+    assert_eq!(
+        notifications.dispatched(),
+        vec![(
+            "Reopened overdue".to_owned(),
+            "Dispatched on worker spawn".to_owned()
+        )]
+    );
     app.mount().await.unwrap();
     app.stop().await.unwrap();
 }

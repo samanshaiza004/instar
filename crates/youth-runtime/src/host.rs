@@ -173,7 +173,7 @@ impl HostState {
     }
 }
 
-fn dispatch_schedule_notifications(
+pub(crate) fn dispatch_schedule_notifications(
     outputs: &[youth_state::SchedulerOutput],
     dispatcher: &dyn crate::NotificationDispatcher,
     state: &youth_state::StateStore,
