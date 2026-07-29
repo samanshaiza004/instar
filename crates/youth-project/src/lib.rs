@@ -54,18 +54,19 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         template_version: 3,
         sdk_revision: SDK_REVISION,
     },
+    ContractProfile {
+        protocol: "0.0.5",
+        wit_sha256: "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385",
+        template_version: 3,
+        // Pinned to the pushed commit where the SDK's Countdown builder API
+        // (crates/youth-sdk/src/lib.rs and component.rs) actually landed and
+        // fully supports this protocol -- not `SDK_REVISION`, which is still
+        // the 0.0.4-default pin `youth new` scaffolds against. Publishing
+        // this profile was deliberately deferred (see prior commit history)
+        // until this exact revision was verified reachable on the remote.
+        sdk_revision: "bfd539ca5e0d8d63b9dcdb28c744758255560dc1",
+    },
 ];
-
-// 0.0.5's WIT and youth-tree schema landed (commit 38683db), and its runtime
-// dispatch/validation landed alongside this comment, but it is deliberately
-// NOT published as a `ContractProfile` yet: `sdk_revision` must name a real,
-// pushed commit whose SDK Rust builder API actually supports the protocol it
-// claims, and youth-sdk's Countdown builder surface hasn't landed yet. This
-// mirrors the project's own two-commit SDK-revision dance (see git history
-// around commits 4a0bba1/e71a9ec): the profile is added, with its real
-// pushed sdk_revision, only once the SDK side of the capability is complete
-// and pushed. Adding it prematurely with a placeholder or unpushed revision
-// would corrupt the regression matrix this struct exists to keep honest.
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -706,16 +707,12 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
         );
     }
 
-    /// 0.0.5 has no published `ContractProfile` yet (see the comment above
-    /// `SUPPORTED_PROFILES`), but its WIT tree's hash is pinned here so a
-    /// future change to that tree is caught before the profile is published,
-    /// not after.
     #[test]
-    fn v005_wit_tree_hash_is_pinned_ahead_of_publication() {
+    fn v005_profile_hash_matches_the_canonical_tree() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.5");
         assert_eq!(
             hash_wit_tree(root).expect("canonical WIT hash"),
-            "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385"
+            SUPPORTED_PROFILES[2].wit_sha256
         );
     }
 }
