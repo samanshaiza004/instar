@@ -51,6 +51,16 @@ expect countdown <node-name>
 `expect countdown` checks that the node contains a host-owned schedule reference;
 it does not resolve the countdown to a display value.
 
+Harness timing uses:
+
+```text
+sleep <milliseconds>
+```
+
+`sleep` is a real wall-clock sleep in the test process. It is intended for short
+durations paired with the platform's minimum schedule duration (100 ms), not as
+a general-purpose delay primitive.
+
 `youth test` builds and validates the component once, runs files in lexical
 order, and reports the file, line, command, expected value, and observed
 semantic node on failure. It never opens a desktop window.

@@ -22,6 +22,9 @@ pub enum Command {
     Activate {
         name: String,
     },
+    Sleep {
+        millis: u64,
+    },
     Restart,
     Key {
         key: LogicalKey,
@@ -90,6 +93,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
                 mounted = true;
             }
             Command::Activate { .. }
+            | Command::Sleep { .. }
             | Command::Key { .. }
             | Command::ExpectText { .. }
             | Command::ExpectCountdown { .. }
@@ -135,6 +139,26 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         return Ok(Command::Activate {
             name: name.to_owned(),
         });
+    }
+    if let Some(digits) = source.strip_prefix("sleep ") {
+        let millis = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            digits.parse::<u64>().map_err(|error| {
+                diagnostic(
+                    path,
+                    line,
+                    source,
+                    &format!("invalid sleep duration in milliseconds: {error}"),
+                )
+            })?
+        } else {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "sleep duration must be a non-negative decimal integer in milliseconds",
+            ));
+        };
+        return Ok(Command::Sleep { millis });
     }
     if let Some(value) = source.strip_prefix("key ") {
         let (key, modifiers) = parse_key(path, line, source, value)?;
@@ -223,7 +247,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, activate, key, restart, expect text, expect countdown, expect focus, or expect state",
+        "unknown command; expected state, mount, activate, sleep, key, restart, expect text, expect countdown, expect focus, or expect state",
     ))
 }
 
@@ -466,6 +490,9 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+            }
+            Command::Sleep { millis } => {
+                tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
             }
             Command::Restart => {
                 app.stop()
@@ -864,6 +891,33 @@ expect state missing "removed"
             Command::ExpectCountdown {
                 name: "remaining".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_sleep_and_rejects_invalid_durations() {
+        let script = parse(Path::new("sleep.youth-test"), "mount\nsleep 150\n").unwrap();
+        assert_eq!(script.commands[1].command, Command::Sleep { millis: 150 });
+
+        for source in ["mount\nsleep abc\n", "mount\nsleep -5\n"] {
+            let error = parse(Path::new("bad.youth-test"), source).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "sleep duration must be a non-negative decimal integer in milliseconds"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_sleep_before_initial_mount() {
+        let error = parse(Path::new("bad.youth-test"), "sleep 1\nmount\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("command appears before the required initial mount"),
+            "{error}"
         );
     }
 

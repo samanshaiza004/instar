@@ -1,7 +1,36 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use youth_state::AppId;
+
+#[tokio::test]
+async fn sleep_command_blocks_real_runtime_progress() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-tally --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("sleep.youth-test");
+    fs::write(&test, "mount\nsleep 50\n").unwrap();
+
+    let started = Instant::now();
+    youth_test::run_file(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-sleep-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "sleep command returned after {:?}",
+        started.elapsed()
+    );
+}
 
 #[tokio::test]
 async fn semantic_dsl_activates_and_persists_through_implicit_restart_mount() {
