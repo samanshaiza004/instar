@@ -31,6 +31,9 @@ pub enum Command {
         name: String,
         expected: String,
     },
+    ExpectCountdown {
+        name: String,
+    },
     ExpectFocus {
         name: Option<String>,
     },
@@ -89,6 +92,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             Command::Activate { .. }
             | Command::Key { .. }
             | Command::ExpectText { .. }
+            | Command::ExpectCountdown { .. }
             | Command::ExpectFocus { .. }
             | Command::ExpectState { .. }
             | Command::Restart => {
@@ -200,6 +204,12 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
             expected,
         });
     }
+    if let Some(name) = source.strip_prefix("expect countdown ") {
+        validate_name(path, line, source, name)?;
+        return Ok(Command::ExpectCountdown {
+            name: name.to_owned(),
+        });
+    }
     if let Some(name) = source.strip_prefix("expect focus ") {
         if name == "none" {
             return Ok(Command::ExpectFocus { name: None });
@@ -213,7 +223,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, activate, key, restart, expect text, expect focus, or expect state",
+        "unknown command; expected state, mount, activate, key, restart, expect text, expect countdown, expect focus, or expect state",
     ))
 }
 
@@ -494,6 +504,14 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                     expected,
                 )?;
             }
+            Command::ExpectCountdown { name } => {
+                expect_countdown(
+                    path,
+                    &located,
+                    snapshot.as_ref().expect("parser requires mount"),
+                    name,
+                )?;
+            }
             Command::ExpectFocus { name } => {
                 let expected = name.as_deref().map(named_id);
                 if interaction.focused() != expected {
@@ -670,6 +688,28 @@ fn expect_text(
     }
 }
 
+fn expect_countdown(
+    path: &Path,
+    located: &LocatedCommand,
+    snapshot: &TreeSnapshot,
+    name: &str,
+) -> Result<(), TestError> {
+    let id = named_id(name);
+    let node = snapshot.nodes.iter().find(|node| node.id == id);
+    match node.map(|node| &node.data) {
+        Some(data) if data.countdown_ref().is_some() => Ok(()),
+        observed => Err(TestError::Diagnostic {
+            path: path.to_path_buf(),
+            line: located.line,
+            command: located.source.clone(),
+            message: format!(
+                "expected countdown {name:?}; observed {}",
+                describe(observed)
+            ),
+        }),
+    }
+}
+
 fn describe(observed: Option<&NodeData>) -> String {
     match observed {
         None => "no semantic node".into(),
@@ -810,6 +850,36 @@ expect state missing "removed"
             }
         );
         assert!(parse(Path::new("bad.youth-test"), "mount\nkey \"ab\"\n").is_err());
+    }
+
+    #[test]
+    fn parses_countdown_assertion() {
+        let script = parse(
+            Path::new("countdown.youth-test"),
+            "mount\nexpect countdown remaining\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectCountdown {
+                name: "remaining".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_countdown_assertion_before_initial_mount() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "expect countdown remaining\nmount\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("command appears before the required initial mount"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -41,6 +41,16 @@ expect state text "key" "value"
 expect state missing "obsolete-key"
 ```
 
+Semantic content assertions use:
+
+```text
+expect text <node-name> <JSON-string>
+expect countdown <node-name>
+```
+
+`expect countdown` checks that the node contains a host-owned schedule reference;
+it does not resolve the countdown to a display value.
+
 `youth test` builds and validates the component once, runs files in lexical
 order, and reports the file, line, command, expected value, and observed
 semantic node on failure. It never opens a desktop window.
