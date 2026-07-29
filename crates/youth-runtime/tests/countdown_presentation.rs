@@ -45,6 +45,7 @@ fn countdown_redraw_is_guestless_and_due_delivery_occurs_once() {
                 deadline_clock: Arc::new(deadline.clone()),
                 wake_driver: Arc::new(VirtualWakeDriver::default()),
                 guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
+                ..RuntimeTimeSeams::default()
             },
             ..RuntimeLimits::default()
         },

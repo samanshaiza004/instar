@@ -132,6 +132,7 @@ pub(crate) struct HostState {
     state: youth_state::StateStore,
     deadline_clock: Arc<dyn youth_state::DeadlineClock>,
     wake_driver: Arc<dyn youth_state::WakeDriver>,
+    notification_dispatcher: Arc<dyn crate::NotificationDispatcher>,
     staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
 }
 
@@ -159,11 +160,43 @@ impl WasiView for HostState {
 impl HostState {
     fn apply_committed_schedule_outputs(&mut self) {
         youth_state::execute_wake_outputs(self.wake_driver.as_ref(), &self.staged_schedule_outputs);
+        dispatch_schedule_notifications(
+            &self.staged_schedule_outputs,
+            self.notification_dispatcher.as_ref(),
+            &self.state,
+        );
         self.staged_schedule_outputs.clear();
     }
 
     fn discard_staged_schedule_outputs(&mut self) {
         self.staged_schedule_outputs.clear();
+    }
+}
+
+fn dispatch_schedule_notifications(
+    outputs: &[youth_state::SchedulerOutput],
+    dispatcher: &dyn crate::NotificationDispatcher,
+    state: &youth_state::StateStore,
+) {
+    for output in outputs {
+        let youth_state::SchedulerOutput::QueueElapsedDelivery { token, .. } = output else {
+            continue;
+        };
+        match state.schedule(token.schedule_id) {
+            Ok(Some(record)) => {
+                if let Some((title, body)) = record.notification {
+                    dispatcher.dispatch(&title, &body);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    schedule_id = token.schedule_id,
+                    %error,
+                    "schedule notification lookup failed"
+                );
+            }
+        }
     }
 }
 
@@ -982,6 +1015,11 @@ impl YouthApp {
                 )
             })?;
         youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        dispatch_schedule_notifications(
+            &outputs,
+            self.store.data().notification_dispatcher.as_ref(),
+            &self.store.data().state,
+        );
         Ok(
             if outputs.iter().any(|output| {
                 matches!(
@@ -1037,6 +1075,11 @@ impl YouthApp {
                 )
             })?;
         youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        dispatch_schedule_notifications(
+            &outputs,
+            self.store.data().notification_dispatcher.as_ref(),
+            &self.store.data().state,
+        );
         Ok(())
     }
 
@@ -1826,6 +1869,7 @@ fn instantiate(
     let deadline_clock = Arc::clone(&limits.time.deadline_clock);
     let wake_driver = Arc::clone(&limits.time.wake_driver);
     let guest_monotonic_clock = Arc::clone(&limits.time.guest_monotonic_clock);
+    let notification_dispatcher = Arc::clone(&limits.time.notification_dispatcher);
     let protocol = detect_protocol(engine, &component).ok_or_else(|| {
         RuntimeError::UnsupportedWorld(ErrorContext::new(
             "component does not export a supported Youth application world",
@@ -1862,6 +1906,11 @@ fn instantiate(
                 )
             })?;
         youth_state::execute_wake_outputs(wake_driver.as_ref(), &scheduler_outputs);
+        dispatch_schedule_notifications(
+            &scheduler_outputs,
+            notification_dispatcher.as_ref(),
+            &state_store,
+        );
     }
     let mut wasi = WasiCtxBuilder::new();
     wasi.monotonic_clock(GuestClockAdapter(guest_monotonic_clock));
@@ -1876,6 +1925,7 @@ fn instantiate(
         state: state_store,
         deadline_clock,
         wake_driver,
+        notification_dispatcher,
         staged_schedule_outputs: Vec::new(),
     };
     let mut store = Store::new(engine, state);

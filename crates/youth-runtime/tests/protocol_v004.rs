@@ -149,6 +149,7 @@ fn runtime_open_arms_future_schedules_without_invoking_the_guest() {
         deadline_clock: Arc::new(deadline.clone()),
         wake_driver: Arc::new(wakes.clone()),
         guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
+        ..RuntimeTimeSeams::default()
     };
     let mut app = YouthApp::load_config(config).expect("runtime opens without mounting the guest");
     assert_eq!(
@@ -198,6 +199,7 @@ fn guest_instant_now_uses_only_the_injected_monotonic_clock() {
         deadline_clock: Arc::new(VirtualDeadlineClock::new(0)),
         wake_driver: Arc::new(VirtualWakeDriver::default()),
         guest_monotonic_clock: Arc::new(guest_clock),
+        ..RuntimeTimeSeams::default()
     };
     let mut app = YouthApp::load_config(config).expect("instant fixture loads");
     let snapshot = app.mount().expect("instant fixture mounts");

@@ -7,6 +7,53 @@ pub use youth_state::{AppId, StateLocation};
 
 use crate::RuntimeLimits;
 
+pub trait NotificationDispatcher: Send + Sync {
+    fn dispatch(&self, title: &str, body: &str);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemNotificationDispatcher;
+
+impl NotificationDispatcher for SystemNotificationDispatcher {
+    fn dispatch(&self, title: &str, body: &str) {
+        let result = std::panic::catch_unwind(|| {
+            notify_rust::Notification::new()
+                .summary(title)
+                .body(body)
+                .show()
+        });
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "OS notification dispatch failed"),
+            Err(_) => tracing::warn!("OS notification dispatch panicked"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecordingNotificationDispatcher {
+    dispatched: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl RecordingNotificationDispatcher {
+    #[must_use]
+    pub fn dispatched(&self) -> Vec<(String, String)> {
+        self.dispatched
+            .lock()
+            .expect("recording notification-dispatcher mutex is not poisoned")
+            .clone()
+    }
+}
+
+impl NotificationDispatcher for RecordingNotificationDispatcher {
+    fn dispatch(&self, title: &str, body: &str) {
+        self.dispatched
+            .lock()
+            .expect("recording notification-dispatcher mutex is not poisoned")
+            .push((title.to_owned(), body.to_owned()));
+    }
+}
+
 pub trait GuestMonotonicClock: Send + Sync {
     fn resolution_nanoseconds(&self) -> u64;
     fn now_nanoseconds(&self) -> u64;
@@ -85,6 +132,7 @@ pub struct RuntimeTimeSeams {
     pub deadline_clock: Arc<dyn youth_state::DeadlineClock>,
     pub wake_driver: Arc<dyn youth_state::WakeDriver>,
     pub guest_monotonic_clock: Arc<dyn GuestMonotonicClock>,
+    pub notification_dispatcher: Arc<dyn NotificationDispatcher>,
 }
 
 impl Default for RuntimeTimeSeams {
@@ -93,6 +141,7 @@ impl Default for RuntimeTimeSeams {
             deadline_clock: Arc::new(youth_state::SystemDeadlineClock),
             wake_driver: Arc::new(youth_state::SystemWakeDriver::default()),
             guest_monotonic_clock: Arc::new(SystemGuestMonotonicClock::default()),
+            notification_dispatcher: Arc::new(SystemNotificationDispatcher),
         }
     }
 }
@@ -110,6 +159,10 @@ impl PartialEq for RuntimeTimeSeams {
         Arc::ptr_eq(&self.deadline_clock, &other.deadline_clock)
             && Arc::ptr_eq(&self.wake_driver, &other.wake_driver)
             && Arc::ptr_eq(&self.guest_monotonic_clock, &other.guest_monotonic_clock)
+            && Arc::ptr_eq(
+                &self.notification_dispatcher,
+                &other.notification_dispatcher,
+            )
     }
 }
 

@@ -18,7 +18,8 @@ mod wire;
 mod worker;
 
 pub use config::{
-    AppId, GuestMonotonicClock, RuntimeTimeSeams, StateLocation, SystemGuestMonotonicClock,
+    AppId, GuestMonotonicClock, NotificationDispatcher, RecordingNotificationDispatcher,
+    RuntimeTimeSeams, StateLocation, SystemGuestMonotonicClock, SystemNotificationDispatcher,
     VirtualGuestMonotonicClock, YouthAppConfig,
 };
 pub use engine::{configured_engine, shared_engine};

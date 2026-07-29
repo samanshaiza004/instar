@@ -37,6 +37,7 @@ fn config(
                 deadline_clock: Arc::new(deadline.clone()),
                 wake_driver: Arc::new(wakes.clone()),
                 guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
+                ..RuntimeTimeSeams::default()
             },
             ..RuntimeLimits::default()
         },

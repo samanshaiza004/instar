@@ -91,6 +91,34 @@ fn elapsed_trap_retains_delivery_and_faults_without_retry() {
 }
 
 #[test]
+fn trapped_elapsed_delivery_succeeds_after_reload_with_a_healthy_guest() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("state.sqlite3");
+    create_due(&database, 0, 100);
+    {
+        let mut app = YouthApp::load_config(config("youth-elapsed-trap", &database)).unwrap();
+        app.mount().unwrap();
+
+        let error = app.deliver_next_pending().unwrap_err();
+        assert_eq!(error.category(), RuntimeErrorCategory::GuestTrap);
+        assert_eq!(app.pending_deliveries().unwrap().len(), 1);
+        assert_eq!(read_integer(&database, "elapsed-count"), None);
+    }
+
+    let mut reloaded = YouthApp::load_config(config("youth-sdk-elapsed", &database)).unwrap();
+    reloaded.mount().unwrap();
+    let receipt = reloaded
+        .deliver_next_pending()
+        .unwrap()
+        .expect("retained delivery is retried");
+
+    assert!(receipt.committed);
+    assert!(reloaded.pending_deliveries().unwrap().is_empty());
+    assert_eq!(read_integer(&database, "elapsed-count"), Some(1));
+    assert!(reloaded.tree().unwrap().canonical().contains("Elapsed: 1"));
+}
+
+#[test]
 fn invalid_elapsed_patch_retains_delivery_and_prior_tree() {
     let directory = tempdir().unwrap();
     let database = directory.path().join("state.sqlite3");
