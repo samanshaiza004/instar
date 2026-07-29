@@ -12,6 +12,7 @@ mod engine;
 mod error;
 mod host;
 mod limits;
+mod presentation;
 mod profile;
 mod wire;
 mod worker;
@@ -27,13 +28,15 @@ pub use host::{
     component_imports,
 };
 pub use limits::{CallBudget, RuntimeLimits};
+pub use presentation::{next_display_boundary_epoch_millis, resolve_countdown_display};
 pub use profile::{
     APPLICATION_PROTOCOL, APPLICATION_WORLD, ComponentValidation, ComponentValidationError,
     PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, SUPPORTED_APPLICATION_PROTOCOLS,
     validate_component,
 };
 pub use worker::{
-    Generation, RequestId, RuntimeEvent, ScheduleId, TurnOrigin, TurnOutcome, YouthAppHandle,
+    Generation, PresentationReader, RequestId, RuntimeEvent, ScheduleId, TurnOrigin, TurnOutcome,
+    YouthAppHandle,
 };
 pub use youth_state::{
     DeadlineClock, GuestCallPhase, PendingDelivery, SchedulerInput, SchedulerOutput, StateLimits,

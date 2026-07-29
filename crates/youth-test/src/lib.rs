@@ -682,6 +682,9 @@ fn describe(observed: Option<&NodeData>) -> String {
         Some(NodeData::Text { value }) | Some(NodeData::AlignedText { value, .. }) => {
             format!("text({value:?})")
         }
+        Some(NodeData::Countdown { .. }) | Some(NodeData::AlignedCountdown { .. }) => {
+            "a countdown node".into()
+        }
         Some(NodeData::Button { label, enabled })
         | Some(NodeData::ShortcutButton { label, enabled, .. }) => {
             format!("button(label={label:?}, enabled={enabled})")

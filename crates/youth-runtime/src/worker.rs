@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,36 @@ const OBSERVER_CAPACITY: usize = 64;
 pub type RequestId = u64;
 pub type ScheduleId = u64;
 pub type Generation = u64;
+
+#[derive(Clone)]
+pub struct PresentationReader {
+    records: Arc<std::sync::RwLock<HashMap<u64, youth_state::ScheduleRecord>>>,
+    deadline_clock: Arc<dyn youth_state::DeadlineClock>,
+}
+
+impl std::fmt::Debug for PresentationReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PresentationReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PresentationReader {
+    #[must_use]
+    pub fn schedule(&self, id: u64) -> Option<youth_state::ScheduleRecord> {
+        self.records
+            .read()
+            .expect("presentation-record lock is not poisoned")
+            .get(&id)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn now_epoch_millis(&self) -> u64 {
+        self.deadline_clock.now_epoch_millis()
+    }
+}
 
 enum AppCommand {
     Mount,
@@ -91,6 +122,7 @@ pub struct YouthAppHandle {
     mailbox_tx: mpsc::Sender<WorkerMessage>,
     event_tx: broadcast::Sender<RuntimeEvent>,
     next_request_id: Arc<AtomicU64>,
+    presentation: PresentationReader,
 }
 
 impl YouthAppHandle {
@@ -99,6 +131,10 @@ impl YouthAppHandle {
         let component_id = component_identity(&config.component_path);
         let (mailbox_tx, mailbox_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (event_tx, _) = broadcast::channel(OBSERVER_CAPACITY);
+        let presentation = PresentationReader {
+            records: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            deadline_clock: Arc::clone(&config.limits.time.deadline_clock),
+        };
         config
             .limits
             .time
@@ -112,9 +148,18 @@ impl YouthAppHandle {
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
         let thread_component_id = component_id.clone();
         let thread_events = event_tx.clone();
+        let thread_presentation = presentation.clone();
         std::thread::Builder::new()
             .name(format!("youth-app-{thread_component_id}"))
-            .spawn(move || worker_main(config, mailbox_rx, thread_events, init_tx))
+            .spawn(move || {
+                worker_main(
+                    config,
+                    mailbox_rx,
+                    thread_events,
+                    thread_presentation,
+                    init_tx,
+                );
+            })
             .map_err(|source| {
                 RuntimeError::WorkerStopped(
                     ErrorContext::new(
@@ -142,6 +187,7 @@ impl YouthAppHandle {
             mailbox_tx,
             event_tx,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            presentation,
         })
     }
 
@@ -166,6 +212,12 @@ impl YouthAppHandle {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Returns a synchronous, presentation-only view of host-owned schedules.
+    #[must_use]
+    pub fn presentation(&self) -> PresentationReader {
+        self.presentation.clone()
     }
 
     pub async fn mount(&self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
@@ -286,6 +338,7 @@ fn worker_main(
     config: YouthAppConfig,
     mut mailbox_rx: mpsc::Receiver<WorkerMessage>,
     event_tx: broadcast::Sender<RuntimeEvent>,
+    presentation: PresentationReader,
     init_tx: std::sync::mpsc::SyncSender<Result<(), RuntimeError>>,
 ) {
     if !matches!(mailbox_rx.blocking_recv(), Some(WorkerMessage::Reconcile)) {
@@ -311,15 +364,16 @@ fn worker_main(
     if init_tx.send(Ok(())).is_err() {
         return;
     }
+    sync_presentation(&app, &presentation);
 
     while let Some(message) = mailbox_rx.blocking_recv() {
         match message {
             WorkerMessage::Request { command, reply } => {
-                if handle_request(&mut app, command, reply, &event_tx) {
+                if handle_request(&mut app, command, reply, &event_tx, &presentation) {
                     break;
                 }
             }
-            WorkerMessage::Wake(token) => handle_wake(&mut app, token, &event_tx),
+            WorkerMessage::Wake(token) => handle_wake(&mut app, token, &event_tx, &presentation),
             WorkerMessage::Reconcile => {
                 if let Err(error) = app.reconcile_schedules() {
                     publish_fault_if_any(&app, &event_tx, &error);
@@ -327,7 +381,26 @@ fn worker_main(
             }
             WorkerMessage::Shutdown => break,
         }
+        sync_presentation(&app, &presentation);
     }
+}
+
+fn sync_presentation(app: &crate::YouthApp, presentation: &PresentationReader) {
+    let records = app
+        .tree()
+        .into_iter()
+        .flat_map(|tree| tree.to_snapshot().nodes)
+        .filter_map(|node| {
+            node.data
+                .countdown_ref()
+                .map(|(schedule, _, _)| schedule.id)
+        })
+        .filter_map(|id| app.schedule(id).ok().flatten().map(|record| (id, record)))
+        .collect();
+    *presentation
+        .records
+        .write()
+        .expect("presentation-record lock is not poisoned") = records;
 }
 
 fn handle_request(
@@ -335,10 +408,12 @@ fn handle_request(
     command: AppCommand,
     reply: ReplySender,
     event_tx: &broadcast::Sender<RuntimeEvent>,
+    presentation: &PresentationReader,
 ) -> bool {
     match (command, reply) {
         (AppCommand::Mount, ReplySender::Snapshot(reply)) => {
             let result = app.mount();
+            sync_presentation(app, presentation);
             if let Ok(snapshot) = &result {
                 let _ = event_tx.send(RuntimeEvent::SnapshotReplaced(snapshot.clone()));
             } else if let Err(error) = &result {
@@ -348,6 +423,7 @@ fn handle_request(
         }
         (AppCommand::Activate { request_id, node }, ReplySender::Turn(reply)) => {
             let result = app.activate(node);
+            sync_presentation(app, presentation);
             if let Ok(receipt) = &result {
                 let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
                     origin: TurnOrigin::Requested(request_id),
@@ -360,6 +436,7 @@ fn handle_request(
         }
         (AppCommand::Resync, ReplySender::Snapshot(reply)) => {
             let result = app.resync();
+            sync_presentation(app, presentation);
             if let Ok(snapshot) = &result {
                 let _ = event_tx.send(RuntimeEvent::SnapshotReplaced(snapshot.clone()));
             } else if let Err(error) = &result {
@@ -391,12 +468,15 @@ fn handle_wake(
     app: &mut crate::YouthApp,
     token: youth_state::WakeToken,
     event_tx: &broadcast::Sender<RuntimeEvent>,
+    presentation: &PresentationReader,
 ) {
     let wake = ScheduleWake {
         application_id: token.app_id.clone(),
         token,
     };
-    match app.receive_schedule_wake(&wake) {
+    let disposition = app.receive_schedule_wake(&wake);
+    sync_presentation(app, presentation);
+    match disposition {
         Ok(WakeDisposition::Discarded) => {}
         Ok(WakeDisposition::DeliveryQueued) if app.lifecycle() != AppLifecycle::Mounted => {}
         Ok(WakeDisposition::DeliveryQueued) => {
@@ -412,6 +492,7 @@ fn handle_wake(
             };
             match app.deliver_next_pending() {
                 Ok(Some(receipt)) => {
+                    sync_presentation(app, presentation);
                     let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
                         origin: TurnOrigin::ScheduleElapsed {
                             schedule_id: delivery.schedule_id,

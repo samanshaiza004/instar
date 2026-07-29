@@ -1009,6 +1009,20 @@ impl YouthApp {
             })
     }
 
+    pub fn schedule(&self, id: u64) -> Result<Option<youth_state::ScheduleRecord>, RuntimeError> {
+        self.store.data().state.schedule(id).map_err(|source| {
+            RuntimeError::StateUnavailable(
+                self.context("schedule could not be read", None)
+                    .with_source(source),
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn now_epoch_millis(&self) -> u64 {
+        self.store.data().deadline_clock.now_epoch_millis()
+    }
+
     pub(crate) fn reconcile_schedules(&mut self) -> Result<(), RuntimeError> {
         let now_epoch_millis = self.store.data().deadline_clock.now_epoch_millis();
         let outputs = self

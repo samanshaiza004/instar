@@ -31,6 +31,7 @@ members = [
     "test-components/bad-revision-after-state-write",
     "test-components/app-error-after-state-write",
     "test-components/sdk-elapsed",
+    "test-components/countdown-presentation",
     "test-components/elapsed-trap",
     "test-components/elapsed-invalid-patch",
 ]
