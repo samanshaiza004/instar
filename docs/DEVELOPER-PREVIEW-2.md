@@ -1,7 +1,7 @@
 # Developer Preview 2 — Durable Scheduling
 
-- Status: **Gate B, C-1/C-2, and C-3 complete**; Gate C-4 in progress (notification dispatch, redelivery evidence, app-repo real-time testing)
-- Checkpoints: `timer-gate-b-platform`, `gate-c3-platform` (this workspace); `gate-c2-real-schedule-adoption`, `gate-c3-countdown-presentation` (Youth Timer)
+- Status: **Gates B, C-1 through C-4 complete**. Overdue recovery, notification dispatch, and redelivery are all proven end to end, including from the Youth Timer's own real-time test suite.
+- Checkpoints: `timer-gate-b-platform`, `gate-c3-platform` (this workspace); `gate-c2-real-schedule-adoption`, `gate-c3-countdown-presentation`, `gate-c4-recovery` (Youth Timer)
 - Application protocol: `youth:app@0.0.4`, with runtime compatibility for `0.0.3` and `0.0.2`
 - Capability protocol: `youth:time@0.0.1`
 - State protocol: `youth:state@0.0.1` (schema version 3)
@@ -645,23 +645,56 @@ deliberately narrow: it does not let a test simulate arbitrary
 durations quickly, only prove that real elapsed time is handled
 correctly at real (short) scale.
 
+### D10 — Reconciling is not delivering; mounting is where the backlog is drained
+
+Building Gate C-4's own decisive evidence (an app repo observing overdue
+recovery for real) surfaced a gap the design's own D4g had correctly
+anticipated but the implementation hadn't finished: reconciliation
+(`reconcile_overdue`, run both by `instantiate`'s `reconcile_on_open`
+and, separately, by the worker's own `reconcile_without_guest`) queues a
+delivery for an already-past deadline without forcing a guest turn —
+exactly as designed, since due detection must not require a guest. But
+nothing then ever attempted that queued delivery: no live wake will ever
+arrive for a deadline already in the past, and none of `youth-desktop`,
+`youth-cli`, or `.youth-test`'s runner called `deliver_next_pending()`
+anywhere. The reconciled backlog was durable and correct, but orphaned —
+Gate C-4's premise (recovery is *observable*, not just internally
+consistent) did not actually hold for any real consumer.
+
+Mounting is the first point a guest turn is actually possible, so
+`YouthAppHandle`'s worker now drains every already-queued pending
+delivery immediately after a successful mount, publishing a
+`TurnCommitted` for each and replacing the snapshot it returns with a
+fresh one if anything delivered — the caller sees the post-recovery tree
+directly, not a stale pre-recovery one that updates moments later. This
+is worker-layer policy, not a change to the lower-level `YouthApp` API,
+which stays exactly as manual as it always was (`deliver_next_pending`
+remains something a direct caller must invoke itself).
+
 ### Gate C-4 scope and sequence
 
 | Step | Content |
 | --- | --- |
-| C4-1 | `NotificationDispatcher` seam (D8a) wired at every `QueueElapsedDelivery` site (D8); a redelivery-after-reload test proving a schedule that faulted on its first elapsed turn succeeds on a later one (closing the one gap `elapsed_delivery.rs` left: retention was proven, eventual success was not) |
-| C4-2 | `.youth-test` `sleep <milliseconds>` command (D9); `docs/metrics/schema-v1.json` generalized from a calculator-specific `calculator_commit` field to an app-agnostic one, so a second Utility Suite app can publish release evidence into the same schema |
+| C4-1 | `NotificationDispatcher` seam (D8a) wired at every `QueueElapsedDelivery` site (D8), including the worker's own separate `reconcile_without_guest` path (missed on the first pass, caught in review); a redelivery-after-reload test proving a schedule that faulted on its first elapsed turn succeeds on a later one |
+| C4-2 | `.youth-test` `sleep <milliseconds>` command (D9); `docs/metrics/schema-v1.json` generalized from a calculator-specific `calculator_commit` field to an app-agnostic one |
+| C4-3 | Mounting drains any backlog of already-overdue deliveries (D10) — the fix that makes C4-2's `sleep`-based recovery test actually observable, discovered while building the Youth Timer's own decisive test |
 
 ### Definition of done for Gate C-4
 
 - A schedule with a notification descriptor gets a real dispatch attempt
   exactly once when its deadline passes, whether detected by a live wake,
-  a clock-advance check, or overdue reconciliation on process open.
+  a clock-advance check, or overdue reconciliation on process open —
+  proven at every path that can produce `QueueElapsedDelivery`, not just
+  the ones checked on the first implementation pass.
 - A dispatch failure never blocks, delays, or fails the elapsed delivery
   it accompanies.
 - A schedule that faulted on its first elapsed turn is proven, not just
   argued, to succeed on a later one.
-- An external app can `sleep` past a short real schedule and observe
-  overdue reconciliation from its own `.youth-test` suite.
+- An external app can `sleep` past a short real schedule, `restart`, and
+  observe the resulting elapsed state directly — not just that a
+  delivery was queued, but that it was delivered.
 - `docs/metrics/schema-v1.json` accepts a second app's release evidence
   without lying about which app produced it.
+- The Youth Timer's own `.youth-test` suite proves overdue recovery end
+  to end (`tests/overdue_recovery.youth-test`), closing `TIMER-F002` and
+  `TIMER-F007` with application evidence, not platform review alone.
