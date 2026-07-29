@@ -19,14 +19,24 @@
 | B-3 | Deadline / wake / guest-clock seams, pure scheduler, reconciliation | Complete (`6d29a50`) |
 | B-4a | Typed elapsed delivery, acknowledgement inside the turn transaction | Complete (`a924c92`) |
 | B-4b | Host-initiated delivery through one worker mailbox, observers | Complete (`97d7b3b`) |
-| C | Timer adopts the capability and deletes its Gate A substitute | In progress |
+| C-1/C-2 (Timer) | Timer migrates durable state and adopts real schedules | Complete |
+| C3-1 | `youth:app@0.0.5` WIT, `youth-tree` countdown schema (D7) | Complete (`38683db`) |
+| C3-2 | Runtime dispatch for `0.0.5`, install-time reference validation (D7d) | Complete (`af83784`) |
+| C3-3 | SDK `Countdown` builder, literal/countdown wire plumbing | Complete (`e30e001`) |
+| C3-4 | Pure display resolution (D7c), desktop `WaitUntil` repaint (D7b), decisive test | Complete (`1d8c227`) |
+| C-3 (Timer) | Timer adopts `Countdown` for its own countdown text node | Not started |
+| C-4 | Recovery and release | Not started |
 
-Gate B proves the **host capability**. The architectural loop is not closed
-until the external Timer removes its manual `Advance` commands and consumes
-`context.time()`, host-issued schedule identity, pause/resume/cancel,
-autonomous `ScheduleElapsed`, overdue recovery, and host-owned countdown
-presentation. Until then `TIMER-F001`, `F002`, `F003`, `F004`, `F007`, and
-`F008` remain open as *application* evidence.
+Gate B proved the **host capability** for scheduling; Gate C-3 proves it for
+**presentation** — a countdown's digits are host-resolved and host-repainted,
+never a guest turn. Both are platform capability, not yet application
+evidence: the architectural loop closes only once Timer's own `view()`
+declares a `Countdown` node instead of a static duration string. Until then
+`TIMER-F004` remains open as *application* evidence, and the `0.0.5`
+`ContractProfile` in `youth-project` is deliberately unpublished — see the
+comment above `SUPPORTED_PROFILES` — pending the post-push two-commit
+SDK-revision pin, the same discipline already used for `0.0.4` and its
+pause/resume fix.
 
 ## Thesis
 
