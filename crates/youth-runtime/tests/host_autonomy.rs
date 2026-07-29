@@ -257,41 +257,73 @@ async fn faulted_delivery_publishes_once_without_retry_and_retains_pending() {
 }
 
 #[tokio::test]
-async fn shutdown_preserves_an_overdue_pending_delivery() {
+async fn mounting_a_reopened_app_delivers_an_overdue_schedule_exactly_once() {
     let directory = tempdir().unwrap();
     let database = directory.path().join("state.sqlite3");
     create_schedule(&database, 100);
     let deadline = VirtualDeadlineClock::new(START + 100);
     let wakes = VirtualWakeDriver::default();
+
+    // Spawning alone reconciles and queues the already-overdue delivery
+    // (D4g: due detection does not require a guest) but never delivers it
+    // -- that needs an actual guest turn, which spawning alone cannot
+    // provide. Mounting is the first point a turn is possible, so it is
+    // where the queued backlog finally gets delivered: the overdue-
+    // recovery case Gate C-4 restores evidence for.
     let app =
         YouthAppHandle::spawn(config("youth-sdk-elapsed", &database, &deadline, &wakes)).unwrap();
+    assert_eq!(app.inspect().await.unwrap().lifecycle, AppLifecycle::Loaded);
+    {
+        let store = StateStore::open_for_app(
+            StateLocation::File(database.clone()),
+            StateLimits::default(),
+            app_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.pending_deliveries().unwrap().len(),
+            1,
+            "spawning alone must only queue, never deliver"
+        );
+    }
+
     app.mount().await.unwrap();
+    {
+        let mut store = StateStore::open_for_app(
+            StateLocation::File(database.clone()),
+            StateLimits::default(),
+            app_id(),
+        )
+        .unwrap();
+        assert!(store.pending_deliveries().unwrap().is_empty());
+        store.begin(GuestCallPhase::Resync).unwrap();
+        assert_eq!(
+            store.get("elapsed-count").unwrap(),
+            Some(StateValue::Integer(1))
+        );
+        store.rollback().unwrap();
+    }
     app.stop().await.unwrap();
 
-    let store = StateStore::open_for_app(
-        StateLocation::File(database.clone()),
-        StateLimits::default(),
-        app_id(),
-    )
-    .unwrap();
-    assert_eq!(store.pending_deliveries().unwrap().len(), 1);
-    drop(store);
-
+    // Reopening and mounting again must not redeliver: there is nothing
+    // left pending, so the count stays at exactly one.
     let reopened =
         YouthAppHandle::spawn(config("youth-sdk-elapsed", &database, &deadline, &wakes)).unwrap();
-    assert_eq!(
-        reopened.inspect().await.unwrap().lifecycle,
-        AppLifecycle::Loaded
-    );
-    let store = StateStore::open_for_app(
+    reopened.mount().await.unwrap();
+    let mut store = StateStore::open_for_app(
         StateLocation::File(database),
         StateLimits::default(),
         app_id(),
     )
     .unwrap();
-    assert_eq!(store.pending_deliveries().unwrap().len(), 1);
+    assert!(store.pending_deliveries().unwrap().is_empty());
+    store.begin(GuestCallPhase::Resync).unwrap();
+    assert_eq!(
+        store.get("elapsed-count").unwrap(),
+        Some(StateValue::Integer(1)),
+        "reopening must not redeliver an already-acknowledged elapse"
+    );
     drop(store);
-    reopened.mount().await.unwrap();
     reopened.stop().await.unwrap();
 }
 

@@ -419,6 +419,12 @@ fn handle_request(
         (AppCommand::Mount, ReplySender::Snapshot(reply)) => {
             let result = app.mount();
             sync_presentation(app, presentation);
+            let result = if result.is_ok() {
+                let delivered = drain_pending_deliveries(app, event_tx, presentation);
+                if delivered { app.snapshot() } else { result }
+            } else {
+                result
+            };
             if let Ok(snapshot) = &result {
                 let _ = event_tx.send(RuntimeEvent::SnapshotReplaced(snapshot.clone()));
             } else if let Err(error) = &result {
@@ -485,33 +491,78 @@ fn handle_wake(
         Ok(WakeDisposition::Discarded) => {}
         Ok(WakeDisposition::DeliveryQueued) if app.lifecycle() != AppLifecycle::Mounted => {}
         Ok(WakeDisposition::DeliveryQueued) => {
-            let delivery = match app.pending_deliveries() {
-                Ok(deliveries) => deliveries.into_iter().next(),
-                Err(error) => {
-                    publish_fault_if_any(app, event_tx, &error);
-                    return;
-                }
-            };
-            let Some(delivery) = delivery else {
-                return;
-            };
-            match app.deliver_next_pending() {
-                Ok(Some(receipt)) => {
-                    sync_presentation(app, presentation);
-                    let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
-                        origin: TurnOrigin::ScheduleElapsed {
-                            schedule_id: delivery.schedule_id,
-                            generation: delivery.generation,
-                        },
-                        receipt,
-                    }));
-                }
-                Ok(None) => {}
-                Err(error) => publish_fault_if_any(app, event_tx, &error),
-            }
+            deliver_one_pending(app, event_tx, presentation);
         }
         Err(error) => publish_fault_if_any(app, event_tx, &error),
     }
+}
+
+/// Attempts one queued elapsed delivery, publishing a `TurnCommitted` on
+/// success. Returns whether a delivery was actually committed, so a caller
+/// (mount's recovery drain, in particular) knows whether the tree it
+/// already has is stale and needs re-fetching.
+fn deliver_one_pending(
+    app: &mut crate::YouthApp,
+    event_tx: &broadcast::Sender<RuntimeEvent>,
+    presentation: &PresentationReader,
+) -> bool {
+    let delivery = match app.pending_deliveries() {
+        Ok(deliveries) => deliveries.into_iter().next(),
+        Err(error) => {
+            publish_fault_if_any(app, event_tx, &error);
+            return false;
+        }
+    };
+    let Some(delivery) = delivery else {
+        return false;
+    };
+    match app.deliver_next_pending() {
+        Ok(Some(receipt)) => {
+            sync_presentation(app, presentation);
+            let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
+                origin: TurnOrigin::ScheduleElapsed {
+                    schedule_id: delivery.schedule_id,
+                    generation: delivery.generation,
+                },
+                receipt,
+            }));
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            publish_fault_if_any(app, event_tx, &error);
+            false
+        }
+    }
+}
+
+/// Drains every schedule already queued for elapsed delivery at the moment
+/// this application became mounted -- most notably the overdue-on-open
+/// case (D4g/Gate C-4): reconciliation queues a delivery for a deadline
+/// that already passed while no process was running, but deliberately
+/// never forces a guest turn by itself (queueing must not require a
+/// guest). Mounting is the first point a guest turn is actually possible,
+/// so this is where any such backlog gets a real delivery attempt, exactly
+/// once each, stopping at the first failure rather than retrying a fault
+/// in a loop. Returns whether at least one delivery committed.
+fn drain_pending_deliveries(
+    app: &mut crate::YouthApp,
+    event_tx: &broadcast::Sender<RuntimeEvent>,
+    presentation: &PresentationReader,
+) -> bool {
+    let mut delivered_any = false;
+    loop {
+        match app.pending_deliveries() {
+            Ok(deliveries) if deliveries.is_empty() => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if !deliver_one_pending(app, event_tx, presentation) {
+            break;
+        }
+        delivered_any = true;
+    }
+    delivered_any
 }
 
 fn publish_fault_if_any(
