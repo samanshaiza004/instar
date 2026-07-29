@@ -1,7 +1,7 @@
 # Developer Preview 2 — Durable Scheduling
 
-- Status: **Gate B complete** (platform capability); Gate C in progress (application adoption)
-- Checkpoint: `timer-gate-b-platform`
+- Status: **Gate B, C-1/C-2, and C-3 complete**; Gate C-4 in progress (notification dispatch, redelivery evidence, app-repo real-time testing)
+- Checkpoints: `timer-gate-b-platform`, `gate-c3-platform` (this workspace); `gate-c2-real-schedule-adoption`, `gate-c3-countdown-presentation` (Youth Timer)
 - Application protocol: `youth:app@0.0.4`, with runtime compatibility for `0.0.3` and `0.0.2`
 - Capability protocol: `youth:time@0.0.1`
 - State protocol: `youth:state@0.0.1` (schema version 3)
@@ -589,3 +589,79 @@ with no uniqueness constraint.
 - `0.0.2`/`0.0.3`/`0.0.4` components continue to load, mount, and run
   unchanged; their text nodes have no countdown capability and none is
   implied for them.
+
+## Gate C-4: recovery and release
+
+Gate C-3 closed presentation. What remains is entirely host-side
+follow-through on facts Gate B already established: a schedule's
+notification descriptor has been durable since B-1/D6 but nothing ever
+sends it anywhere, redelivery-after-a-fault is proven to *retain* but
+not proven to later *succeed*, and app-repo test suites still have no
+way to make real time pass, which blocks proving overdue recovery from
+outside the Youth workspace.
+
+### D8 — Notification is dispatched once, exactly when the deadline passes, independent of delivery
+
+`SchedulerOutput::QueueElapsedDelivery` (`crates/youth-state/src/scheduler.rs`)
+is already the single point every due-detection path — `Create` racing
+an already-past deadline, `ClockAdvanced`, `WakeReceived`, and
+`ProcessOpened`'s overdue reconciliation — funnels through. Whenever
+this output is produced and the schedule's stored `notification`
+descriptor (`ScheduleRecord.notification: Option<(String, String)>`) is
+`Some`, the host attempts a best-effort OS notification dispatch using
+it, exactly once per schedule generation. Dispatch success or failure
+never affects whether the elapsed delivery is queued, delivered, or
+acknowledged — the notification and the durable elapsed delivery are
+two independent effects of the same fact ("this deadline passed"), not
+a pipeline where one gates the other. A dispatch failure (no
+notification daemon, permission denied, sandboxed environment) is
+swallowed and logged, never surfaced as a `RuntimeError`.
+
+### D8a — The dispatcher is a seam, not a hard dependency
+
+Mirroring `RuntimeTimeSeams`'s `DeadlineClock`/`WakeDriver`/
+`GuestMonotonicClock` pattern (D3), a `NotificationDispatcher` trait
+abstracts "send this title and body somewhere." `SystemNotificationDispatcher`
+is the real implementation. Tests and the headless `.youth-test` runner
+use a recording or no-op test double, so `cargo test` and `youth test`
+never pop a real OS notification and dispatch is assertable
+deterministically (title/body observed, exactly once, at the right
+moment) without depending on a desktop notification center existing in
+CI.
+
+### D9 — An app-repo test can make real time pass without a virtual clock
+
+`.youth-test`'s real-headless runner already defaults to
+`SystemDeadlineClock` (real wall-clock time), not a virtual one —
+external apps were never given a way to *wait*, not because the
+runtime lacks real time, but because the DSL had no command that
+blocks. A minimal `sleep <milliseconds>` command — a genuine wall-clock
+sleep in the test harness process, between two ordinary commands, nothing
+guest-visible — is sufficient: paired with the minimum schedule
+duration (100 ms), an app can arm a short-lived schedule, `sleep` past
+it, and `restart` to observe overdue reconciliation for real, from its
+own repository, without any virtual-clock machinery. This is
+deliberately narrow: it does not let a test simulate arbitrary
+durations quickly, only prove that real elapsed time is handled
+correctly at real (short) scale.
+
+### Gate C-4 scope and sequence
+
+| Step | Content |
+| --- | --- |
+| C4-1 | `NotificationDispatcher` seam (D8a) wired at every `QueueElapsedDelivery` site (D8); a redelivery-after-reload test proving a schedule that faulted on its first elapsed turn succeeds on a later one (closing the one gap `elapsed_delivery.rs` left: retention was proven, eventual success was not) |
+| C4-2 | `.youth-test` `sleep <milliseconds>` command (D9); `docs/metrics/schema-v1.json` generalized from a calculator-specific `calculator_commit` field to an app-agnostic one, so a second Utility Suite app can publish release evidence into the same schema |
+
+### Definition of done for Gate C-4
+
+- A schedule with a notification descriptor gets a real dispatch attempt
+  exactly once when its deadline passes, whether detected by a live wake,
+  a clock-advance check, or overdue reconciliation on process open.
+- A dispatch failure never blocks, delays, or fails the elapsed delivery
+  it accompanies.
+- A schedule that faulted on its first elapsed turn is proven, not just
+  argued, to succeed on a later one.
+- An external app can `sleep` past a short real schedule and observe
+  overdue reconciliation from its own `.youth-test` suite.
+- `docs/metrics/schema-v1.json` accepts a second app's release evidence
+  without lying about which app produced it.
