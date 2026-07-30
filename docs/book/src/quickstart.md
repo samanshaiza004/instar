@@ -21,3 +21,19 @@ native display is available and you want to verify window presentation.
 The generated project commits both `Youth.toml` and `Youth.lock`. Do not edit
 the lock by hand. DP0 has no lock-upgrade command; a mismatch explains the
 conflicting fields and asks you to regenerate or restore the locked input.
+
+## Utility Suite releases
+
+The completed external applications are maintained as sibling repositories:
+
+- [Calculator](https://github.com/samanshaiza004/youth-calculator) probes layout,
+  focus, keyboard commands, and formatting.
+- [Timer](https://github.com/samanshaiza004/youth-timer) probes clocks,
+  schedules, elapsed delivery, and recovery.
+- [Todo](https://github.com/samanshaiza004/youth-todo) probes bounded dynamic
+  collections, stable identities, structural updates, migration, and view
+  convergence.
+
+Todo’s release tag is `utility-todo-gate-d-release`. Its findings and metrics
+are application evidence; they do not add list nodes, structured state, state
+enumeration, or automatic tree diffing to Youth.

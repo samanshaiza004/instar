@@ -26,7 +26,7 @@ diffing, and reactive dependencies remain out of scope.
 | `utility-todo-gate-a-domain-proof` | Pure collection model, strict v1/v2 codec, atomic migration plan, SDK blocker reproduction | Complete (Todo `f690a7b`) |
 | `utility-todo-gate-b-structural-sdk` | Derived identities, named containers, explicit structural updates, derived test selectors, view convergence | Complete (`4b06841`; SDK tag at `844102b`) |
 | `utility-todo-gate-c-collection-evidence` | Complete external Todo behavior, paging/filtering, rollback, focus, restart, migration | Complete (Todo `fee04a5`; Youth `9b562af`) |
-| `utility-todo-gate-d-release` | Canonical artifact certified unchanged on all hosts, source-build portability, metrics and findings | Complete (Todo `632e20c`; Youth Gate D candidate) |
+| `utility-todo-gate-d-release` | Canonical artifact certified unchanged on all hosts, source-build portability, metrics and findings | Complete (Todo `632e20c`; Youth `3e77b9e`) |
 
 Gate B is intentionally split into independently green B-1 through B-5
 checkpoints: derived identities; structural SDK operations; test selectors;

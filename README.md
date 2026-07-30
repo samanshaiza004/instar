@@ -27,6 +27,20 @@ semantic tests backed by the real runtime. See the
 [DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
 [tooling findings](docs/DEVELOPER-PREVIEW-FINDINGS.md).
 
+## Utility Suite status
+
+The completed Utility Suite applications are independent architecture probes:
+
+| Application | Capability pressure | Release evidence |
+| --- | --- | --- |
+| [Calculator](https://github.com/samanshaiza004/youth-calculator) | Rows, grid layout, keyboard focus, commands, formatting | Canonical component certified on Ubuntu, Windows, and macOS |
+| [Timer](https://github.com/samanshaiza004/youth-timer) | Host clocks, durable schedules, elapsed delivery, recovery | Gate C-4 recovery complete |
+| [Todo](https://github.com/samanshaiza004/youth-todo) | Dynamic collections, stable identities, structural updates, migration | `utility-todo-gate-d-release`; canonical component certified on all three hosts |
+
+Todo is the latest completed probe and remains on `youth:app@0.0.5`. Its
+findings are evidence for future platform decisions, not an authorization for
+list nodes, structured state, state enumeration, or automatic tree diffing.
+
 ## Transactional Visible Counter foundation
 
 Milestone 1 presents the counter in a native window while preserving the
@@ -53,7 +67,7 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app-v0.0.4/`, `wit/youth-app-v0.0.3/`, `wit/youth-app/` | The current `youth:app@0.0.4` WIT contract and supported `0.0.3`/`0.0.2` predecessors |
+| `wit/youth-app-v0.0.5/`, `wit/youth-app-v0.0.4/`, `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts through `0.0.5`; the unversioned tree is the generated-project default (`0.0.4`) |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker |
