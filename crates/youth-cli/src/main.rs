@@ -47,7 +47,11 @@ enum Command {
         release: bool,
     },
     /// Run all semantic `tests/*.youth-test` files headlessly.
-    Test,
+    Test {
+        /// Reconstruct and compare the guest view after every committed turn.
+        #[arg(long)]
+        verify_view_convergence: bool,
+    },
     /// Rebuild and restart the current project when its inputs change.
     Dev {
         /// Exercise the supervisor without native presentation.
@@ -209,7 +213,9 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::New { destination, id } => project_commands::new_project(&destination, &id)?,
         Command::Check => project_commands::check_project()?,
         Command::Build { release } => project_commands::build_project(release)?,
-        Command::Test => project_commands::test_project().await?,
+        Command::Test {
+            verify_view_convergence,
+        } => project_commands::test_project(verify_view_convergence).await?,
         Command::Dev {
             headless_supervisor,
         } => project_commands::dev_project(headless_supervisor).await?,

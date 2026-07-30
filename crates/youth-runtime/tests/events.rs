@@ -72,6 +72,24 @@ fn resync_after_activations_replaces_the_tree_at_the_live_revision() {
 }
 
 #[test]
+fn verification_resync_returns_a_pair_without_replacing_authority_or_accounting() {
+    let mut app = YouthApp::load(counter_component()).expect("counter component loads");
+    app.mount().expect("mount succeeds");
+    app.activate(id(4)).expect("activation succeeds");
+    let before = app.inspect();
+
+    let verification = app.verify_view().expect("verification resync succeeds");
+    let after = app.inspect();
+
+    assert_eq!(verification.retained, verification.reconstructed);
+    assert_eq!(after.canonical_tree, before.canonical_tree);
+    assert_eq!(after.current_revision, before.current_revision);
+    assert_eq!(after.last_turn, before.last_turn);
+    assert_eq!(after.state_metrics, before.state_metrics);
+    assert_eq!(after.last_event_sequence, before.last_event_sequence);
+}
+
+#[test]
 fn rejected_text_activation_does_not_mutate_or_fault() {
     let mut app = YouthApp::load(counter_component()).expect("counter component loads");
     app.mount().expect("mount succeeds");

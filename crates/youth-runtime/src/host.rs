@@ -95,6 +95,13 @@ pub struct AppInspection {
     pub canonical_tree: String,
 }
 
+/// Atomic retained/reconstructed snapshot pair produced only for test tooling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewVerification {
+    pub retained: youth_tree::TreeSnapshot,
+    pub reconstructed: youth_tree::TreeSnapshot,
+}
+
 struct MemoryLimiter {
     maximum: usize,
     max_table_elements: usize,
@@ -1453,7 +1460,7 @@ impl YouthApp {
             transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
-        let result = span.in_scope(|| self.resync_inner(base_revision, turn_id));
+        let result = span.in_scope(|| self.resync_inner(base_revision, turn_id, true));
         span.record("result", if result.is_ok() { "ok" } else { "error" });
         result
     }
@@ -1462,6 +1469,7 @@ impl YouthApp {
         &mut self,
         live_revision: u64,
         turn_id: Option<u64>,
+        install: bool,
     ) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         self.prepare_call(self.limits.resync, "resync", turn_id)?;
         self.begin_state(youth_state::GuestCallPhase::Resync, turn_id)?;
@@ -1543,8 +1551,29 @@ impl YouthApp {
         }
         self.store.data_mut().discard_staged_schedule_outputs();
         self.record_state_metrics("read_only");
-        self.tree = Some(tree);
+        if install {
+            self.tree = Some(tree);
+        }
         Ok(snapshot)
+    }
+
+    /// Reconstructs the guest view without replacing host authority or
+    /// changing externally visible turn accounting.
+    #[doc(hidden)]
+    pub fn verify_view(&mut self) -> Result<ViewVerification, RuntimeError> {
+        let retained = self.snapshot()?;
+        let metrics = self.store.data().state.metrics();
+        let result = self
+            .resync_inner(retained.revision, self.last_event_sequence, false)
+            .map(|reconstructed| ViewVerification {
+                retained,
+                reconstructed,
+            });
+        self.store
+            .data_mut()
+            .state
+            .restore_verification_metrics(metrics);
+        result
     }
 
     /// Stops a mounted application and releases its retained tree.

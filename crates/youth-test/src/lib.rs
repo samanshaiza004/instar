@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,12 @@ use youth_state::{AppId, GuestCallPhase, StateLimits, StateLocation, StateStore,
 use youth_tree::{NodeData, NodeId, Tree, TreeSnapshot};
 
 use youth_interaction::{InteractionState, LogicalKey, Modifiers, SemanticAction};
+use youth_runtime::RuntimeEvent;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunOptions {
+    pub verify_view_convergence: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Selector {
@@ -579,6 +586,15 @@ pub async fn run_directory(
     component: &Path,
     app_id: &AppId,
 ) -> Result<usize, TestError> {
+    run_directory_with_options(tests_directory, component, app_id, RunOptions::default()).await
+}
+
+pub async fn run_directory_with_options(
+    tests_directory: &Path,
+    component: &Path,
+    app_id: &AppId,
+    options: RunOptions,
+) -> Result<usize, TestError> {
     let mut files = fs::read_dir(tests_directory)
         .map_err(|source| TestError::Io {
             path: tests_directory.to_path_buf(),
@@ -610,12 +626,21 @@ pub async fn run_directory(
                 message: "test entries must be regular files, not symlinks".into(),
             });
         }
-        run_file(path, component, app_id).await?;
+        run_file_with_options(path, component, app_id, options).await?;
     }
     Ok(files.len())
 }
 
 pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(), TestError> {
+    run_file_with_options(path, component, app_id, RunOptions::default()).await
+}
+
+pub async fn run_file_with_options(
+    path: &Path,
+    component: &Path,
+    app_id: &AppId,
+    options: RunOptions,
+) -> Result<(), TestError> {
     let source = fs::read_to_string(path).map_err(|source| TestError::Io {
         path: path.to_path_buf(),
         source,
@@ -628,6 +653,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
     let state_file = state.path().join("state.sqlite3");
     seed_state(path, &script.commands, app_id, &state_file)?;
     let mut app = spawn(component, app_id, &state_file)?;
+    let mut events = app.subscribe();
     let mut snapshot = None;
     let mut interaction = InteractionState::default();
 
@@ -641,6 +667,9 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+                if options.verify_view_convergence {
+                    verify_view_convergence(path, &located, &app).await?;
+                }
             }
             Command::Activate { selector } => {
                 let node = selector.node_id();
@@ -662,6 +691,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
                 app = spawn(component, app_id, &state_file)?;
+                events = app.subscribe();
                 snapshot = Some(
                     app.mount()
                         .await
@@ -669,6 +699,9 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                 );
                 interaction = InteractionState::default();
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+                if options.verify_view_convergence {
+                    verify_view_convergence(path, &located, &app).await?;
+                }
             }
             Command::Key { key, modifiers } => {
                 let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
@@ -803,6 +836,9 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                 expect_state(path, &located, app_id, &state_file, key, expected)?;
             }
         }
+        if options.verify_view_convergence {
+            verify_committed_events(path, &located, &app, &mut events).await?;
+        }
     }
     app.stop().await.map_err(|error| TestError::Diagnostic {
         path: path.to_path_buf(),
@@ -907,6 +943,100 @@ fn state_error(
         line: command.line,
         command: command.source.clone(),
         message: format!("{context}: {error}"),
+    }
+}
+
+async fn verify_committed_events(
+    path: &Path,
+    located: &LocatedCommand,
+    app: &YouthAppHandle,
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+) -> Result<(), TestError> {
+    loop {
+        match events.try_recv() {
+            Ok(RuntimeEvent::TurnCommitted(_)) => {
+                verify_view_convergence(path, located, app).await?;
+            }
+            Ok(RuntimeEvent::Faulted(_) | RuntimeEvent::SnapshotReplaced(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                return Err(assertion_error(
+                    path,
+                    located,
+                    "runtime observer stream closed during convergence verification".into(),
+                ));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                return Err(assertion_error(
+                    path,
+                    located,
+                    format!(
+                        "runtime observer lagged by {count} events during convergence verification"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+async fn verify_view_convergence(
+    path: &Path,
+    located: &LocatedCommand,
+    app: &YouthAppHandle,
+) -> Result<(), TestError> {
+    let verification = app
+        .verify_view()
+        .await
+        .map_err(|error| runtime(path, located, error))?;
+    compare_guest_semantics(&verification.retained, &verification.reconstructed).map_err(
+        |message| assertion_error(path, located, format!("view convergence failed: {message}")),
+    )
+}
+
+fn compare_guest_semantics(
+    retained: &TreeSnapshot,
+    reconstructed: &TreeSnapshot,
+) -> Result<(), String> {
+    let retained = retained
+        .nodes
+        .iter()
+        .filter(|node| !matches!(&node.data, NodeData::Root))
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let reconstructed = reconstructed
+        .nodes
+        .iter()
+        .filter(|node| !matches!(&node.data, NodeData::Root))
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let missing = retained
+        .keys()
+        .filter(|id| !reconstructed.contains_key(id))
+        .map(|id| id.get())
+        .collect::<Vec<_>>();
+    let extra = reconstructed
+        .keys()
+        .filter(|id| !retained.contains_key(id))
+        .map(|id| id.get())
+        .collect::<Vec<_>>();
+    let changed = retained
+        .iter()
+        .filter_map(|(id, retained)| {
+            reconstructed
+                .get(id)
+                .filter(|reconstructed| {
+                    retained.data != reconstructed.data
+                        || retained.children != reconstructed.children
+                })
+                .map(|_| id.get())
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() && extra.is_empty() && changed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing nodes {missing:?}; extra nodes {extra:?}; changed nodes {changed:?}"
+        ))
     }
 }
 
@@ -1365,6 +1495,65 @@ mount
         assert_eq!(
             youth_sdk::derived_command_id("todo", 1, "toggle").unwrap(),
             0x8b5e_c3bc_b296_c4a5
+        );
+    }
+
+    #[test]
+    fn convergence_diagnostics_separate_missing_extra_and_changed_nodes() {
+        let id = |value| NodeId::new(value).unwrap();
+        let retained = TreeSnapshot {
+            revision: 1,
+            root: id(1),
+            nodes: vec![
+                youth_tree::Node {
+                    id: id(1),
+                    data: NodeData::Root,
+                    children: vec![id(2)],
+                },
+                youth_tree::Node {
+                    id: id(2),
+                    data: NodeData::Text {
+                        value: "old".into(),
+                    },
+                    children: vec![],
+                },
+                youth_tree::Node {
+                    id: id(3),
+                    data: NodeData::Text {
+                        value: "missing".into(),
+                    },
+                    children: vec![],
+                },
+            ],
+        };
+        let reconstructed = TreeSnapshot {
+            revision: 1,
+            root: id(1),
+            nodes: vec![
+                youth_tree::Node {
+                    id: id(1),
+                    data: NodeData::Root,
+                    children: vec![id(2)],
+                },
+                youth_tree::Node {
+                    id: id(2),
+                    data: NodeData::Text {
+                        value: "new".into(),
+                    },
+                    children: vec![],
+                },
+                youth_tree::Node {
+                    id: id(4),
+                    data: NodeData::Text {
+                        value: "extra".into(),
+                    },
+                    children: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            compare_guest_semantics(&retained, &reconstructed).unwrap_err(),
+            "missing nodes [3]; extra nodes [4]; changed nodes [2]"
         );
     }
 }

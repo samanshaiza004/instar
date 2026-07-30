@@ -54,6 +54,7 @@ enum AppCommand {
         node: youth_tree::NodeId,
     },
     Resync,
+    VerifyView,
     Snapshot,
     Inspect,
     #[cfg(feature = "test-support")]
@@ -65,6 +66,7 @@ enum ReplySender {
     Snapshot(oneshot::Sender<Result<youth_tree::TreeSnapshot, RuntimeError>>),
     Turn(oneshot::Sender<Result<TurnReceipt, RuntimeError>>),
     Inspection(oneshot::Sender<Result<AppInspection, RuntimeError>>),
+    ViewVerification(oneshot::Sender<Result<crate::ViewVerification, RuntimeError>>),
     Stop(oneshot::Sender<Result<(), RuntimeError>>),
 }
 
@@ -248,6 +250,15 @@ impl YouthAppHandle {
     pub async fn snapshot(&self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         let (reply, response) = oneshot::channel();
         self.send_request(AppCommand::Snapshot, ReplySender::Snapshot(reply))
+            .await?;
+        response.await.map_err(|_| self.worker_stopped())?
+    }
+
+    /// Reconstructs a read-only guest view without publishing or installing it.
+    #[doc(hidden)]
+    pub async fn verify_view(&self) -> Result<crate::ViewVerification, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send_request(AppCommand::VerifyView, ReplySender::ViewVerification(reply))
             .await?;
         response.await.map_err(|_| self.worker_stopped())?
     }
@@ -454,6 +465,11 @@ fn handle_request(
                 publish_fault_if_any(app, event_tx, error);
             }
             let _ = reply.send(result);
+        }
+        (AppCommand::VerifyView, ReplySender::ViewVerification(reply)) => {
+            // Verification is deliberately invisible to observers and
+            // presentation. The host-owned authoritative tree is untouched.
+            let _ = reply.send(app.verify_view());
         }
         (AppCommand::Snapshot, ReplySender::Snapshot(reply)) => {
             let _ = reply.send(app.snapshot());

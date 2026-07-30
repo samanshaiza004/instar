@@ -301,12 +301,15 @@ pub fn build_project(release: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-pub async fn test_project() -> Result<(), CliError> {
+pub async fn test_project(verify_view_convergence: bool) -> Result<(), CliError> {
     let (project, _) = build_and_validate(false)?;
-    let count = youth_test::run_directory(
+    let count = youth_test::run_directory_with_options(
         &project.root().join("tests"),
         &project.cargo_component(false),
         &project.app_id,
+        youth_test::RunOptions {
+            verify_view_convergence,
+        },
     )
     .await
     .map_err(|error| message(error.to_string()))?;
