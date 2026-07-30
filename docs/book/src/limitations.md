@@ -8,8 +8,9 @@ not a general application platform.
 - Layout is limited to deterministic columns, rows, and equal-track grids;
   styling, spans, and arbitrary constraints are absent.
 - Mouse and bounded logical keyboard input are supported. Native accessibility
-  projection is still absent (0%); focus remains host-owned so it can be added
-  without changing guests.
+  projection is not yet available; no standardized completeness inventory has
+  been collected. Focus remains host-owned so it can be added without changing
+  guests.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
 - The latest application protocol is `0.0.5`; the host also runs `0.0.4`,
