@@ -8,7 +8,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 
 | App | Repository | Findings prefix | Status |
 | --- | --- | --- | --- |
-| Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D release candidate; CI certification in progress |
+| Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D complete; one canonical component certified on Ubuntu, Windows, and macOS |
 | Timer | [samanshaiza004/youth-timer](https://github.com/samanshaiza004/youth-timer) | `TIMER-F` | Gate A app proof published; probes `youth:time` scope ahead of any implementation |
 
 ## Open findings

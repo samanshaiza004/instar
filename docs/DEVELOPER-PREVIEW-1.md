@@ -1,6 +1,7 @@
 # Youth — Developer Preview 1
 
-**Status:** Active  
+**Status:** Complete
+
 **Application protocol:** `youth:app@0.0.3` with runtime compatibility for `0.0.2`  
 **State protocol:** `youth:state@0.0.1`
 
@@ -234,9 +235,10 @@ begin only after two comparable releases.
 
 The first release baseline is recorded in
 `docs/metrics/calculator-dp1-macos-arm64.json`, with its limitations and
-interpretation in the accompanying Markdown summary. Publication and
-cross-platform identity become authoritative only when the Gate D CI run is
-green; until then this document remains an active release candidate.
+interpretation in the accompanying Markdown summary. Gate D CI run
+`30504489792` certified one canonical component byte-for-byte on Ubuntu,
+Windows, and macOS. The local host build remains separate source-portability
+evidence and is not required to be byte-reproducible.
 
 ## Checkpoints
 
