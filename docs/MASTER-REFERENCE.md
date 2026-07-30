@@ -2,9 +2,9 @@
 
 Authoritative documents, in order of precedence:
 
-1. [DEVELOPER-PREVIEW-3.md](DEVELOPER-PREVIEW-3.md) — active Utility Suite
-   Todo milestone for bounded dynamic collections on application protocol
-   `0.0.5`.
+1. [DEVELOPER-PREVIEW-3.md](DEVELOPER-PREVIEW-3.md) — completed latest Utility
+   Suite Todo milestone for bounded dynamic collections on application protocol
+   `0.0.5`; its release tag is `utility-todo-gate-d-release`.
 2. [DEVELOPER-PREVIEW-2.md](DEVELOPER-PREVIEW-2.md) — completed durable
    scheduling, countdown presentation, and recovery milestone:
    `youth:time@0.0.1` and application protocols `0.0.4`/`0.0.5`.

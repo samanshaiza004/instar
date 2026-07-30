@@ -1,7 +1,8 @@
 # Limitations
 
-Developer Preview 1 proves the first Utility Suite application on the runtime.
-It is not a general application platform yet.
+Developer Preview 3 proves the external workflow and three Utility Suite
+applications on the runtime. Youth is still an architecture-probing platform,
+not a general application platform.
 
 - Rendering and its framebuffer fixtures are provisional.
 - Layout is limited to deterministic columns, rows, and equal-track grids;
@@ -11,12 +12,14 @@ It is not a general application platform yet.
   without changing guests.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
-- The current application protocol is `0.0.4`; the host also runs `0.0.3` and
-  `0.0.2`.
+- The latest application protocol is `0.0.5`; the host also runs `0.0.4`,
+  `0.0.3`, and `0.0.2`. Generated Tally projects still default to `0.0.4`.
 - Guests are Rust-only and target `wasm32-wasip2`.
 - `youth build` emits a bare validated component, not an installable package.
 - Packaging, publishing, registries, and SDK upgrades are absent.
 
 Reactive UI, text input/IME, images, animation, multiple windows, arbitrary
-SQL, expression parsing, and scientific calculator behavior remain outside
-DP1.
+SQL, expression parsing, packaging, publishing, and SDK upgrade tooling remain
+outside the current previews. Todo additionally does not provide text entry,
+scrolling, list nodes, structured state, state enumeration, or automatic tree
+diffing.

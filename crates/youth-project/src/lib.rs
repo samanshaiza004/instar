@@ -58,12 +58,8 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         protocol: "0.0.5",
         wit_sha256: "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385",
         template_version: 3,
-        // Pinned to the pushed commit where the SDK's Countdown builder API
-        // (crates/youth-sdk/src/lib.rs and component.rs) actually landed and
-        // fully supports this protocol -- not `SDK_REVISION`, which is still
-        // the 0.0.4-default pin `youth new` scaffolds against. Publishing
-        // this profile was deliberately deferred (see prior commit history)
-        // until this exact revision was verified reachable on the remote.
+        // Timer's published 0.0.5 profile. The collections profile below uses
+        // a different immutable SDK revision under the same protocol/WIT tuple.
         sdk_revision: "bfd539ca5e0d8d63b9dcdb28c744758255560dc1",
     },
     ContractProfile {
@@ -487,15 +483,17 @@ mod tests {
 
     const WIT_V003: &str = "package youth:app@0.0.3;\n";
     const WIT_V004: &str = "package youth:app@0.0.4;\n";
+    const WIT_V005: &str = "package youth:app@0.0.5;\n";
 
     fn fixture(profile: ContractProfile) -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = temporary.path();
         fs::create_dir_all(root.join("wit/youth")).expect("WIT directory");
-        let wit = if profile.protocol == "0.0.3" {
-            WIT_V003
-        } else {
-            WIT_V004
+        let wit = match profile.protocol {
+            "0.0.3" => WIT_V003,
+            "0.0.4" => WIT_V004,
+            "0.0.5" => WIT_V005,
+            protocol => panic!("unsupported fixture protocol {protocol}"),
         };
         let revision = profile.sdk_revision;
         fs::write(root.join("wit/youth/app.wit"), wit).expect("WIT fixture");
@@ -647,6 +645,20 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
     fn accepts_each_supported_contract_profile() {
         for profile in SUPPORTED_PROFILES {
             Project::load(fixture(*profile).path()).expect("supported profile loads");
+        }
+    }
+
+    #[test]
+    fn profile_fixtures_use_matching_wit_package_versions() {
+        for profile in SUPPORTED_PROFILES {
+            let fixture = fixture(*profile);
+            let wit =
+                fs::read_to_string(fixture.path().join("wit/youth/app.wit")).expect("fixture WIT");
+            assert!(
+                wit.contains(&format!("package youth:app@{}", profile.protocol)),
+                "fixture WIT must match profile protocol {}",
+                profile.protocol
+            );
         }
     }
 

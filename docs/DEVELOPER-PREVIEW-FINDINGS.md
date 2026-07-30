@@ -236,4 +236,6 @@ automatically authorize new features.
   mix unverified action upgrades into the artifact-path repair.
 - **Tooling implication:** CI action runtimes need the same explicit upgrade
   review as Rust dependencies and toolchain pins.
-- **Resolution:** Pending a focused compatibility upgrade and green matrix.
+- **Resolution:** The DP3 release matrix is green on Ubuntu, Windows, and
+  macOS. The warning remains open as CI maintenance: review the next supported
+  action majors separately rather than changing a certified release workflow.
