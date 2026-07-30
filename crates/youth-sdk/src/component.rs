@@ -85,14 +85,14 @@ impl<A: Application> Guest for Adapter<A> {
             };
             let update = A::handle(&mut EventContext, &events)?;
             let tree = state.tree.as_mut().ok_or_else(Error::invalid_state)?;
-            tree.apply(&update)?;
+            let applied = tree.apply(&update)?;
             let base = state.revision;
-            let next = if update.operations.is_empty() {
+            let next = if applied.is_empty() {
                 base
             } else {
                 base.checked_add(1).ok_or_else(Error::internal)?
             };
-            let patches = update.operations.into_iter().map(wire_patch).collect();
+            let patches = applied.into_iter().map(wire_patch).collect();
             state.revision = next;
             Ok(ui::PatchBatch {
                 base_tree_revision: base,
@@ -145,65 +145,65 @@ fn snapshot(tree: &FlatTree, revision: u64) -> ui::TreeSnapshot {
     ui::TreeSnapshot {
         revision,
         root: tree.root,
-        nodes: tree
-            .nodes
-            .iter()
-            .map(|node| ui::Node {
-                id: node.id,
-                data: match &node.data {
-                    FlatNodeData::Root => ui::NodeData::Root,
-                    FlatNodeData::Box { enabled, layout } => ui::NodeData::Box(ui::BoxData {
-                        enabled: *enabled,
-                        layout: match layout {
-                            super::Layout::Column => ui::BoxLayout::Column,
-                            super::Layout::Row => ui::BoxLayout::Row,
-                            super::Layout::Grid(columns) => {
-                                ui::BoxLayout::Grid(ui::GridLayout { columns: *columns })
-                            }
-                        },
-                    }),
-                    FlatNodeData::Text { value, alignment } => ui::NodeData::Text(ui::TextData {
-                        content: ui::TextContent::Literal(value.clone()),
-                        alignment: match alignment {
-                            super::TextAlign::Start => ui::TextAlignment::Start,
-                            super::TextAlign::Center => ui::TextAlignment::Center,
-                            super::TextAlign::End => ui::TextAlignment::End,
-                        },
-                    }),
-                    FlatNodeData::Countdown {
-                        schedule,
-                        precision,
-                        format,
-                        alignment,
-                    } => ui::NodeData::Text(ui::TextData {
-                        content: ui::TextContent::Countdown(ui::CountdownData {
-                            schedule: ui::ScheduleRef {
-                                id: schedule.id(),
-                                generation: schedule.generation(),
-                            },
-                            precision: wire_precision(*precision),
-                            format: wire_format(*format),
-                        }),
-                        alignment: match alignment {
-                            super::TextAlign::Start => ui::TextAlignment::Start,
-                            super::TextAlign::Center => ui::TextAlignment::Center,
-                            super::TextAlign::End => ui::TextAlignment::End,
-                        },
-                    }),
-                    FlatNodeData::Button {
-                        label,
-                        enabled,
-                        shortcuts,
-                        ..
-                    } => ui::NodeData::Button(ui::ButtonData {
-                        label: label.clone(),
-                        enabled: *enabled,
-                        shortcuts: shortcuts.iter().copied().map(wire_shortcut).collect(),
-                    }),
+        nodes: tree.nodes.iter().map(wire_node).collect(),
+    }
+}
+
+fn wire_node(node: &super::FlatNode) -> ui::Node {
+    ui::Node {
+        id: node.id,
+        data: match &node.data {
+            FlatNodeData::Root => ui::NodeData::Root,
+            FlatNodeData::Box { enabled, layout } => ui::NodeData::Box(ui::BoxData {
+                enabled: *enabled,
+                layout: match layout {
+                    super::Layout::Column => ui::BoxLayout::Column,
+                    super::Layout::Row => ui::BoxLayout::Row,
+                    super::Layout::Grid(columns) => {
+                        ui::BoxLayout::Grid(ui::GridLayout { columns: *columns })
+                    }
                 },
-                children: node.children.clone(),
-            })
-            .collect(),
+            }),
+            FlatNodeData::Text { value, alignment } => ui::NodeData::Text(ui::TextData {
+                content: ui::TextContent::Literal(value.clone()),
+                alignment: match alignment {
+                    super::TextAlign::Start => ui::TextAlignment::Start,
+                    super::TextAlign::Center => ui::TextAlignment::Center,
+                    super::TextAlign::End => ui::TextAlignment::End,
+                },
+            }),
+            FlatNodeData::Countdown {
+                schedule,
+                precision,
+                format,
+                alignment,
+            } => ui::NodeData::Text(ui::TextData {
+                content: ui::TextContent::Countdown(ui::CountdownData {
+                    schedule: ui::ScheduleRef {
+                        id: schedule.id(),
+                        generation: schedule.generation(),
+                    },
+                    precision: wire_precision(*precision),
+                    format: wire_format(*format),
+                }),
+                alignment: match alignment {
+                    super::TextAlign::Start => ui::TextAlignment::Start,
+                    super::TextAlign::Center => ui::TextAlignment::Center,
+                    super::TextAlign::End => ui::TextAlignment::End,
+                },
+            }),
+            FlatNodeData::Button {
+                label,
+                enabled,
+                shortcuts,
+                ..
+            } => ui::NodeData::Button(ui::ButtonData {
+                label: label.clone(),
+                enabled: *enabled,
+                shortcuts: shortcuts.iter().copied().map(wire_shortcut).collect(),
+            }),
+        },
+        children: node.children.clone(),
     }
 }
 
@@ -228,15 +228,19 @@ fn wire_shortcut(shortcut: super::Shortcut) -> ui::ShortcutKey {
     }
 }
 
-fn wire_patch(operation: super::UpdateOperation) -> ui::Patch {
+fn wire_patch(operation: super::AppliedPatch) -> ui::Patch {
     match operation {
-        super::UpdateOperation::Text(key, value) => ui::Patch::SetText(ui::SetText {
-            id: key.id(),
+        super::AppliedPatch::Create(node) => ui::Patch::Create(ui::CreateNode {
+            value: wire_node(&node),
+        }),
+        super::AppliedPatch::Delete(id) => ui::Patch::Delete(ui::DeleteNode { id }),
+        super::AppliedPatch::Text(id, value) => ui::Patch::SetText(ui::SetText {
+            id,
             value: ui::TextContent::Literal(value),
         }),
-        super::UpdateOperation::Countdown(key, schedule, precision, format) => {
+        super::AppliedPatch::Countdown(id, schedule, precision, format) => {
             ui::Patch::SetText(ui::SetText {
-                id: key.id(),
+                id,
                 value: ui::TextContent::Countdown(ui::CountdownData {
                     schedule: ui::ScheduleRef {
                         id: schedule.id(),
@@ -247,13 +251,38 @@ fn wire_patch(operation: super::UpdateOperation) -> ui::Patch {
                 }),
             })
         }
-        super::UpdateOperation::Label(key, value) => ui::Patch::SetLabel(ui::SetLabel {
-            id: key.id(),
-            value,
+        super::AppliedPatch::Label(id, value) => ui::Patch::SetLabel(ui::SetLabel { id, value }),
+        super::AppliedPatch::Enabled(id, enabled) => {
+            ui::Patch::SetEnabled(ui::SetEnabled { id, value: enabled })
+        }
+        super::AppliedPatch::InsertChild {
+            parent,
+            index,
+            child,
+        } => ui::Patch::InsertChild(ui::InsertChild {
+            parent,
+            index: u32::try_from(index).expect("validated tree indices fit u32"),
+            child,
         }),
-        super::UpdateOperation::Enabled(key, enabled) => ui::Patch::SetEnabled(ui::SetEnabled {
-            id: key.id(),
-            value: enabled,
+        super::AppliedPatch::RemoveChild {
+            parent,
+            index,
+            child,
+        } => ui::Patch::RemoveChild(ui::RemoveChild {
+            parent,
+            index: u32::try_from(index).expect("validated tree indices fit u32"),
+            expected_child: child,
+        }),
+        super::AppliedPatch::MoveChild {
+            parent,
+            from_index,
+            to_index,
+            child,
+        } => ui::Patch::MoveChild(ui::MoveChild {
+            parent,
+            from_index: u32::try_from(from_index).expect("validated tree indices fit u32"),
+            to_index: u32::try_from(to_index).expect("validated tree indices fit u32"),
+            expected_child: child,
         }),
     }
 }
