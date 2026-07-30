@@ -6,7 +6,7 @@ and follows metrics schema v1.
 
 The local measurements were captured on 2026-07-22 with Youth commit
 `c80244eb67f16341675c230e5790ef210feab2cd`, calculator commit
-`fe962a0a3f8a7476e9e3e928fc8992e7aaaea9e5`, Rust `1.97.1`, Wasmtime `46.0.1`,
+`696d2fbac58a99116fec28238ca51f5a4a5c2acd`, Rust `1.97.1`, Wasmtime `46.0.1`,
 macOS `26.5.2`, arm64. The release component is 124,589 bytes with SHA-256
 `9ea0c22b89a7121c41d595fac10170871bb865fafa96f8df6222ee0eb08e2bd4`.
 

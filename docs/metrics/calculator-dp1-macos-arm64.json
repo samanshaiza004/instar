@@ -3,7 +3,7 @@
   "environment": {
     "youth_commit": "c80244eb67f16341675c230e5790ef210feab2cd",
     "sdk_revision": "8696bd97ebc4f1d34b9f632e5992dd1882b724de",
-    "app_commit": "fe962a0a3f8a7476e9e3e928fc8992e7aaaea9e5",
+    "app_commit": "696d2fbac58a99116fec28238ca51f5a4a5c2acd",
     "app_name": "calculator",
     "rust_version": "1.97.1",
     "wasmtime_version": "46.0.1",
