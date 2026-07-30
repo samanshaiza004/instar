@@ -43,8 +43,11 @@ const FNV_PRIME: u64 = 1_099_511_628_211;
 // This spelling is locked by the public cross-language test vectors.
 const NAMED_DOMAIN: &[u8] = b"youth:node-id:v1\\0";
 const COMMAND_DOMAIN: &[u8] = b"youth:command-id:v1\\0";
+const ITEM_NODE_DOMAIN: &[u8] = b"youth:item-node-id:v1\0";
+const ITEM_COMMAND_DOMAIN: &[u8] = b"youth:item-command-id:v1\0";
 const NAMED_BIT: u64 = 0x8000_0000_0000_0000;
 const VALUE_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+const MAX_ITEM_IDENTITY_PART_BYTES: usize = 256;
 
 /// Calculates the stable, app-global wire ID for an exact UTF-8 node name.
 #[must_use]
@@ -74,6 +77,168 @@ const fn named_id(domain: &[u8], name: &str) -> u64 {
         index += 1;
     }
     (hash & VALUE_MASK) | NAMED_BIT
+}
+
+fn item_id(domain: &[u8], namespace: &str, item: u64, role: &str) -> u64 {
+    let mut hash = FNV_OFFSET;
+    for byte in domain
+        .iter()
+        .copied()
+        .chain((namespace.len() as u32).to_be_bytes())
+        .chain(namespace.as_bytes().iter().copied())
+        .chain(item.to_be_bytes())
+        .chain((role.len() as u32).to_be_bytes())
+        .chain(role.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash & VALUE_MASK) | NAMED_BIT
+}
+
+/// Calculates a validated runtime-derived node ID.
+pub fn derived_node_id(namespace: &str, item: u64, role: &str) -> Result<u64> {
+    Ok(ItemKey::new(namespace, item)?.node(role)?.id())
+}
+
+/// Calculates a validated runtime-derived command ID.
+pub fn derived_command_id(namespace: &str, item: u64, role: &str) -> Result<u64> {
+    Ok(ItemKey::new(namespace, item)?.command(role)?.id())
+}
+
+/// A runtime item identity namespace and nonzero application-owned item ID.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ItemKey {
+    namespace: String,
+    item: u64,
+}
+
+impl ItemKey {
+    /// Creates an item key. Namespaces are exact, unnormalized UTF-8.
+    pub fn new(namespace: impl Into<String>, item: u64) -> Result<Self> {
+        let namespace = namespace.into();
+        validate_item_identity_part("item namespace", &namespace)?;
+        if item == 0 {
+            return Err(Error::invalid_state().with_message("an item ID must be nonzero"));
+        }
+        Ok(Self { namespace, item })
+    }
+
+    /// Derives a stable app-global node identity for one role of this item.
+    pub fn node(&self, role: impl Into<String>) -> Result<ItemNodeKey> {
+        let role = role.into();
+        validate_item_identity_part("item node role", &role)?;
+        Ok(ItemNodeKey::new_unchecked(
+            self.namespace.clone(),
+            self.item,
+            role,
+        ))
+    }
+
+    /// Derives a stable app-global command identity for one role of this item.
+    pub fn command(&self, role: impl Into<String>) -> Result<ItemCommandKey> {
+        let role = role.into();
+        validate_item_identity_part("item command role", &role)?;
+        Ok(ItemCommandKey::new_unchecked(
+            self.namespace.clone(),
+            self.item,
+            role,
+        ))
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    #[must_use]
+    pub const fn item(&self) -> u64 {
+        self.item
+    }
+}
+
+fn validate_item_identity_part(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::invalid_state().with_message(format!("{label} must not be empty")));
+    }
+    if value.len() > MAX_ITEM_IDENTITY_PART_BYTES {
+        return Err(Error::invalid_state().with_message(format!(
+            "{label} exceeds {MAX_ITEM_IDENTITY_PART_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// A stable node identity derived from an item namespace, ID, and role.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ItemNodeKey {
+    namespace: String,
+    item: u64,
+    role: String,
+    id: u64,
+}
+
+impl ItemNodeKey {
+    fn new_unchecked(namespace: String, item: u64, role: String) -> Self {
+        let id = item_id(ITEM_NODE_DOMAIN, &namespace, item, &role);
+        Self {
+            namespace,
+            item,
+            role,
+            id,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[cfg(test)]
+    fn with_id(namespace: &str, item: u64, role: &str, id: u64) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            item,
+            role: role.to_owned(),
+            id,
+        }
+    }
+}
+
+/// A stable command identity derived from an item namespace, ID, and role.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ItemCommandKey {
+    namespace: String,
+    item: u64,
+    role: String,
+    id: u64,
+}
+
+impl ItemCommandKey {
+    fn new_unchecked(namespace: String, item: u64, role: String) -> Self {
+        let id = item_id(ITEM_COMMAND_DOMAIN, &namespace, item, &role);
+        Self {
+            namespace,
+            item,
+            role,
+            id,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[cfg(test)]
+    fn with_id(namespace: &str, item: u64, role: &str, id: u64) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            item,
+            role: role.to_owned(),
+            id,
+        }
+    }
 }
 
 /// A symbolic node name and its stable app-global wire ID.
@@ -142,6 +307,95 @@ impl CommandKey {
     #[must_use]
     pub const fn id(self) -> u64 {
         self.id
+    }
+}
+
+/// A typed static or runtime-derived node identity accepted by SDK builders.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NodeIdentity {
+    Static(NodeKey),
+    Item(ItemNodeKey),
+}
+
+impl NodeIdentity {
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        match self {
+            Self::Static(key) => key.id(),
+            Self::Item(key) => key.id(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Static(key) => format!("static node {:?}", key.name()),
+            Self::Item(key) => format!(
+                "derived node namespace {:?}, item {}, role {:?}",
+                key.namespace, key.item, key.role
+            ),
+        }
+    }
+}
+
+impl From<NodeKey> for NodeIdentity {
+    fn from(value: NodeKey) -> Self {
+        Self::Static(value)
+    }
+}
+
+impl From<ItemNodeKey> for NodeIdentity {
+    fn from(value: ItemNodeKey) -> Self {
+        Self::Item(value)
+    }
+}
+
+/// A typed static or runtime-derived application command identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CommandIdentity {
+    Static(CommandKey),
+    Item(ItemCommandKey),
+}
+
+impl CommandIdentity {
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        match self {
+            Self::Static(key) => key.id(),
+            Self::Item(key) => key.id(),
+        }
+    }
+
+    fn node_identity(&self) -> NodeIdentity {
+        match self {
+            Self::Static(key) => NodeKey::new(key.name()).into(),
+            Self::Item(key) => NodeIdentity::Item(ItemNodeKey::new_unchecked(
+                key.namespace.clone(),
+                key.item,
+                key.role.clone(),
+            )),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Static(key) => format!("static command {:?}", key.name()),
+            Self::Item(key) => format!(
+                "derived command namespace {:?}, item {}, role {:?}",
+                key.namespace, key.item, key.role
+            ),
+        }
+    }
+}
+
+impl From<CommandKey> for CommandIdentity {
+    fn from(value: CommandKey) -> Self {
+        Self::Static(value)
+    }
+}
+
+impl From<ItemCommandKey> for CommandIdentity {
+    fn from(value: ItemCommandKey) -> Self {
+        Self::Item(value)
     }
 }
 
@@ -262,7 +516,7 @@ pub struct Text;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextElement {
-    key: NodeKey,
+    key: NodeIdentity,
     value: String,
     alignment: TextAlign,
 }
@@ -270,10 +524,10 @@ struct TextElement {
 impl Text {
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(key: NodeKey, value: impl Into<String>) -> Element {
+    pub fn new(key: impl Into<NodeIdentity>, value: impl Into<String>) -> Element {
         Element {
             kind: ElementKind::Text(TextElement {
-                key,
+                key: key.into(),
                 value: value.into(),
                 alignment: TextAlign::Start,
             }),
@@ -286,7 +540,7 @@ pub struct Countdown;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CountdownElement {
-    key: NodeKey,
+    key: NodeIdentity,
     schedule: Schedule,
     precision: TimePrecision,
     format: CountdownFormat,
@@ -296,10 +550,10 @@ struct CountdownElement {
 impl Countdown {
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(key: NodeKey, schedule: Schedule) -> Element {
+    pub fn new(key: impl Into<NodeIdentity>, schedule: Schedule) -> Element {
         Element {
             kind: ElementKind::Countdown(CountdownElement {
-                key,
+                key: key.into(),
                 schedule,
                 precision: TimePrecision::Seconds,
                 format: CountdownFormat::MinutesSeconds,
@@ -314,20 +568,20 @@ pub struct Button;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ButtonElement {
-    key: NodeKey,
+    key: NodeIdentity,
     label: String,
     enabled: bool,
-    command: Option<CommandKey>,
+    command: Option<CommandIdentity>,
     shortcuts: Vec<Shortcut>,
 }
 
 impl Button {
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(key: NodeKey, label: impl Into<String>) -> Element {
+    pub fn new(key: impl Into<NodeIdentity>, label: impl Into<String>) -> Element {
         Element {
             kind: ElementKind::Button(ButtonElement {
-                key,
+                key: key.into(),
                 label: label.into(),
                 enabled: true,
                 command: None,
@@ -337,13 +591,14 @@ impl Button {
     }
 
     #[must_use]
-    pub fn command(key: CommandKey, label: impl Into<String>) -> Element {
+    pub fn command(key: impl Into<CommandIdentity>, label: impl Into<String>) -> Element {
+        let command = key.into();
         Element {
             kind: ElementKind::Button(ButtonElement {
-                key: NodeKey::new(key.name()),
+                key: command.node_identity(),
                 label: label.into(),
                 enabled: true,
-                command: Some(key),
+                command: Some(command),
                 shortcuts: Vec::new(),
             }),
         }
@@ -567,14 +822,16 @@ pub struct Events {
 
 impl Events {
     #[must_use]
-    pub fn activated(&self, key: NodeKey) -> bool {
+    pub fn activated(&self, key: impl Into<NodeIdentity>) -> bool {
+        let key = key.into();
         self.events
             .iter()
             .any(|event| matches!(event, Event::Activated(id) if *id == key.id()))
     }
 
     #[must_use]
-    pub fn commanded(&self, key: CommandKey) -> bool {
+    pub fn commanded(&self, key: impl Into<CommandIdentity>) -> bool {
+        let key = key.into();
         self.commanded.contains(&key.id())
     }
 
@@ -605,10 +862,10 @@ impl<'a> IntoIterator for &'a Events {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UpdateOperation {
-    Text(NodeKey, String),
-    Countdown(NodeKey, Schedule, TimePrecision, CountdownFormat),
-    Label(NodeKey, String),
-    Enabled(NodeKey, bool),
+    Text(NodeIdentity, String),
+    Countdown(NodeIdentity, Schedule, TimePrecision, CountdownFormat),
+    Label(NodeIdentity, String),
+    Enabled(NodeIdentity, bool),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -630,35 +887,40 @@ impl Update {
     }
 
     #[must_use]
-    pub fn set_text(mut self, key: NodeKey, value: impl Into<String>) -> Self {
+    pub fn set_text(mut self, key: impl Into<NodeIdentity>, value: impl Into<String>) -> Self {
         self.operations
-            .push(UpdateOperation::Text(key, value.into()));
+            .push(UpdateOperation::Text(key.into(), value.into()));
         self
     }
 
     #[must_use]
     pub fn set_countdown(
         mut self,
-        key: NodeKey,
+        key: impl Into<NodeIdentity>,
         schedule: Schedule,
         precision: TimePrecision,
         format: CountdownFormat,
     ) -> Self {
-        self.operations
-            .push(UpdateOperation::Countdown(key, schedule, precision, format));
+        self.operations.push(UpdateOperation::Countdown(
+            key.into(),
+            schedule,
+            precision,
+            format,
+        ));
         self
     }
 
     #[must_use]
-    pub fn set_label(mut self, key: NodeKey, value: impl Into<String>) -> Self {
+    pub fn set_label(mut self, key: impl Into<NodeIdentity>, value: impl Into<String>) -> Self {
         self.operations
-            .push(UpdateOperation::Label(key, value.into()));
+            .push(UpdateOperation::Label(key.into(), value.into()));
         self
     }
 
     #[must_use]
-    pub fn set_enabled(mut self, key: NodeKey, enabled: bool) -> Self {
-        self.operations.push(UpdateOperation::Enabled(key, enabled));
+    pub fn set_enabled(mut self, key: impl Into<NodeIdentity>, enabled: bool) -> Self {
+        self.operations
+            .push(UpdateOperation::Enabled(key.into(), enabled));
         self
     }
 }
@@ -895,7 +1157,7 @@ enum FlatNodeData {
     Button {
         label: String,
         enabled: bool,
-        command: Option<CommandKey>,
+        command: Option<CommandIdentity>,
         shortcuts: Vec<Shortcut>,
     },
 }
@@ -924,7 +1186,7 @@ impl FlatTree {
                 UpdateOperation::Text(key, _)
                 | UpdateOperation::Countdown(key, ..)
                 | UpdateOperation::Label(key, _)
-                | UpdateOperation::Enabled(key, _) => *key,
+                | UpdateOperation::Enabled(key, _) => key,
             };
             if !changed.insert(key.id()) {
                 return Err(Error::invalid_state().with_message("a node is updated twice"));
@@ -988,8 +1250,8 @@ impl FlatTree {
 struct FlatTreeBuilder {
     next_anonymous: u64,
     nodes: Vec<FlatNode>,
-    names: BTreeMap<u64, &'static str>,
-    commands: BTreeMap<u64, &'static str>,
+    names: BTreeMap<u64, NodeIdentity>,
+    commands: BTreeMap<u64, CommandIdentity>,
     ids: BTreeSet<u64>,
 }
 
@@ -1015,7 +1277,7 @@ impl FlatTreeBuilder {
                 Ok(id)
             }
             ElementKind::Text(value) => {
-                let id = self.allocate_named(value.key)?;
+                let id = self.allocate_named(&value.key)?;
                 self.nodes.push(FlatNode {
                     id,
                     data: FlatNodeData::Text {
@@ -1027,7 +1289,7 @@ impl FlatTreeBuilder {
                 Ok(id)
             }
             ElementKind::Countdown(value) => {
-                let id = self.allocate_named(value.key)?;
+                let id = self.allocate_named(&value.key)?;
                 self.nodes.push(FlatNode {
                     id,
                     data: FlatNodeData::Countdown {
@@ -1045,23 +1307,27 @@ impl FlatTreeBuilder {
                     return Err(Error::invalid_state()
                         .with_message("a button declares more than four shortcuts"));
                 }
-                if let Some(command) = value.command
-                    && let Some(existing) = self.commands.insert(command.id(), command.name())
+                if let Some(command) = &value.command
+                    && let Some(existing) = self.commands.insert(command.id(), command.clone())
                 {
-                    let message = if existing == command.name() {
-                        "a command is bound more than once"
+                    let message = if existing == *command {
+                        format!("{} is bound more than once", command.describe())
                     } else {
-                        "two symbolic command names collide"
+                        format!(
+                            "command identity collision between {} and {}",
+                            existing.describe(),
+                            command.describe()
+                        )
                     };
                     return Err(Error::invalid_state().with_message(message));
                 }
-                let id = self.allocate_named(value.key)?;
+                let id = self.allocate_named(&value.key)?;
                 self.nodes.push(FlatNode {
                     id,
                     data: FlatNodeData::Button {
                         label: value.label.clone(),
                         enabled: value.enabled,
-                        command: value.command,
+                        command: value.command.clone(),
                         shortcuts: value.shortcuts.clone(),
                     },
                     children: Vec::new(),
@@ -1084,19 +1350,23 @@ impl FlatTreeBuilder {
         Ok(id)
     }
 
-    fn allocate_named(&mut self, key: NodeKey) -> Result<u64> {
+    fn allocate_named(&mut self, key: &NodeIdentity) -> Result<u64> {
         if let Some(existing) = self.names.get(&key.id()) {
-            let message = if *existing == key.name() {
-                "a symbolic node name is used more than once"
+            let message = if existing == key {
+                format!("{} is used more than once", key.describe())
             } else {
-                "two symbolic node names collide"
+                format!(
+                    "node identity collision between {} and {}",
+                    existing.describe(),
+                    key.describe()
+                )
             };
             return Err(Error::invalid_state().with_message(message));
         }
         if !self.ids.insert(key.id()) {
             return Err(Error::invalid_state().with_message("a node ID is used more than once"));
         }
-        self.names.insert(key.id(), key.name());
+        self.names.insert(key.id(), key.clone());
         Ok(key.id())
     }
 }
@@ -1299,11 +1569,12 @@ mod time {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandKey, Countdown, CountdownFormat,
-        ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events, Generation, Grid,
-        NodeId, NodeKey, Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions,
-        Shortcut, Text, TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext,
-        command, node,
+        Application, BoxNode, Button, Column, CommandIdentity, CommandKey, Countdown,
+        CountdownFormat, ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events,
+        Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity, NodeKey,
+        Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
+        TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext, command,
+        derived_command_id, derived_node_id, node,
     };
 }
 
@@ -1354,6 +1625,75 @@ mod tests {
         assert_eq!(named_command_id("digit-7"), 0x9848_57b0_7512_75f7);
         assert_eq!(named_command_id("equals"), 0xee40_8611_9b13_a04b);
         assert_ne!(named_command_id("equals"), named_node_id("equals"));
+    }
+
+    #[test]
+    fn derived_identity_vectors_and_validation_are_stable() {
+        assert_eq!(
+            derived_node_id("todo", 1, "row").unwrap(),
+            0xe4ea_3f45_0dc3_046f
+        );
+        assert_eq!(
+            derived_node_id("todo", 42, "title").unwrap(),
+            0x872f_87fc_4c39_8fe4
+        );
+        assert_eq!(
+            derived_command_id("todo", 1, "toggle").unwrap(),
+            0x8b5e_c3bc_b296_c4a5
+        );
+        assert!(ItemKey::new("", 1).is_err());
+        assert!(ItemKey::new("todo", 0).is_err());
+        let item = ItemKey::new("todo", 1).unwrap();
+        assert!(item.node("").is_err());
+        assert!(item.command("x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn derived_identities_work_across_builders_updates_and_events() {
+        let item = ItemKey::new("todo", 1).unwrap();
+        let title = item.node("title").unwrap();
+        let toggle = item.command("toggle").unwrap();
+        let mut tree = Tree::root(Row::new([
+            Text::new(title.clone(), "Task 1"),
+            Button::command(toggle.clone(), "Done"),
+        ]))
+        .flatten()
+        .unwrap();
+        tree.apply(&Update::new().set_text(title, "Task 1 updated"))
+            .unwrap();
+        let button_id = CommandIdentity::from(toggle.clone()).node_identity().id();
+        let events = Events {
+            events: vec![Event::Activated(button_id)],
+            commanded: vec![toggle.id()],
+        };
+        assert!(events.commanded(toggle));
+    }
+
+    #[test]
+    fn derived_collisions_report_both_full_identities() {
+        let first = ItemNodeKey::with_id("todo", 1, "row", NAMED_BIT | 11);
+        let second = ItemNodeKey::with_id("todo", 2, "title", NAMED_BIT | 11);
+        let error = Tree::root(Row::new([
+            Text::new(first, "one"),
+            Text::new(second, "two"),
+        ]))
+        .flatten()
+        .unwrap_err();
+        let message = error.message.unwrap();
+        assert!(message.contains("namespace \"todo\", item 1, role \"row\""));
+        assert!(message.contains("namespace \"todo\", item 2, role \"title\""));
+
+        let first = ItemCommandKey::with_id("todo", 1, "toggle", NAMED_BIT | 12);
+        let second = ItemCommandKey::with_id("todo", 2, "delete", NAMED_BIT | 12);
+        let error = Tree::root(Row::new([
+            Button::command(first, "Done"),
+            Button::command(second, "Delete"),
+        ]))
+        .flatten()
+        .unwrap_err();
+        let message = error.message.unwrap();
+        assert!(message.contains("namespace \"todo\", item 1, role \"toggle\""));
+        assert!(message.contains("namespace \"todo\", item 2, role \"delete\""));
     }
 
     #[test]

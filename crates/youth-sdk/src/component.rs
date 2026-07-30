@@ -69,7 +69,7 @@ impl<A: Application> Guest for Adapter<A> {
                         if node.id != id {
                             return None;
                         }
-                        match node.data {
+                        match &node.data {
                             FlatNodeData::Button {
                                 command: Some(command),
                                 ..
