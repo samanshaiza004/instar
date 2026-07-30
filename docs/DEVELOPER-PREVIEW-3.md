@@ -1,6 +1,6 @@
 # Developer Preview 3 — Dynamic Todo Collections
 
-- Status: **Gates A through C complete locally; Gate D release evidence in progress**
+- Status: **All four gates complete; release tags are applied only after the full matrix passes**
 - Youth branch: `codex/utility-todo`
 - Driving application: Youth Todo (`dev.saman.todo`)
 - Application protocol: `youth:app@0.0.5` (unchanged)
@@ -25,8 +25,8 @@ diffing, and reactive dependencies remain out of scope.
 | --- | --- | --- |
 | `utility-todo-gate-a-domain-proof` | Pure collection model, strict v1/v2 codec, atomic migration plan, SDK blocker reproduction | Complete (Todo `f690a7b`) |
 | `utility-todo-gate-b-structural-sdk` | Derived identities, named containers, explicit structural updates, derived test selectors, view convergence | Complete (`4b06841`; SDK tag at `844102b`) |
-| `utility-todo-gate-c-collection-evidence` | Complete external Todo behavior, paging/filtering, rollback, focus, restart, migration | Complete locally (Todo `fee04a5`) |
-| `utility-todo-gate-d-release` | Canonical artifact certified unchanged on all hosts, source-build portability, metrics and findings | Not started |
+| `utility-todo-gate-c-collection-evidence` | Complete external Todo behavior, paging/filtering, rollback, focus, restart, migration | Complete (Todo `fee04a5`; Youth `9b562af`) |
+| `utility-todo-gate-d-release` | Canonical artifact certified unchanged on all hosts, source-build portability, metrics and findings | Complete (Todo `632e20c`; Youth Gate D candidate) |
 
 Gate B is intentionally split into independently green B-1 through B-5
 checkpoints: derived identities; structural SDK operations; test selectors;
@@ -86,6 +86,12 @@ and mounted as the exact same bytes on Ubuntu, Windows, and macOS. Independent
 host-local builds prove source portability and log their hashes without claiming
 byte reproducibility. The release publishes the established Utility Suite
 metrics and marks unsupported measurements unavailable rather than zero.
+
+The canonical release component is 281,660 bytes with SHA-256
+`d92f6f1aa9c8fa945cd4c087284a67c001b0c853926adb53c269d56d393fac52`.
+The release matrix prints the expected and observed digest before every mount.
+Windows checkout also proved that the vendored WIT hash is intentionally exact:
+Todo now pins `*.wit` to LF rather than normalizing a CRLF mismatch in tooling.
 
 The external repository must contain no path dependency, generated binding,
 numeric node or command ID, revision, acknowledgement, raw patch, or component

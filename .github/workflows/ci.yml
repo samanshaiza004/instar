@@ -124,7 +124,7 @@ jobs:
           echo "calculator.wasm SHA-256: $digest ($bytes bytes)"
       - name: Build Todo component once
         env:
-          TODO_COMMIT: c8ae6798c7144d36125c1fd78ca168be24d458ea
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
         run: |
           set -euo pipefail
           todo="$RUNNER_TEMP/youth-todo"
@@ -139,7 +139,7 @@ jobs:
       - name: Record Todo SHA-256
         id: todo_hash
         env:
-          TODO_COMMIT: c8ae6798c7144d36125c1fd78ca168be24d458ea
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
           YOUTH_COMMIT: ${{ github.sha }}
           CI_RUN_ID: ${{ github.run_id }}
         run: |
@@ -452,7 +452,7 @@ jobs:
       - name: External Todo workflow
         shell: pwsh
         env:
-          TODO_COMMIT: c8ae6798c7144d36125c1fd78ca168be24d458ea
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
         run: |
           $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
           $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path

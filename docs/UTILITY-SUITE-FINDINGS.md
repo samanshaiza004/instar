@@ -10,7 +10,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | --- | --- | --- | --- |
 | Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D complete; one canonical component certified on Ubuntu, Windows, and macOS |
 | Timer | [samanshaiza004/youth-timer](https://github.com/samanshaiza004/youth-timer) | `TIMER-F` | Gate C-4 complete; durable scheduling, countdown presentation, overdue recovery, and redelivery proven |
-| Todo | Local sibling repository until Gate D | `TODO-F` | Gate C complete locally; 64-item structural, migration, focus, restart, rollback, and convergence evidence passing |
+| Todo | [samanshaiza004/youth-todo](https://github.com/samanshaiza004/youth-todo) | `TODO-F` | Gate D complete; canonical portability, source builds, 64-item collections, migration, focus, rollback, and convergence certified |
 
 ## Open findings
 
@@ -52,6 +52,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | TODO-F007 | Boundary confirmation | Todo `fee04a5`; Youth `844102b` | Five external scenarios reconstruct an equivalent view after mount, restart, and every committed turn | Convergence is now enforceable headlessly without installing the reconstructed tree or publishing observer traffic; automatic diffing remains unproven |
 | TODO-F008 | Tooling defect | Todo 64-item scenario; Youth Todo branch | A guest failure diagnostic omitted its stable category, hiding that the defect was `FuelExhausted` | Test diagnostics now include stable runtime categories without exposing raw guest errors; bounded projected lookup fixed the app defect |
 | TODO-F010 | Boundary confirmation | Todo `fee04a5` source audit | Dynamic collections, migration, structural updates, and derived commands expose zero raw WIT/lifecycle machinery | DP0's SDK boundary survives the third and most structurally demanding Utility application |
+| TODO-F011 | Tooling defect | First Todo release matrix on Windows | Git checkout changed the vendored WIT snapshot from LF to CRLF, so exact contract verification correctly failed | Pin `*.wit` checkout bytes to LF in the app repository; retain exact hashing and never normalize a contract mismatch away |
 
 ## Classification
 
