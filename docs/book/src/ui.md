@@ -1,7 +1,7 @@
 # UI guide
 
-DP1 supports one root containing column, row, and equal-track grid boxes,
-text, and buttons. The SDK
+The current Utility Suite contract supports one root containing column, row,
+and equal-track grid boxes, text, and buttons. The SDK
 assigns anonymous root and container IDs deterministically in the lower half
 of the ID space. `node!("name")` creates an app-global stable ID in the upper
 half.
@@ -33,6 +33,14 @@ Ok(Update::unchanged())
 Node and command names are exact UTF-8 and app-global, but use separate typed
 ID domains. Duplicate names, commands, shortcuts, and collisions are errors.
 A button under a disabled box cannot be activated.
+
+For dynamic collections, the SDK also provides bounded `ItemKey` identities.
+An item key derives stable node and command identities from an application
+namespace, nonzero item ID, and role. Named containers and explicit
+`insert_child`, `remove_subtree`, and `move_child` updates express structural
+changes without exposing WIT patches or numeric IDs. Todo uses these APIs for
+its five-row projection; list nodes and automatic tree diffing remain outside
+the current contract.
 
 Focus and key interpretation are host-owned. Tab traverses enabled buttons in
 semantic preorder without wrapping; arrows stay within the nearest applicable

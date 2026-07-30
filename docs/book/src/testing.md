@@ -65,7 +65,7 @@ a general-purpose delay primitive.
 order, and reports the file, line, command, expected value, and observed
 semantic node on failure. It never opens a desktop window.
 
-DP1 tests may drive the host interaction layer without native scan codes:
+Tests may drive the host interaction layer without native scan codes:
 
 ```text
 mount
@@ -82,3 +82,18 @@ Named keys are `enter`, `escape`, `backspace`, `space`, `tab`, `shift-tab`,
 `left`, `right`, `up`, and `down`. Character keys are one-scalar JSON strings.
 These commands exercise host focus and shortcut policy; the component still
 receives only semantic button activation.
+
+Dynamic collection tests can address a derived identity without knowing its
+numeric representation:
+
+```text
+activate derived "todo" 1 "toggle"
+expect present derived "todo" 1 "row"
+expect text derived "todo" 1 "title" "Task 1"
+expect child-count items 5
+```
+
+Run `youth test --verify-view-convergence` to reconstruct the guest view after
+mount, restart, and every committed turn. The checker compares guest-owned
+semantics and reports missing, extra, and changed nodes without installing the
+verification snapshot or publishing another turn.

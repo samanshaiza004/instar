@@ -89,13 +89,16 @@ semantics and need evidence from more than one application.
 
 ## Application schema evolution
 
-Youth DP1 does not provide application-state migrations. Persisted key names,
-value types, and encodings are part of the application's durable format. An
-incompatible preview change requires an explicit application migration, a
-documented state reset, or a new storage identity; it must not silently
+Youth does not provide a platform migration service. Persisted key names,
+value types, and encodings remain part of the application's durable format.
+An incompatible application change requires an explicit application migration,
+a documented state reset, or a new storage identity; it must not silently
 reinterpret old values.
 
 For a multi-field model, storing an application-owned schema marker such as
 `model-schema-version = 1` can make incompatible state detectable. The marker
 does not create a platform migration system: the application still owns its
-format, validation, and any transition between versions.
+format, validation, and any transition between versions. Todo is the current
+reference for this pattern: it atomically converts its version-1 boolean
+status keys to version-2 text status keys during the first accepted turn,
+while filter and page remain ephemeral session state.
