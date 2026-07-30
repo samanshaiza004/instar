@@ -2,17 +2,21 @@
 
 Authoritative documents, in order of precedence:
 
-1. [DEVELOPER-PREVIEW-2.md](DEVELOPER-PREVIEW-2.md) — proposed durable
-   scheduling milestone: `youth:time@0.0.1` and application protocol `0.0.4`.
-2. [DEVELOPER-PREVIEW-1.md](DEVELOPER-PREVIEW-1.md) — completed Utility Suite
+1. [DEVELOPER-PREVIEW-3.md](DEVELOPER-PREVIEW-3.md) — active Utility Suite
+   Todo milestone for bounded dynamic collections on application protocol
+   `0.0.5`.
+2. [DEVELOPER-PREVIEW-2.md](DEVELOPER-PREVIEW-2.md) — completed durable
+   scheduling, countdown presentation, and recovery milestone:
+   `youth:time@0.0.1` and application protocols `0.0.4`/`0.0.5`.
+3. [DEVELOPER-PREVIEW-1.md](DEVELOPER-PREVIEW-1.md) — completed Utility Suite
    calculator milestone and application protocol `0.0.3`.
-3. [DEVELOPER-PREVIEW-0.md](DEVELOPER-PREVIEW-0.md) — completed external
+4. [DEVELOPER-PREVIEW-0.md](DEVELOPER-PREVIEW-0.md) — completed external
    application workflow at protocol `0.0.2`.
-4. [MILESTONE-1.md](MILESTONE-1.md) — completed Transactional Visible Counter
+5. [MILESTONE-1.md](MILESTONE-1.md) — completed Transactional Visible Counter
    specification (application protocol `0.0.2`).
-5. [MILESTONE-0.md](MILESTONE-0.md) — completed Headless Protocol Core
+6. [MILESTONE-0.md](MILESTONE-0.md) — completed Headless Protocol Core
    specification (protocol version `0.0.1`).
-6. [GUEST-PROFILE.md](GUEST-PROFILE.md) — Youth Rust Guest Profile 0.0.2:
+7. [GUEST-PROFILE.md](GUEST-PROFILE.md) — Youth Rust Guest Profile 0.0.2:
    the guest import budget and build-target gating policy.
 
 [DEVELOPER-PREVIEW-FINDINGS.md](DEVELOPER-PREVIEW-FINDINGS.md) is a durable

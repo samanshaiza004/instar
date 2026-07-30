@@ -9,7 +9,8 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | App | Repository | Findings prefix | Status |
 | --- | --- | --- | --- |
 | Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D complete; one canonical component certified on Ubuntu, Windows, and macOS |
-| Timer | [samanshaiza004/youth-timer](https://github.com/samanshaiza004/youth-timer) | `TIMER-F` | Gate A app proof published; probes `youth:time` scope ahead of any implementation |
+| Timer | [samanshaiza004/youth-timer](https://github.com/samanshaiza004/youth-timer) | `TIMER-F` | Gate C-4 complete; durable scheduling, countdown presentation, overdue recovery, and redelivery proven |
+| Todo | Local sibling repository until Gate D | `TODO-F` | Gate A domain and codec proof; dynamic identity and structural SDK blockers reproduced |
 
 ## Open findings
 
