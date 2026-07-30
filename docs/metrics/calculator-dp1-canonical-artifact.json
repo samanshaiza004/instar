@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.saman.calculator",
+  "app_commit": "696d2fbac58a99116fec28238ca51f5a4a5c2acd",
+  "youth_commit": "0b62c3dcfd535d7544056fdf529c1369fe48fa3e",
+  "sdk_revision": "8696bd97ebc4f1d34b9f632e5992dd1882b724de",
+  "protocol": "0.0.3",
+  "wit_sha256": "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928",
+  "component_sha256": "d1eb0ab24d423d77b4535134c6a3ea53e2563eaef37f8d02ed068cf7b4ae9c4d",
+  "component_bytes": 124589,
+  "rustc": "rustc 1.97.1",
+  "cargo": "cargo 1.97.1",
+  "build_profile": "release",
+  "canonical_builder": "ubuntu-x86_64",
+  "build_command": "cargo build --manifest-path <calculator>/Cargo.toml --target wasm32-wasip2 --release",
+  "ci_run_id": 30504489792,
+  "supported_contract_profiles": [
+    "youth:app@0.0.3"
+  ]
+}

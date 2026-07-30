@@ -73,13 +73,53 @@ jobs:
             --release
       - name: Record calculator SHA-256
         id: calculator_hash
+        env:
+          CALCULATOR_COMMIT: 696d2fbac58a99116fec28238ca51f5a4a5c2acd
+          YOUTH_COMMIT: ${{ github.sha }}
+          CI_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           component=target/calculator-external/wasm32-wasip2/release/calculator.wasm
           test -f "$component"
           digest=$(sha256sum "$component" | cut -d' ' -f1)
+          bytes=$(stat -c '%s' "$component")
+          calculator="$RUNNER_TEMP/youth-calculator"
+          protocol=$(awk -F'"' '/^protocol[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          sdk_revision=$(awk -F'"' '/^sdk-revision[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          wit_sha256=$(awk -F'"' '/^wit-sha256[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          rustc_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          export CALCULATOR_COMMIT YOUTH_COMMIT CI_RUN_ID digest bytes protocol sdk_revision wit_sha256 rustc_version cargo_version
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = {
+              "app_id": "dev.saman.calculator",
+              "app_commit": os.environ["CALCULATOR_COMMIT"],
+              "youth_commit": os.environ["YOUTH_COMMIT"],
+              "sdk_revision": os.environ["sdk_revision"],
+              "protocol": os.environ["protocol"],
+              "wit_sha256": os.environ["wit_sha256"],
+              "component_sha256": os.environ["digest"],
+              "component_bytes": int(os.environ["bytes"]),
+              "rustc": os.environ["rustc_version"],
+              "cargo": os.environ["cargo_version"],
+              "build_profile": "release",
+              "canonical_builder": "ubuntu-x86_64",
+              "build_command": "cargo build --manifest-path <calculator>/Cargo.toml --target wasm32-wasip2 --release",
+              "ci_run_id": int(os.environ["CI_RUN_ID"]),
+              "supported_contract_profiles": ["youth:app@0.0.3"],
+          }
+          output = Path("target/calculator-external/calculator-canonical-manifest.json")
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+          mkdir -p target/calculator-certified-artifact
+          cp "$component" target/calculator-certified-artifact/calculator.wasm
+          cp target/calculator-external/calculator-canonical-manifest.json target/calculator-certified-artifact/
           echo "sha256=$digest" >> "$GITHUB_OUTPUT"
-          echo "calculator.wasm SHA-256: $digest"
+          echo "calculator.wasm SHA-256: $digest ($bytes bytes)"
       - uses: actions/upload-artifact@v4
         with:
           name: counter-wasm
@@ -112,7 +152,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: calculator-wasm
-          path: target/calculator-external/wasm32-wasip2/release/calculator.wasm
+          path: target/calculator-certified-artifact/*
           if-no-files-found: error
 
   host:
@@ -261,9 +301,27 @@ jobs:
           $certifiedComponent = (Resolve-Path "target/calculator-certified/calculator.wasm").Path
           $certifiedHash = (Get-FileHash $certifiedComponent -Algorithm SHA256).Hash.ToLowerInvariant()
           $expectedHash = "${{ needs.guest.outputs.calculator_sha256 }}".ToLowerInvariant()
+          $manifestPath = (Resolve-Path "target/calculator-certified/calculator-canonical-manifest.json").Path
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.app_id -ne "dev.saman.calculator") {
+            throw "canonical calculator manifest app ID is unexpected: $($manifest.app_id)"
+          }
+          if ($manifest.app_commit -ne $env:CALCULATOR_COMMIT) {
+            throw "canonical calculator manifest app commit mismatch: expected $env:CALCULATOR_COMMIT, got $($manifest.app_commit)"
+          }
+          if ($manifest.protocol -ne "0.0.3") {
+            throw "canonical calculator manifest protocol is unexpected: $($manifest.protocol)"
+          }
+          if ($manifest.component_sha256 -ne $expectedHash) {
+            throw "canonical calculator manifest mismatch: expected $expectedHash, got $($manifest.component_sha256)"
+          }
+          if ([int64]$manifest.component_bytes -ne (Get-Item $certifiedComponent).Length) {
+            throw "canonical calculator manifest byte count does not match the downloaded component"
+          }
           if ($certifiedHash -ne $expectedHash) {
             throw "certified calculator SHA-256 mismatch: expected $expectedHash, got $certifiedHash"
           }
+          Write-Host "calculator certified SHA-256: expected $expectedHash, observed $certifiedHash"
           & $cli mount $certifiedComponent
           if ($LASTEXITCODE -ne 0) { throw "certified calculator mount failed" }
           $calculator = Join-Path $env:RUNNER_TEMP "youth-calculator"

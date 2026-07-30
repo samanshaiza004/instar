@@ -10,7 +10,10 @@ The local measurements were captured on 2026-07-22 with Youth commit
 macOS `26.5.2`, arm64. The release component is 124,589 bytes with SHA-256
 `9ea0c22b89a7121c41d595fac10170871bb865fafa96f8df6222ee0eb08e2bd4`.
 
-That hash identifies the locally measured macOS build. Gate D CI run
+That hash identifies the locally measured macOS build. The machine-readable
+canonical artifact record is
+[`calculator-dp1-canonical-artifact.json`](calculator-dp1-canonical-artifact.json).
+Gate D CI run
 [`30504489792`](https://github.com/samanshaiza004/youth/actions/runs/30504489792)
 built one canonical 124,589-byte component on Ubuntu and mounted those exact
 bytes on Ubuntu, Windows, and macOS. Its certified SHA-256 is

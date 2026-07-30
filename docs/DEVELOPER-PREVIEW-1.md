@@ -238,7 +238,15 @@ The first release baseline is recorded in
 interpretation in the accompanying Markdown summary. Gate D CI run
 `30504489792` certified one canonical component byte-for-byte on Ubuntu,
 Windows, and macOS. The local host build remains separate source-portability
-evidence and is not required to be byte-reproducible.
+evidence and is not required to be byte-reproducible. The canonical artifact
+identity and build provenance are recorded in
+`docs/metrics/calculator-dp1-canonical-artifact.json`.
+
+Youth application releases use one canonical validated component artifact.
+Supported hosts execute and certify those exact bytes. Platform-local builds
+provide source-portability evidence and are not expected to match the
+canonical artifact byte-for-byte unless a release explicitly claims
+reproducible builds.
 
 ## Checkpoints
 
