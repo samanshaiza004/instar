@@ -1,0 +1,13 @@
+[package]
+name = "youth-time-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth protocol 0.0.4 durable scheduling fixture."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

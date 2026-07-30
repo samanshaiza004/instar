@@ -3,6 +3,8 @@ use std::fmt;
 use crate::RuntimeLimits;
 use crate::bindings::v002::youth::app::ui as generated;
 use crate::bindings::v003::youth::app::ui as generated_v003;
+use crate::bindings::v004::youth::app::ui as generated_v004;
+use crate::bindings::v005::youth::app::ui as generated_v005;
 use crate::bindings::{RawPatchBatch, RawTreeSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +84,8 @@ pub(crate) fn tree_snapshot(
     match value {
         RawTreeSnapshot::V002(value) => tree_snapshot_v002(value, limits),
         RawTreeSnapshot::V003(value) => tree_snapshot_v003(value, limits),
+        RawTreeSnapshot::V004(value) => tree_snapshot_v004(value, limits),
+        RawTreeSnapshot::V005(value) => tree_snapshot_v005(value, limits),
     }
 }
 
@@ -116,6 +120,46 @@ fn tree_snapshot_v003(
         .nodes
         .into_iter()
         .map(|node| convert_node_v003(node, limits, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(youth_tree::TreeSnapshot {
+        revision: value.revision,
+        root,
+        nodes,
+    })
+}
+
+fn tree_snapshot_v004(
+    value: generated_v004::TreeSnapshot,
+    limits: &RuntimeLimits,
+) -> Result<youth_tree::TreeSnapshot, WireError> {
+    let mut budget = TransferBudget::new(limits.max_guest_to_host_transfer);
+    budget.charge(16)?;
+    budget.charge_list(value.nodes.len(), 32)?;
+    let root = node_id(value.root)?;
+    let nodes = value
+        .nodes
+        .into_iter()
+        .map(|node| convert_node_v004(node, limits, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(youth_tree::TreeSnapshot {
+        revision: value.revision,
+        root,
+        nodes,
+    })
+}
+
+fn tree_snapshot_v005(
+    value: generated_v005::TreeSnapshot,
+    limits: &RuntimeLimits,
+) -> Result<youth_tree::TreeSnapshot, WireError> {
+    let mut budget = TransferBudget::new(limits.max_guest_to_host_transfer);
+    budget.charge(16)?;
+    budget.charge_list(value.nodes.len(), 32)?;
+    let root = node_id(value.root)?;
+    let nodes = value
+        .nodes
+        .into_iter()
+        .map(|node| convert_node_v005(node, limits, &mut budget))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(youth_tree::TreeSnapshot {
         revision: value.revision,
@@ -265,6 +309,250 @@ fn convert_node_v003(
     })
 }
 
+fn convert_node_v004(
+    value: generated_v004::Node,
+    limits: &RuntimeLimits,
+    budget: &mut TransferBudget,
+) -> Result<youth_tree::Node, WireError> {
+    use youth_tree::{NodeData, ShortcutKey, TextAlignment};
+
+    budget.charge_list(value.children.len(), size_of::<u64>())?;
+    let children = value
+        .children
+        .into_iter()
+        .map(node_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = match value.data {
+        generated_v004::NodeData::Root => NodeData::Root,
+        generated_v004::NodeData::Box(value) => match value.layout {
+            generated_v004::BoxLayout::Column => NodeData::Box {
+                enabled: value.enabled,
+            },
+            generated_v004::BoxLayout::Row => NodeData::Row {
+                enabled: value.enabled,
+            },
+            generated_v004::BoxLayout::Grid(grid) => NodeData::Grid {
+                enabled: value.enabled,
+                columns: grid.columns,
+            },
+        },
+        generated_v004::NodeData::Text(value) => {
+            budget.charge(value.value.len())?;
+            if value.value.len() > limits.tree.max_text_len {
+                return Err(WireError::invalid(format!(
+                    "text value has {} bytes, exceeding the limit of {}",
+                    value.value.len(),
+                    limits.tree.max_text_len
+                )));
+            }
+            match value.alignment {
+                generated_v004::TextAlignment::Start => NodeData::Text { value: value.value },
+                generated_v004::TextAlignment::Center => NodeData::AlignedText {
+                    value: value.value,
+                    alignment: TextAlignment::Center,
+                },
+                generated_v004::TextAlignment::End => NodeData::AlignedText {
+                    value: value.value,
+                    alignment: TextAlignment::End,
+                },
+            }
+        }
+        generated_v004::NodeData::Button(value) => {
+            budget.charge(value.label.len())?;
+            if value.label.len() > limits.tree.max_label_len {
+                return Err(WireError::invalid(format!(
+                    "button label has {} bytes, exceeding the limit of {}",
+                    value.label.len(),
+                    limits.tree.max_label_len
+                )));
+            }
+            budget.charge_list(value.shortcuts.len(), 16)?;
+            let shortcuts = value
+                .shortcuts
+                .into_iter()
+                .map(|shortcut| match shortcut {
+                    generated_v004::ShortcutKey::Character(value) => {
+                        budget.charge(value.len())?;
+                        Ok(ShortcutKey::Character(value))
+                    }
+                    generated_v004::ShortcutKey::Enter => Ok(ShortcutKey::Enter),
+                    generated_v004::ShortcutKey::Escape => Ok(ShortcutKey::Escape),
+                    generated_v004::ShortcutKey::Backspace => Ok(ShortcutKey::Backspace),
+                })
+                .collect::<Result<Vec<_>, WireError>>()?;
+            if shortcuts.is_empty() {
+                NodeData::Button {
+                    label: value.label,
+                    enabled: value.enabled,
+                }
+            } else {
+                NodeData::ShortcutButton {
+                    label: value.label,
+                    enabled: value.enabled,
+                    shortcuts,
+                }
+            }
+        }
+    };
+    Ok(youth_tree::Node {
+        id: node_id(value.id)?,
+        data,
+        children,
+    })
+}
+
+fn convert_node_v005(
+    value: generated_v005::Node,
+    limits: &RuntimeLimits,
+    budget: &mut TransferBudget,
+) -> Result<youth_tree::Node, WireError> {
+    use youth_tree::{NodeData, ShortcutKey};
+
+    budget.charge_list(value.children.len(), size_of::<u64>())?;
+    let children = value
+        .children
+        .into_iter()
+        .map(node_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = match value.data {
+        generated_v005::NodeData::Root => NodeData::Root,
+        generated_v005::NodeData::Box(value) => match value.layout {
+            generated_v005::BoxLayout::Column => NodeData::Box {
+                enabled: value.enabled,
+            },
+            generated_v005::BoxLayout::Row => NodeData::Row {
+                enabled: value.enabled,
+            },
+            generated_v005::BoxLayout::Grid(grid) => NodeData::Grid {
+                enabled: value.enabled,
+                columns: grid.columns,
+            },
+        },
+        generated_v005::NodeData::Text(value) => {
+            convert_text_content_v005(value.content, value.alignment, limits, budget)?
+        }
+        generated_v005::NodeData::Button(value) => {
+            budget.charge(value.label.len())?;
+            if value.label.len() > limits.tree.max_label_len {
+                return Err(WireError::invalid(format!(
+                    "button label has {} bytes, exceeding the limit of {}",
+                    value.label.len(),
+                    limits.tree.max_label_len
+                )));
+            }
+            budget.charge_list(value.shortcuts.len(), 16)?;
+            let shortcuts = value
+                .shortcuts
+                .into_iter()
+                .map(|shortcut| match shortcut {
+                    generated_v005::ShortcutKey::Character(value) => {
+                        budget.charge(value.len())?;
+                        Ok(ShortcutKey::Character(value))
+                    }
+                    generated_v005::ShortcutKey::Enter => Ok(ShortcutKey::Enter),
+                    generated_v005::ShortcutKey::Escape => Ok(ShortcutKey::Escape),
+                    generated_v005::ShortcutKey::Backspace => Ok(ShortcutKey::Backspace),
+                })
+                .collect::<Result<Vec<_>, WireError>>()?;
+            if shortcuts.is_empty() {
+                NodeData::Button {
+                    label: value.label,
+                    enabled: value.enabled,
+                }
+            } else {
+                NodeData::ShortcutButton {
+                    label: value.label,
+                    enabled: value.enabled,
+                    shortcuts,
+                }
+            }
+        }
+    };
+    Ok(youth_tree::Node {
+        id: node_id(value.id)?,
+        data,
+        children,
+    })
+}
+
+fn convert_text_content_v005(
+    content: generated_v005::TextContent,
+    alignment: generated_v005::TextAlignment,
+    limits: &RuntimeLimits,
+    budget: &mut TransferBudget,
+) -> Result<youth_tree::NodeData, WireError> {
+    use youth_tree::{NodeData, TextAlignment};
+
+    match content {
+        generated_v005::TextContent::Literal(value) => {
+            budget.charge(value.len())?;
+            if value.len() > limits.tree.max_text_len {
+                return Err(WireError::invalid(format!(
+                    "text value has {} bytes, exceeding the limit of {}",
+                    value.len(),
+                    limits.tree.max_text_len
+                )));
+            }
+            Ok(match alignment {
+                generated_v005::TextAlignment::Start => NodeData::Text { value },
+                generated_v005::TextAlignment::Center => NodeData::AlignedText {
+                    value,
+                    alignment: TextAlignment::Center,
+                },
+                generated_v005::TextAlignment::End => NodeData::AlignedText {
+                    value,
+                    alignment: TextAlignment::End,
+                },
+            })
+        }
+        generated_v005::TextContent::Countdown(value) => {
+            budget.charge(24)?;
+            let (schedule, precision, format) = convert_countdown_v005(value);
+            Ok(match alignment {
+                generated_v005::TextAlignment::Start => NodeData::Countdown {
+                    schedule,
+                    precision,
+                    format,
+                },
+                generated_v005::TextAlignment::Center => NodeData::AlignedCountdown {
+                    schedule,
+                    precision,
+                    format,
+                    alignment: TextAlignment::Center,
+                },
+                generated_v005::TextAlignment::End => NodeData::AlignedCountdown {
+                    schedule,
+                    precision,
+                    format,
+                    alignment: TextAlignment::End,
+                },
+            })
+        }
+    }
+}
+
+fn convert_countdown_v005(
+    value: generated_v005::CountdownData,
+) -> (
+    youth_tree::ScheduleRef,
+    youth_tree::TimePrecision,
+    youth_tree::CountdownFormat,
+) {
+    let schedule = youth_tree::ScheduleRef {
+        id: value.schedule.id,
+        generation: value.schedule.generation,
+    };
+    let precision = match value.precision {
+        generated_v005::TimePrecision::Seconds => youth_tree::TimePrecision::Seconds,
+    };
+    let format = match value.format {
+        generated_v005::CountdownFormat::MinutesSeconds => {
+            youth_tree::CountdownFormat::MinutesSeconds
+        }
+    };
+    (schedule, precision, format)
+}
+
 impl TryFrom<generated::TreeSnapshot> for youth_tree::TreeSnapshot {
     type Error = WireError;
 
@@ -280,6 +568,8 @@ pub(crate) fn patch_batch(
     match value {
         RawPatchBatch::V002(value) => patch_batch_v002(value, limits),
         RawPatchBatch::V003(value) => patch_batch_v003(value, limits),
+        RawPatchBatch::V004(value) => patch_batch_v004(value, limits),
+        RawPatchBatch::V005(value) => patch_batch_v005(value, limits),
     }
 }
 
@@ -323,6 +613,54 @@ fn patch_batch_v003(
         .patches
         .into_iter()
         .map(|patch| convert_patch_v003(patch, limits, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(youth_tree::PatchBatch {
+        base_revision: value.base_tree_revision,
+        next_revision: value.next_tree_revision,
+        patches,
+    })
+}
+
+fn patch_batch_v004(
+    value: generated_v004::PatchBatch,
+    limits: &RuntimeLimits,
+) -> Result<youth_tree::PatchBatch, WireError> {
+    let mut budget = TransferBudget::new(limits.max_guest_to_host_transfer);
+    budget.charge(24)?;
+    budget.charge_list(value.patches.len(), 32)?;
+    if value.patches.len() > limits.tree.max_patches {
+        return Err(WireError::invalid(
+            "patch list exceeds the configured limit",
+        ));
+    }
+    let patches = value
+        .patches
+        .into_iter()
+        .map(|patch| convert_patch_v004(patch, limits, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(youth_tree::PatchBatch {
+        base_revision: value.base_tree_revision,
+        next_revision: value.next_tree_revision,
+        patches,
+    })
+}
+
+fn patch_batch_v005(
+    value: generated_v005::PatchBatch,
+    limits: &RuntimeLimits,
+) -> Result<youth_tree::PatchBatch, WireError> {
+    let mut budget = TransferBudget::new(limits.max_guest_to_host_transfer);
+    budget.charge(24)?;
+    budget.charge_list(value.patches.len(), 32)?;
+    if value.patches.len() > limits.tree.max_patches {
+        return Err(WireError::invalid(
+            "patch list exceeds the configured limit",
+        ));
+    }
+    let patches = value
+        .patches
+        .into_iter()
+        .map(|patch| convert_patch_v005(patch, limits, &mut budget))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(youth_tree::PatchBatch {
         base_revision: value.base_tree_revision,
@@ -441,6 +779,136 @@ fn convert_patch_v003(
             expected_child: node_id(value.expected_child)?,
         },
         generated_v003::Patch::MoveChild(value) => youth_tree::Patch::MoveChild {
+            parent: node_id(value.parent)?,
+            from_index: value.from_index,
+            to_index: value.to_index,
+            expected_child: node_id(value.expected_child)?,
+        },
+    })
+}
+
+fn convert_patch_v004(
+    value: generated_v004::Patch,
+    limits: &RuntimeLimits,
+    budget: &mut TransferBudget,
+) -> Result<youth_tree::Patch, WireError> {
+    Ok(match value {
+        generated_v004::Patch::Create(value) => youth_tree::Patch::Create {
+            node: convert_node_v004(value.value, limits, budget)?,
+        },
+        generated_v004::Patch::Delete(value) => youth_tree::Patch::Delete {
+            id: node_id(value.id)?,
+        },
+        generated_v004::Patch::SetText(value) => {
+            budget.charge(value.value.len())?;
+            if value.value.len() > limits.tree.max_text_len {
+                return Err(WireError::invalid(
+                    "text patch exceeds the configured limit",
+                ));
+            }
+            youth_tree::Patch::SetText {
+                id: node_id(value.id)?,
+                value: value.value,
+            }
+        }
+        generated_v004::Patch::SetLabel(value) => {
+            budget.charge(value.value.len())?;
+            if value.value.len() > limits.tree.max_label_len {
+                return Err(WireError::invalid(
+                    "label patch exceeds the configured limit",
+                ));
+            }
+            youth_tree::Patch::SetLabel {
+                id: node_id(value.id)?,
+                value: value.value,
+            }
+        }
+        generated_v004::Patch::SetEnabled(value) => youth_tree::Patch::SetEnabled {
+            id: node_id(value.id)?,
+            value: value.value,
+        },
+        generated_v004::Patch::InsertChild(value) => youth_tree::Patch::InsertChild {
+            parent: node_id(value.parent)?,
+            index: value.index,
+            child: node_id(value.child)?,
+        },
+        generated_v004::Patch::RemoveChild(value) => youth_tree::Patch::RemoveChild {
+            parent: node_id(value.parent)?,
+            index: value.index,
+            expected_child: node_id(value.expected_child)?,
+        },
+        generated_v004::Patch::MoveChild(value) => youth_tree::Patch::MoveChild {
+            parent: node_id(value.parent)?,
+            from_index: value.from_index,
+            to_index: value.to_index,
+            expected_child: node_id(value.expected_child)?,
+        },
+    })
+}
+
+fn convert_patch_v005(
+    value: generated_v005::Patch,
+    limits: &RuntimeLimits,
+    budget: &mut TransferBudget,
+) -> Result<youth_tree::Patch, WireError> {
+    Ok(match value {
+        generated_v005::Patch::Create(value) => youth_tree::Patch::Create {
+            node: convert_node_v005(value.value, limits, budget)?,
+        },
+        generated_v005::Patch::Delete(value) => youth_tree::Patch::Delete {
+            id: node_id(value.id)?,
+        },
+        generated_v005::Patch::SetText(value) => match value.value {
+            generated_v005::TextContent::Literal(text) => {
+                budget.charge(text.len())?;
+                if text.len() > limits.tree.max_text_len {
+                    return Err(WireError::invalid(
+                        "text patch exceeds the configured limit",
+                    ));
+                }
+                youth_tree::Patch::SetText {
+                    id: node_id(value.id)?,
+                    value: text,
+                }
+            }
+            generated_v005::TextContent::Countdown(countdown) => {
+                budget.charge(24)?;
+                let (schedule, precision, format) = convert_countdown_v005(countdown);
+                youth_tree::Patch::SetCountdown {
+                    id: node_id(value.id)?,
+                    schedule,
+                    precision,
+                    format,
+                }
+            }
+        },
+        generated_v005::Patch::SetLabel(value) => {
+            budget.charge(value.value.len())?;
+            if value.value.len() > limits.tree.max_label_len {
+                return Err(WireError::invalid(
+                    "label patch exceeds the configured limit",
+                ));
+            }
+            youth_tree::Patch::SetLabel {
+                id: node_id(value.id)?,
+                value: value.value,
+            }
+        }
+        generated_v005::Patch::SetEnabled(value) => youth_tree::Patch::SetEnabled {
+            id: node_id(value.id)?,
+            value: value.value,
+        },
+        generated_v005::Patch::InsertChild(value) => youth_tree::Patch::InsertChild {
+            parent: node_id(value.parent)?,
+            index: value.index,
+            child: node_id(value.child)?,
+        },
+        generated_v005::Patch::RemoveChild(value) => youth_tree::Patch::RemoveChild {
+            parent: node_id(value.parent)?,
+            index: value.index,
+            expected_child: node_id(value.expected_child)?,
+        },
+        generated_v005::Patch::MoveChild(value) => youth_tree::Patch::MoveChild {
             parent: node_id(value.parent)?,
             from_index: value.from_index,
             to_index: value.to_index,

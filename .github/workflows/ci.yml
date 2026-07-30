@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'codex/**']
   pull_request:
 
 env:
@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha256: ${{ steps.hash.outputs.sha256 }}
+      calculator_sha256: ${{ steps.calculator_hash.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -42,6 +43,14 @@ jobs:
           -p youth-invalid-patch-after-state-write
           -p youth-bad-revision-after-state-write
           -p youth-app-error-after-state-write
+          -p youth-countdown-presentation
+          -p youth-elapsed-invalid-patch
+          -p youth-elapsed-trap
+          -p youth-instant-now
+          -p youth-legacy-v003
+          -p youth-sdk-elapsed
+          -p youth-sdk-time
+          -p youth-time-stub
           --target wasm32-wasip2 --release
       - name: Record SHA-256
         id: hash
@@ -49,6 +58,28 @@ jobs:
           digest=$(sha256sum target/wasm32-wasip2/release/youth_counter.wasm | cut -d' ' -f1)
           echo "sha256=$digest" >> "$GITHUB_OUTPUT"
           echo "counter.wasm SHA-256: $digest"
+      - name: Build calculator component once
+        env:
+          CALCULATOR_COMMIT: 696d2fbac58a99116fec28238ca51f5a4a5c2acd
+        run: |
+          set -euo pipefail
+          calculator="$RUNNER_TEMP/youth-calculator"
+          git clone --quiet https://github.com/samanshaiza004/youth-calculator.git "$calculator"
+          git -C "$calculator" checkout --quiet "$CALCULATOR_COMMIT"
+          cargo build \
+            --manifest-path "$calculator/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target/calculator-external" \
+            --target wasm32-wasip2 \
+            --release
+      - name: Record calculator SHA-256
+        id: calculator_hash
+        run: |
+          set -euo pipefail
+          component=target/calculator-external/wasm32-wasip2/release/calculator.wasm
+          test -f "$component"
+          digest=$(sha256sum "$component" | cut -d' ' -f1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          echo "calculator.wasm SHA-256: $digest"
       - uses: actions/upload-artifact@v4
         with:
           name: counter-wasm
@@ -69,6 +100,19 @@ jobs:
             target/wasm32-wasip2/release/youth_invalid_patch_after_state_write.wasm
             target/wasm32-wasip2/release/youth_bad_revision_after_state_write.wasm
             target/wasm32-wasip2/release/youth_app_error_after_state_write.wasm
+            target/wasm32-wasip2/release/youth_countdown_presentation.wasm
+            target/wasm32-wasip2/release/youth_elapsed_invalid_patch.wasm
+            target/wasm32-wasip2/release/youth_elapsed_trap.wasm
+            target/wasm32-wasip2/release/youth_instant_now.wasm
+            target/wasm32-wasip2/release/youth_legacy_v003.wasm
+            target/wasm32-wasip2/release/youth_sdk_elapsed.wasm
+            target/wasm32-wasip2/release/youth_sdk_time.wasm
+            target/wasm32-wasip2/release/youth_time_stub.wasm
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calculator-wasm
+          path: target/calculator-external/wasm32-wasip2/release/calculator.wasm
           if-no-files-found: error
 
   host:
@@ -94,6 +138,10 @@ jobs:
         with:
           name: counter-wasm
           path: target/wasm32-wasip2/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: calculator-wasm
+          path: target/calculator-certified
       - name: Verify guest SHA-256
         shell: pwsh
         run: |
@@ -164,7 +212,13 @@ jobs:
           }
           Write-Host "canonical snapshot SHA-256: $actualHash"
       - name: Build (release)
-        run: cargo build --workspace --release
+        run: |
+          # The CLI embeds reviewable template files. Clear cached package
+          # artifacts so a restored target directory cannot retain an older
+          # embedded WIT hash across branch commits.
+          cargo clean -p youth-cli
+          cargo clean -p youth-project
+          cargo build --workspace --release
       - name: Native doctor smoke (Ubuntu/Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo run --quiet -p youth-cli --release -- doctor --full
@@ -197,6 +251,70 @@ jobs:
           } finally {
             Pop-Location
           }
+      - name: External calculator workflow
+        shell: pwsh
+        env:
+          CALCULATOR_COMMIT: 696d2fbac58a99116fec28238ca51f5a4a5c2acd
+        run: |
+          $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
+          $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
+          $certifiedComponent = (Resolve-Path "target/calculator-certified/calculator.wasm").Path
+          $certifiedHash = (Get-FileHash $certifiedComponent -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = "${{ needs.guest.outputs.calculator_sha256 }}".ToLowerInvariant()
+          if ($certifiedHash -ne $expectedHash) {
+            throw "certified calculator SHA-256 mismatch: expected $expectedHash, got $certifiedHash"
+          }
+          & $cli mount $certifiedComponent
+          if ($LASTEXITCODE -ne 0) { throw "certified calculator mount failed" }
+          $calculator = Join-Path $env:RUNNER_TEMP "youth-calculator"
+          git clone --quiet https://github.com/samanshaiza004/youth-calculator.git $calculator
+          git -C $calculator checkout --quiet $env:CALCULATOR_COMMIT
+          $checkedOut = (git -C $calculator rev-parse HEAD).Trim()
+          if ($checkedOut -ne $env:CALCULATOR_COMMIT) {
+            throw "calculator revision mismatch: expected $env:CALCULATOR_COMMIT, got $checkedOut"
+          }
+          Push-Location $calculator
+          try {
+            & $cli check
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth check failed" }
+            & $cli test
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth test failed" }
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { throw "calculator youth build --release failed" }
+            $component = Join-Path $calculator "dist/dev.saman.calculator.wasm"
+            if (-not (Test-Path $component -PathType Leaf)) {
+              throw "calculator release component was not produced"
+            }
+            & wasm-tools validate $component
+            if ($LASTEXITCODE -ne 0) { throw "calculator component validation failed" }
+            if (Select-String -Path Cargo.toml -Pattern 'path\s*=') {
+              throw "calculator Cargo.toml contains a local path dependency"
+            }
+            $forbidden = 'wit_bindgen|wasmtime|PatchBatch|acknowledg|numeric wire|revision|component export'
+            $source = Get-ChildItem src -Recurse -File -Filter *.rs
+            if ($source | Select-String -Pattern $forbidden) {
+              throw "calculator source contains raw Youth runtime or WIT concepts"
+            }
+            $lock = Get-Content Youth.lock -Raw
+            if ($lock -notmatch 'sdk-revision\s*=\s*"8696bd97ebc4f1d34b9f632e5992dd1882b724de"') {
+              throw "calculator Youth.lock does not pin the certified SDK revision"
+            }
+            $localHash = (Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant()
+            $metadata = Join-Path $env:RUNNER_TEMP "calculator-sha-$env:RUNNER_OS.txt"
+            Set-Content -Path $metadata -Value $certifiedHash -NoNewline
+            Write-Host "calculator certified revision: $checkedOut"
+            Write-Host "calculator component bytes: $((Get-Item $component).Length)"
+            Write-Host "calculator locally-built SHA-256: $localHash"
+            Write-Host "calculator certified SHA-256: $certifiedHash"
+          } finally {
+            Pop-Location
+          }
+      - name: Upload calculator identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: calculator-sha-${{ runner.os }}
+          path: ${{ runner.temp }}/calculator-sha-${{ runner.os }}.txt
+          if-no-files-found: error
       - name: Ubuntu full dev restart E2E
         if: runner.os == 'Linux'
         shell: bash
@@ -231,3 +349,24 @@ jobs:
         run: |
           git status --short
           test -z "$(git status --short)"
+
+  calculator-cross-platform:
+    needs: host
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download calculator identities
+        uses: actions/download-artifact@v4
+        with:
+          pattern: calculator-sha-*
+          path: calculator-identities
+          merge-multiple: true
+      - name: Require one calculator component identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find calculator-identities -type f -name '*.txt' -print | sort)
+          test "${#files[@]}" -eq 3
+          mapfile -t hashes < <(for file in "${files[@]}"; do tr -d '\r\n' < "$file"; printf '\n'; done | sort -u)
+          test "${#hashes[@]}" -eq 1
+          [[ "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]]
+          echo "calculator component SHA-256 is identical on all hosts: ${hashes[0]}"

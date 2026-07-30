@@ -8,11 +8,19 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+mod scheduler;
 mod store;
+mod time;
 
+pub use scheduler::{SchedulerInput, SchedulerOutput, WakeToken, transition};
 pub use store::{
-    GuestCallPhase, StateError, StateStore, TurnStateMetrics, Usage, Verification, repair_usage,
+    DeliveryProtocol, ElapsedReason, GuestCallPhase, PendingDelivery, ScheduleRecord,
+    ScheduleStatus, StateError, StateStore, TurnStateMetrics, Usage, Verification, repair_usage,
     verify_file,
+};
+pub use time::{
+    DeadlineClock, SystemDeadlineClock, SystemWakeDriver, VirtualDeadlineClock, VirtualWakeDriver,
+    WakeDriver, WakeSink, execute_wake_outputs,
 };
 
 /// Stable application identity used to select durable state.
@@ -108,6 +116,11 @@ pub struct StateLimits {
     pub max_keys: u32,
     pub max_writes_per_turn: u32,
     pub max_calls_per_turn: u32,
+    pub max_active_schedules: usize,
+    pub min_schedule_millis: u64,
+    pub max_schedule_millis: u64,
+    pub max_notification_title_bytes: usize,
+    pub max_notification_body_bytes: usize,
 }
 
 impl Default for StateLimits {
@@ -120,6 +133,11 @@ impl Default for StateLimits {
             max_keys: 16_384,
             max_writes_per_turn: 1_024,
             max_calls_per_turn: 4_096,
+            max_active_schedules: 32,
+            min_schedule_millis: 100,
+            max_schedule_millis: 30 * 24 * 60 * 60 * 1_000,
+            max_notification_title_bytes: 256,
+            max_notification_body_bytes: 1_024,
         }
     }
 }
@@ -184,5 +202,10 @@ mod tests {
         assert_eq!(limits.max_total_bytes, 16 * 1024 * 1024);
         assert_eq!(limits.max_writes_per_turn, 1_024);
         assert_eq!(limits.max_calls_per_turn, 4_096);
+        assert_eq!(limits.max_active_schedules, 32);
+        assert_eq!(limits.min_schedule_millis, 100);
+        assert_eq!(limits.max_schedule_millis, 30 * 24 * 60 * 60 * 1_000);
+        assert_eq!(limits.max_notification_title_bytes, 256);
+        assert_eq!(limits.max_notification_body_bytes, 1_024);
     }
 }

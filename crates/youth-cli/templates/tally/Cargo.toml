@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-youth-sdk = { git = "https://github.com/samanshaiza004/youth", rev = "8696bd97ebc4f1d34b9f632e5992dd1882b724de" }
+youth-sdk = { git = "https://github.com/samanshaiza004/youth", rev = "4a0bba175e7eb9643a0348a94a6a3efadbdae0e1" }
 
 [profile.release]
 lto = true

@@ -11,7 +11,8 @@ It is not a general application platform yet.
   without changing guests.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
-- The current application protocol is `0.0.3`; the host also runs `0.0.2`.
+- The current application protocol is `0.0.4`; the host also runs `0.0.3` and
+  `0.0.2`.
 - Guests are Rust-only and target `wasm32-wasip2`.
 - `youth build` emits a bare validated component, not an installable package.
 - Packaging, publishing, registries, and SDK upgrades are absent.

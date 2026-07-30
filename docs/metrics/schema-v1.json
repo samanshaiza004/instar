@@ -11,14 +11,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "youth_commit", "sdk_revision", "calculator_commit", "rust_version",
+        "youth_commit", "sdk_revision", "app_commit", "app_name", "rust_version",
         "wasmtime_version", "os", "architecture", "cpu", "runner_type",
         "build_profile", "wasmtime_cache_state", "component_sha256"
       ],
       "properties": {
         "youth_commit": { "$ref": "#/$defs/sha1" },
         "sdk_revision": { "$ref": "#/$defs/sha1" },
-        "calculator_commit": { "$ref": "#/$defs/sha1" },
+        "app_commit": { "$ref": "#/$defs/sha1" },
+        "app_name": { "type": "string", "minLength": 1 },
         "rust_version": { "type": "string", "minLength": 1 },
         "wasmtime_version": { "type": "string", "minLength": 1 },
         "os": { "type": "string", "minLength": 1 },

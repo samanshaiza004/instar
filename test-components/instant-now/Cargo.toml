@@ -1,0 +1,13 @@
+[package]
+name = "youth-instant-now"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guest monotonic-clock hermeticity fixture."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { path = "../../crates/youth-sdk" }

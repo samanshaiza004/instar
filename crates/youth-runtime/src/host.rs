@@ -2,13 +2,17 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracing::info_span;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
+use wasmtime_wasi::clocks::HostMonotonicClock;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::bindings::{ApplicationBindings, GuestError, GuestErrorCode, ProtocolVersion};
+use crate::bindings::{
+    ApplicationBindings, GuestError, GuestErrorCode, HostEvent, ProtocolVersion,
+};
 use crate::engine::deadline_ticks;
 use crate::error::ErrorContext;
 use crate::wire::from_guest::{self, WireErrorKind};
@@ -56,6 +60,18 @@ pub struct TurnReceipt {
 pub struct AppFault {
     pub category: RuntimeErrorCategory,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleWake {
+    pub application_id: youth_state::AppId,
+    pub token: youth_state::WakeToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WakeDisposition {
+    DeliveryQueued,
+    Discarded,
 }
 
 /// A synchronous snapshot of host-owned application state.
@@ -114,6 +130,22 @@ pub(crate) struct HostState {
     wasi: WasiCtx,
     limiter: MemoryLimiter,
     state: youth_state::StateStore,
+    deadline_clock: Arc<dyn youth_state::DeadlineClock>,
+    wake_driver: Arc<dyn youth_state::WakeDriver>,
+    notification_dispatcher: Arc<dyn crate::NotificationDispatcher>,
+    staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
+}
+
+struct GuestClockAdapter(Arc<dyn crate::GuestMonotonicClock>);
+
+impl HostMonotonicClock for GuestClockAdapter {
+    fn resolution(&self) -> u64 {
+        self.0.resolution_nanoseconds()
+    }
+
+    fn now(&self) -> u64 {
+        self.0.now_nanoseconds()
+    }
 }
 
 impl WasiView for HostState {
@@ -121,6 +153,49 @@ impl WasiView for HostState {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+        }
+    }
+}
+
+impl HostState {
+    fn apply_committed_schedule_outputs(&mut self) {
+        youth_state::execute_wake_outputs(self.wake_driver.as_ref(), &self.staged_schedule_outputs);
+        dispatch_schedule_notifications(
+            &self.staged_schedule_outputs,
+            self.notification_dispatcher.as_ref(),
+            &self.state,
+        );
+        self.staged_schedule_outputs.clear();
+    }
+
+    fn discard_staged_schedule_outputs(&mut self) {
+        self.staged_schedule_outputs.clear();
+    }
+}
+
+pub(crate) fn dispatch_schedule_notifications(
+    outputs: &[youth_state::SchedulerOutput],
+    dispatcher: &dyn crate::NotificationDispatcher,
+    state: &youth_state::StateStore,
+) {
+    for output in outputs {
+        let youth_state::SchedulerOutput::QueueElapsedDelivery { token, .. } = output else {
+            continue;
+        };
+        match state.schedule(token.schedule_id) {
+            Ok(Some(record)) => {
+                if let Some((title, body)) = record.notification {
+                    dispatcher.dispatch(&title, &body);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    schedule_id = token.schedule_id,
+                    %error,
+                    "schedule notification lookup failed"
+                );
+            }
         }
     }
 }
@@ -200,6 +275,12 @@ fn to_wire_state_error_v002(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
@@ -284,12 +365,508 @@ fn to_wire_state_error_v003(
         | youth_state::StateError::Filesystem(_)
         | youth_state::StateError::Corrupt(_)
         | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
         | youth_state::StateError::BackupExists
         | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
     };
     crate::bindings::v003::youth::state::store::StateError {
         code,
         message: None,
+    }
+}
+
+impl crate::bindings::v004::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v004::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v004::youth::state::store::Value>,
+        crate::bindings::v004::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v004))
+            .map_err(to_wire_state_error_v004)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v004::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v004::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v004(value))
+            .map_err(to_wire_state_error_v004)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v004::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v004)
+    }
+}
+
+fn to_wire_state_value_v004(
+    value: youth_state::StateValue,
+) -> crate::bindings::v004::youth::state::store::Value {
+    use crate::bindings::v004::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v004(
+    value: crate::bindings::v004::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v004::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v004(
+    error: youth_state::StateError,
+) -> crate::bindings::v004::youth::state::store::StateError {
+    use crate::bindings::v004::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v004::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+impl crate::bindings::v004::youth::time::scheduler::Host for HostState {
+    fn schedule_after(
+        &mut self,
+        millis: u64,
+        options: crate::bindings::v004::youth::time::scheduler::ScheduleOptions,
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let notification = options
+            .notification
+            .map(|notification| (notification.title, notification.body));
+        let record = self
+            .state
+            .schedule_create(now_epoch_millis, millis, notification)
+            .map_err(to_wire_schedule_error_v004)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Create {
+                app_id: self.state.app_id().clone(),
+                record: record.clone(),
+                now_epoch_millis,
+            },
+        ));
+        Ok(to_wire_schedule_v004(&record))
+    }
+
+    fn pause(
+        &mut self,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let paused = self
+            .state
+            .schedule_pause(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v004)?;
+        let wire_paused = to_wire_schedule_v004(&paused);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Pause {
+                app_id: self.state.app_id().clone(),
+                previous,
+                paused,
+            },
+        ));
+        Ok(wire_paused)
+    }
+
+    fn resume(
+        &mut self,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v004::youth::time::scheduler::Schedule,
+        crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let resumed = self
+            .state
+            .schedule_resume(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v004)?;
+        let wire_resumed = to_wire_schedule_v004(&resumed);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Resume {
+                app_id: self.state.app_id().clone(),
+                previous,
+                resumed,
+                now_epoch_millis,
+            },
+        ));
+        Ok(wire_resumed)
+    }
+
+    fn cancel(
+        &mut self,
+        value: crate::bindings::v004::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode> {
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(
+                crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        self.state
+            .schedule_cancel(value.id, value.generation)
+            .map_err(to_wire_schedule_error_v004)?;
+        let cancelled = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v004)?
+            .ok_or(crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode::Internal)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Cancel {
+                app_id: self.state.app_id().clone(),
+                previous,
+                cancelled,
+            },
+        ));
+        Ok(())
+    }
+}
+
+fn to_wire_schedule_v004(
+    record: &youth_state::ScheduleRecord,
+) -> crate::bindings::v004::youth::time::scheduler::Schedule {
+    crate::bindings::v004::youth::time::scheduler::Schedule {
+        id: record.id,
+        generation: record.generation,
+    }
+}
+
+fn to_wire_schedule_error_v004(
+    error: youth_state::StateError,
+) -> crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode {
+    use crate::bindings::v004::youth::time::scheduler::ScheduleErrorCode;
+    match error {
+        youth_state::StateError::InvalidScheduleDuration => ScheduleErrorCode::InvalidDuration,
+        youth_state::StateError::TooManySchedules => ScheduleErrorCode::TooManySchedules,
+        youth_state::StateError::UnknownSchedule => ScheduleErrorCode::UnknownSchedule,
+        youth_state::StateError::StaleScheduleGeneration => ScheduleErrorCode::StaleGeneration,
+        youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::InvalidScheduleState => ScheduleErrorCode::InvalidState,
+        youth_state::StateError::ReadOnly
+        | youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ScheduleErrorCode::Unavailable,
+        ref error if error.is_busy() => ScheduleErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidKey
+        | youth_state::StateError::InvalidValue
+        | youth_state::StateError::QuotaExceeded
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
+    }
+}
+
+impl crate::bindings::v005::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v005::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v005::youth::state::store::Value>,
+        crate::bindings::v005::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v005))
+            .map_err(to_wire_state_error_v005)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v005::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v005::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v005(value))
+            .map_err(to_wire_state_error_v005)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v005::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v005)
+    }
+}
+
+fn to_wire_state_value_v005(
+    value: youth_state::StateValue,
+) -> crate::bindings::v005::youth::state::store::Value {
+    use crate::bindings::v005::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v005(
+    value: crate::bindings::v005::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v005::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v005(
+    error: youth_state::StateError,
+) -> crate::bindings::v005::youth::state::store::StateError {
+    use crate::bindings::v005::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v005::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+impl crate::bindings::v005::youth::time::scheduler::Host for HostState {
+    fn schedule_after(
+        &mut self,
+        millis: u64,
+        options: crate::bindings::v005::youth::time::scheduler::ScheduleOptions,
+    ) -> Result<
+        crate::bindings::v005::youth::time::scheduler::Schedule,
+        crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let notification = options
+            .notification
+            .map(|notification| (notification.title, notification.body));
+        let record = self
+            .state
+            .schedule_create(now_epoch_millis, millis, notification)
+            .map_err(to_wire_schedule_error_v005)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Create {
+                app_id: self.state.app_id().clone(),
+                record: record.clone(),
+                now_epoch_millis,
+            },
+        ));
+        Ok(to_wire_schedule_v005(&record))
+    }
+
+    fn pause(
+        &mut self,
+        value: crate::bindings::v005::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v005::youth::time::scheduler::Schedule,
+        crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v005)?
+            .ok_or(
+                crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let paused = self
+            .state
+            .schedule_pause(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v005)?;
+        let wire_paused = to_wire_schedule_v005(&paused);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Pause {
+                app_id: self.state.app_id().clone(),
+                previous,
+                paused,
+            },
+        ));
+        Ok(wire_paused)
+    }
+
+    fn resume(
+        &mut self,
+        value: crate::bindings::v005::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v005::youth::time::scheduler::Schedule,
+        crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v005)?
+            .ok_or(
+                crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let resumed = self
+            .state
+            .schedule_resume(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v005)?;
+        let wire_resumed = to_wire_schedule_v005(&resumed);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Resume {
+                app_id: self.state.app_id().clone(),
+                previous,
+                resumed,
+                now_epoch_millis,
+            },
+        ));
+        Ok(wire_resumed)
+    }
+
+    fn cancel(
+        &mut self,
+        value: crate::bindings::v005::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode> {
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v005)?
+            .ok_or(
+                crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        self.state
+            .schedule_cancel(value.id, value.generation)
+            .map_err(to_wire_schedule_error_v005)?;
+        let cancelled = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v005)?
+            .ok_or(crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode::Internal)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Cancel {
+                app_id: self.state.app_id().clone(),
+                previous,
+                cancelled,
+            },
+        ));
+        Ok(())
+    }
+}
+
+fn to_wire_schedule_v005(
+    record: &youth_state::ScheduleRecord,
+) -> crate::bindings::v005::youth::time::scheduler::Schedule {
+    crate::bindings::v005::youth::time::scheduler::Schedule {
+        id: record.id,
+        generation: record.generation,
+    }
+}
+
+fn to_wire_schedule_error_v005(
+    error: youth_state::StateError,
+) -> crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode {
+    use crate::bindings::v005::youth::time::scheduler::ScheduleErrorCode;
+    match error {
+        youth_state::StateError::InvalidScheduleDuration => ScheduleErrorCode::InvalidDuration,
+        youth_state::StateError::TooManySchedules => ScheduleErrorCode::TooManySchedules,
+        youth_state::StateError::UnknownSchedule => ScheduleErrorCode::UnknownSchedule,
+        youth_state::StateError::StaleScheduleGeneration => ScheduleErrorCode::StaleGeneration,
+        youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::InvalidScheduleState => ScheduleErrorCode::InvalidState,
+        youth_state::StateError::ReadOnly
+        | youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ScheduleErrorCode::Unavailable,
+        ref error if error.is_busy() => ScheduleErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidKey
+        | youth_state::StateError::InvalidValue
+        | youth_state::StateError::QuotaExceeded
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
     }
 }
 
@@ -339,10 +916,20 @@ impl YouthApp {
     }
 
     pub fn load_config(config: YouthAppConfig) -> Result<Self, RuntimeError> {
-        Self::load_with_engine(config, crate::shared_engine())
+        Self::load_with_engine(config, crate::shared_engine(), true)
     }
 
-    fn load_with_engine(config: YouthAppConfig, engine: &Engine) -> Result<Self, RuntimeError> {
+    pub(crate) fn load_config_deferred_reconcile(
+        config: YouthAppConfig,
+    ) -> Result<Self, RuntimeError> {
+        Self::load_with_engine(config, crate::shared_engine(), false)
+    }
+
+    fn load_with_engine(
+        config: YouthAppConfig,
+        engine: &Engine,
+        reconcile_on_open: bool,
+    ) -> Result<Self, RuntimeError> {
         let path = config.component_path.as_path();
         let component_id = component_identity(path);
         let load_span = info_span!("component.load", component_id = %component_id);
@@ -372,6 +959,7 @@ impl YouthApp {
                 config.app_id,
                 config.state,
                 config.limits,
+                reconcile_on_open,
             )
         })
     }
@@ -400,6 +988,99 @@ impl YouthApp {
                     None,
                 ))
             })
+    }
+
+    /// Revalidates a process-local wake against durable state without
+    /// constructing or invoking a guest turn.
+    pub fn receive_schedule_wake(
+        &mut self,
+        wake: &ScheduleWake,
+    ) -> Result<WakeDisposition, RuntimeError> {
+        if wake.application_id != self.app_id {
+            return Ok(WakeDisposition::Discarded);
+        }
+        let now_epoch_millis = self.store.data().deadline_clock.now_epoch_millis();
+        let outputs = self
+            .store
+            .data_mut()
+            .state
+            .receive_wake(wake.token.clone(), now_epoch_millis)
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context(
+                        "schedule wake could not be checked against durable state",
+                        None,
+                    )
+                    .with_source(source),
+                )
+            })?;
+        youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        dispatch_schedule_notifications(
+            &outputs,
+            self.store.data().notification_dispatcher.as_ref(),
+            &self.store.data().state,
+        );
+        Ok(
+            if outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    youth_state::SchedulerOutput::QueueElapsedDelivery { .. }
+                )
+            }) {
+                WakeDisposition::DeliveryQueued
+            } else {
+                WakeDisposition::Discarded
+            },
+        )
+    }
+
+    pub fn pending_deliveries(&self) -> Result<Vec<youth_state::PendingDelivery>, RuntimeError> {
+        self.store
+            .data()
+            .state
+            .pending_deliveries()
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context("pending schedule deliveries could not be read", None)
+                        .with_source(source),
+                )
+            })
+    }
+
+    pub fn schedule(&self, id: u64) -> Result<Option<youth_state::ScheduleRecord>, RuntimeError> {
+        self.store.data().state.schedule(id).map_err(|source| {
+            RuntimeError::StateUnavailable(
+                self.context("schedule could not be read", None)
+                    .with_source(source),
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn now_epoch_millis(&self) -> u64 {
+        self.store.data().deadline_clock.now_epoch_millis()
+    }
+
+    pub(crate) fn reconcile_schedules(&mut self) -> Result<(), RuntimeError> {
+        let now_epoch_millis = self.store.data().deadline_clock.now_epoch_millis();
+        let outputs = self
+            .store
+            .data_mut()
+            .state
+            .reconcile_overdue(now_epoch_millis)
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    self.context("durable schedules could not be reconciled", None)
+                        .with_source(source),
+                )
+            })?;
+        youth_state::execute_wake_outputs(self.store.data().wake_driver.as_ref(), &outputs);
+        dispatch_schedule_notifications(
+            &outputs,
+            self.store.data().notification_dispatcher.as_ref(),
+            &self.store.data().state,
+        );
+        Ok(())
     }
 
     #[cfg(feature = "test-support")]
@@ -497,17 +1178,77 @@ impl YouthApp {
             transaction_result = tracing::field::Empty,
             result = tracing::field::Empty,
         );
-        let result = span.in_scope(|| self.activate_inner(node, sequence, base_revision));
+        let event = HostEvent::Activate {
+            sequence,
+            node: node.get(),
+        };
+        let result = span.in_scope(|| self.handle_inner(event, None, base_revision));
         span.record("result", if result.is_ok() { "ok" } else { "error" });
         result
     }
 
-    fn activate_inner(
+    /// Delivers the oldest durable elapsed event, if one exists.
+    ///
+    /// This method is intentionally synchronous and explicit. It does not
+    /// arrange a wake or retry itself.
+    pub fn deliver_next_pending(&mut self) -> Result<Option<TurnReceipt>, RuntimeError> {
+        if self.lifecycle != AppLifecycle::Mounted {
+            return Err(RuntimeError::InvalidLifecycle(self.context(
+                format!(
+                    "pending delivery is not allowed while the app is {}",
+                    self.lifecycle
+                ),
+                None,
+            )));
+        }
+        let Some(delivery) = self.pending_deliveries()?.into_iter().next() else {
+            return Ok(None);
+        };
+        if delivery.required_protocol == youth_state::DeliveryProtocol::V004
+            && !matches!(
+                self.bindings.version(),
+                ProtocolVersion::V004 | ProtocolVersion::V005
+            )
+        {
+            let error = RuntimeError::UnsupportedWorld(self.context(
+                format!(
+                    "pending schedule delivery requires protocol 0.0.4, but the loaded component exports {}",
+                    self.bindings.version().world()
+                ),
+                None,
+            ));
+            return Err(self.enter_fault(error));
+        }
+        let sequence = self
+            .last_event_sequence
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(self.context("event sequence space is exhausted", None))
+            })?;
+        self.last_event_sequence = Some(sequence);
+        let base_revision = self
+            .tree
+            .as_ref()
+            .expect("mounted applications retain a tree")
+            .revision();
+        let event = HostEvent::ScheduleElapsed {
+            sequence,
+            schedule: delivery.schedule_id,
+            generation: delivery.generation,
+            reason: delivery.reason,
+        };
+        let result = self.handle_inner(event, Some(delivery), base_revision);
+        result.map(Some)
+    }
+
+    fn handle_inner(
         &mut self,
-        node: youth_tree::NodeId,
-        sequence: u64,
+        event: HostEvent,
+        delivery: Option<youth_state::PendingDelivery>,
         base_revision: u64,
     ) -> Result<TurnReceipt, RuntimeError> {
+        let sequence = event.sequence();
         let turn_id = Some(sequence);
         self.prepare_call(self.limits.handle, "handle", turn_id)?;
         let mut staged_tree = self
@@ -520,7 +1261,7 @@ impl YouthApp {
                 self.context("event batch exceeds the configured limit", turn_id),
             ));
         }
-        let events = [(sequence, node.get())];
+        let events = [event];
         self.begin_state(youth_state::GuestCallPhase::Handle, turn_id)?;
 
         let started = std::time::Instant::now();
@@ -540,10 +1281,13 @@ impl YouthApp {
             Ok(batch) => batch,
             Err(error) => {
                 let writes = self.store.data().state.metrics().writes;
-                let recoverable = error.code == GuestErrorCode::RejectedEvent && writes == 0;
+                let recoverable = delivery.is_none()
+                    && error.code == GuestErrorCode::RejectedEvent
+                    && writes == 0;
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
+                self.store.data_mut().discard_staged_schedule_outputs();
                 self.record_state_metrics("rolled_back");
                 return if recoverable {
                     Err(error)
@@ -623,9 +1367,29 @@ impl YouthApp {
             };
             return Err(self.rollback_and_fault(error));
         }
+        if let Err(error) = self.validate_countdown_references(&staged_tree, turn_id) {
+            return Err(self.rollback_and_fault(error));
+        }
 
         let state_writes = self.store.data().state.metrics().writes;
+        if let Some(delivery) = delivery
+            && let Err(source) = self
+                .store
+                .data_mut()
+                .state
+                .acknowledge_pending_delivery(delivery)
+        {
+            let error = RuntimeError::StateUnavailable(
+                self.context(
+                    "pending schedule delivery could not be acknowledged in its turn",
+                    turn_id,
+                )
+                .with_source(source),
+            );
+            return Err(self.rollback_and_fault(error));
+        }
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after patch validation", turn_id)
@@ -633,6 +1397,7 @@ impl YouthApp {
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().apply_committed_schedule_outputs();
         self.record_state_metrics("committed");
         self.tree = Some(staged_tree);
         let elapsed = started.elapsed();
@@ -717,6 +1482,7 @@ impl YouthApp {
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
                 let _ = self.store.data_mut().state.rollback();
+                self.store.data_mut().discard_staged_schedule_outputs();
                 self.record_state_metrics("rolled_back");
                 return Err(error);
             }
@@ -764,13 +1530,18 @@ impl YouthApp {
             }
         };
         let snapshot = tree.to_snapshot();
+        if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
+            return Err(self.rollback_and_fault(error));
+        }
         if let Err(source) = self.store.data_mut().state.rollback() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             let error = RuntimeError::StateUnavailable(
                 self.context("read-only resync transaction could not close", turn_id)
                     .with_source(source),
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().discard_staged_schedule_outputs();
         self.record_state_metrics("read_only");
         self.tree = Some(tree);
         Ok(snapshot)
@@ -889,7 +1660,11 @@ impl YouthApp {
             Err(error) => return Err(self.rollback_and_fault(error)),
         };
         let snapshot = tree.to_snapshot();
+        if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
+            return Err(self.rollback_and_fault(error));
+        }
         if let Err(source) = self.store.data_mut().state.commit() {
+            self.store.data_mut().discard_staged_schedule_outputs();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after mount validation", turn_id)
@@ -897,10 +1672,62 @@ impl YouthApp {
             );
             return Err(self.enter_fault(error));
         }
+        self.store.data_mut().apply_committed_schedule_outputs();
         self.record_state_metrics("committed");
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
         Ok(snapshot)
+    }
+
+    fn validate_countdown_references(
+        &self,
+        tree: &youth_tree::Tree,
+        turn_id: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        for node in tree.to_snapshot().nodes {
+            let Some((schedule, _, _)) = node.data.countdown_ref() else {
+                continue;
+            };
+            let record = self
+                .store
+                .data()
+                .state
+                .schedule(schedule.id)
+                .map_err(|source| {
+                    RuntimeError::StateUnavailable(
+                        self.context(
+                            format!(
+                                "countdown schedule {} could not be validated before tree install",
+                                schedule.id
+                            ),
+                            turn_id,
+                        )
+                        .with_source(source),
+                    )
+                })?;
+            match record {
+                Some(record) if record.generation == schedule.generation => {}
+                Some(record) => {
+                    return Err(RuntimeError::GuestRejected(self.context(
+                        format!(
+                            "countdown references stale schedule {} generation {}; live generation is {}",
+                            schedule.id, schedule.generation, record.generation
+                        ),
+                        turn_id,
+                    )));
+                }
+                None => {
+                    return Err(RuntimeError::GuestRejected(self.context(
+                        format!(
+                            "countdown references unknown schedule {} generation {}",
+                            schedule.id, schedule.generation
+                        ),
+                        turn_id,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn guest_error_context(
@@ -960,6 +1787,7 @@ impl YouthApp {
 
     fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
         let _ = self.store.data_mut().state.rollback();
+        self.store.data_mut().discard_staged_schedule_outputs();
         self.record_state_metrics("rolled_back");
         self.enter_fault(error)
     }
@@ -1036,7 +1864,12 @@ fn instantiate(
     app_id: youth_state::AppId,
     state_location: StateLocation,
     limits: RuntimeLimits,
+    reconcile_on_open: bool,
 ) -> Result<YouthApp, RuntimeError> {
+    let deadline_clock = Arc::clone(&limits.time.deadline_clock);
+    let wake_driver = Arc::clone(&limits.time.wake_driver);
+    let guest_monotonic_clock = Arc::clone(&limits.time.guest_monotonic_clock);
+    let notification_dispatcher = Arc::clone(&limits.time.notification_dispatcher);
     let protocol = detect_protocol(engine, &component).ok_or_else(|| {
         RuntimeError::UnsupportedWorld(ErrorContext::new(
             "component does not export a supported Youth application world",
@@ -1045,27 +1878,55 @@ fn instantiate(
             None,
         ))
     })?;
-    let state_store =
-        youth_state::StateStore::open(state_location, limits.state).map_err(|source| {
-            RuntimeError::StateUnavailable(
-                ErrorContext::new(
-                    "application state could not be opened",
-                    &component_id,
-                    AppLifecycle::Loaded,
-                    None,
+    let mut state_store =
+        youth_state::StateStore::open_for_app(state_location, limits.state, app_id.clone())
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    ErrorContext::new(
+                        "application state could not be opened",
+                        &component_id,
+                        AppLifecycle::Loaded,
+                        None,
+                    )
+                    .with_source(source),
                 )
-                .with_source(source),
-            )
-        })?;
+            })?;
+    if reconcile_on_open {
+        let scheduler_outputs = state_store
+            .reconcile_overdue(deadline_clock.now_epoch_millis())
+            .map_err(|source| {
+                RuntimeError::StateUnavailable(
+                    ErrorContext::new(
+                        "durable schedules could not be reconciled",
+                        &component_id,
+                        AppLifecycle::Loaded,
+                        None,
+                    )
+                    .with_source(source),
+                )
+            })?;
+        youth_state::execute_wake_outputs(wake_driver.as_ref(), &scheduler_outputs);
+        dispatch_schedule_notifications(
+            &scheduler_outputs,
+            notification_dispatcher.as_ref(),
+            &state_store,
+        );
+    }
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.monotonic_clock(GuestClockAdapter(guest_monotonic_clock));
     let state = HostState {
         table: ResourceTable::new(),
-        wasi: WasiCtxBuilder::new().build(),
+        wasi: wasi.build(),
         limiter: MemoryLimiter {
             maximum: limits.max_linear_memory,
             max_table_elements: limits.max_table_elements,
             limit_hit: false,
         },
         state: state_store,
+        deadline_clock,
+        wake_driver,
+        notification_dispatcher,
+        staged_schedule_outputs: Vec::new(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);
@@ -1123,6 +1984,42 @@ fn instantiate(
                 .map_err(|source| instantiation_error(&component_id, &store, source))?;
             ApplicationBindings::V003(value)
         }
+        ProtocolVersion::V004 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v004::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v004::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V004(value)
+        }
+        ProtocolVersion::V005 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v005::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v005::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V005(value)
+        }
     };
     Ok(YouthApp {
         component_id,
@@ -1143,13 +2040,19 @@ fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVer
     let exports = component_type.exports(engine);
     let mut v002 = false;
     let mut v003 = false;
+    let mut v004 = false;
+    let mut v005 = false;
     for (name, _) in exports {
         v002 |= name == "youth:app/lifecycle@0.0.2";
         v003 |= name == "youth:app/lifecycle@0.0.3";
+        v004 |= name == "youth:app/lifecycle@0.0.4";
+        v005 |= name == "youth:app/lifecycle@0.0.5";
     }
-    match (v002, v003) {
-        (false, true) => Some(ProtocolVersion::V003),
-        (true, false) => Some(ProtocolVersion::V002),
+    match (v002, v003, v004, v005) {
+        (false, false, false, true) => Some(ProtocolVersion::V005),
+        (false, false, true, false) => Some(ProtocolVersion::V004),
+        (false, true, false, false) => Some(ProtocolVersion::V003),
+        (true, false, false, false) => Some(ProtocolVersion::V002),
         _ => None,
     }
 }

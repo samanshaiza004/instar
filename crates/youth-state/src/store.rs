@@ -5,16 +5,20 @@ use std::time::Duration;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::{StateLimits, StateLocation, StateSummary, StateValue, logical_entry_bytes};
+use crate::{
+    AppId, SchedulerInput, SchedulerOutput, StateLimits, StateLocation, StateSummary, StateValue,
+    WakeToken, logical_entry_bytes, transition,
+};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SCHEMA: &str = r#"
 CREATE TABLE youth_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
-INSERT INTO youth_meta(key, value) VALUES ('schema-version', '1');
+INSERT INTO youth_meta(key, value) VALUES ('schema-version', '4');
+INSERT INTO youth_meta(key, value) VALUES ('next-schedule-id', '1');
 
 CREATE TABLE youth_state (
     key           TEXT PRIMARY KEY,
@@ -37,6 +41,133 @@ CREATE TABLE youth_usage (
     logical_bytes INTEGER NOT NULL CHECK (logical_bytes >= 0)
 ) STRICT, WITHOUT ROWID;
 INSERT INTO youth_usage(id, key_count, logical_bytes) VALUES (1, 0, 0);
+
+CREATE TABLE youth_schedule (
+    id                 INTEGER PRIMARY KEY,
+    generation         INTEGER NOT NULL CHECK (generation > 0),
+    status             INTEGER NOT NULL CHECK (status BETWEEN 0 AND 3),
+    creation_sequence  INTEGER NOT NULL UNIQUE CHECK (creation_sequence > 0),
+    armed_at_millis    INTEGER,
+    deadline_millis    INTEGER,
+    duration_millis    INTEGER NOT NULL CHECK (duration_millis >= 0),
+    remaining_millis   INTEGER,
+    notification_title TEXT,
+    notification_body  TEXT,
+    required_protocol  INTEGER NOT NULL CHECK (required_protocol = 4),
+    CHECK (
+        (status IN (0, 2) AND armed_at_millis IS NOT NULL AND deadline_millis IS NOT NULL
+            AND remaining_millis IS NULL AND deadline_millis >= armed_at_millis)
+        OR (status = 1 AND armed_at_millis IS NULL AND deadline_millis IS NULL
+            AND remaining_millis IS NOT NULL AND remaining_millis >= 0
+            AND remaining_millis <= duration_millis)
+        OR (status = 3 AND armed_at_millis IS NULL AND deadline_millis IS NULL
+            AND remaining_millis IS NULL)
+    ),
+    CHECK (
+        (notification_title IS NULL AND notification_body IS NULL)
+        OR (notification_title IS NOT NULL AND notification_body IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE youth_pending_delivery (
+    schedule_id      INTEGER NOT NULL,
+    generation       INTEGER NOT NULL CHECK (generation > 0),
+    deadline_millis  INTEGER NOT NULL CHECK (deadline_millis >= 0),
+    creation_sequence INTEGER NOT NULL CHECK (creation_sequence > 0),
+    required_protocol INTEGER NOT NULL CHECK (required_protocol = 4),
+    elapsed_reason    INTEGER NOT NULL CHECK (elapsed_reason IN (0, 1)),
+    PRIMARY KEY (schedule_id, generation),
+    FOREIGN KEY (schedule_id) REFERENCES youth_schedule(id)
+) STRICT, WITHOUT ROWID;
+"#;
+
+const MIGRATE_V3_TO_V4: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE youth_schedule
+    ADD COLUMN required_protocol INTEGER NOT NULL DEFAULT 4 CHECK (required_protocol = 4);
+ALTER TABLE youth_pending_delivery
+    ADD COLUMN required_protocol INTEGER NOT NULL DEFAULT 4 CHECK (required_protocol = 4);
+ALTER TABLE youth_pending_delivery
+    ADD COLUMN elapsed_reason INTEGER NOT NULL DEFAULT 1 CHECK (elapsed_reason IN (0, 1));
+UPDATE youth_meta SET value = '4' WHERE key = 'schema-version';
+COMMIT;
+"#;
+
+const MIGRATE_V1_TO_V2: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE youth_schedule (
+    id                 INTEGER PRIMARY KEY,
+    generation         INTEGER NOT NULL CHECK (generation > 0),
+    status             INTEGER NOT NULL CHECK (status IN (0, 1)),
+    armed_at_millis    INTEGER,
+    deadline_millis    INTEGER,
+    duration_millis    INTEGER NOT NULL CHECK (duration_millis >= 0),
+    remaining_millis   INTEGER,
+    notification_title TEXT,
+    notification_body  TEXT,
+    CHECK (
+        (status = 0 AND armed_at_millis IS NOT NULL AND deadline_millis IS NOT NULL
+            AND remaining_millis IS NULL AND deadline_millis >= armed_at_millis)
+        OR (status = 1 AND armed_at_millis IS NULL AND deadline_millis IS NULL
+            AND remaining_millis IS NOT NULL AND remaining_millis >= 0
+            AND remaining_millis <= duration_millis)
+    ),
+    CHECK (
+        (notification_title IS NULL AND notification_body IS NULL)
+        OR (notification_title IS NOT NULL AND notification_body IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+INSERT INTO youth_meta(key, value) VALUES ('next-schedule-id', '1');
+UPDATE youth_meta SET value = '2' WHERE key = 'schema-version';
+COMMIT;
+"#;
+
+const MIGRATE_V2_TO_V3: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE youth_schedule RENAME TO youth_schedule_v2;
+CREATE TABLE youth_schedule (
+    id                 INTEGER PRIMARY KEY,
+    generation         INTEGER NOT NULL CHECK (generation > 0),
+    status             INTEGER NOT NULL CHECK (status BETWEEN 0 AND 3),
+    creation_sequence  INTEGER NOT NULL UNIQUE CHECK (creation_sequence > 0),
+    armed_at_millis    INTEGER,
+    deadline_millis    INTEGER,
+    duration_millis    INTEGER NOT NULL CHECK (duration_millis >= 0),
+    remaining_millis   INTEGER,
+    notification_title TEXT,
+    notification_body  TEXT,
+    CHECK (
+        (status IN (0, 2) AND armed_at_millis IS NOT NULL AND deadline_millis IS NOT NULL
+            AND remaining_millis IS NULL AND deadline_millis >= armed_at_millis)
+        OR (status = 1 AND armed_at_millis IS NULL AND deadline_millis IS NULL
+            AND remaining_millis IS NOT NULL AND remaining_millis >= 0
+            AND remaining_millis <= duration_millis)
+        OR (status = 3 AND armed_at_millis IS NULL AND deadline_millis IS NULL
+            AND remaining_millis IS NULL)
+    ),
+    CHECK (
+        (notification_title IS NULL AND notification_body IS NULL)
+        OR (notification_title IS NOT NULL AND notification_body IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+INSERT INTO youth_schedule(
+    id, generation, status, creation_sequence, armed_at_millis, deadline_millis,
+    duration_millis, remaining_millis, notification_title, notification_body
+)
+SELECT id, generation, status, id, armed_at_millis, deadline_millis,
+       duration_millis, remaining_millis, notification_title, notification_body
+FROM youth_schedule_v2;
+DROP TABLE youth_schedule_v2;
+CREATE TABLE youth_pending_delivery (
+    schedule_id       INTEGER NOT NULL,
+    generation        INTEGER NOT NULL CHECK (generation > 0),
+    deadline_millis   INTEGER NOT NULL CHECK (deadline_millis >= 0),
+    creation_sequence INTEGER NOT NULL CHECK (creation_sequence > 0),
+    PRIMARY KEY (schedule_id, generation),
+    FOREIGN KEY (schedule_id) REFERENCES youth_schedule(id)
+) STRICT, WITHOUT ROWID;
+UPDATE youth_meta SET value = '3' WHERE key = 'schema-version';
+COMMIT;
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +207,49 @@ pub struct Verification {
     pub computed: Usage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleStatus {
+    Running,
+    Paused,
+    Due,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryProtocol {
+    V004,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElapsedReason {
+    Deadline,
+    RecoveredOverdue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleRecord {
+    pub id: u64,
+    pub generation: u64,
+    pub status: ScheduleStatus,
+    pub creation_sequence: u64,
+    pub armed_at_millis: Option<u64>,
+    pub deadline_millis: Option<u64>,
+    pub duration_millis: u64,
+    pub remaining_millis: Option<u64>,
+    pub notification: Option<(String, String)>,
+    pub required_protocol: DeliveryProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingDelivery {
+    pub schedule_id: u64,
+    pub generation: u64,
+    pub deadline_millis: u64,
+    pub creation_sequence: u64,
+    pub required_protocol: DeliveryProtocol,
+    pub reason: ElapsedReason,
+}
+
 impl Verification {
     #[must_use]
     pub fn usage_matches(&self) -> bool {
@@ -103,6 +277,18 @@ pub enum StateError {
     Idle,
     #[error("state quota exceeded")]
     QuotaExceeded,
+    #[error("schedule duration is invalid")]
+    InvalidScheduleDuration,
+    #[error("schedule notification is invalid")]
+    InvalidScheduleNotification,
+    #[error("too many active schedules")]
+    TooManySchedules,
+    #[error("schedule does not exist")]
+    UnknownSchedule,
+    #[error("schedule generation is stale")]
+    StaleScheduleGeneration,
+    #[error("schedule is not in the required state")]
+    InvalidScheduleState,
     #[error("a state transaction is already active")]
     TransactionActive,
     #[error("no state transaction is active")]
@@ -131,6 +317,7 @@ impl From<rusqlite::Error> for StateError {
 }
 
 pub struct StateStore {
+    app_id: AppId,
     connection: Connection,
     location: StateLocation,
     limits: StateLimits,
@@ -154,6 +341,18 @@ impl std::fmt::Debug for StateStore {
 
 impl StateStore {
     pub fn open(location: StateLocation, limits: StateLimits) -> Result<Self, StateError> {
+        Self::open_for_app(
+            location,
+            limits,
+            AppId::parse("dev.youth.state").expect("built-in state application ID is valid"),
+        )
+    }
+
+    pub fn open_for_app(
+        location: StateLocation,
+        limits: StateLimits,
+        app_id: AppId,
+    ) -> Result<Self, StateError> {
         let location_kind = match &location {
             StateLocation::Memory => "memory",
             StateLocation::File(_) => "file",
@@ -173,9 +372,11 @@ impl StateStore {
         if initialize || is_empty(&connection)? {
             connection.execute_batch(SCHEMA)?;
         } else {
+            migrate_if_needed(&connection)?;
             require_valid(&verify_connection(&connection)?)?;
         }
         Ok(Self {
+            app_id,
             connection,
             location,
             limits,
@@ -185,6 +386,11 @@ impl StateStore {
             #[cfg(feature = "test-support")]
             fail_next_commit: false,
         })
+    }
+
+    #[must_use]
+    pub fn app_id(&self) -> &AppId {
+        &self.app_id
     }
 
     #[must_use]
@@ -357,6 +563,383 @@ impl StateStore {
         Ok(true)
     }
 
+    pub fn schedule_create(
+        &mut self,
+        now_epoch_millis: u64,
+        duration_millis: u64,
+        notification: Option<(String, String)>,
+    ) -> Result<ScheduleRecord, StateError> {
+        let _span = tracing::info_span!("state.schedule_create").entered();
+        self.attempt_call()?;
+        self.require_writable()?;
+        if duration_millis < self.limits.min_schedule_millis
+            || duration_millis > self.limits.max_schedule_millis
+        {
+            return Err(StateError::InvalidScheduleDuration);
+        }
+        if notification.as_ref().is_some_and(|(title, body)| {
+            title.len() > self.limits.max_notification_title_bytes
+                || body.len() > self.limits.max_notification_body_bytes
+        }) {
+            return Err(StateError::InvalidScheduleNotification);
+        }
+        self.attempt_write()?;
+        let active: i64 = self.connection.query_row(
+            "SELECT count(*) FROM youth_schedule WHERE status != 3",
+            [],
+            |row| row.get(0),
+        )?;
+        let active = usize::try_from(active)
+            .map_err(|_| StateError::Corrupt("invalid active schedule count"))?;
+        if active >= self.limits.max_active_schedules {
+            return Err(StateError::TooManySchedules);
+        }
+
+        let id = read_next_schedule_id(&self.connection)?;
+        let next_id = id
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule ID overflow"))?;
+        write_next_schedule_id(&self.connection, next_id)?;
+        let deadline_millis = now_epoch_millis
+            .checked_add(duration_millis)
+            .ok_or(StateError::InvalidScheduleDuration)?;
+        let id_sql = to_sql_u64(id, "invalid schedule ID")?;
+        let now_sql = to_sql_u64(now_epoch_millis, "invalid schedule time")?;
+        let deadline_sql = to_sql_u64(deadline_millis, "invalid schedule deadline")?;
+        let duration_sql = to_sql_u64(duration_millis, "invalid schedule duration")?;
+        let (title, body) = notification.as_ref().map_or((None, None), |(title, body)| {
+            (Some(title.as_str()), Some(body.as_str()))
+        });
+        self.connection.execute(
+            "INSERT INTO youth_schedule(
+                id, generation, status, creation_sequence, armed_at_millis, deadline_millis, duration_millis,
+                remaining_millis, notification_title, notification_body, required_protocol
+             ) VALUES (?1, 1, 0, ?1, ?2, ?3, ?4, NULL, ?5, ?6, 4)",
+            params![id_sql, now_sql, deadline_sql, duration_sql, title, body],
+        )?;
+        read_schedule(&self.connection, id)?
+            .ok_or(StateError::Corrupt("newly created schedule is missing"))
+    }
+
+    pub fn schedule_pause(
+        &mut self,
+        now_epoch_millis: u64,
+        id: u64,
+        generation: u64,
+    ) -> Result<ScheduleRecord, StateError> {
+        let _span = tracing::info_span!("state.schedule_pause").entered();
+        self.attempt_call()?;
+        self.require_writable()?;
+        let current = require_schedule(&self.connection, id, generation)?;
+        if current.status != ScheduleStatus::Running {
+            return Err(StateError::InvalidScheduleState);
+        }
+        self.attempt_write()?;
+        let deadline = current
+            .deadline_millis
+            .ok_or(StateError::Corrupt("armed schedule has no deadline"))?;
+        let remaining = deadline.saturating_sub(now_epoch_millis);
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule generation overflow"))?;
+        self.connection.execute(
+            "UPDATE youth_schedule
+             SET generation = ?1, status = 1, armed_at_millis = NULL, deadline_millis = NULL,
+                 remaining_millis = ?2
+             WHERE id = ?3",
+            params![
+                to_sql_u64(next_generation, "invalid schedule generation")?,
+                to_sql_u64(remaining, "invalid schedule remainder")?,
+                to_sql_u64(id, "invalid schedule ID")?
+            ],
+        )?;
+        read_schedule(&self.connection, id)?
+            .ok_or(StateError::Corrupt("paused schedule is missing"))
+    }
+
+    pub fn schedule_resume(
+        &mut self,
+        now_epoch_millis: u64,
+        id: u64,
+        generation: u64,
+    ) -> Result<ScheduleRecord, StateError> {
+        let _span = tracing::info_span!("state.schedule_resume").entered();
+        self.attempt_call()?;
+        self.require_writable()?;
+        let current = require_schedule(&self.connection, id, generation)?;
+        if current.status != ScheduleStatus::Paused {
+            return Err(StateError::InvalidScheduleState);
+        }
+        self.attempt_write()?;
+        let remaining = current
+            .remaining_millis
+            .ok_or(StateError::Corrupt("paused schedule has no remainder"))?;
+        let deadline = now_epoch_millis
+            .checked_add(remaining)
+            .ok_or(StateError::InvalidScheduleDuration)?;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule generation overflow"))?;
+        self.connection.execute(
+            "UPDATE youth_schedule
+             SET generation = ?1, status = 0, armed_at_millis = ?2, deadline_millis = ?3,
+                 remaining_millis = NULL
+             WHERE id = ?4",
+            params![
+                to_sql_u64(next_generation, "invalid schedule generation")?,
+                to_sql_u64(now_epoch_millis, "invalid schedule time")?,
+                to_sql_u64(deadline, "invalid schedule deadline")?,
+                to_sql_u64(id, "invalid schedule ID")?
+            ],
+        )?;
+        read_schedule(&self.connection, id)?
+            .ok_or(StateError::Corrupt("resumed schedule is missing"))
+    }
+
+    pub fn schedule_cancel(&mut self, id: u64, generation: u64) -> Result<(), StateError> {
+        let _span = tracing::info_span!("state.schedule_cancel").entered();
+        self.attempt_call()?;
+        self.require_writable()?;
+        let current = require_schedule(&self.connection, id, generation)?;
+        self.attempt_write()?;
+        if matches!(
+            current.status,
+            ScheduleStatus::Due | ScheduleStatus::Cancelled
+        ) {
+            return Err(StateError::InvalidScheduleState);
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule generation overflow"))?;
+        self.connection.execute(
+            "DELETE FROM youth_pending_delivery WHERE schedule_id = ?1",
+            [to_sql_u64(id, "invalid schedule ID")?],
+        )?;
+        self.connection.execute(
+            "UPDATE youth_schedule
+             SET generation = ?1, status = 3, armed_at_millis = NULL, deadline_millis = NULL,
+                 remaining_millis = NULL
+             WHERE id = ?2",
+            params![
+                to_sql_u64(next_generation, "invalid schedule generation")?,
+                to_sql_u64(id, "invalid schedule ID")?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Re-arms a schedule as a new generation and retires a pending delivery
+    /// for the generation it replaces. This participates in the caller's open
+    /// guest transaction.
+    pub fn schedule_reset(
+        &mut self,
+        now_epoch_millis: u64,
+        duration_millis: u64,
+        id: u64,
+        generation: u64,
+    ) -> Result<ScheduleRecord, StateError> {
+        let _span = tracing::info_span!("state.schedule_reset").entered();
+        self.attempt_call()?;
+        self.require_writable()?;
+        if duration_millis < self.limits.min_schedule_millis
+            || duration_millis > self.limits.max_schedule_millis
+        {
+            return Err(StateError::InvalidScheduleDuration);
+        }
+        let current = require_schedule(&self.connection, id, generation)?;
+        if current.status == ScheduleStatus::Cancelled {
+            return Err(StateError::InvalidScheduleState);
+        }
+        self.attempt_write()?;
+        let deadline = now_epoch_millis
+            .checked_add(duration_millis)
+            .ok_or(StateError::InvalidScheduleDuration)?;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule generation overflow"))?;
+        self.connection.execute(
+            "DELETE FROM youth_pending_delivery
+             WHERE schedule_id = ?1 AND generation = ?2",
+            params![
+                to_sql_u64(id, "invalid schedule ID")?,
+                to_sql_u64(generation, "invalid schedule generation")?,
+            ],
+        )?;
+        self.connection.execute(
+            "UPDATE youth_schedule
+             SET generation = ?1, status = 0, armed_at_millis = ?2,
+                 deadline_millis = ?3, duration_millis = ?4,
+                 remaining_millis = NULL
+             WHERE id = ?5",
+            params![
+                to_sql_u64(next_generation, "invalid schedule generation")?,
+                to_sql_u64(now_epoch_millis, "invalid schedule time")?,
+                to_sql_u64(deadline, "invalid schedule deadline")?,
+                to_sql_u64(duration_millis, "invalid schedule duration")?,
+                to_sql_u64(id, "invalid schedule ID")?,
+            ],
+        )?;
+        read_schedule(&self.connection, id)?.ok_or(StateError::Corrupt("reset schedule is missing"))
+    }
+
+    pub fn schedules(&self) -> Result<Vec<ScheduleRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, generation, status, creation_sequence, armed_at_millis, deadline_millis, duration_millis,
+                    remaining_millis, notification_title, notification_body, required_protocol
+             FROM youth_schedule ORDER BY id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(decode_schedule(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn schedule(&self, id: u64) -> Result<Option<ScheduleRecord>, StateError> {
+        read_schedule(&self.connection, id)
+    }
+
+    pub fn pending_deliveries(&self) -> Result<Vec<PendingDelivery>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT schedule_id, generation, deadline_millis, creation_sequence,
+                    required_protocol, elapsed_reason
+             FROM youth_pending_delivery
+             ORDER BY deadline_millis, creation_sequence, schedule_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(PendingDelivery {
+                schedule_id: from_sql_u64(row.get(0)?, "invalid pending schedule ID")?,
+                generation: from_sql_u64(row.get(1)?, "invalid pending generation")?,
+                deadline_millis: from_sql_u64(row.get(2)?, "invalid pending deadline")?,
+                creation_sequence: from_sql_u64(row.get(3)?, "invalid pending creation sequence")?,
+                required_protocol: decode_delivery_protocol(row.get(4)?)?,
+                reason: decode_elapsed_reason(row.get(5)?)?,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Acknowledges exactly one delivery inside the currently open handle
+    /// transaction and retires its one-shot schedule.
+    pub fn acknowledge_pending_delivery(
+        &mut self,
+        delivery: PendingDelivery,
+    ) -> Result<(), StateError> {
+        self.require_writable()?;
+        let removed = self.connection.execute(
+            "DELETE FROM youth_pending_delivery
+             WHERE schedule_id = ?1 AND generation = ?2",
+            params![
+                to_sql_u64(delivery.schedule_id, "invalid schedule ID")?,
+                to_sql_u64(delivery.generation, "invalid schedule generation")?,
+            ],
+        )?;
+        if removed != 1 {
+            return Err(StateError::Corrupt(
+                "pending delivery disappeared during its turn",
+            ));
+        }
+        let next_generation = delivery
+            .generation
+            .checked_add(1)
+            .ok_or(StateError::Corrupt("schedule generation overflow"))?;
+        let changed = self.connection.execute(
+            "UPDATE youth_schedule
+             SET generation = ?1, status = 3, armed_at_millis = NULL,
+                 deadline_millis = NULL, remaining_millis = NULL
+             WHERE id = ?2 AND generation = ?3 AND status = 2",
+            params![
+                to_sql_u64(next_generation, "invalid schedule generation")?,
+                to_sql_u64(delivery.schedule_id, "invalid schedule ID")?,
+                to_sql_u64(delivery.generation, "invalid schedule generation")?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::Corrupt(
+                "pending delivery has no matching due schedule",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_overdue(
+        &mut self,
+        now_epoch_millis: u64,
+    ) -> Result<Vec<SchedulerOutput>, StateError> {
+        self.require_scheduler_idle()?;
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.reconcile_overdue_inner(now_epoch_millis);
+        finish_scheduler_transaction(&self.connection, result)
+    }
+
+    pub fn receive_wake(
+        &mut self,
+        token: WakeToken,
+        now_epoch_millis: u64,
+    ) -> Result<Vec<SchedulerOutput>, StateError> {
+        self.require_scheduler_idle()?;
+        if token.app_id != self.app_id {
+            return Ok(vec![SchedulerOutput::DiscardStaleWake(token)]);
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let authoritative = read_schedule(&self.connection, token.schedule_id)?;
+            let delivery_pending = pending_delivery_exists(&self.connection, &token)?;
+            let outputs = transition(SchedulerInput::WakeReceived {
+                token,
+                authoritative,
+                now_epoch_millis,
+                delivery_pending,
+            });
+            apply_scheduler_outputs(&self.connection, &outputs)?;
+            Ok(outputs)
+        })();
+        finish_scheduler_transaction(&self.connection, result)
+    }
+
+    fn reconcile_overdue_inner(
+        &self,
+        now_epoch_millis: u64,
+    ) -> Result<Vec<SchedulerOutput>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, generation, status, creation_sequence, armed_at_millis, deadline_millis,
+                    duration_millis, remaining_millis, notification_title, notification_body,
+                    required_protocol
+             FROM youth_schedule
+             WHERE status = 0
+             ORDER BY deadline_millis, creation_sequence",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(decode_schedule(row)?);
+        }
+        let mut all_outputs = Vec::new();
+        for record in records {
+            let token = WakeToken::for_record(self.app_id.clone(), &record);
+            let outputs = transition(SchedulerInput::ProcessOpened {
+                app_id: self.app_id.clone(),
+                record,
+                now_epoch_millis,
+                delivery_pending: pending_delivery_exists(&self.connection, &token)?,
+            });
+            apply_scheduler_outputs(&self.connection, &outputs)?;
+            all_outputs.extend(outputs);
+        }
+        Ok(all_outputs)
+    }
+
+    fn require_scheduler_idle(&self) -> Result<(), StateError> {
+        if self.transaction_active {
+            Err(StateError::TransactionActive)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn summary(&self) -> Result<StateSummary, StateError> {
         let usage = read_usage(&self.connection)?;
         Ok(StateSummary {
@@ -373,6 +956,9 @@ impl StateStore {
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             self.connection.execute("DELETE FROM youth_state", [])?;
+            self.connection
+                .execute("DELETE FROM youth_pending_delivery", [])?;
+            self.connection.execute("DELETE FROM youth_schedule", [])?;
             write_usage(&self.connection, Usage::default())?;
             self.connection.execute_batch("COMMIT")?;
             Ok::<_, StateError>(())
@@ -506,10 +1092,40 @@ fn is_empty(connection: &Connection) -> Result<bool, StateError> {
     Ok(tables == 0)
 }
 
+fn migrate_if_needed(connection: &Connection) -> Result<(), StateError> {
+    loop {
+        let verification = verify_connection(connection)?;
+        match verification.schema_version {
+            SCHEMA_VERSION => return Ok(()),
+            1 => {
+                require_integrity_and_usage(&verification)?;
+                if let Err(error) = connection.execute_batch(MIGRATE_V1_TO_V2) {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            2 => {
+                require_integrity_and_usage(&verification)?;
+                if let Err(error) = connection.execute_batch(MIGRATE_V2_TO_V3) {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            3 => {
+                require_integrity_and_usage(&verification)?;
+                if let Err(error) = connection.execute_batch(MIGRATE_V3_TO_V4) {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            _ => return Err(StateError::Corrupt("unsupported schema version")),
+        }
+    }
+}
+
 fn verify_connection(connection: &Connection) -> Result<Verification, StateError> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let integrity_ok = integrity == "ok";
-    verify_schema_shape(connection)?;
     let version: String = connection
         .query_row(
             "SELECT value FROM youth_meta WHERE key = 'schema-version'",
@@ -521,6 +1137,7 @@ fn verify_connection(connection: &Connection) -> Result<Verification, StateError
     let schema_version = version
         .parse::<u32>()
         .map_err(|_| StateError::Corrupt("invalid schema version"))?;
+    verify_schema_shape(connection, schema_version)?;
     let stored = read_usage(connection)?;
     let computed = compute_usage(connection)?;
     Ok(Verification {
@@ -533,10 +1150,7 @@ fn verify_connection(connection: &Connection) -> Result<Verification, StateError
 
 fn require_valid(verification: &Verification) -> Result<(), StateError> {
     require_repairable(verification)?;
-    if !verification.usage_matches() {
-        return Err(StateError::UsageMismatch);
-    }
-    Ok(())
+    require_integrity_and_usage(verification)
 }
 
 fn require_repairable(verification: &Verification) -> Result<(), StateError> {
@@ -549,8 +1163,37 @@ fn require_repairable(verification: &Verification) -> Result<(), StateError> {
     Ok(())
 }
 
-fn verify_schema_shape(connection: &Connection) -> Result<(), StateError> {
-    for table in ["youth_meta", "youth_state", "youth_usage"] {
+fn require_integrity_and_usage(verification: &Verification) -> Result<(), StateError> {
+    if !verification.integrity_ok {
+        return Err(StateError::Corrupt("SQLite integrity check failed"));
+    }
+    if !verification.usage_matches() {
+        return Err(StateError::UsageMismatch);
+    }
+    Ok(())
+}
+
+fn verify_schema_shape(connection: &Connection, schema_version: u32) -> Result<(), StateError> {
+    let tables: &[&str] = match schema_version {
+        1 => &["youth_meta", "youth_state", "youth_usage"],
+        2 => &["youth_meta", "youth_state", "youth_usage", "youth_schedule"],
+        3 => &[
+            "youth_meta",
+            "youth_state",
+            "youth_usage",
+            "youth_schedule",
+            "youth_pending_delivery",
+        ],
+        4 => &[
+            "youth_meta",
+            "youth_state",
+            "youth_usage",
+            "youth_schedule",
+            "youth_pending_delivery",
+        ],
+        _ => return Err(StateError::Corrupt("unsupported schema version")),
+    };
+    for table in tables {
         let sql: Option<String> = connection
             .query_row(
                 "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
@@ -569,6 +1212,243 @@ fn verify_schema_shape(connection: &Connection) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+fn read_next_schedule_id(connection: &Connection) -> Result<u64, StateError> {
+    let value: String = connection
+        .query_row(
+            "SELECT value FROM youth_meta WHERE key = 'next-schedule-id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(StateError::Corrupt("missing next schedule ID"))?;
+    value
+        .parse()
+        .map_err(|_| StateError::Corrupt("invalid next schedule ID"))
+}
+
+fn write_next_schedule_id(connection: &Connection, id: u64) -> Result<(), StateError> {
+    let changed = connection.execute(
+        "UPDATE youth_meta SET value = ?1 WHERE key = 'next-schedule-id'",
+        [id.to_string()],
+    )?;
+    if changed != 1 {
+        return Err(StateError::Corrupt("missing next schedule ID"));
+    }
+    Ok(())
+}
+
+fn read_schedule(connection: &Connection, id: u64) -> Result<Option<ScheduleRecord>, StateError> {
+    let mut statement = connection.prepare(
+        "SELECT id, generation, status, creation_sequence, armed_at_millis, deadline_millis, duration_millis,
+                remaining_millis, notification_title, notification_body, required_protocol
+         FROM youth_schedule WHERE id = ?1",
+    )?;
+    let mut rows = statement.query([to_sql_u64(id, "invalid schedule ID")?])?;
+    rows.next()?.map(decode_schedule).transpose()
+}
+
+fn require_schedule(
+    connection: &Connection,
+    id: u64,
+    generation: u64,
+) -> Result<ScheduleRecord, StateError> {
+    let record = read_schedule(connection, id)?.ok_or(StateError::UnknownSchedule)?;
+    if record.generation != generation {
+        return Err(StateError::StaleScheduleGeneration);
+    }
+    Ok(record)
+}
+
+fn decode_schedule(row: &rusqlite::Row<'_>) -> Result<ScheduleRecord, StateError> {
+    let id = from_sql_u64(row.get(0)?, "invalid schedule ID")?;
+    let generation = from_sql_u64(row.get(1)?, "invalid schedule generation")?;
+    let status = match row.get::<_, i64>(2)? {
+        0 => ScheduleStatus::Running,
+        1 => ScheduleStatus::Paused,
+        2 => ScheduleStatus::Due,
+        3 => ScheduleStatus::Cancelled,
+        _ => return Err(StateError::Corrupt("invalid schedule status")),
+    };
+    let creation_sequence = from_sql_u64(row.get(3)?, "invalid schedule creation sequence")?;
+    let armed_at_millis = row
+        .get::<_, Option<i64>>(4)?
+        .map(|value| from_sql_u64(value, "invalid schedule time"))
+        .transpose()?;
+    let deadline_millis = row
+        .get::<_, Option<i64>>(5)?
+        .map(|value| from_sql_u64(value, "invalid schedule deadline"))
+        .transpose()?;
+    let duration_millis = from_sql_u64(row.get(6)?, "invalid schedule duration")?;
+    let remaining_millis = row
+        .get::<_, Option<i64>>(7)?
+        .map(|value| from_sql_u64(value, "invalid schedule remainder"))
+        .transpose()?;
+    let title: Option<String> = row.get(8)?;
+    let body: Option<String> = row.get(9)?;
+    let notification = match (title, body) {
+        (None, None) => None,
+        (Some(title), Some(body)) => Some((title, body)),
+        _ => return Err(StateError::Corrupt("invalid schedule notification")),
+    };
+    let required_protocol = decode_delivery_protocol(row.get(10)?)?;
+    Ok(ScheduleRecord {
+        id,
+        generation,
+        status,
+        creation_sequence,
+        armed_at_millis,
+        deadline_millis,
+        duration_millis,
+        remaining_millis,
+        notification,
+        required_protocol,
+    })
+}
+
+fn decode_delivery_protocol(value: i64) -> Result<DeliveryProtocol, StateError> {
+    match value {
+        4 => Ok(DeliveryProtocol::V004),
+        _ => Err(StateError::Corrupt("invalid required delivery protocol")),
+    }
+}
+
+fn decode_elapsed_reason(value: i64) -> Result<ElapsedReason, StateError> {
+    match value {
+        0 => Ok(ElapsedReason::Deadline),
+        1 => Ok(ElapsedReason::RecoveredOverdue),
+        _ => Err(StateError::Corrupt("invalid elapsed reason")),
+    }
+}
+
+const fn elapsed_reason_sql(reason: ElapsedReason) -> i64 {
+    match reason {
+        ElapsedReason::Deadline => 0,
+        ElapsedReason::RecoveredOverdue => 1,
+    }
+}
+
+fn pending_delivery_exists(connection: &Connection, token: &WakeToken) -> Result<bool, StateError> {
+    let count: i64 = connection.query_row(
+        "SELECT count(*) FROM youth_pending_delivery
+         WHERE schedule_id = ?1 AND generation = ?2",
+        params![
+            to_sql_u64(token.schedule_id, "invalid schedule ID")?,
+            to_sql_u64(token.generation, "invalid schedule generation")?
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count != 0)
+}
+
+fn apply_scheduler_outputs(
+    connection: &Connection,
+    outputs: &[SchedulerOutput],
+) -> Result<(), StateError> {
+    for output in outputs {
+        match output {
+            SchedulerOutput::PersistMutation(record) => {
+                connection.execute(
+                    "UPDATE youth_schedule
+                     SET generation = ?1, status = ?2, creation_sequence = ?3,
+                         armed_at_millis = ?4, deadline_millis = ?5, duration_millis = ?6,
+                         remaining_millis = ?7, notification_title = ?8,
+                         notification_body = ?9
+                     WHERE id = ?10",
+                    params![
+                        to_sql_u64(record.generation, "invalid schedule generation")?,
+                        schedule_status_sql(record.status),
+                        to_sql_u64(record.creation_sequence, "invalid creation sequence")?,
+                        record
+                            .armed_at_millis
+                            .map(|value| to_sql_u64(value, "invalid schedule time"))
+                            .transpose()?,
+                        record
+                            .deadline_millis
+                            .map(|value| to_sql_u64(value, "invalid schedule deadline"))
+                            .transpose()?,
+                        to_sql_u64(record.duration_millis, "invalid schedule duration")?,
+                        record
+                            .remaining_millis
+                            .map(|value| to_sql_u64(value, "invalid schedule remainder"))
+                            .transpose()?,
+                        record.notification.as_ref().map(|value| value.0.as_str()),
+                        record.notification.as_ref().map(|value| value.1.as_str()),
+                        to_sql_u64(record.id, "invalid schedule ID")?,
+                    ],
+                )?;
+            }
+            SchedulerOutput::QueueElapsedDelivery { token, reason } => {
+                let record = read_schedule(connection, token.schedule_id)?
+                    .ok_or(StateError::Corrupt("due schedule disappeared"))?;
+                let deadline = record
+                    .deadline_millis
+                    .ok_or(StateError::Corrupt("due schedule has no deadline"))?;
+                connection.execute(
+                    "INSERT OR IGNORE INTO youth_pending_delivery(
+                        schedule_id, generation, deadline_millis, creation_sequence,
+                        required_protocol, elapsed_reason
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        to_sql_u64(token.schedule_id, "invalid schedule ID")?,
+                        to_sql_u64(token.generation, "invalid schedule generation")?,
+                        to_sql_u64(deadline, "invalid schedule deadline")?,
+                        to_sql_u64(record.creation_sequence, "invalid creation sequence")?,
+                        delivery_protocol_sql(record.required_protocol),
+                        elapsed_reason_sql(*reason),
+                    ],
+                )?;
+            }
+            SchedulerOutput::ArmWake { .. }
+            | SchedulerOutput::CancelWake(_)
+            | SchedulerOutput::DiscardStaleWake(_) => {}
+        }
+    }
+    Ok(())
+}
+
+const fn delivery_protocol_sql(protocol: DeliveryProtocol) -> i64 {
+    match protocol {
+        DeliveryProtocol::V004 => 4,
+    }
+}
+
+const fn schedule_status_sql(status: ScheduleStatus) -> i64 {
+    match status {
+        ScheduleStatus::Running => 0,
+        ScheduleStatus::Paused => 1,
+        ScheduleStatus::Due => 2,
+        ScheduleStatus::Cancelled => 3,
+    }
+}
+
+fn finish_scheduler_transaction<T>(
+    connection: &Connection,
+    result: Result<T, StateError>,
+) -> Result<T, StateError> {
+    match result {
+        Ok(value) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(value)
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn to_sql_u64(value: u64, message: &'static str) -> Result<i64, StateError> {
+    i64::try_from(value).map_err(|_| StateError::Corrupt(message))
+}
+
+fn from_sql_u64(value: i64, message: &'static str) -> Result<u64, StateError> {
+    u64::try_from(value).map_err(|_| StateError::Corrupt(message))
 }
 
 fn compute_usage(connection: &Connection) -> Result<Usage, StateError> {
@@ -649,6 +1529,34 @@ fn write_usage(connection: &Connection, usage: Usage) -> Result<(), StateError> 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const SCHEMA_V1: &str = r#"
+CREATE TABLE youth_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+INSERT INTO youth_meta(key, value) VALUES ('schema-version', '1');
+CREATE TABLE youth_state (
+    key TEXT PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    integer_value INTEGER,
+    text_value TEXT,
+    blob_value BLOB,
+    CHECK (kind BETWEEN 0 AND 3),
+    CHECK (
+        (kind = 0 AND integer_value IN (0, 1) AND text_value IS NULL AND blob_value IS NULL)
+        OR (kind = 1 AND integer_value IS NOT NULL AND text_value IS NULL AND blob_value IS NULL)
+        OR (kind = 2 AND integer_value IS NULL AND text_value IS NOT NULL AND blob_value IS NULL)
+        OR (kind = 3 AND integer_value IS NULL AND text_value IS NULL AND blob_value IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+CREATE TABLE youth_usage (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    key_count INTEGER NOT NULL CHECK (key_count >= 0),
+    logical_bytes INTEGER NOT NULL CHECK (logical_bytes >= 0)
+) STRICT, WITHOUT ROWID;
+INSERT INTO youth_usage(id, key_count, logical_bytes) VALUES (1, 0, 0);
+"#;
 
     fn memory() -> StateStore {
         StateStore::open(StateLocation::Memory, StateLimits::default()).unwrap()
@@ -794,5 +1702,429 @@ mod tests {
         assert!(repair_usage(&path, &backup).unwrap().usage_matches());
         assert!(backup.exists());
         assert!(StateStore::open(StateLocation::File(path), StateLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn schedule_create_pause_resume_and_cancel_round_trip() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let created = store
+            .schedule_create(1_000, 1_000, Some(("Title".into(), "Body".into())))
+            .unwrap();
+        assert_eq!(created.id, 1);
+        assert_eq!(created.generation, 1);
+        assert_eq!(created.status, ScheduleStatus::Running);
+        assert_eq!(created.armed_at_millis, Some(1_000));
+        assert_eq!(created.deadline_millis, Some(2_000));
+        assert_eq!(created.duration_millis, 1_000);
+        assert_eq!(created.remaining_millis, None);
+
+        let paused = store.schedule_pause(1_600, created.id, 1).unwrap();
+        assert_eq!(paused.generation, 2);
+        assert_eq!(paused.status, ScheduleStatus::Paused);
+        assert_eq!(paused.armed_at_millis, None);
+        assert_eq!(paused.deadline_millis, None);
+        assert_eq!(paused.remaining_millis, Some(400));
+
+        let resumed = store.schedule_resume(5_000, created.id, 2).unwrap();
+        assert_eq!(resumed.generation, 3);
+        assert_eq!(resumed.status, ScheduleStatus::Running);
+        assert_eq!(resumed.armed_at_millis, Some(5_000));
+        assert_eq!(resumed.deadline_millis, Some(5_400));
+        assert_eq!(resumed.duration_millis, 1_000);
+        assert_eq!(resumed.remaining_millis, None);
+        assert_eq!(resumed.notification, Some(("Title".into(), "Body".into())));
+
+        store.schedule_cancel(created.id, 3).unwrap();
+        let cancelled = store.schedule(created.id).unwrap().unwrap();
+        assert_eq!(cancelled.status, ScheduleStatus::Cancelled);
+        assert_eq!(cancelled.generation, 4);
+        assert_eq!(store.metrics().calls, 4);
+        assert_eq!(store.metrics().writes, 4);
+        store.commit().unwrap();
+    }
+
+    #[test]
+    fn stale_generations_and_invalid_states_are_rejected() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let created = store.schedule_create(10, 1_000, None).unwrap();
+        let paused = store
+            .schedule_pause(110, created.id, created.generation)
+            .unwrap();
+        assert!(matches!(
+            store.schedule_pause(120, created.id, created.generation),
+            Err(StateError::StaleScheduleGeneration)
+        ));
+        assert!(matches!(
+            store.schedule_resume(120, created.id, created.generation),
+            Err(StateError::StaleScheduleGeneration)
+        ));
+        assert!(matches!(
+            store.schedule_cancel(created.id, created.generation),
+            Err(StateError::StaleScheduleGeneration)
+        ));
+        assert!(matches!(
+            store.schedule_pause(120, paused.id, paused.generation),
+            Err(StateError::InvalidScheduleState)
+        ));
+        let resumed = store
+            .schedule_resume(200, paused.id, paused.generation)
+            .unwrap();
+        assert!(matches!(
+            store.schedule_resume(210, resumed.id, resumed.generation),
+            Err(StateError::InvalidScheduleState)
+        ));
+        assert!(matches!(
+            store.schedule_cancel(999, 1),
+            Err(StateError::UnknownSchedule)
+        ));
+        store.rollback().unwrap();
+    }
+
+    #[test]
+    fn schedule_ids_are_not_reused_after_cancel() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let first = store.schedule_create(0, 100, None).unwrap();
+        store.schedule_cancel(first.id, first.generation).unwrap();
+        let second = store.schedule_create(0, 100, None).unwrap();
+        assert_eq!(first.id, 1);
+        assert_eq!(second.id, 2);
+        store.commit().unwrap();
+    }
+
+    #[test]
+    fn schedule_limits_return_specific_errors() {
+        let limits = StateLimits {
+            max_active_schedules: 1,
+            min_schedule_millis: 100,
+            max_schedule_millis: 200,
+            max_notification_title_bytes: 3,
+            max_notification_body_bytes: 4,
+            ..StateLimits::default()
+        };
+        let mut store = StateStore::open(StateLocation::Memory, limits).unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        assert!(matches!(
+            store.schedule_create(0, 99, None),
+            Err(StateError::InvalidScheduleDuration)
+        ));
+        assert!(matches!(
+            store.schedule_create(0, 201, None),
+            Err(StateError::InvalidScheduleDuration)
+        ));
+        assert!(matches!(
+            store.schedule_create(0, 100, Some(("four".into(), "body".into()))),
+            Err(StateError::InvalidScheduleNotification)
+        ));
+        assert!(matches!(
+            store.schedule_create(0, 100, Some(("ok".into(), "large".into()))),
+            Err(StateError::InvalidScheduleNotification)
+        ));
+        store.schedule_create(0, 100, None).unwrap();
+        assert!(matches!(
+            store.schedule_create(0, 100, None),
+            Err(StateError::TooManySchedules)
+        ));
+        store.rollback().unwrap();
+    }
+
+    #[test]
+    fn schedule_rollback_leaves_no_row_or_consumed_id() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store.schedule_create(0, 100, None).unwrap();
+        store.rollback().unwrap();
+        assert!(store.schedules().unwrap().is_empty());
+
+        store.begin(GuestCallPhase::Handle).unwrap();
+        assert_eq!(store.schedule_create(0, 100, None).unwrap().id, 1);
+        store.commit().unwrap();
+    }
+
+    #[test]
+    fn schedule_mutations_are_rejected_during_resync() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Resync).unwrap();
+        assert!(matches!(
+            store.schedule_create(0, 100, None),
+            Err(StateError::ReadOnly)
+        ));
+        assert_eq!(store.metrics().calls, 1);
+        assert_eq!(store.metrics().writes, 0);
+        store.rollback().unwrap();
+    }
+
+    #[test]
+    fn schedules_are_readable_after_fresh_open_without_a_transaction() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        {
+            let mut store =
+                StateStore::open(StateLocation::File(path.clone()), StateLimits::default())
+                    .unwrap();
+            store.begin(GuestCallPhase::Handle).unwrap();
+            store.schedule_create(1_000, 500, None).unwrap();
+            store.commit().unwrap();
+        }
+        let reopened = StateStore::open(StateLocation::File(path), StateLimits::default()).unwrap();
+        assert!(!reopened.transaction_active());
+        assert_eq!(reopened.phase(), GuestCallPhase::Idle);
+        assert_eq!(reopened.schedules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schedules_do_not_change_state_usage_or_verification() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut store =
+            StateStore::open(StateLocation::File(path.clone()), StateLimits::default()).unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store.set("count", StateValue::Integer(7)).unwrap();
+        store.commit().unwrap();
+        let before = store.summary().unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store.schedule_create(1_000, 500, None).unwrap();
+        store.commit().unwrap();
+        assert_eq!(store.summary().unwrap(), before);
+        drop(store);
+        let verification = verify_file(&path).unwrap();
+        assert!(verification.usage_matches());
+        assert_eq!(verification.stored.key_count, 1);
+        assert_eq!(verification.stored.logical_bytes, 45);
+    }
+
+    #[test]
+    fn repeated_overdue_reconciliation_has_one_pending_delivery() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut store =
+            StateStore::open(StateLocation::File(path.clone()), StateLimits::default()).unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store.schedule_create(1_000, 100, None).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let mut first =
+            StateStore::open(StateLocation::File(path.clone()), StateLimits::default()).unwrap();
+        first.reconcile_overdue(1_100).unwrap();
+        drop(first);
+        let mut second =
+            StateStore::open(StateLocation::File(path), StateLimits::default()).unwrap();
+        second.reconcile_overdue(1_100).unwrap();
+        assert_eq!(second.pending_deliveries().unwrap().len(), 1);
+        assert_eq!(
+            second.schedule(1).unwrap().unwrap().status,
+            ScheduleStatus::Due
+        );
+    }
+
+    #[test]
+    fn due_deliveries_are_ordered_by_deadline_then_creation_sequence() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let later = store.schedule_create(1_000, 300, None).unwrap();
+        let first_tie = store.schedule_create(1_000, 200, None).unwrap();
+        let second_tie = store.schedule_create(1_000, 200, None).unwrap();
+        store.commit().unwrap();
+        store.reconcile_overdue(1_300).unwrap();
+        let ids: Vec<_> = store
+            .pending_deliveries()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.schedule_id)
+            .collect();
+        assert_eq!(ids, vec![first_tie.id, second_tie.id, later.id]);
+    }
+
+    #[test]
+    fn wake_rechecks_authoritative_state_before_queuing() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let created = store.schedule_create(1_000, 100, None).unwrap();
+        store.commit().unwrap();
+        let token = WakeToken::for_record(store.app_id().clone(), &created);
+        assert_eq!(
+            store.receive_wake(token.clone(), 1_099).unwrap(),
+            vec![SchedulerOutput::DiscardStaleWake(token.clone())]
+        );
+        let due = store.receive_wake(token.clone(), 1_100).unwrap();
+        assert_eq!(
+            due.iter()
+                .filter(|output| { matches!(output, SchedulerOutput::QueueElapsedDelivery { .. }) })
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.receive_wake(token.clone(), 1_100).unwrap(),
+            vec![SchedulerOutput::DiscardStaleWake(token)]
+        );
+        assert_eq!(store.pending_deliveries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scheduler_storage_operates_without_any_guest_instance() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        store.schedule_create(0, 100, None).unwrap();
+        store.commit().unwrap();
+        store.reconcile_overdue(100).unwrap();
+        assert_eq!(store.pending_deliveries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_one_database_migrates_in_place_with_state_and_usage_intact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO youth_state(
+                    key, kind, integer_value, text_value, blob_value
+                 ) VALUES ('count', 1, 9, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE youth_usage SET key_count = 1, logical_bytes = 45 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut migrated =
+            StateStore::open(StateLocation::File(path.clone()), StateLimits::default()).unwrap();
+        assert_eq!(migrated.summary().unwrap().schema_version, 4);
+        assert!(migrated.schedules().unwrap().is_empty());
+        migrated.begin(GuestCallPhase::Resync).unwrap();
+        assert_eq!(migrated.get("count").unwrap(), Some(StateValue::Integer(9)));
+        migrated.rollback().unwrap();
+        drop(migrated);
+
+        let verification = verify_file(&path).unwrap();
+        assert_eq!(verification.schema_version, 4);
+        assert!(verification.integrity_ok);
+        assert!(verification.usage_matches());
+        assert_eq!(verification.stored.key_count, 1);
+        assert_eq!(verification.stored.logical_bytes, 45);
+    }
+
+    #[test]
+    fn version_two_database_migrates_in_place_with_schedules_intact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection.execute_batch(MIGRATE_V1_TO_V2).unwrap();
+        connection
+            .execute(
+                "INSERT INTO youth_schedule(
+                    id, generation, status, armed_at_millis, deadline_millis, duration_millis,
+                    remaining_millis, notification_title, notification_body
+                 ) VALUES (1, 2, 0, 1000, 1100, 100, NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE youth_meta SET value = '2' WHERE key = 'next-schedule-id'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let migrated = StateStore::open(StateLocation::File(path), StateLimits::default()).unwrap();
+        assert_eq!(migrated.summary().unwrap().schema_version, 4);
+        let schedule = migrated.schedule(1).unwrap().unwrap();
+        assert_eq!(schedule.status, ScheduleStatus::Running);
+        assert_eq!(schedule.creation_sequence, 1);
+        assert!(migrated.pending_deliveries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_three_database_migrates_in_place_with_pending_delivery_intact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection.execute_batch(MIGRATE_V1_TO_V2).unwrap();
+        connection.execute_batch(MIGRATE_V2_TO_V3).unwrap();
+        connection
+            .execute(
+                "INSERT INTO youth_schedule(
+                    id, generation, status, creation_sequence, armed_at_millis,
+                    deadline_millis, duration_millis, remaining_millis,
+                    notification_title, notification_body
+                 ) VALUES (1, 2, 2, 1, 1000, 1100, 100, NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO youth_pending_delivery(
+                    schedule_id, generation, deadline_millis, creation_sequence
+                 ) VALUES (1, 2, 1100, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = StateStore::open(StateLocation::File(path), StateLimits::default()).unwrap();
+        assert_eq!(migrated.summary().unwrap().schema_version, 4);
+        assert_eq!(
+            migrated.schedule(1).unwrap().unwrap().required_protocol,
+            DeliveryProtocol::V004
+        );
+        let pending = migrated.pending_deliveries().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].schedule_id, 1);
+        assert_eq!(pending[0].generation, 2);
+        assert_eq!(pending[0].required_protocol, DeliveryProtocol::V004);
+        assert_eq!(pending[0].reason, ElapsedReason::RecoveredOverdue);
+    }
+
+    #[test]
+    fn due_schedule_rejects_pause_resume_and_cancel() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let schedule = store.schedule_create(0, 100, None).unwrap();
+        store.commit().unwrap();
+        store.reconcile_overdue(100).unwrap();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        assert!(matches!(
+            store.schedule_pause(100, schedule.id, schedule.generation),
+            Err(StateError::InvalidScheduleState)
+        ));
+        assert!(matches!(
+            store.schedule_resume(100, schedule.id, schedule.generation),
+            Err(StateError::InvalidScheduleState)
+        ));
+        assert!(matches!(
+            store.schedule_cancel(schedule.id, schedule.generation),
+            Err(StateError::InvalidScheduleState)
+        ));
+        store.rollback().unwrap();
+    }
+
+    #[test]
+    fn reset_retires_replaced_generations_pending_delivery() {
+        let mut store = memory();
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let schedule = store.schedule_create(0, 100, None).unwrap();
+        store.commit().unwrap();
+        store.reconcile_overdue(100).unwrap();
+        assert_eq!(store.pending_deliveries().unwrap().len(), 1);
+
+        store.begin(GuestCallPhase::Handle).unwrap();
+        let reset = store
+            .schedule_reset(200, 300, schedule.id, schedule.generation)
+            .unwrap();
+        store.commit().unwrap();
+
+        assert_eq!(reset.generation, schedule.generation + 1);
+        assert_eq!(reset.status, ScheduleStatus::Running);
+        assert_eq!(reset.deadline_millis, Some(500));
+        assert!(store.pending_deliveries().unwrap().is_empty());
     }
 }

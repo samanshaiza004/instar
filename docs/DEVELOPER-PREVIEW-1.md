@@ -1,6 +1,7 @@
 # Youth — Developer Preview 1
 
-**Status:** Active  
+**Status:** Complete
+
 **Application protocol:** `youth:app@0.0.3` with runtime compatibility for `0.0.2`  
 **State protocol:** `youth:state@0.0.1`
 
@@ -76,7 +77,7 @@ shortcut-key = character(string) | enter | escape | backspace
 - Rows and columns use deterministic host spacing and never carry pixel style
   values from the guest.
 - A button has at most four shortcuts and a tree has at most 256 shortcuts.
-- Character wire values are bounded to 16 UTF-8 bytes. Runtime validation then
+- Character wire values are bounded to four UTF-8 bytes and runtime validation
   requires exactly one Unicode scalar for DP1.
 - Duplicate logical shortcuts, command bindings, and named-key declarations
   are hard validation errors, including when controls are disabled.
@@ -175,7 +176,7 @@ state while retaining semantic focus.
 ```rust
 pub struct InteractionSnapshot {
     pub focused: Option<NodeId>,
-    pub enabled_actions: /* bounded semantic action set */,
+    pub enabled_actions: Vec<SemanticAction>,
 }
 
 pub enum SemanticAction {
@@ -184,10 +185,29 @@ pub enum SemanticAction {
 }
 ```
 
+`enabled_actions` contains `Focus` and `Activate` for each enabled button in
+semantic order and is bounded by the validated tree's node limit.
+
 The renderer consumes the focus state. A future AccessKit projection will
 consume the same stable semantic IDs, roles, focus, and actions. DP1 honestly
 reports zero native accessibility projection rather than making focus
 renderer-private.
+
+## Semantic view convergence
+
+After an accepted turn, applying its update to the previous normalized tree is
+intended to produce the same guest-owned semantic tree as constructing a fresh
+view from the committed durable state. Host-owned focus, pointer state,
+geometry, raster output, and other interaction or presentation state are
+excluded.
+
+DP1 does not generally enforce this invariant. Explicit patches remain the
+authoring model, and production does not call the guest again after every turn.
+A future test-only convergence check could compare a patched tree with a
+read-only reconstruction, but it first requires `Application::view` to be
+formally deterministic and free of observable side effects. SDK tree diffing,
+reactive dependencies, and `youth test --verify-view-convergence` are deferred
+mechanisms, not DP1 features.
 
 ## Evidence and metrics
 
@@ -212,6 +232,13 @@ The calculator release establishes performance baselines. Exact component
 identity, zero idle guest calls, transactional recovery, and zero raw-WIT
 concepts in app source are immediate hard gates. Numeric regression budgets
 begin only after two comparable releases.
+
+The first release baseline is recorded in
+`docs/metrics/calculator-dp1-macos-arm64.json`, with its limitations and
+interpretation in the accompanying Markdown summary. Gate D CI run
+`30504489792` certified one canonical component byte-for-byte on Ubuntu,
+Windows, and macOS. The local host build remains separate source-portability
+evidence and is not required to be byte-reproducible.
 
 ## Checkpoints
 

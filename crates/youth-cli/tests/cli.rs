@@ -108,7 +108,7 @@ fn explicit_headless_state_persists_and_maintenance_prints_no_values() {
     assert_success(&inspected);
     assert_eq!(
         String::from_utf8(inspected.stdout).unwrap(),
-        "app: dev.youth.counter\nschema: 1\nkeys: 1\nbytes: 45\n"
+        "app: dev.youth.counter\nschema: 4\nkeys: 1\nbytes: 45\n"
     );
 
     let verified = youth([

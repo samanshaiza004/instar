@@ -21,6 +21,9 @@ pub struct RuntimeLimits {
     pub handle: CallBudget,
     pub resync: CallBudget,
     pub state: youth_state::StateLimits,
+    /// Runtime-owned time dependencies, carried here so adding B-3 remains
+    /// source-compatible with existing `YouthAppConfig` struct literals.
+    pub time: crate::config::RuntimeTimeSeams,
 }
 
 impl Default for RuntimeLimits {
@@ -46,6 +49,7 @@ impl Default for RuntimeLimits {
                 deadline: Duration::from_millis(500),
             },
             state: youth_state::StateLimits::default(),
+            time: crate::config::RuntimeTimeSeams::default(),
         }
     }
 }

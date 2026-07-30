@@ -184,6 +184,10 @@ fn measure(tree: &Tree, id: NodeId) -> Result<LogicalSize, GeometryError> {
             width: value.chars().count() as f64 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
         }),
+        NodeData::Countdown { .. } | NodeData::AlignedCountdown { .. } => Ok(LogicalSize {
+            width: 5.0 * GLYPH_WIDTH,
+            height: GLYPH_HEIGHT,
+        }),
         NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
             Ok(LogicalSize {
                 width: (label.chars().count() as f64 * GLYPH_WIDTH
@@ -260,7 +264,11 @@ fn place(
         | NodeData::Grid { enabled, .. }
         | NodeData::Button { enabled, .. }
         | NodeData::ShortcutButton { enabled, .. } => *enabled,
-        NodeData::Root | NodeData::Text { .. } | NodeData::AlignedText { .. } => true,
+        NodeData::Root
+        | NodeData::Text { .. }
+        | NodeData::AlignedText { .. }
+        | NodeData::Countdown { .. }
+        | NodeData::AlignedCountdown { .. } => true,
     };
     let effective_enabled = ancestor_enabled && own_enabled;
     snapshot.nodes.insert(

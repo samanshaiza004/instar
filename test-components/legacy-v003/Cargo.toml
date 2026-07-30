@@ -1,0 +1,13 @@
+[package]
+name = "youth-legacy-v003"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hand-written Youth protocol 0.0.3 compatibility fixture."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

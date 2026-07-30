@@ -58,6 +58,24 @@ pub enum TextAlignment {
     End,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ScheduleRef {
+    pub id: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimePrecision {
+    Seconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountdownFormat {
+    MinutesSeconds,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortcutKey {
@@ -93,6 +111,17 @@ pub enum NodeData {
         value: String,
         alignment: TextAlignment,
     },
+    Countdown {
+        schedule: ScheduleRef,
+        precision: TimePrecision,
+        format: CountdownFormat,
+    },
+    AlignedCountdown {
+        schedule: ScheduleRef,
+        precision: TimePrecision,
+        format: CountdownFormat,
+        alignment: TextAlignment,
+    },
     Button {
         label: String,
         enabled: bool,
@@ -118,8 +147,10 @@ impl NodeData {
     #[must_use]
     pub const fn text_alignment(&self) -> Option<TextAlignment> {
         match self {
-            Self::Text { .. } => Some(TextAlignment::Start),
-            Self::AlignedText { alignment, .. } => Some(*alignment),
+            Self::Text { .. } | Self::Countdown { .. } => Some(TextAlignment::Start),
+            Self::AlignedText { alignment, .. } | Self::AlignedCountdown { alignment, .. } => {
+                Some(*alignment)
+            }
             _ => None,
         }
     }
@@ -128,6 +159,24 @@ impl NodeData {
     pub fn text_value(&self) -> Option<&str> {
         match self {
             Self::Text { value } | Self::AlignedText { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn countdown_ref(&self) -> Option<(ScheduleRef, TimePrecision, CountdownFormat)> {
+        match self {
+            Self::Countdown {
+                schedule,
+                precision,
+                format,
+            }
+            | Self::AlignedCountdown {
+                schedule,
+                precision,
+                format,
+                ..
+            } => Some((*schedule, *precision, *format)),
             _ => None,
         }
     }
@@ -156,7 +205,11 @@ impl NodeData {
             | Self::Grid { enabled, .. }
             | Self::Button { enabled, .. }
             | Self::ShortcutButton { enabled, .. } => *enabled,
-            Self::Root | Self::Text { .. } | Self::AlignedText { .. } => true,
+            Self::Root
+            | Self::Text { .. }
+            | Self::AlignedText { .. }
+            | Self::Countdown { .. }
+            | Self::AlignedCountdown { .. } => true,
         }
     }
 
@@ -209,7 +262,7 @@ impl Default for Limits {
             max_grid_columns: 16,
             max_shortcuts_per_button: 4,
             max_shortcuts_per_tree: 256,
-            max_shortcut_character_bytes: 16,
+            max_shortcut_character_bytes: 4,
         }
     }
 }
@@ -227,6 +280,12 @@ pub enum Patch {
     SetText {
         id: NodeId,
         value: String,
+    },
+    SetCountdown {
+        id: NodeId,
+        schedule: ScheduleRef,
+        precision: TimePrecision,
+        format: CountdownFormat,
     },
     SetLabel {
         id: NodeId,
@@ -447,6 +506,11 @@ impl Tree {
                             actual: value.len(),
                             max: limits.max_text_len,
                         });
+                    }
+                }
+                NodeData::Countdown { .. } | NodeData::AlignedCountdown { .. } => {
+                    if !node.children.is_empty() {
+                        return Err(ValidationError::LeafWithChildren { node: id });
                     }
                 }
                 NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
@@ -686,11 +750,41 @@ impl Tree {
                     .nodes
                     .get_mut(&id)
                     .ok_or(PatchError::UnknownNode { patch_index, id })?;
-                match &mut node.data {
-                    NodeData::Text { value: current }
-                    | NodeData::AlignedText { value: current, .. } => *current = value,
+                node.data = match &node.data {
+                    NodeData::Text { .. } | NodeData::Countdown { .. } => NodeData::Text { value },
+                    NodeData::AlignedText { alignment, .. }
+                    | NodeData::AlignedCountdown { alignment, .. } => NodeData::AlignedText {
+                        value,
+                        alignment: *alignment,
+                    },
                     _ => return Err(PatchError::WrongNodeKind { patch_index, id }),
-                }
+                };
+            }
+            Patch::SetCountdown {
+                id,
+                schedule,
+                precision,
+                format,
+            } => {
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                node.data = match &node.data {
+                    NodeData::Text { .. } | NodeData::Countdown { .. } => NodeData::Countdown {
+                        schedule,
+                        precision,
+                        format,
+                    },
+                    NodeData::AlignedText { alignment, .. }
+                    | NodeData::AlignedCountdown { alignment, .. } => NodeData::AlignedCountdown {
+                        schedule,
+                        precision,
+                        format,
+                        alignment: *alignment,
+                    },
+                    _ => return Err(PatchError::WrongNodeKind { patch_index, id }),
+                };
             }
             Patch::SetLabel { id, value } => {
                 let node = self
@@ -717,7 +811,11 @@ impl Tree {
                     | NodeData::ShortcutButton { enabled, .. } => {
                         *enabled = value;
                     }
-                    NodeData::Root | NodeData::Text { .. } | NodeData::AlignedText { .. } => {
+                    NodeData::Root
+                    | NodeData::Text { .. }
+                    | NodeData::AlignedText { .. }
+                    | NodeData::Countdown { .. }
+                    | NodeData::AlignedCountdown { .. } => {
                         return Err(PatchError::WrongNodeKind { patch_index, id });
                     }
                 }
@@ -982,6 +1080,42 @@ fn append_node_description(output: &mut String, node: &Node) {
             }
             return;
         }
+        NodeData::Countdown {
+            schedule,
+            precision,
+            format,
+        }
+        | NodeData::AlignedCountdown {
+            schedule,
+            precision,
+            format,
+            ..
+        } => {
+            output.push_str("countdown");
+            output.push_str(" #");
+            output.push_str(&node.id.to_string());
+            output.push_str(" schedule={id=");
+            output.push_str(&schedule.id.to_string());
+            output.push_str(",generation=");
+            output.push_str(&schedule.generation.to_string());
+            output.push_str("} precision=");
+            output.push_str(match precision {
+                TimePrecision::Seconds => "seconds",
+            });
+            output.push_str(" format=");
+            output.push_str(match format {
+                CountdownFormat::MinutesSeconds => "minutes-seconds",
+            });
+            if let NodeData::AlignedCountdown { alignment, .. } = &node.data {
+                output.push_str(" align=");
+                output.push_str(match alignment {
+                    TextAlignment::Start => "start",
+                    TextAlignment::Center => "center",
+                    TextAlignment::End => "end",
+                });
+            }
+            return;
+        }
         NodeData::Button { label, enabled } | NodeData::ShortcutButton { label, enabled, .. } => {
             output.push_str("button");
             output.push_str(" #");
@@ -1113,7 +1247,134 @@ mod tests {
     }
 
     #[test]
+    fn countdown_nodes_round_trip_through_snapshot_validation() {
+        let original = snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(
+                    2,
+                    NodeData::Countdown {
+                        schedule: ScheduleRef {
+                            id: 41,
+                            generation: 7,
+                        },
+                        precision: TimePrecision::Seconds,
+                        format: CountdownFormat::MinutesSeconds,
+                    },
+                    &[],
+                ),
+                node(
+                    3,
+                    NodeData::AlignedCountdown {
+                        schedule: ScheduleRef {
+                            id: 42,
+                            generation: 8,
+                        },
+                        precision: TimePrecision::Seconds,
+                        format: CountdownFormat::MinutesSeconds,
+                        alignment: TextAlignment::Center,
+                    },
+                    &[],
+                ),
+            ],
+        );
+
+        let first = validate(original).unwrap();
+        let canonical_snapshot = first.to_snapshot();
+        let second = validate(canonical_snapshot.clone()).unwrap();
+
+        assert_eq!(second.to_snapshot(), canonical_snapshot);
+        assert_eq!(second.canonical(), first.canonical());
+    }
+
+    #[test]
+    fn countdown_text_alignment_is_never_missing() {
+        let countdown = NodeData::Countdown {
+            schedule: ScheduleRef {
+                id: 41,
+                generation: 7,
+            },
+            precision: TimePrecision::Seconds,
+            format: CountdownFormat::MinutesSeconds,
+        };
+        let aligned = NodeData::AlignedCountdown {
+            schedule: ScheduleRef {
+                id: 42,
+                generation: 8,
+            },
+            precision: TimePrecision::Seconds,
+            format: CountdownFormat::MinutesSeconds,
+            alignment: TextAlignment::End,
+        };
+
+        assert_eq!(countdown.text_alignment(), Some(TextAlignment::Start));
+        assert_eq!(aligned.text_alignment(), Some(TextAlignment::End));
+        assert_eq!(countdown.text_value(), None);
+        assert_eq!(aligned.text_value(), None);
+        assert!(countdown.enabled());
+        assert!(aligned.enabled());
+    }
+
+    #[test]
+    fn countdown_ref_only_matches_countdown_variants() {
+        let expected = (
+            ScheduleRef {
+                id: 41,
+                generation: 7,
+            },
+            TimePrecision::Seconds,
+            CountdownFormat::MinutesSeconds,
+        );
+        let countdown = NodeData::Countdown {
+            schedule: expected.0,
+            precision: expected.1,
+            format: expected.2,
+        };
+        let aligned = NodeData::AlignedCountdown {
+            schedule: expected.0,
+            precision: expected.1,
+            format: expected.2,
+            alignment: TextAlignment::Center,
+        };
+
+        assert_eq!(countdown.countdown_ref(), Some(expected));
+        assert_eq!(aligned.countdown_ref(), Some(expected));
+
+        let other_variants = [
+            NodeData::Root,
+            NodeData::Box { enabled: true },
+            NodeData::Row { enabled: true },
+            NodeData::Grid {
+                enabled: true,
+                columns: 2,
+            },
+            NodeData::Text {
+                value: "literal".into(),
+            },
+            NodeData::AlignedText {
+                value: "literal".into(),
+                alignment: TextAlignment::End,
+            },
+            NodeData::Button {
+                label: "button".into(),
+                enabled: true,
+            },
+            NodeData::ShortcutButton {
+                label: "shortcut".into(),
+                enabled: true,
+                shortcuts: vec![ShortcutKey::Enter],
+            },
+        ];
+        for data in other_variants {
+            assert_eq!(data.countdown_ref(), None);
+        }
+    }
+
+    #[test]
     fn invalid_grid_and_shortcut_contracts_are_rejected() {
+        assert_eq!(Limits::default().max_shortcut_character_bytes, 4);
+
         let invalid_grid = validate(snapshot(
             1,
             vec![
@@ -1181,6 +1442,23 @@ mod tests {
             multiple_scalars,
             Err(ValidationError::InvalidShortcutCharacter { .. })
         ));
+
+        let four_byte_scalar = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "Abacus".into(),
+                        enabled: true,
+                        shortcuts: vec![ShortcutKey::Character("🧮".into())],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(four_byte_scalar.is_ok());
     }
 
     #[test]
@@ -1580,6 +1858,34 @@ mod tests {
         assert_eq!(second.canonical(), first.canonical());
     }
 
+    #[test]
+    fn countdown_canonical_output_is_stable_and_reference_only() {
+        let tree = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::Countdown {
+                        schedule: ScheduleRef {
+                            id: 123,
+                            generation: 9,
+                        },
+                        precision: TimePrecision::Seconds,
+                        format: CountdownFormat::MinutesSeconds,
+                    },
+                    &[],
+                ),
+            ],
+        ))
+        .unwrap();
+        let expected = "root #1\n└── countdown #2 schedule={id=123,generation=9} precision=seconds format=minutes-seconds\n";
+
+        assert_eq!(tree.canonical(), expected);
+        assert_eq!(tree.canonical(), expected);
+        assert!(!tree.canonical().contains("00:"));
+    }
+
     fn patch_tree(nodes: Vec<Node>) -> Tree {
         validate(snapshot(1, nodes)).unwrap()
     }
@@ -1671,6 +1977,104 @@ mod tests {
         let before = tree.clone();
         tree.apply(batch(vec![]), &Limits::default()).unwrap();
         assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn text_and_countdown_patches_retarget_with_alignment_preserved() {
+        let mut tree = patch_tree(vec![
+            node(1, NodeData::Root, &[2, 3]),
+            node(
+                2,
+                NodeData::Text {
+                    value: "start".into(),
+                },
+                &[],
+            ),
+            node(
+                3,
+                NodeData::AlignedText {
+                    value: "aligned".into(),
+                    alignment: TextAlignment::End,
+                },
+                &[],
+            ),
+        ]);
+        let schedule = ScheduleRef {
+            id: 123,
+            generation: 9,
+        };
+
+        tree.apply(
+            PatchBatch {
+                base_revision: 7,
+                next_revision: 8,
+                patches: vec![
+                    Patch::SetCountdown {
+                        id: id(2),
+                        schedule,
+                        precision: TimePrecision::Seconds,
+                        format: CountdownFormat::MinutesSeconds,
+                    },
+                    Patch::SetCountdown {
+                        id: id(3),
+                        schedule,
+                        precision: TimePrecision::Seconds,
+                        format: CountdownFormat::MinutesSeconds,
+                    },
+                ],
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree.node(id(2)).unwrap().data,
+            NodeData::Countdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+            }
+        );
+        assert_eq!(
+            tree.node(id(3)).unwrap().data,
+            NodeData::AlignedCountdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+                alignment: TextAlignment::End,
+            }
+        );
+
+        tree.apply(
+            PatchBatch {
+                base_revision: 8,
+                next_revision: 9,
+                patches: vec![
+                    Patch::SetText {
+                        id: id(2),
+                        value: "literal".into(),
+                    },
+                    Patch::SetText {
+                        id: id(3),
+                        value: "aligned literal".into(),
+                    },
+                ],
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree.node(id(2)).unwrap().data,
+            NodeData::Text {
+                value: "literal".into(),
+            }
+        );
+        assert_eq!(
+            tree.node(id(3)).unwrap().data,
+            NodeData::AlignedText {
+                value: "aligned literal".into(),
+                alignment: TextAlignment::End,
+            }
+        );
     }
 
     #[test]
@@ -1943,6 +2347,51 @@ mod tests {
             result,
             Err(PatchError::WrongNodeKind { patch_index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn rejects_set_countdown_on_button_like_set_text() {
+        let nodes = vec![
+            node(1, NodeData::Root, &[2]),
+            node(
+                2,
+                NodeData::Button {
+                    label: "go".into(),
+                    enabled: true,
+                },
+                &[],
+            ),
+        ];
+        let mut countdown_tree = patch_tree(nodes.clone());
+        let countdown_result = countdown_tree.apply(
+            batch(vec![Patch::SetCountdown {
+                id: id(2),
+                schedule: ScheduleRef {
+                    id: 123,
+                    generation: 9,
+                },
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+            }]),
+            &Limits::default(),
+        );
+        let mut text_tree = patch_tree(nodes);
+        let text_result = text_tree.apply(
+            batch(vec![Patch::SetText {
+                id: id(2),
+                value: "bad".into(),
+            }]),
+            &Limits::default(),
+        );
+
+        assert_eq!(
+            countdown_result,
+            Err(PatchError::WrongNodeKind {
+                patch_index: 0,
+                id: id(2),
+            })
+        );
+        assert_eq!(countdown_result, text_result);
     }
 
     #[test]

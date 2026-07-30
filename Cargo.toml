@@ -11,7 +11,11 @@ members = [
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",
+    "test-components/legacy-v003",
     "test-components/sdk-tally",
+    "test-components/sdk-time",
+    "test-components/time-stub",
+    "test-components/instant-now",
     "test-components/trap-on-mount",
     "test-components/trap-on-handle",
     "test-components/invalid-snapshot",
@@ -26,6 +30,10 @@ members = [
     "test-components/invalid-patch-after-state-write",
     "test-components/bad-revision-after-state-write",
     "test-components/app-error-after-state-write",
+    "test-components/sdk-elapsed",
+    "test-components/countdown-presentation",
+    "test-components/elapsed-trap",
+    "test-components/elapsed-invalid-patch",
 ]
 exclude = ["crates/youth-cli/templates/tally"]
 

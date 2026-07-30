@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
@@ -161,6 +162,16 @@ pub enum TextAlign {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimePrecision {
+    Seconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CountdownFormat {
+    MinutesSeconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shortcut {
     Character(char),
     Enter,
@@ -264,6 +275,34 @@ impl Text {
             kind: ElementKind::Text(TextElement {
                 key,
                 value: value.into(),
+                alignment: TextAlign::Start,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Countdown;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CountdownElement {
+    key: NodeKey,
+    schedule: Schedule,
+    precision: TimePrecision,
+    format: CountdownFormat,
+    alignment: TextAlign,
+}
+
+impl Countdown {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(key: NodeKey, schedule: Schedule) -> Element {
+        Element {
+            kind: ElementKind::Countdown(CountdownElement {
+                key,
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
                 alignment: TextAlign::Start,
             }),
         }
@@ -387,6 +426,7 @@ pub struct Element {
 enum ElementKind {
     Box(BoxElement),
     Text(TextElement),
+    Countdown(CountdownElement),
     Button(ButtonElement),
 }
 
@@ -396,15 +436,17 @@ impl Element {
         match &mut self.kind {
             ElementKind::Box(value) => value.enabled = enabled,
             ElementKind::Button(value) => value.enabled = enabled,
-            ElementKind::Text(_) => {}
+            ElementKind::Text(_) | ElementKind::Countdown(_) => {}
         }
         self
     }
 
     #[must_use]
     pub fn align(mut self, alignment: TextAlign) -> Self {
-        if let ElementKind::Text(value) = &mut self.kind {
-            value.alignment = alignment;
+        match &mut self.kind {
+            ElementKind::Text(value) => value.alignment = alignment,
+            ElementKind::Countdown(value) => value.alignment = alignment,
+            ElementKind::Box(_) | ElementKind::Button(_) => {}
         }
         self
     }
@@ -451,27 +493,120 @@ impl Tree {
     }
 }
 
+pub type NodeId = u64;
+pub type ScheduleId = u64;
+pub type Generation = u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElapsedReason {
+    Deadline,
+    RecoveredOverdue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    Activated(NodeId),
+    ScheduleElapsed {
+        schedule: ScheduleId,
+        generation: Generation,
+        reason: ElapsedReason,
+    },
+}
+
+#[cfg(any(test, all(target_os = "wasi", target_env = "p2")))]
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IncomingEvent {
+    Activated(NodeId),
+    ScheduleElapsed {
+        schedule: ScheduleId,
+        generation: Generation,
+        reason: ElapsedReason,
+    },
+    #[cfg(test)]
+    Unsupported,
+}
+
+#[cfg(any(test, all(target_os = "wasi", target_env = "p2")))]
+pub(crate) fn decode_incoming_events(
+    incoming: impl IntoIterator<Item = IncomingEvent>,
+) -> Result<Vec<Event>> {
+    incoming
+        .into_iter()
+        .map(|event| match event {
+            IncomingEvent::Activated(id) if id != 0 => Ok(Event::Activated(id)),
+            IncomingEvent::Activated(_) => {
+                Err(Error::invalid_state().with_message("event contains an invalid node ID"))
+            }
+            IncomingEvent::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            } if schedule != 0 && generation != 0 => Ok(Event::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            }),
+            IncomingEvent::ScheduleElapsed { .. } => {
+                Err(Error::invalid_state()
+                    .with_message("event contains an invalid schedule identity"))
+            }
+            #[cfg(test)]
+            IncomingEvent::Unsupported => {
+                Err(Error::invalid_state().with_message("event kind is not supported by this SDK"))
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Events {
-    activated: Vec<u64>,
+    events: Vec<Event>,
     commanded: Vec<u64>,
 }
 
 impl Events {
     #[must_use]
     pub fn activated(&self, key: NodeKey) -> bool {
-        self.activated.contains(&key.id())
+        self.events
+            .iter()
+            .any(|event| matches!(event, Event::Activated(id) if *id == key.id()))
     }
 
     #[must_use]
     pub fn commanded(&self, key: CommandKey) -> bool {
         self.commanded.contains(&key.id())
     }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Event> {
+        self.events.iter()
+    }
+
+    pub fn elapsed(&self) -> impl Iterator<Item = (ScheduleId, Generation, ElapsedReason)> + '_ {
+        self.events.iter().filter_map(|event| match event {
+            Event::ScheduleElapsed {
+                schedule,
+                generation,
+                reason,
+            } => Some((*schedule, *generation, *reason)),
+            Event::Activated(_) => None,
+        })
+    }
+}
+
+impl<'a> IntoIterator for &'a Events {
+    type Item = &'a Event;
+    type IntoIter = std::slice::Iter<'a, Event>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.iter()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UpdateOperation {
     Text(NodeKey, String),
+    Countdown(NodeKey, Schedule, TimePrecision, CountdownFormat),
     Label(NodeKey, String),
     Enabled(NodeKey, bool),
 }
@@ -502,6 +637,19 @@ impl Update {
     }
 
     #[must_use]
+    pub fn set_countdown(
+        mut self,
+        key: NodeKey,
+        schedule: Schedule,
+        precision: TimePrecision,
+        format: CountdownFormat,
+    ) -> Self {
+        self.operations
+            .push(UpdateOperation::Countdown(key, schedule, precision, format));
+        self
+    }
+
+    #[must_use]
     pub fn set_label(mut self, key: NodeKey, value: impl Into<String>) -> Self {
         self.operations
             .push(UpdateOperation::Label(key, value.into()));
@@ -523,6 +671,9 @@ impl ViewContext {
     pub const fn state(&self) -> StateReader {
         StateReader
     }
+
+    // Deliberately no `time()` method: rendering a view must remain
+    // side-effect free, while every scheduler operation mutates host state.
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -532,6 +683,98 @@ impl EventContext {
     #[must_use]
     pub const fn state(&mut self) -> StateWriter {
         StateWriter
+    }
+
+    #[must_use]
+    pub const fn time(&mut self) -> TimeScheduler {
+        TimeScheduler
+    }
+}
+
+/// A host-issued schedule identity.
+///
+/// Applications cannot construct this handle. The raw values are exposed only
+/// so an application can persist them; prefer [`StateReader::schedule`] and
+/// [`StateWriter::set_schedule`] for a checked round trip through typed state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Schedule {
+    id: u64,
+    generation: u64,
+}
+
+impl Schedule {
+    /// Returns the host-issued identifier for persistence.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    /// Returns the host-issued generation for persistence.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Notification {
+    title: String,
+    body: String,
+}
+
+impl Notification {
+    #[must_use]
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduleOptions {
+    notification: Option<Notification>,
+}
+
+impl ScheduleOptions {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { notification: None }
+    }
+
+    #[must_use]
+    pub fn notification(mut self, value: Notification) -> Self {
+        self.notification = Some(value);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimeScheduler;
+
+impl TimeScheduler {
+    pub fn schedule_after(self, duration: Duration, options: ScheduleOptions) -> Result<Schedule> {
+        let millis = u64::try_from(duration.as_millis()).map_err(|_| {
+            Error::invalid_state().with_message("schedule duration exceeds u64::MAX milliseconds")
+        })?;
+        if millis < 100 {
+            return Err(Error::invalid_state()
+                .with_message("schedule duration must be at least 100 milliseconds"));
+        }
+        time::schedule_after(millis, options)
+    }
+
+    pub fn pause(self, schedule: Schedule) -> Result<Schedule> {
+        time::pause(schedule)
+    }
+
+    pub fn resume(self, schedule: Schedule) -> Result<Schedule> {
+        time::resume(schedule)
+    }
+
+    pub fn cancel(self, schedule: Schedule) -> Result<()> {
+        time::cancel(schedule)
     }
 }
 
@@ -553,6 +796,22 @@ impl StateReader {
 
     pub fn bytes(self, key: &str) -> Result<Option<Vec<u8>>> {
         state::get_bytes(key)
+    }
+
+    /// Restores a schedule handle previously written by
+    /// [`StateWriter::set_schedule`].
+    pub fn schedule(self, key: &str) -> Result<Option<Schedule>> {
+        let Some(bytes) = self.bytes(key)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| Error::invalid_state().with_message("stored schedule is malformed"))?;
+        let (id, generation) = bytes.split_at(8);
+        Ok(Some(Schedule {
+            id: u64::from_be_bytes(id.try_into().expect("slice has eight bytes")),
+            generation: u64::from_be_bytes(generation.try_into().expect("slice has eight bytes")),
+        }))
     }
 }
 
@@ -576,6 +835,10 @@ impl StateWriter {
         StateReader.bytes(key)
     }
 
+    pub fn schedule(self, key: &str) -> Result<Option<Schedule>> {
+        StateReader.schedule(key)
+    }
+
     pub fn set_boolean(self, key: &str, value: bool) -> Result<()> {
         state::set_boolean(key, value)
     }
@@ -590,6 +853,15 @@ impl StateWriter {
 
     pub fn set_bytes(self, key: &str, value: &[u8]) -> Result<()> {
         state::set_bytes(key, value)
+    }
+
+    /// Persists a host-issued schedule handle for
+    /// [`StateReader::schedule`] to restore.
+    pub fn set_schedule(self, key: &str, value: Schedule) -> Result<()> {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&value.id.to_be_bytes());
+        bytes[8..].copy_from_slice(&value.generation.to_be_bytes());
+        self.set_bytes(key, &bytes)
     }
 
     pub fn delete(self, key: &str) -> Result<bool> {
@@ -612,6 +884,12 @@ enum FlatNodeData {
     },
     Text {
         value: String,
+        alignment: TextAlign,
+    },
+    Countdown {
+        schedule: Schedule,
+        precision: TimePrecision,
+        format: CountdownFormat,
         alignment: TextAlign,
     },
     Button {
@@ -644,6 +922,7 @@ impl FlatTree {
         for operation in &update.operations {
             let key = match operation {
                 UpdateOperation::Text(key, _)
+                | UpdateOperation::Countdown(key, ..)
                 | UpdateOperation::Label(key, _)
                 | UpdateOperation::Enabled(key, _) => *key,
             };
@@ -653,27 +932,52 @@ impl FlatTree {
             let Some(node) = self.nodes.iter_mut().find(|node| node.id == key.id()) else {
                 return Err(Error::invalid_state().with_message("an update names an unknown node"));
             };
-            match (operation, &mut node.data) {
-                (UpdateOperation::Text(_, value), FlatNodeData::Text { value: current, .. }) => {
-                    current.clone_from(value);
+            match operation {
+                UpdateOperation::Text(_, value) => {
+                    let alignment = match &node.data {
+                        FlatNodeData::Text { alignment, .. }
+                        | FlatNodeData::Countdown { alignment, .. } => *alignment,
+                        _ => {
+                            return Err(Error::invalid_state()
+                                .with_message("an update does not match the named node type"));
+                        }
+                    };
+                    node.data = FlatNodeData::Text {
+                        value: value.clone(),
+                        alignment,
+                    };
                 }
-                (UpdateOperation::Label(_, value), FlatNodeData::Button { label, .. }) => {
-                    label.clone_from(value);
+                UpdateOperation::Countdown(_, schedule, precision, format) => {
+                    let alignment = match &node.data {
+                        FlatNodeData::Text { alignment, .. }
+                        | FlatNodeData::Countdown { alignment, .. } => *alignment,
+                        _ => {
+                            return Err(Error::invalid_state()
+                                .with_message("an update does not match the named node type"));
+                        }
+                    };
+                    node.data = FlatNodeData::Countdown {
+                        schedule: *schedule,
+                        precision: *precision,
+                        format: *format,
+                        alignment,
+                    };
                 }
-                (
-                    UpdateOperation::Enabled(_, enabled),
-                    FlatNodeData::Button { enabled: value, .. },
-                )
-                | (
-                    UpdateOperation::Enabled(_, enabled),
-                    FlatNodeData::Box { enabled: value, .. },
-                ) => {
-                    *value = *enabled;
-                }
-                _ => {
-                    return Err(Error::invalid_state()
-                        .with_message("an update does not match the named node type"));
-                }
+                UpdateOperation::Label(_, value) => match &mut node.data {
+                    FlatNodeData::Button { label, .. } => label.clone_from(value),
+                    _ => {
+                        return Err(Error::invalid_state()
+                            .with_message("an update does not match the named node type"));
+                    }
+                },
+                UpdateOperation::Enabled(_, enabled) => match &mut node.data {
+                    FlatNodeData::Button { enabled: value, .. }
+                    | FlatNodeData::Box { enabled: value, .. } => *value = *enabled,
+                    _ => {
+                        return Err(Error::invalid_state()
+                            .with_message("an update does not match the named node type"));
+                    }
+                },
             }
         }
         Ok(())
@@ -716,6 +1020,20 @@ impl FlatTreeBuilder {
                     id,
                     data: FlatNodeData::Text {
                         value: value.value.clone(),
+                        alignment: value.alignment,
+                    },
+                    children: Vec::new(),
+                });
+                Ok(id)
+            }
+            ElementKind::Countdown(value) => {
+                let id = self.allocate_named(value.key)?;
+                self.nodes.push(FlatNode {
+                    id,
+                    data: FlatNodeData::Countdown {
+                        schedule: value.schedule,
+                        precision: value.precision,
+                        format: value.format,
                         alignment: value.alignment,
                     },
                     children: Vec::new(),
@@ -893,10 +1211,98 @@ mod state {
     }
 }
 
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+mod time {
+    use super::{Error, Result, Schedule, ScheduleOptions};
+    use crate::component::bindings::youth::time::scheduler::{self, ScheduleErrorCode};
+
+    pub fn schedule_after(millis: u64, options: ScheduleOptions) -> Result<Schedule> {
+        let options = scheduler::ScheduleOptions {
+            notification: options.notification.map(|value| scheduler::Notification {
+                title: value.title,
+                body: value.body,
+            }),
+        };
+        scheduler::schedule_after(millis, &options)
+            .map(from_wire_schedule)
+            .map_err(map_error)
+    }
+
+    pub fn pause(value: Schedule) -> Result<Schedule> {
+        scheduler::pause(wire_schedule(value))
+            .map(from_wire_schedule)
+            .map_err(map_error)
+    }
+
+    pub fn resume(value: Schedule) -> Result<Schedule> {
+        scheduler::resume(wire_schedule(value))
+            .map(from_wire_schedule)
+            .map_err(map_error)
+    }
+
+    pub fn cancel(value: Schedule) -> Result<()> {
+        scheduler::cancel(wire_schedule(value)).map_err(map_error)
+    }
+
+    const fn wire_schedule(value: Schedule) -> scheduler::Schedule {
+        scheduler::Schedule {
+            id: value.id,
+            generation: value.generation,
+        }
+    }
+
+    const fn from_wire_schedule(value: scheduler::Schedule) -> Schedule {
+        Schedule {
+            id: value.id,
+            generation: value.generation,
+        }
+    }
+
+    fn map_error(error: ScheduleErrorCode) -> Error {
+        let message = match error {
+            ScheduleErrorCode::InvalidDuration => "host rejected the schedule duration",
+            ScheduleErrorCode::TooManySchedules => "host schedule limit reached",
+            ScheduleErrorCode::UnknownSchedule => "host does not recognize the schedule",
+            ScheduleErrorCode::StaleGeneration => "schedule generation is stale",
+            ScheduleErrorCode::InvalidState => "schedule is not valid in its current state",
+            ScheduleErrorCode::Unavailable => "host scheduling is unavailable",
+            ScheduleErrorCode::Internal => return Error::internal(),
+        };
+        Error::invalid_state().with_message(message)
+    }
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+mod time {
+    use super::{Error, Result, Schedule, ScheduleOptions};
+
+    fn unavailable<T>() -> Result<T> {
+        Err(Error::internal().with_message("host time calls require wasm32-wasip2"))
+    }
+
+    pub fn schedule_after(_millis: u64, _options: ScheduleOptions) -> Result<Schedule> {
+        unavailable()
+    }
+
+    pub fn pause(_value: Schedule) -> Result<Schedule> {
+        unavailable()
+    }
+
+    pub fn resume(_value: Schedule) -> Result<Schedule> {
+        unavailable()
+    }
+
+    pub fn cancel(_value: Schedule) -> Result<()> {
+        unavailable()
+    }
+}
+
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandKey, Element, Error, ErrorKind, EventContext,
-        Events, Grid, NodeKey, Result, Row, Shortcut, Text, TextAlign, Tree, Update, ViewContext,
+        Application, BoxNode, Button, Column, CommandKey, Countdown, CountdownFormat,
+        ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events, Generation, Grid,
+        NodeId, NodeKey, Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions,
+        Shortcut, Text, TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext,
         command, node,
     };
 }
@@ -927,6 +1333,13 @@ pub mod __private {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schedule() -> Schedule {
+        Schedule {
+            id: 17,
+            generation: 3,
+        }
+    }
 
     #[test]
     fn symbolic_id_vectors_are_stable() {
@@ -981,6 +1394,37 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn countdown_flattens_with_schedule_and_defaults() {
+        let schedule = schedule();
+        let flat = Tree::root(Countdown::new(node!("remaining"), schedule))
+            .flatten()
+            .expect("countdown tree is valid");
+        assert_eq!(
+            flat.nodes[1].data,
+            FlatNodeData::Countdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+                alignment: TextAlign::Start,
+            }
+        );
+    }
+
+    #[test]
+    fn countdown_alignment_flattens_without_wire_details() {
+        let flat = Tree::root(Countdown::new(node!("remaining"), schedule()).align(TextAlign::End))
+            .flatten()
+            .expect("countdown tree is valid");
+        assert!(matches!(
+            flat.nodes[1].data,
+            FlatNodeData::Countdown {
+                alignment: TextAlign::End,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1054,5 +1498,107 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn text_update_retargets_countdown_and_preserves_alignment() {
+        let mut tree =
+            Tree::root(Countdown::new(node!("remaining"), schedule()).align(TextAlign::Center))
+                .flatten()
+                .expect("countdown tree is valid");
+        tree.apply(&Update::new().set_text(node!("remaining"), "05:00"))
+            .expect("countdown can be retargeted to literal text");
+        assert_eq!(
+            tree.nodes[1].data,
+            FlatNodeData::Text {
+                value: "05:00".to_owned(),
+                alignment: TextAlign::Center,
+            }
+        );
+    }
+
+    #[test]
+    fn countdown_update_retargets_text_and_preserves_alignment() {
+        let schedule = schedule();
+        let mut tree = Tree::root(Text::new(node!("remaining"), "05:00").align(TextAlign::End))
+            .flatten()
+            .expect("text tree is valid");
+        tree.apply(&Update::new().set_countdown(
+            node!("remaining"),
+            schedule,
+            TimePrecision::Seconds,
+            CountdownFormat::MinutesSeconds,
+        ))
+        .expect("literal text can be retargeted to a countdown");
+        assert_eq!(
+            tree.nodes[1].data,
+            FlatNodeData::Countdown {
+                schedule,
+                precision: TimePrecision::Seconds,
+                format: CountdownFormat::MinutesSeconds,
+                alignment: TextAlign::End,
+            }
+        );
+    }
+
+    #[test]
+    fn text_family_updates_reject_button_targets() {
+        let mut tree = Tree::root(Button::new(node!("start"), "Start"))
+            .flatten()
+            .expect("button tree is valid");
+        let text_error = tree
+            .apply(&Update::new().set_text(node!("start"), "bad"))
+            .expect_err("a button cannot be retargeted to text");
+        assert_eq!(
+            text_error.message.as_deref(),
+            Some("an update does not match the named node type")
+        );
+
+        let countdown_error = tree
+            .apply(&Update::new().set_countdown(
+                node!("start"),
+                schedule(),
+                TimePrecision::Seconds,
+                CountdownFormat::MinutesSeconds,
+            ))
+            .expect_err("a button cannot be retargeted to a countdown");
+        assert_eq!(
+            countdown_error.message.as_deref(),
+            Some("an update does not match the named node type")
+        );
+    }
+
+    #[test]
+    fn countdown_update_participates_in_duplicate_key_rejection() {
+        let mut tree = Tree::root(Text::new(node!("remaining"), "05:00"))
+            .flatten()
+            .expect("text tree is valid");
+        let error = tree
+            .apply(
+                &Update::new()
+                    .set_countdown(
+                        node!("remaining"),
+                        schedule(),
+                        TimePrecision::Seconds,
+                        CountdownFormat::MinutesSeconds,
+                    )
+                    .set_text(node!("remaining"), "04:59"),
+            )
+            .expect_err("a countdown and text update cannot share a key");
+        assert_eq!(error.message.as_deref(), Some("a node is updated twice"));
+    }
+
+    #[test]
+    fn unsupported_event_does_not_invoke_application_or_advance_acknowledgement() {
+        let mut application_invoked = false;
+        let mut processed_through = 0;
+        let decoded = decode_incoming_events([IncomingEvent::Unsupported]);
+        if decoded.is_ok() {
+            application_invoked = true;
+            processed_through = 9;
+        }
+        assert!(decoded.is_err());
+        assert!(!application_invoked);
+        assert_eq!(processed_through, 0);
     }
 }

@@ -1,11 +1,12 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use softbuffer::{Context, Surface};
 use thiserror::Error;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize as WinitLogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -15,7 +16,10 @@ use crate::{
     LogicalSize, Modifiers, Palette, PointerState, RenderState, RendererMirror, SemanticAction,
     layout, render,
 };
-use youth_runtime::{RuntimeErrorCategory, YouthAppConfig, YouthAppHandle};
+use youth_runtime::{
+    PresentationReader, RuntimeErrorCategory, YouthAppConfig, YouthAppHandle,
+    next_display_boundary_epoch_millis,
+};
 use youth_tree::{Node, NodeData, NodeId, TreeSnapshot};
 
 #[derive(Clone, Debug)]
@@ -58,6 +62,7 @@ struct NativeApp {
     interaction: InteractionState,
     modifiers: ModifiersState,
     controller: Option<Controller>,
+    presentation: Option<PresentationReader>,
     fault: Option<String>,
     smoke_presented: bool,
 }
@@ -105,6 +110,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         interaction: InteractionState::default(),
         modifiers: ModifiersState::empty(),
         controller: None,
+        presentation: None,
         fault: None,
         smoke_presented: false,
     };
@@ -113,6 +119,14 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
 }
 
 impl ApplicationHandler<NativeEvent> for NativeApp {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. })
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match &mut self.mode {
             Mode::Application(config) => {
@@ -132,6 +146,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
         match event {
             NativeEvent::Mounted(handle, snapshot) => {
                 self.install_snapshot(snapshot);
+                self.presentation = Some(handle.presentation());
                 let proxy = self.proxy.clone();
                 self.controller = Some(Controller::spawn(handle, move |event| {
                     let _ = proxy.send_event(NativeEvent::Runtime(event));
@@ -392,6 +407,7 @@ impl NativeApp {
             pressed: self.pointer.pressed.then_some(self.pointer.armed).flatten(),
             focused: self.interaction.focused(),
             fault_category: self.fault.as_deref(),
+            presentation: self.presentation.as_ref(),
         };
         let Ok(frame) = render(
             mirror.tree(),
@@ -418,10 +434,41 @@ impl NativeApp {
             self.fault = Some("surface_failure".to_owned());
             return;
         }
+        self.arm_countdown_repaint(event_loop);
         if matches!(self.mode, Mode::Smoke) && !self.smoke_presented {
             self.smoke_presented = true;
             event_loop.exit();
         }
+    }
+
+    fn arm_countdown_repaint(&self, event_loop: &ActiveEventLoop) {
+        let (Some(mirror), Some(presentation)) = (&self.mirror, &self.presentation) else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let now_epoch_millis = presentation.now_epoch_millis();
+        let next_epoch_millis = mirror
+            .tree()
+            .to_snapshot()
+            .nodes
+            .iter()
+            .filter_map(|node| node.data.countdown_ref())
+            .filter_map(|(schedule, _, _)| {
+                let record = presentation.schedule(schedule.id)?;
+                (record.generation == schedule.generation).then_some(record)
+            })
+            .filter_map(|record| {
+                next_display_boundary_epoch_millis(Some(&record), now_epoch_millis)
+            })
+            .min();
+        let Some(next_epoch_millis) = next_epoch_millis else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let delay = next_epoch_millis.saturating_sub(now_epoch_millis);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(delay),
+        ));
     }
 }
 

@@ -1,4 +1,5 @@
 use thiserror::Error;
+use youth_runtime::{PresentationReader, resolve_countdown_display};
 use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
 
 use crate::geometry::{LayoutSnapshot, LogicalRect};
@@ -38,12 +39,13 @@ impl Default for Palette {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct RenderState<'a> {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
     pub focused: Option<NodeId>,
     pub fault_category: Option<&'a str>,
+    pub presentation: Option<&'a PresentationReader>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,30 +214,61 @@ pub fn render(
                 frame.border(rect, palette.border);
             }
             NodeData::Text { value } => {
-                frame.text(
-                    rect.x,
-                    rect.y,
+                draw_text(
+                    &mut frame,
+                    rect,
                     value,
-                    palette.text,
-                    scale_factor.round() as u32,
+                    TextAlignment::Start,
+                    scale_factor,
+                    palette,
                 );
             }
             NodeData::AlignedText { value, alignment } => {
-                let glyph_scale = scale_factor.round().max(1.0) as u32;
-                let text_width = u32::try_from(value.chars().count())
-                    .unwrap_or(u32::MAX)
-                    .saturating_mul(8)
-                    .saturating_mul(glyph_scale);
-                let text_x = match alignment {
-                    TextAlignment::Start => rect.x,
-                    TextAlignment::Center => rect
-                        .x
-                        .saturating_add(rect.width.saturating_sub(text_width) / 2),
-                    TextAlignment::End => {
-                        rect.x.saturating_add(rect.width.saturating_sub(text_width))
-                    }
-                };
-                frame.text(text_x, rect.y, value, palette.text, glyph_scale);
+                draw_text(&mut frame, rect, value, *alignment, scale_factor, palette);
+            }
+            NodeData::Countdown {
+                schedule,
+                precision,
+                format,
+            }
+            | NodeData::AlignedCountdown {
+                schedule,
+                precision,
+                format,
+                alignment: TextAlignment::Start,
+            } => {
+                let record = state
+                    .presentation
+                    .and_then(|reader| reader.schedule(schedule.id));
+                let now = state
+                    .presentation
+                    .map_or(0, PresentationReader::now_epoch_millis);
+                let value =
+                    resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
+                draw_text(
+                    &mut frame,
+                    rect,
+                    &value,
+                    TextAlignment::Start,
+                    scale_factor,
+                    palette,
+                );
+            }
+            NodeData::AlignedCountdown {
+                schedule,
+                precision,
+                format,
+                alignment,
+            } => {
+                let record = state
+                    .presentation
+                    .and_then(|reader| reader.schedule(schedule.id));
+                let now = state
+                    .presentation
+                    .map_or(0, PresentationReader::now_epoch_millis);
+                let value =
+                    resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
+                draw_text(&mut frame, rect, &value, *alignment, scale_factor, palette);
             }
             NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
                 let color = if !node.effective_enabled {
@@ -278,6 +311,29 @@ pub fn render(
         frame.text(16, 32, category, palette.fault_text, 1);
     }
     Ok(frame)
+}
+
+fn draw_text(
+    frame: &mut FrameBuffer,
+    rect: PixelRect,
+    value: &str,
+    alignment: TextAlignment,
+    scale_factor: f64,
+    palette: Palette,
+) {
+    let glyph_scale = scale_factor.round().max(1.0) as u32;
+    let text_width = u32::try_from(value.chars().count())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(8)
+        .saturating_mul(glyph_scale);
+    let text_x = match alignment {
+        TextAlignment::Start => rect.x,
+        TextAlignment::Center => rect
+            .x
+            .saturating_add(rect.width.saturating_sub(text_width) / 2),
+        TextAlignment::End => rect.x.saturating_add(rect.width.saturating_sub(text_width)),
+    };
+    frame.text(text_x, rect.y, value, palette.text, glyph_scale);
 }
 
 #[must_use]
@@ -468,6 +524,87 @@ mod tests {
         .unwrap()
     }
 
+    fn single_text(data: NodeData) -> Tree {
+        Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                    },
+                    Node {
+                        id: id(2),
+                        data,
+                        children: vec![],
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn countdowns_render_and_aligned_countdowns_share_text_alignment() {
+        let schedule = youth_tree::ScheduleRef {
+            id: 7,
+            generation: 1,
+        };
+        let countdown = single_text(NodeData::Countdown {
+            schedule,
+            precision: youth_tree::TimePrecision::Seconds,
+            format: youth_tree::CountdownFormat::MinutesSeconds,
+        });
+        let countdown_layout = layout(&countdown, LogicalSize::new(100.0, 20.0).unwrap()).unwrap();
+        render(
+            &countdown,
+            &countdown_layout,
+            100,
+            20,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        )
+        .unwrap();
+
+        let aligned = single_text(NodeData::AlignedCountdown {
+            schedule,
+            precision: youth_tree::TimePrecision::Seconds,
+            format: youth_tree::CountdownFormat::MinutesSeconds,
+            alignment: TextAlignment::End,
+        });
+        let literal = single_text(NodeData::AlignedText {
+            value: "--:--".into(),
+            alignment: TextAlignment::End,
+        });
+        let aligned_layout = layout(&aligned, LogicalSize::new(100.0, 20.0).unwrap()).unwrap();
+        let literal_layout = layout(&literal, LogicalSize::new(100.0, 20.0).unwrap()).unwrap();
+        let aligned_frame = render(
+            &aligned,
+            &aligned_layout,
+            100,
+            20,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        )
+        .unwrap();
+        let literal_frame = render(
+            &literal,
+            &literal_layout,
+            100,
+            20,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        )
+        .unwrap();
+        assert_eq!(aligned_frame, literal_frame);
+    }
+
     #[test]
     fn raw_frame_fixtures_are_deterministic() {
         let tree = counter();
@@ -507,6 +644,7 @@ mod tests {
                 pressed: Some(id(4)),
                 focused: None,
                 fault_category: None,
+                presentation: None,
             },
             palette,
         )

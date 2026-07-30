@@ -1,0 +1,12 @@
+[package]
+name = "youth-countdown-presentation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { path = "../../crates/youth-sdk" }

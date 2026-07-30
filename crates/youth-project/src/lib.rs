@@ -15,15 +15,58 @@ use youth_state::AppId;
 
 pub const MANIFEST_NAME: &str = "Youth.toml";
 pub const LOCK_NAME: &str = "Youth.lock";
-pub const SUPPORTED_PROTOCOL: &str = "0.0.3";
+/// Default protocol for newly generated projects.
+pub const SUPPORTED_PROTOCOL: &str = "0.0.4";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "8696bd97ebc4f1d34b9f632e5992dd1882b724de";
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const SDK_REVISION: &str = "4a0bba175e7eb9643a0348a94a6a3efadbdae0e1";
+/// Default template version for newly generated projects.
+pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// WIT digest used by the default generated-project profile.
 pub const TEMPLATE_WIT_SHA256: &str =
-    "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928";
+    "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractProfile {
+    pub protocol: &'static str,
+    pub wit_sha256: &'static str,
+    pub template_version: u32,
+    /// The SDK revision this contract was released against. This travels
+    /// with the profile rather than being a single global constant: an
+    /// application pinned to an earlier released contract must keep
+    /// validating after the CLI moves on, exactly as it must for the
+    /// protocol and WIT hash.
+    pub sdk_revision: &'static str,
+}
+
+pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
+    ContractProfile {
+        protocol: "0.0.3",
+        wit_sha256: "bb4b564b390074608651a7090855abafd35163fad5cfb8bb91a6293c58183928",
+        template_version: 2,
+        sdk_revision: "8696bd97ebc4f1d34b9f632e5992dd1882b724de",
+    },
+    ContractProfile {
+        protocol: "0.0.4",
+        wit_sha256: "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad",
+        template_version: 3,
+        sdk_revision: SDK_REVISION,
+    },
+    ContractProfile {
+        protocol: "0.0.5",
+        wit_sha256: "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385",
+        template_version: 3,
+        // Pinned to the pushed commit where the SDK's Countdown builder API
+        // (crates/youth-sdk/src/lib.rs and component.rs) actually landed and
+        // fully supports this protocol -- not `SDK_REVISION`, which is still
+        // the 0.0.4-default pin `youth new` scaffolds against. Publishing
+        // this profile was deliberately deferred (see prior commit history)
+        // until this exact revision was verified reachable on the remote.
+        sdk_revision: "bfd539ca5e0d8d63b9dcdb28c744758255560dc1",
+    },
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -152,9 +195,10 @@ impl Project {
             &self.lock.cli_version,
             running_cli_version,
         )?;
+        let profile = contract_profile(&self.manifest.app.protocol)?;
         let digest = hash_wit_tree(self.root.join("wit/youth"))?;
         compare("lock.wit-sha256", &self.lock.wit_sha256, &digest)?;
-        compare("embedded-template.wit-sha256", TEMPLATE_WIT_SHA256, &digest)?;
+        compare("contract-profile.wit-sha256", profile.wit_sha256, &digest)?;
         verify_cargo_manifest(&self.root.join("Cargo.toml"), &self.lock)?;
         verify_cargo_lock(&self.root.join("Cargo.lock"), &self.lock)?;
         Ok(())
@@ -173,7 +217,7 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ProjectErro
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), ProjectError> {
-    compare("app.protocol", &manifest.app.protocol, SUPPORTED_PROTOCOL)?;
+    contract_profile(&manifest.app.protocol)?;
     compare(
         "build.language",
         &manifest.build.language,
@@ -195,18 +239,23 @@ fn validate_lock(manifest: &Manifest, lock: &Lock) -> Result<(), ProjectError> {
     if lock.lock_version != 1 {
         return mismatch("lock-version", lock.lock_version, 1);
     }
-    compare(
-        "Youth.toml app.protocol",
-        &manifest.app.protocol,
-        &lock.protocol,
-    )?;
-    compare("runtime protocol", &lock.protocol, SUPPORTED_PROTOCOL)?;
-    compare("sdk-source", &lock.sdk_source, SDK_SOURCE)?;
-    compare("sdk-revision", &lock.sdk_revision, SDK_REVISION)?;
-    compare("cli-version", &lock.cli_version, CLI_VERSION)?;
-    if lock.template_version != TEMPLATE_VERSION {
-        return mismatch("template-version", lock.template_version, TEMPLATE_VERSION);
+    let profile = contract_profile(&manifest.app.protocol)?;
+    if lock.protocol != profile.protocol
+        || lock.wit_sha256 != profile.wit_sha256
+        || lock.template_version != profile.template_version
+        || lock.sdk_revision != profile.sdk_revision
+    {
+        return Err(ProjectError::Contract(format!(
+            "lock contract fields do not match the {:?} profile: expected protocol {:?}, wit-sha256 {:?}, template-version {}, and sdk-revision {:?}; profile fields cannot be mixed",
+            profile.protocol,
+            profile.protocol,
+            profile.wit_sha256,
+            profile.template_version,
+            profile.sdk_revision,
+        )));
     }
+    compare("sdk-source", &lock.sdk_source, SDK_SOURCE)?;
+    compare("cli-version", &lock.cli_version, CLI_VERSION)?;
     if !is_lower_hex(&lock.sdk_revision, 40) {
         return Err(ProjectError::Contract(
             "sdk-revision must be exactly 40 lowercase hexadecimal characters".into(),
@@ -218,6 +267,22 @@ fn validate_lock(manifest: &Manifest, lock: &Lock) -> Result<(), ProjectError> {
         ));
     }
     Ok(())
+}
+
+fn contract_profile(protocol: &str) -> Result<&'static ContractProfile, ProjectError> {
+    SUPPORTED_PROFILES
+        .iter()
+        .find(|profile| profile.protocol == protocol)
+        .ok_or_else(|| {
+            let supported = SUPPORTED_PROFILES
+                .iter()
+                .map(|profile| profile.protocol)
+                .collect::<Vec<_>>()
+                .join(", ");
+            ProjectError::Contract(format!(
+                "app.protocol {protocol:?} is unsupported; supported protocols: {supported}"
+            ))
+        })
 }
 
 fn validate_relative_path(path: &Path, field: &str) -> Result<(), ProjectError> {
@@ -392,20 +457,27 @@ mod tests {
 
     use super::*;
 
-    const WIT: &str = "package youth:app@0.0.3;\n";
+    const WIT_V003: &str = "package youth:app@0.0.3;\n";
+    const WIT_V004: &str = "package youth:app@0.0.4;\n";
 
-    fn fixture() -> TempDir {
+    fn fixture(profile: ContractProfile) -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let root = temporary.path();
         fs::create_dir_all(root.join("wit/youth")).expect("WIT directory");
-        fs::write(root.join("wit/youth/app.wit"), WIT).expect("WIT fixture");
-        let hash = hash_wit_tree(root.join("wit/youth")).expect("WIT hash");
+        let wit = if profile.protocol == "0.0.3" {
+            WIT_V003
+        } else {
+            WIT_V004
+        };
+        let revision = profile.sdk_revision;
+        fs::write(root.join("wit/youth/app.wit"), wit).expect("WIT fixture");
         fs::write(
             root.join(MANIFEST_NAME),
-            r#"[app]
+            format!(
+                r#"[app]
 id = "dev.saman.tally"
 name = "Tally"
-protocol = "0.0.3"
+protocol = "{}"
 
 [build]
 language = "rust"
@@ -415,19 +487,22 @@ target = "wasm32-wasip2"
 [development]
 state = ".youth/state"
 "#,
+                profile.protocol
+            ),
         )
         .expect("manifest fixture");
         fs::write(
             root.join(LOCK_NAME),
             format!(
                 r#"lock-version = 1
-protocol = "0.0.3"
+protocol = "{}"
 sdk-source = "{SDK_SOURCE}"
-sdk-revision = "{SDK_REVISION}"
-wit-sha256 = "{hash}"
+sdk-revision = "{revision}"
+wit-sha256 = "{}"
 cli-version = "{CLI_VERSION}"
-template-version = 2
-"#
+template-version = {}
+"#,
+                profile.protocol, profile.wit_sha256, profile.template_version
             ),
         )
         .expect("lock fixture");
@@ -439,7 +514,7 @@ name = "tally"
 version = "0.0.1"
 
 [dependencies]
-youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{SDK_REVISION}" }}
+youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{revision}" }}
 "#
             ),
         )
@@ -452,7 +527,7 @@ youth-sdk = {{ git = "{SDK_SOURCE}", rev = "{SDK_REVISION}" }}
 [[package]]
 name = "youth-sdk"
 version = "0.0.1"
-source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
+source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
 "#
             ),
         )
@@ -462,7 +537,7 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
 
     #[test]
     fn discovers_upward_and_derives_paths() {
-        let fixture = fixture();
+        let fixture = fixture(SUPPORTED_PROFILES[0]);
         let nested = fixture.path().join("src/deep");
         fs::create_dir_all(&nested).expect("nested directory");
         let project = Project::discover(&nested).expect("project");
@@ -479,7 +554,7 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
 
     #[test]
     fn verifies_exact_locked_cargo_and_wit_inputs() {
-        let fixture = fixture();
+        let fixture = fixture(SUPPORTED_PROFILES[0]);
         let mut project = Project::load(fixture.path()).expect("project");
         project.lock.wit_sha256 = hash_wit_tree(fixture.path().join("wit/youth")).expect("hash");
         // This fixture does not use the production template snapshot, so the
@@ -491,13 +566,13 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
 
     #[test]
     fn rejects_unknown_fields_and_escaping_state_paths() {
-        let unknown_fixture = fixture();
+        let unknown_fixture = fixture(SUPPORTED_PROFILES[0]);
         let manifest = unknown_fixture.path().join(MANIFEST_NAME);
         let text = fs::read_to_string(&manifest).expect("manifest");
         fs::write(&manifest, format!("{text}\nunknown = true\n")).expect("change manifest");
         assert!(Project::load(unknown_fixture.path()).is_err());
 
-        let escaping_fixture = fixture();
+        let escaping_fixture = fixture(SUPPORTED_PROFILES[0]);
         let manifest = escaping_fixture.path().join(MANIFEST_NAME);
         let text = fs::read_to_string(&manifest)
             .expect("manifest")
@@ -513,10 +588,10 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
 
     #[test]
     fn hash_is_path_and_content_sensitive() {
-        let fixture = fixture();
+        let fixture = fixture(SUPPORTED_PROFILES[0]);
         let root = fixture.path().join("wit/youth");
         let first = hash_wit_tree(&root).expect("first hash");
-        fs::write(root.join("app.wit"), format!("{WIT}// changed\n")).expect("changed WIT");
+        fs::write(root.join("app.wit"), format!("{WIT_V003}// changed\n")).expect("changed WIT");
         let second = hash_wit_tree(&root).expect("second hash");
         assert_ne!(first, second);
         fs::rename(root.join("app.wit"), root.join("renamed.wit")).expect("renamed WIT");
@@ -529,7 +604,7 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
     fn rejects_wit_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let fixture = fixture();
+        let fixture = fixture(SUPPORTED_PROFILES[0]);
         let root = fixture.path().join("wit/youth");
         symlink(root.join("app.wit"), root.join("alias.wit")).expect("symlink");
         assert!(
@@ -537,6 +612,107 @@ source = "git+{SDK_SOURCE}?rev={SDK_REVISION}#{SDK_REVISION}"
                 .expect_err("symlink rejection")
                 .to_string()
                 .contains("symlink")
+        );
+    }
+
+    #[test]
+    fn accepts_each_supported_contract_profile() {
+        for profile in SUPPORTED_PROFILES {
+            Project::load(fixture(*profile).path()).expect("supported profile loads");
+        }
+    }
+
+    #[test]
+    fn generated_project_defaults_select_the_v004_profile() {
+        let default = contract_profile(SUPPORTED_PROTOCOL).expect("default profile");
+        assert_eq!(default.protocol, "0.0.4");
+        assert_eq!(default.wit_sha256, TEMPLATE_WIT_SHA256);
+        assert_eq!(default.template_version, TEMPLATE_VERSION);
+        assert!(
+            SUPPORTED_PROFILES
+                .iter()
+                .any(|profile| profile.protocol == "0.0.3")
+        );
+    }
+
+    #[test]
+    fn rejects_lock_fields_mixed_between_profiles() {
+        let fixture = fixture(SUPPORTED_PROFILES[1]);
+        let lock_path = fixture.path().join(LOCK_NAME);
+        let lock = fs::read_to_string(&lock_path)
+            .expect("lock")
+            .replace("template-version = 3", "template-version = 2");
+        fs::write(lock_path, lock).expect("mixed lock");
+        let error = Project::load(fixture.path()).expect_err("mixed profile must fail");
+        assert!(error.to_string().contains("profile fields cannot be mixed"));
+    }
+
+    /// The regression this closes: `sdk_revision` was once a single global
+    /// constant compared independently of `SUPPORTED_PROFILES`, so a lock
+    /// could carry a stale revision under an otherwise-current profile and
+    /// pass. Every field in `ContractProfile` must be validated as one
+    /// tuple, not four independent equalities — this is the case that
+    /// distinguishes the two: only `sdk-revision` disagrees.
+    #[test]
+    fn rejects_a_lock_with_an_sdk_revision_from_a_different_profile() {
+        for fixture_profile in SUPPORTED_PROFILES {
+            for foreign_profile in SUPPORTED_PROFILES {
+                if fixture_profile == foreign_profile {
+                    continue;
+                }
+                let fixture = fixture(*fixture_profile);
+                let lock_path = fixture.path().join(LOCK_NAME);
+                let lock = fs::read_to_string(&lock_path).expect("lock");
+                let mixed = lock.replace(
+                    &format!("sdk-revision = \"{}\"", fixture_profile.sdk_revision),
+                    &format!("sdk-revision = \"{}\"", foreign_profile.sdk_revision),
+                );
+                assert_ne!(mixed, lock, "sdk-revision line must have been rewritten");
+                fs::write(&lock_path, mixed).expect("mixed lock");
+                let error = Project::load(fixture.path()).expect_err(&format!(
+                    "protocol {:?} with a foreign sdk-revision must fail",
+                    fixture_profile.protocol
+                ));
+                assert!(
+                    error.to_string().contains("profile fields cannot be mixed"),
+                    "protocol {:?}: unexpected error {error}",
+                    fixture_profile.protocol
+                );
+            }
+        }
+    }
+
+    /// Every published profile's full tuple round-trips, and no two
+    /// profiles accidentally share a field that would let one profile's
+    /// lock validate against another's expectations.
+    #[test]
+    fn published_profiles_have_pairwise_distinct_sdk_revisions() {
+        for (index, profile) in SUPPORTED_PROFILES.iter().enumerate() {
+            for other in &SUPPORTED_PROFILES[index + 1..] {
+                assert_ne!(
+                    profile.sdk_revision, other.sdk_revision,
+                    "profiles {:?} and {:?} must not share an SDK revision",
+                    profile.protocol, other.protocol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v004_profile_hash_matches_the_canonical_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.4");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            SUPPORTED_PROFILES[1].wit_sha256
+        );
+    }
+
+    #[test]
+    fn v005_profile_hash_matches_the_canonical_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.5");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            SUPPORTED_PROFILES[2].wit_sha256
         );
     }
 }
