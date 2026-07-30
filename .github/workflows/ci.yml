@@ -29,6 +29,7 @@ jobs:
           cargo build
           -p youth-counter
           -p youth-sdk-tally
+          -p youth-sdk-todo
           -p youth-trap-on-mount
           -p youth-trap-on-handle
           -p youth-invalid-snapshot

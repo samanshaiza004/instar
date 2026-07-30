@@ -10,7 +10,7 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | --- | --- | --- | --- |
 | Calculator | [samanshaiza004/youth-calculator](https://github.com/samanshaiza004/youth-calculator) | `CALC-F` | Gate D complete; one canonical component certified on Ubuntu, Windows, and macOS |
 | Timer | [samanshaiza004/youth-timer](https://github.com/samanshaiza004/youth-timer) | `TIMER-F` | Gate C-4 complete; durable scheduling, countdown presentation, overdue recovery, and redelivery proven |
-| Todo | Local sibling repository until Gate D | `TODO-F` | Gate A domain and codec proof; dynamic identity and structural SDK blockers reproduced |
+| Todo | Local sibling repository until Gate D | `TODO-F` | Gate C complete locally; 64-item structural, migration, focus, restart, rollback, and convergence evidence passing |
 
 ## Open findings
 
@@ -23,6 +23,9 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | TIMER-F005 | Platform discovery | A `handle`-only `enabled` omission produced a real, reproduced retained-tree divergence (keyboard shortcut silently stopped resolving) | Timer / Youth | Materially strengthens CALC-F009; build a `--verify-view-convergence` test mode in `crates/youth-test` (design proposed in Timer's `FINDINGS.md`) before considering SDK diffing or reactive dependencies |
 | TIMER-F006 | Platform discovery | Notification delivery design choice: guest-requested-after-elapse vs. schedule-attached descriptor | Timer / Youth | Recommends attaching a bounded notification descriptor to the schedule at creation, not a general effects API; decide before Gate C |
 | TIMER-F008 | Platform discovery | Application session counters and host schedule delivery identity must not be conflated | Timer / Youth | `youth:time` schedule generation must be host-issued and checked by the host, never guest-invented |
+| TODO-F004 | Platform discovery | Explicit per-item persistence repeats key construction, full record writes, cleanup, and migration | Todo / Youth | Compare with a later record-heavy application before choosing scoped keys, typed records, documents, or collection transactions |
+| TODO-F006 | Application convention | Explicit projection diffing is substantial; an initial full-model insertion lookup exhausted turn fuel at capacity | Todo | Bounded locally to the five-row projection; retain as evidence when evaluating SDK tree diffing |
+| TODO-F009 | Platform discovery | Replacing a five-row page expands into many existing primitive structural patches | Todo / Youth | Measure patch count and latency before considering list semantics; one application does not authorize a protocol node |
 
 ## Accepted evidence
 
@@ -44,6 +47,11 @@ produced them. An entry is evidence, not automatic authorization for a feature.
 | TIMER-F009 | Boundary confirmation | `ab65ec3` 22 unit tests plus one full `.youth-test` scenario, zero raw WIT concepts | The mode machine, bounded configuration, session counting, eleven distinct commands with shortcuts, durable persistence, and restart recovery all built without any protocol change | The next `youth:time` work should stay narrow — scheduling, presentation, delivery, reconciliation, notification — and should not touch application lifecycle, persistence API, or command system |
 | TIMER-F011 | Platform discovery | Youth `97d7b3b` Gate B | A durable schedule had no representation outliving one spawned app instance | Closed: schedule creation, persistence, due detection, wake validation, pending delivery, and acknowledgement are host-owned; the guest owns only its transactional reaction. Auto-mount of an unloaded app remains deferred policy (DP2 D4g) |
 | TIMER-F010 | Boundary confirmation | `ab65ec3` `tests/basic.youth-test` paused-advance case | `activate advance-1s` reaches the guest's `handle` while the button is presented disabled; `crates/youth-interaction`'s `enabled_buttons` filtering is not applied to direct activation | `enabled` is presentation policy only, not access control; every guest must independently validate command preconditions. The test DSL's `activate` should eventually be documented (or renamed) as direct semantic injection, distinct from a future interaction-policy-respecting `click` |
+| TODO-F001 | Platform discovery | Todo Gate A `f690a7b`; Youth `784c17d` | Static-only SDK keys could not express stable identities derived from durable task IDs | Addressed by bounded typed `ItemKey` derivation with frozen vectors and full-tree collision rejection; no WIT change |
+| TODO-F002 | Platform discovery | Todo Gate A `f690a7b`; Youth `90b7bf8` | Existing protocol patches were inaccessible without raw bindings | Addressed by named containers and strict SDK operations that expand into the unchanged `0.0.5` patch vocabulary |
+| TODO-F007 | Boundary confirmation | Todo `fee04a5`; Youth `844102b` | Five external scenarios reconstruct an equivalent view after mount, restart, and every committed turn | Convergence is now enforceable headlessly without installing the reconstructed tree or publishing observer traffic; automatic diffing remains unproven |
+| TODO-F008 | Tooling defect | Todo 64-item scenario; Youth Todo branch | A guest failure diagnostic omitted its stable category, hiding that the defect was `FuelExhausted` | Test diagnostics now include stable runtime categories without exposing raw guest errors; bounded projected lookup fixed the app defect |
+| TODO-F010 | Boundary confirmation | Todo `fee04a5` source audit | Dynamic collections, migration, structural updates, and derived commands expose zero raw WIT/lifecycle machinery | DP0's SDK boundary survives the third and most structurally demanding Utility application |
 
 ## Classification
 

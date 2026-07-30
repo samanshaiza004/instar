@@ -13,6 +13,7 @@ members = [
     "guests/counter",
     "test-components/legacy-v003",
     "test-components/sdk-tally",
+    "test-components/sdk-todo",
     "test-components/sdk-time",
     "test-components/time-stub",
     "test-components/instant-now",

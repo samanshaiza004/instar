@@ -1141,7 +1141,7 @@ fn runtime(path: &Path, command: &LocatedCommand, error: youth_runtime::RuntimeE
         path: path.to_path_buf(),
         line: command.line,
         command: command.source.clone(),
-        message: error.to_string(),
+        message: format!("{:?}: {error}", error.category()),
     }
 }
 

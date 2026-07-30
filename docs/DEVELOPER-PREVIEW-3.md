@@ -1,6 +1,6 @@
 # Developer Preview 3 — Dynamic Todo Collections
 
-- Status: **Gate A in progress**
+- Status: **Gates A through C complete locally; Gate D release evidence in progress**
 - Youth branch: `codex/utility-todo`
 - Driving application: Youth Todo (`dev.saman.todo`)
 - Application protocol: `youth:app@0.0.5` (unchanged)
@@ -23,9 +23,9 @@ diffing, and reactive dependencies remain out of scope.
 
 | Gate | Evidence | Status |
 | --- | --- | --- |
-| `utility-todo-gate-a-domain-proof` | Pure collection model, strict v1/v2 codec, atomic migration plan, SDK blocker reproduction | In progress |
-| `utility-todo-gate-b-structural-sdk` | Derived identities, named containers, explicit structural updates, derived test selectors, view convergence | Not started |
-| `utility-todo-gate-c-collection-evidence` | Complete external Todo behavior, paging/filtering, rollback, focus, restart, migration | Not started |
+| `utility-todo-gate-a-domain-proof` | Pure collection model, strict v1/v2 codec, atomic migration plan, SDK blocker reproduction | Complete (Todo `f690a7b`) |
+| `utility-todo-gate-b-structural-sdk` | Derived identities, named containers, explicit structural updates, derived test selectors, view convergence | Complete (`4b06841`; SDK tag at `844102b`) |
+| `utility-todo-gate-c-collection-evidence` | Complete external Todo behavior, paging/filtering, rollback, focus, restart, migration | Complete locally (Todo `fee04a5`) |
 | `utility-todo-gate-d-release` | Canonical artifact certified unchanged on all hosts, source-build portability, metrics and findings | Not started |
 
 Gate B is intentionally split into independently green B-1 through B-5
