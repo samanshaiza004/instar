@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,19 @@ impl Selector {
                 .expect("parsed derived selectors are valid"),
         };
         NodeId::new(value).expect("symbolic IDs are nonzero")
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(name) => write!(formatter, "{name:?}"),
+            Self::Derived {
+                namespace,
+                item,
+                role,
+            } => write!(formatter, "derived {namespace:?} {item} {role:?}"),
+        }
     }
 }
 
@@ -738,12 +752,16 @@ pub async fn run_file_with_options(
             Command::ExpectFocus { selector } => {
                 let expected = selector.as_ref().map(Selector::node_id);
                 if interaction.focused() != expected {
+                    let expected = selector
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "none".to_owned());
                     return Err(TestError::Diagnostic {
                         path: path.to_path_buf(),
                         line: located.line,
                         command: located.source.clone(),
                         message: format!(
-                            "expected focus {selector:?}; observed {:?}",
+                            "expected focus {expected}; observed {:?}",
                             interaction.focused().map(NodeId::get)
                         ),
                     });
@@ -759,7 +777,7 @@ pub async fn run_file_with_options(
                     return Err(assertion_error(
                         path,
                         &located,
-                        format!("expected {selector:?} to be present; observed no semantic node"),
+                        format!("expected {selector} to be present; observed no semantic node"),
                     ));
                 }
             }
@@ -774,7 +792,7 @@ pub async fn run_file_with_options(
                         path,
                         &located,
                         format!(
-                            "expected {selector:?} to be missing; observed {}",
+                            "expected {selector} to be missing; observed {}",
                             describe(Some(&node.data))
                         ),
                     ));
@@ -1085,7 +1103,7 @@ fn expect_text(
             line: located.line,
             command: located.source.clone(),
             message: format!(
-                "expected text {selector:?} to equal {expected:?}; observed {}",
+                "expected text {selector} to equal {expected:?}; observed {}",
                 describe(observed)
             ),
         }),
@@ -1107,7 +1125,7 @@ fn expect_countdown(
             line: located.line,
             command: located.source.clone(),
             message: format!(
-                "expected countdown {selector:?}; observed {}",
+                "expected countdown {selector}; observed {}",
                 describe(observed)
             ),
         }),
