@@ -28,7 +28,7 @@ impl Application for TodoFixture {
     }
 
     fn handle(context: &mut EventContext, events: &Events) -> Result<Update> {
-        if !events.commanded(command!("add")) {
+        if !events.activated(command!("add")) {
             return Err(Error::rejected_event());
         }
         let state = context.state();

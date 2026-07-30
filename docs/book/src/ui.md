@@ -1,10 +1,22 @@
 # UI guide
 
 The current Utility Suite contract supports one root containing column, row,
-and equal-track grid boxes, text, and buttons. The SDK
-assigns anonymous root and container IDs deterministically in the lower half
-of the ID space. `node!("name")` creates an app-global stable ID in the upper
-half.
+and equal-track grid boxes, text, and buttons. Named identities are app-global
+and stable across reconstruction; node and command identities are separate
+typed domains. Anonymous containers are deterministic and should be reserved
+for static layout. Name any subtree whose identity must survive insertion,
+movement, filtering, focus, resync, or replacement.
+
+For repeated use, declare identities once:
+
+```rust
+mod ui {
+    youth_sdk::ui_ids! {
+        node DISPLAY = "display";
+        command EQUALS = "equals";
+    }
+}
+```
 
 ```rust
 Tree::root(Column::new([
@@ -24,15 +36,21 @@ Tree::root(Column::new([
 Handle an activation by returning the smallest supported semantic update:
 
 ```rust
-if events.commanded(command!("equals")) {
-    return Ok(Update::new().set_text(node!("display"), "42"));
+if events.activated(ui::EQUALS) {
+    return Ok(Update::new().set_text(ui::DISPLAY, "42"));
 }
 Ok(Update::unchanged())
 ```
 
+`Events::commanded` remains as a source-compatible alias for existing Utility
+Suite applications; new code should use `activated` for both node and command
+identities.
+
 Node and command names are exact UTF-8 and app-global, but use separate typed
 ID domains. Duplicate names, commands, shortcuts, and collisions are errors.
-A button under a disabled box cannot be activated.
+A disabled button is skipped by normal host interaction policy. Direct
+semantic invocation may still reach the guest, so the guest must validate
+command preconditions against its own domain state.
 
 For dynamic collections, the SDK also provides bounded `ItemKey` identities.
 An item key derives stable node and command identities from an application

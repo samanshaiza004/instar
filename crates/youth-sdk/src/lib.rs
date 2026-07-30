@@ -408,6 +408,69 @@ macro_rules! command {
     }};
 }
 
+/// Declares typed, reusable application identities once at module scope.
+///
+/// The generated constants retain the static `NodeKey` and `CommandKey` types,
+/// so view construction and event handling cannot drift because of repeated
+/// string literals.
+#[macro_export]
+macro_rules! ui_ids {
+    () => {};
+    (node $name:ident = $node_name:literal; $($rest:tt)*) => {
+        pub const $name: $crate::NodeKey = $crate::NodeKey::new($node_name);
+        $crate::ui_ids!($($rest)*);
+    };
+    (command $name:ident = $command_name:literal; $($rest:tt)*) => {
+        pub const $name: $crate::CommandKey = $crate::CommandKey::new($command_name);
+        $crate::ui_ids!($($rest)*);
+    };
+}
+
+/// A statically typed identity that can be checked against a semantic
+/// activation. Node identities match direct node activation; command
+/// identities match the command attached to the activated button.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ActivationKey {
+    Node(NodeIdentity),
+    Command(CommandIdentity),
+}
+
+impl From<NodeKey> for ActivationKey {
+    fn from(value: NodeKey) -> Self {
+        Self::Node(value.into())
+    }
+}
+
+impl From<ItemNodeKey> for ActivationKey {
+    fn from(value: ItemNodeKey) -> Self {
+        Self::Node(value.into())
+    }
+}
+
+impl From<NodeIdentity> for ActivationKey {
+    fn from(value: NodeIdentity) -> Self {
+        Self::Node(value)
+    }
+}
+
+impl From<CommandKey> for ActivationKey {
+    fn from(value: CommandKey) -> Self {
+        Self::Command(value.into())
+    }
+}
+
+impl From<ItemCommandKey> for ActivationKey {
+    fn from(value: ItemCommandKey) -> Self {
+        Self::Command(value.into())
+    }
+}
+
+impl From<CommandIdentity> for ActivationKey {
+    fn from(value: CommandIdentity) -> Self {
+        Self::Command(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextAlign {
     Start,
@@ -875,17 +938,19 @@ pub struct Events {
 
 impl Events {
     #[must_use]
-    pub fn activated(&self, key: impl Into<NodeIdentity>) -> bool {
-        let key = key.into();
-        self.events
-            .iter()
-            .any(|event| matches!(event, Event::Activated(id) if *id == key.id()))
+    pub fn activated(&self, key: impl Into<ActivationKey>) -> bool {
+        match key.into() {
+            ActivationKey::Node(key) => self
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Activated(id) if *id == key.id())),
+            ActivationKey::Command(key) => self.commanded.contains(&key.id()),
+        }
     }
 
     #[must_use]
     pub fn commanded(&self, key: impl Into<CommandIdentity>) -> bool {
-        let key = key.into();
-        self.commanded.contains(&key.id())
+        self.activated(key.into())
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Event> {
@@ -1905,12 +1970,12 @@ mod time {
 
 pub mod prelude {
     pub use crate::{
-        Application, BoxNode, Button, Column, CommandIdentity, CommandKey, Countdown,
-        CountdownFormat, ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events,
-        Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity, NodeKey,
-        Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
+        ActivationKey, Application, BoxNode, Button, Column, CommandIdentity, CommandKey,
+        Countdown, CountdownFormat, ElapsedReason, Element, Error, ErrorKind, Event, EventContext,
+        Events, Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity,
+        NodeKey, Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
         TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext, command,
-        derived_command_id, derived_node_id, node,
+        derived_command_id, derived_node_id, node, ui_ids,
     };
 }
 
@@ -1941,6 +2006,14 @@ pub mod __private {
 mod tests {
     use super::*;
 
+    mod declared_ids {
+        crate::ui_ids! {
+            node DISPLAY = "display";
+            command EQUALS = "equals";
+            node STATUS = "status";
+        }
+    }
+
     fn schedule() -> Schedule {
         Schedule {
             id: 17,
@@ -1953,6 +2026,14 @@ mod tests {
         assert_eq!(named_node_id("count"), 0xf700_b2fe_97f6_53d6);
         assert_eq!(named_node_id("increment"), 0xd9e1_c44e_444d_fb74);
         assert_eq!(named_node_id("café"), 0xcab8_7ecf_2aee_1d93);
+    }
+
+    #[test]
+    fn declared_ids_preserve_typed_static_keys() {
+        assert_eq!(declared_ids::DISPLAY.name(), "display");
+        assert_eq!(declared_ids::STATUS.name(), "status");
+        assert_eq!(declared_ids::EQUALS.name(), "equals");
+        assert_ne!(declared_ids::DISPLAY.id(), declared_ids::EQUALS.id());
     }
 
     #[test]
@@ -2002,7 +2083,7 @@ mod tests {
             events: vec![Event::Activated(button_id)],
             commanded: vec![toggle.id()],
         };
-        assert!(events.commanded(toggle));
+        assert!(events.activated(toggle));
     }
 
     #[test]
