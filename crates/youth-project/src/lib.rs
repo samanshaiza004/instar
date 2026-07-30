@@ -66,6 +66,12 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         // until this exact revision was verified reachable on the remote.
         sdk_revision: "bfd539ca5e0d8d63b9dcdb28c744758255560dc1",
     },
+    ContractProfile {
+        protocol: "0.0.5",
+        wit_sha256: "59a787f283d587c6c35d9f596ca69b479c21cebf4f25519f1bface96c25e2385",
+        template_version: 3,
+        sdk_revision: "844102bbeadfbbf135e4b9da36423bdc435fbb16",
+    },
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -195,7 +201,7 @@ impl Project {
             &self.lock.cli_version,
             running_cli_version,
         )?;
-        let profile = contract_profile(&self.manifest.app.protocol)?;
+        let profile = contract_profile_for_lock(&self.manifest, &self.lock)?;
         let digest = hash_wit_tree(self.root.join("wit/youth"))?;
         compare("lock.wit-sha256", &self.lock.wit_sha256, &digest)?;
         compare("contract-profile.wit-sha256", profile.wit_sha256, &digest)?;
@@ -239,21 +245,6 @@ fn validate_lock(manifest: &Manifest, lock: &Lock) -> Result<(), ProjectError> {
     if lock.lock_version != 1 {
         return mismatch("lock-version", lock.lock_version, 1);
     }
-    let profile = contract_profile(&manifest.app.protocol)?;
-    if lock.protocol != profile.protocol
-        || lock.wit_sha256 != profile.wit_sha256
-        || lock.template_version != profile.template_version
-        || lock.sdk_revision != profile.sdk_revision
-    {
-        return Err(ProjectError::Contract(format!(
-            "lock contract fields do not match the {:?} profile: expected protocol {:?}, wit-sha256 {:?}, template-version {}, and sdk-revision {:?}; profile fields cannot be mixed",
-            profile.protocol,
-            profile.protocol,
-            profile.wit_sha256,
-            profile.template_version,
-            profile.sdk_revision,
-        )));
-    }
     compare("sdk-source", &lock.sdk_source, SDK_SOURCE)?;
     compare("cli-version", &lock.cli_version, CLI_VERSION)?;
     if !is_lower_hex(&lock.sdk_revision, 40) {
@@ -266,7 +257,44 @@ fn validate_lock(manifest: &Manifest, lock: &Lock) -> Result<(), ProjectError> {
             "wit-sha256 must be exactly 64 lowercase hexadecimal characters".into(),
         ));
     }
+    contract_profile_for_lock(manifest, lock)?;
     Ok(())
+}
+
+fn contract_profile_for_lock(
+    manifest: &Manifest,
+    lock: &Lock,
+) -> Result<&'static ContractProfile, ProjectError> {
+    contract_profile(&manifest.app.protocol)?;
+    SUPPORTED_PROFILES
+        .iter()
+        .find(|profile| {
+            manifest.app.protocol == profile.protocol
+                && lock.protocol == profile.protocol
+                && lock.wit_sha256 == profile.wit_sha256
+                && lock.template_version == profile.template_version
+                && lock.sdk_revision == profile.sdk_revision
+        })
+        .ok_or_else(|| {
+            let expected = SUPPORTED_PROFILES
+                .iter()
+                .filter(|profile| profile.protocol == manifest.app.protocol)
+                .map(|profile| {
+                    format!(
+                        "(protocol {:?}, wit-sha256 {:?}, template-version {}, sdk-revision {:?})",
+                        profile.protocol,
+                        profile.wit_sha256,
+                        profile.template_version,
+                        profile.sdk_revision
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" or ");
+            ProjectError::Contract(format!(
+                "lock contract fields do not match an exact supported profile: found (protocol {:?}, wit-sha256 {:?}, template-version {}, sdk-revision {:?}); expected {expected}; profile fields cannot be mixed",
+                lock.protocol, lock.wit_sha256, lock.template_version, lock.sdk_revision
+            ))
+        })
 }
 
 fn contract_profile(protocol: &str) -> Result<&'static ContractProfile, ProjectError> {
@@ -669,6 +697,17 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
                 );
                 assert_ne!(mixed, lock, "sdk-revision line must have been rewritten");
                 fs::write(&lock_path, mixed).expect("mixed lock");
+                let substituted_tuple_is_published = SUPPORTED_PROFILES.iter().any(|profile| {
+                    profile.protocol == fixture_profile.protocol
+                        && profile.wit_sha256 == fixture_profile.wit_sha256
+                        && profile.template_version == fixture_profile.template_version
+                        && profile.sdk_revision == foreign_profile.sdk_revision
+                });
+                if substituted_tuple_is_published {
+                    Project::load(fixture.path())
+                        .expect("a second exact profile for one protocol must validate");
+                    continue;
+                }
                 let error = Project::load(fixture.path()).expect_err(&format!(
                     "protocol {:?} with a foreign sdk-revision must fail",
                     fixture_profile.protocol
@@ -713,6 +752,16 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
         assert_eq!(
             hash_wit_tree(root).expect("canonical WIT hash"),
             SUPPORTED_PROFILES[2].wit_sha256
+        );
+        assert_eq!(SUPPORTED_PROFILES[2].protocol, "0.0.5");
+        assert_eq!(SUPPORTED_PROFILES[3].protocol, "0.0.5");
+        assert_eq!(
+            SUPPORTED_PROFILES[2].wit_sha256,
+            SUPPORTED_PROFILES[3].wit_sha256
+        );
+        assert_ne!(
+            SUPPORTED_PROFILES[2].sdk_revision,
+            SUPPORTED_PROFILES[3].sdk_revision
         );
     }
 }

@@ -25,8 +25,8 @@ pub use config::{
 pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
 pub use host::{
-    AppFault, AppInspection, AppLifecycle, ScheduleWake, TurnReceipt, WakeDisposition, YouthApp,
-    component_imports,
+    AppFault, AppInspection, AppLifecycle, ScheduleWake, TurnReceipt, ViewVerification,
+    WakeDisposition, YouthApp, component_imports,
 };
 pub use limits::{CallBudget, RuntimeLimits};
 pub use presentation::{next_display_boundary_epoch_millis, resolve_countdown_display};

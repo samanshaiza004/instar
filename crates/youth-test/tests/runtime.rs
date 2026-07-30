@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use youth_state::AppId;
+use youth_test::RunOptions;
 
 #[tokio::test]
 async fn sleep_command_blocks_real_runtime_progress() {
@@ -57,6 +58,38 @@ expect text count "Count: 1"
         &test,
         &component,
         &AppId::parse("dev.youth.dsl-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn convergence_mode_verifies_mount_committed_turn_and_restart() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-tally --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("convergence.youth-test");
+    fs::write(
+        &test,
+        r#"mount
+activate increment
+restart
+expect text count "Count: 1"
+"#,
+    )
+    .unwrap();
+
+    youth_test::run_file_with_options(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-convergence-fixture").unwrap(),
+        RunOptions {
+            verify_view_convergence: true,
+        },
     )
     .await
     .unwrap();

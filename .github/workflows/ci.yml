@@ -18,6 +18,7 @@ jobs:
     outputs:
       sha256: ${{ steps.hash.outputs.sha256 }}
       calculator_sha256: ${{ steps.calculator_hash.outputs.sha256 }}
+      todo_sha256: ${{ steps.todo_hash.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -29,6 +30,7 @@ jobs:
           cargo build
           -p youth-counter
           -p youth-sdk-tally
+          -p youth-sdk-todo
           -p youth-trap-on-mount
           -p youth-trap-on-handle
           -p youth-invalid-snapshot
@@ -73,19 +75,124 @@ jobs:
             --release
       - name: Record calculator SHA-256
         id: calculator_hash
+        env:
+          CALCULATOR_COMMIT: 696d2fbac58a99116fec28238ca51f5a4a5c2acd
+          YOUTH_COMMIT: ${{ github.sha }}
+          CI_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           component=target/calculator-external/wasm32-wasip2/release/calculator.wasm
           test -f "$component"
           digest=$(sha256sum "$component" | cut -d' ' -f1)
+          bytes=$(stat -c '%s' "$component")
+          calculator="$RUNNER_TEMP/youth-calculator"
+          protocol=$(awk -F'"' '/^protocol[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          sdk_revision=$(awk -F'"' '/^sdk-revision[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          wit_sha256=$(awk -F'"' '/^wit-sha256[[:space:]]*=/{print $2; exit}' "$calculator/Youth.lock")
+          rustc_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          export CALCULATOR_COMMIT YOUTH_COMMIT CI_RUN_ID digest bytes protocol sdk_revision wit_sha256 rustc_version cargo_version
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = {
+              "app_id": "dev.saman.calculator",
+              "app_commit": os.environ["CALCULATOR_COMMIT"],
+              "youth_commit": os.environ["YOUTH_COMMIT"],
+              "sdk_revision": os.environ["sdk_revision"],
+              "protocol": os.environ["protocol"],
+              "wit_sha256": os.environ["wit_sha256"],
+              "component_sha256": os.environ["digest"],
+              "component_bytes": int(os.environ["bytes"]),
+              "rustc": os.environ["rustc_version"],
+              "cargo": os.environ["cargo_version"],
+              "build_profile": "release",
+              "canonical_builder": "ubuntu-x86_64",
+              "build_command": "cargo build --manifest-path <calculator>/Cargo.toml --target wasm32-wasip2 --release",
+              "ci_run_id": int(os.environ["CI_RUN_ID"]),
+              "supported_contract_profiles": ["youth:app@0.0.3"],
+          }
+          output = Path("target/calculator-external/calculator-canonical-manifest.json")
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+          mkdir -p target/calculator-certified-artifact
+          cp "$component" target/calculator-certified-artifact/calculator.wasm
+          cp target/calculator-external/calculator-canonical-manifest.json target/calculator-certified-artifact/
           echo "sha256=$digest" >> "$GITHUB_OUTPUT"
-          echo "calculator.wasm SHA-256: $digest"
+          echo "calculator.wasm SHA-256: $digest ($bytes bytes)"
+      - name: Build Todo component once
+        env:
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
+        run: |
+          set -euo pipefail
+          todo="$RUNNER_TEMP/youth-todo"
+          git clone --quiet https://github.com/samanshaiza004/youth-todo.git "$todo"
+          git -C "$todo" checkout --quiet "$TODO_COMMIT"
+          cargo build \
+            --manifest-path "$todo/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target/todo-external" \
+            --target wasm32-wasip2 \
+            --release \
+            --locked
+      - name: Record Todo SHA-256
+        id: todo_hash
+        env:
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
+          YOUTH_COMMIT: ${{ github.sha }}
+          CI_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          component=target/todo-external/wasm32-wasip2/release/youth_todo.wasm
+          test -f "$component"
+          digest=$(sha256sum "$component" | cut -d' ' -f1)
+          bytes=$(stat -c '%s' "$component")
+          todo="$RUNNER_TEMP/youth-todo"
+          protocol=$(awk -F'"' '/^protocol[[:space:]]*=/{print $2; exit}' "$todo/Youth.lock")
+          sdk_revision=$(awk -F'"' '/^sdk-revision[[:space:]]*=/{print $2; exit}' "$todo/Youth.lock")
+          wit_sha256=$(awk -F'"' '/^wit-sha256[[:space:]]*=/{print $2; exit}' "$todo/Youth.lock")
+          rustc_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          export TODO_COMMIT YOUTH_COMMIT CI_RUN_ID digest bytes protocol sdk_revision wit_sha256 rustc_version cargo_version
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = {
+              "app_id": "dev.saman.todo",
+              "app_commit": os.environ["TODO_COMMIT"],
+              "youth_commit": os.environ["YOUTH_COMMIT"],
+              "sdk_revision": os.environ["sdk_revision"],
+              "protocol": os.environ["protocol"],
+              "wit_sha256": os.environ["wit_sha256"],
+              "component_sha256": os.environ["digest"],
+              "component_bytes": int(os.environ["bytes"]),
+              "rustc": os.environ["rustc_version"],
+              "cargo": os.environ["cargo_version"],
+              "build_profile": "release",
+              "canonical_builder": "ubuntu-x86_64",
+              "build_command": "cargo build --manifest-path <todo>/Cargo.toml --target wasm32-wasip2 --release",
+              "ci_run_id": int(os.environ["CI_RUN_ID"]),
+              "supported_contract_profiles": ["youth:app@0.0.5"],
+              "reproducible_builds_claimed": False,
+          }
+          output = Path("target/todo-external/todo-canonical-manifest.json")
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+          mkdir -p target/todo-certified-artifact
+          cp "$component" target/todo-certified-artifact/todo.wasm
+          cp target/todo-external/todo-canonical-manifest.json target/todo-certified-artifact/
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          echo "todo.wasm SHA-256: $digest ($bytes bytes)"
       - uses: actions/upload-artifact@v4
         with:
           name: counter-wasm
           path: |
             target/wasm32-wasip2/release/youth_counter.wasm
             target/wasm32-wasip2/release/youth_sdk_tally.wasm
+            target/wasm32-wasip2/release/youth_sdk_todo.wasm
             target/wasm32-wasip2/release/youth_trap_on_mount.wasm
             target/wasm32-wasip2/release/youth_trap_on_handle.wasm
             target/wasm32-wasip2/release/youth_invalid_snapshot.wasm
@@ -112,7 +219,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: calculator-wasm
-          path: target/calculator-external/wasm32-wasip2/release/calculator.wasm
+          path: target/calculator-certified-artifact/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: todo-wasm
+          path: target/todo-certified-artifact/*
           if-no-files-found: error
 
   host:
@@ -142,6 +254,10 @@ jobs:
         with:
           name: calculator-wasm
           path: target/calculator-certified
+      - uses: actions/download-artifact@v4
+        with:
+          name: todo-wasm
+          path: target/todo-certified
       - name: Verify guest SHA-256
         shell: pwsh
         run: |
@@ -261,9 +377,27 @@ jobs:
           $certifiedComponent = (Resolve-Path "target/calculator-certified/calculator.wasm").Path
           $certifiedHash = (Get-FileHash $certifiedComponent -Algorithm SHA256).Hash.ToLowerInvariant()
           $expectedHash = "${{ needs.guest.outputs.calculator_sha256 }}".ToLowerInvariant()
+          $manifestPath = (Resolve-Path "target/calculator-certified/calculator-canonical-manifest.json").Path
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.app_id -ne "dev.saman.calculator") {
+            throw "canonical calculator manifest app ID is unexpected: $($manifest.app_id)"
+          }
+          if ($manifest.app_commit -ne $env:CALCULATOR_COMMIT) {
+            throw "canonical calculator manifest app commit mismatch: expected $env:CALCULATOR_COMMIT, got $($manifest.app_commit)"
+          }
+          if ($manifest.protocol -ne "0.0.3") {
+            throw "canonical calculator manifest protocol is unexpected: $($manifest.protocol)"
+          }
+          if ($manifest.component_sha256 -ne $expectedHash) {
+            throw "canonical calculator manifest mismatch: expected $expectedHash, got $($manifest.component_sha256)"
+          }
+          if ([int64]$manifest.component_bytes -ne (Get-Item $certifiedComponent).Length) {
+            throw "canonical calculator manifest byte count does not match the downloaded component"
+          }
           if ($certifiedHash -ne $expectedHash) {
             throw "certified calculator SHA-256 mismatch: expected $expectedHash, got $certifiedHash"
           }
+          Write-Host "calculator certified SHA-256: expected $expectedHash, observed $certifiedHash"
           & $cli mount $certifiedComponent
           if ($LASTEXITCODE -ne 0) { throw "certified calculator mount failed" }
           $calculator = Join-Path $env:RUNNER_TEMP "youth-calculator"
@@ -314,6 +448,89 @@ jobs:
         with:
           name: calculator-sha-${{ runner.os }}
           path: ${{ runner.temp }}/calculator-sha-${{ runner.os }}.txt
+          if-no-files-found: error
+      - name: External Todo workflow
+        shell: pwsh
+        env:
+          TODO_COMMIT: 632e20cb569d862139a09a48622b317e04b7238a
+        run: |
+          $cliName = if ($IsWindows) { "youth.exe" } else { "youth" }
+          $cli = (Resolve-Path (Join-Path "target/release" $cliName)).Path
+          $certifiedComponent = (Resolve-Path "target/todo-certified/todo.wasm").Path
+          $certifiedHash = (Get-FileHash $certifiedComponent -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = "${{ needs.guest.outputs.todo_sha256 }}".ToLowerInvariant()
+          $manifestPath = (Resolve-Path "target/todo-certified/todo-canonical-manifest.json").Path
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.app_id -ne "dev.saman.todo") {
+            throw "canonical Todo manifest app ID is unexpected: $($manifest.app_id)"
+          }
+          if ($manifest.app_commit -ne $env:TODO_COMMIT) {
+            throw "canonical Todo manifest app commit mismatch: expected $env:TODO_COMMIT, got $($manifest.app_commit)"
+          }
+          if ($manifest.protocol -ne "0.0.5") {
+            throw "canonical Todo manifest protocol is unexpected: $($manifest.protocol)"
+          }
+          if ($manifest.component_sha256 -ne $expectedHash) {
+            throw "canonical Todo manifest hash mismatch: expected $expectedHash, got $($manifest.component_sha256)"
+          }
+          if ([int64]$manifest.component_bytes -ne (Get-Item $certifiedComponent).Length) {
+            throw "canonical Todo manifest byte count does not match the downloaded component"
+          }
+          if ($certifiedHash -ne $expectedHash) {
+            throw "certified Todo SHA-256 mismatch: expected $expectedHash, got $certifiedHash"
+          }
+          Write-Host "Todo certified SHA-256: expected $expectedHash, observed $certifiedHash"
+          & $cli mount $certifiedComponent
+          if ($LASTEXITCODE -ne 0) { throw "certified Todo mount failed" }
+
+          $todo = Join-Path $env:RUNNER_TEMP "youth-todo-host"
+          git clone --quiet https://github.com/samanshaiza004/youth-todo.git $todo
+          git -C $todo checkout --quiet $env:TODO_COMMIT
+          $checkedOut = (git -C $todo rev-parse HEAD).Trim()
+          if ($checkedOut -ne $env:TODO_COMMIT) {
+            throw "Todo revision mismatch: expected $env:TODO_COMMIT, got $checkedOut"
+          }
+          Push-Location $todo
+          try {
+            & $cli check
+            if ($LASTEXITCODE -ne 0) { throw "Todo youth check failed" }
+            & $cli test --verify-view-convergence
+            if ($LASTEXITCODE -ne 0) { throw "Todo convergent youth test failed" }
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { throw "Todo youth build --release failed" }
+            $component = Join-Path $todo "dist/dev.saman.todo.wasm"
+            if (-not (Test-Path $component -PathType Leaf)) {
+              throw "Todo release component was not produced"
+            }
+            & wasm-tools validate $component
+            if ($LASTEXITCODE -ne 0) { throw "Todo component validation failed" }
+            if (Select-String -Path Cargo.toml -Pattern 'path\s*=') {
+              throw "Todo Cargo.toml contains a local path dependency"
+            }
+            $forbidden = 'wit_bindgen|bindings::|PatchBatch|tree_revision|acknowledg|NodeId::new|CommandKey::new|NodeKey::new'
+            $source = Get-ChildItem src -Recurse -File -Filter *.rs
+            if ($source | Select-String -Pattern $forbidden) {
+              throw "Todo source contains raw Youth runtime or WIT concepts"
+            }
+            $lock = Get-Content Youth.lock -Raw
+            if ($lock -notmatch 'sdk-revision\s*=\s*"844102bbeadfbbf135e4b9da36423bdc435fbb16"') {
+              throw "Todo Youth.lock does not pin the certified collections SDK revision"
+            }
+            $localHash = (Get-FileHash $component -Algorithm SHA256).Hash.ToLowerInvariant()
+            $metadata = Join-Path $env:RUNNER_TEMP "todo-sha-$env:RUNNER_OS.txt"
+            Set-Content -Path $metadata -Value $certifiedHash -NoNewline
+            Write-Host "Todo certified revision: $checkedOut"
+            Write-Host "Todo component bytes: $((Get-Item $component).Length)"
+            Write-Host "Todo locally-built SHA-256: $localHash"
+            Write-Host "Todo certified SHA-256: $certifiedHash"
+          } finally {
+            Pop-Location
+          }
+      - name: Upload Todo identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: todo-sha-${{ runner.os }}
+          path: ${{ runner.temp }}/todo-sha-${{ runner.os }}.txt
           if-no-files-found: error
       - name: Ubuntu full dev restart E2E
         if: runner.os == 'Linux'
@@ -370,3 +587,24 @@ jobs:
           test "${#hashes[@]}" -eq 1
           [[ "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]]
           echo "calculator component SHA-256 is identical on all hosts: ${hashes[0]}"
+
+  todo-cross-platform:
+    needs: host
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Todo identities
+        uses: actions/download-artifact@v4
+        with:
+          pattern: todo-sha-*
+          path: todo-identities
+          merge-multiple: true
+      - name: Require one certified Todo component identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find todo-identities -type f -name '*.txt' -print | sort)
+          test "${#files[@]}" -eq 3
+          mapfile -t hashes < <(for file in "${files[@]}"; do tr -d '\r\n' < "$file"; printf '\n'; done | sort -u)
+          test "${#hashes[@]}" -eq 1
+          [[ "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]]
+          echo "the exact certified Todo component ran on all hosts: ${hashes[0]}"

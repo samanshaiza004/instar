@@ -24,19 +24,16 @@
 | C3-2 | Runtime dispatch for `0.0.5`, install-time reference validation (D7d) | Complete (`af83784`) |
 | C3-3 | SDK `Countdown` builder, literal/countdown wire plumbing | Complete (`e30e001`) |
 | C3-4 | Pure display resolution (D7c), desktop `WaitUntil` repaint (D7b), decisive test | Complete (`1d8c227`) |
-| C-3 (Timer) | Timer adopts `Countdown` for its own countdown text node | Not started |
-| C-4 | Recovery and release | Not started |
+| C-3 (Timer) | Timer adopts `Countdown` for its own countdown text node | Complete (`gate-c3-countdown-presentation`) |
+| C-4 | Recovery, notification dispatch, and redelivery | Complete (`gate-c4-recovery`) |
 
-Gate B proved the **host capability** for scheduling; Gate C-3 proves it for
+Gate B proved the **host capability** for scheduling; Gate C-3 proved it for
 **presentation** — a countdown's digits are host-resolved and host-repainted,
-never a guest turn. Both are platform capability, not yet application
-evidence: the architectural loop closes only once Timer's own `view()`
-declares a `Countdown` node instead of a static duration string. Until then
-`TIMER-F004` remains open as *application* evidence, and the `0.0.5`
-`ContractProfile` in `youth-project` is deliberately unpublished — see the
-comment above `SUPPORTED_PROFILES` — pending the post-push two-commit
-SDK-revision pin, the same discipline already used for `0.0.4` and its
-pause/resume fix.
+never a guest turn. Timer then closed the application-evidence loop by
+declaring its own `Countdown` node. Gate C-4 proved overdue recovery,
+notification dispatch, and redelivery through the external application's real
+test suite. The published `0.0.5` contract profile remains pinned to Timer's
+immutable SDK revision.
 
 ## Thesis
 

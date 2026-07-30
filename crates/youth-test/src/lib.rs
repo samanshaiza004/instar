@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +13,50 @@ use youth_state::{AppId, GuestCallPhase, StateLimits, StateLocation, StateStore,
 use youth_tree::{NodeData, NodeId, Tree, TreeSnapshot};
 
 use youth_interaction::{InteractionState, LogicalKey, Modifiers, SemanticAction};
+use youth_runtime::RuntimeEvent;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunOptions {
+    pub verify_view_convergence: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Selector {
+    Static(String),
+    Derived {
+        namespace: String,
+        item: u64,
+        role: String,
+    },
+}
+
+impl Selector {
+    fn node_id(&self) -> NodeId {
+        let value = match self {
+            Self::Static(name) => youth_sdk::named_node_id(name),
+            Self::Derived {
+                namespace,
+                item,
+                role,
+            } => youth_sdk::derived_node_id(namespace, *item, role)
+                .expect("parsed derived selectors are valid"),
+        };
+        NodeId::new(value).expect("symbolic IDs are nonzero")
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(name) => write!(formatter, "{name:?}"),
+            Self::Derived {
+                namespace,
+                item,
+                role,
+            } => write!(formatter, "derived {namespace:?} {item} {role:?}"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -20,7 +66,7 @@ pub enum Command {
     },
     Mount,
     Activate {
-        name: String,
+        selector: Selector,
     },
     Sleep {
         millis: u64,
@@ -31,14 +77,29 @@ pub enum Command {
         modifiers: Modifiers,
     },
     ExpectText {
-        name: String,
+        selector: Selector,
         expected: String,
     },
     ExpectCountdown {
-        name: String,
+        selector: Selector,
     },
     ExpectFocus {
-        name: Option<String>,
+        selector: Option<Selector>,
+    },
+    ExpectPresent {
+        selector: Selector,
+    },
+    ExpectMissing {
+        selector: Selector,
+    },
+    ExpectChildCount {
+        parent: Selector,
+        expected: usize,
+    },
+    ExpectChild {
+        parent: Selector,
+        index: usize,
+        child: Selector,
     },
     ExpectState {
         key: String,
@@ -98,6 +159,10 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             | Command::ExpectText { .. }
             | Command::ExpectCountdown { .. }
             | Command::ExpectFocus { .. }
+            | Command::ExpectPresent { .. }
+            | Command::ExpectMissing { .. }
+            | Command::ExpectChildCount { .. }
+            | Command::ExpectChild { .. }
             | Command::ExpectState { .. }
             | Command::Restart => {
                 if !mounted {
@@ -135,10 +200,9 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         return Ok(Command::Restart);
     }
     if let Some(name) = source.strip_prefix("activate ") {
-        validate_name(path, line, source, name)?;
-        return Ok(Command::Activate {
-            name: name.to_owned(),
-        });
+        let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::Activate { selector });
     }
     if let Some(digits) = source.strip_prefix("sleep ") {
         let millis = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -211,44 +275,164 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         return Ok(Command::ExpectState { key, expected });
     }
     if let Some(arguments) = source.strip_prefix("expect text ") {
-        let (name, encoded) = arguments.split_once(' ').ok_or_else(|| {
-            diagnostic(
+        let (selector, encoded) = parse_selector_prefix(path, line, source, arguments)?;
+        if encoded.is_empty() {
+            return Err(diagnostic(
                 path,
                 line,
                 source,
-                "expected: expect text <node-name> <JSON-string>",
-            )
-        })?;
-        validate_name(path, line, source, name)?;
+                "expected: expect text <selector> <JSON-string>",
+            ));
+        }
         let expected: String = serde_json::from_str(encoded).map_err(|error| {
             diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
         })?;
-        return Ok(Command::ExpectText {
-            name: name.to_owned(),
-            expected,
-        });
+        return Ok(Command::ExpectText { selector, expected });
     }
     if let Some(name) = source.strip_prefix("expect countdown ") {
-        validate_name(path, line, source, name)?;
-        return Ok(Command::ExpectCountdown {
-            name: name.to_owned(),
-        });
+        let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectCountdown { selector });
     }
     if let Some(name) = source.strip_prefix("expect focus ") {
         if name == "none" {
-            return Ok(Command::ExpectFocus { name: None });
+            return Ok(Command::ExpectFocus { selector: None });
         }
-        validate_name(path, line, source, name)?;
+        let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
+        require_empty(path, line, source, remainder)?;
         return Ok(Command::ExpectFocus {
-            name: Some(name.to_owned()),
+            selector: Some(selector),
+        });
+    }
+    if let Some(value) = source.strip_prefix("expect present ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, value)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectPresent { selector });
+    }
+    if let Some(value) = source.strip_prefix("expect missing ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, value)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectMissing { selector });
+    }
+    if let Some(value) = source.strip_prefix("expect child-count ") {
+        let (parent, remainder) = parse_selector_prefix(path, line, source, value)?;
+        let expected = parse_usize(path, line, source, remainder, "child count")?;
+        return Ok(Command::ExpectChildCount { parent, expected });
+    }
+    if let Some(value) = source.strip_prefix("expect child ") {
+        let (parent, remainder) = parse_selector_prefix(path, line, source, value)?;
+        let (index, remainder) = parse_usize_prefix(path, line, source, remainder, "child index")?;
+        let (child, remainder) = parse_selector_prefix(path, line, source, remainder)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectChild {
+            parent,
+            index,
+            child,
         });
     }
     Err(diagnostic(
         path,
         line,
         source,
-        "unknown command; expected state, mount, activate, sleep, key, restart, expect text, expect countdown, expect focus, or expect state",
+        "unknown command; expected state, mount, activate, sleep, key, restart, or an expect assertion",
     ))
+}
+
+fn parse_selector_prefix<'a>(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &'a str,
+) -> Result<(Selector, &'a str), TestError> {
+    if let Some(input) = input.strip_prefix("derived ") {
+        let (namespace, input) = parse_json_string_prefix(path, line, source, input)?;
+        let (item, input) = parse_u64_prefix(path, line, source, input, "derived item ID")?;
+        if item == 0 {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "derived item ID must be nonzero",
+            ));
+        }
+        let (role, remainder) = parse_json_string_prefix(path, line, source, input)?;
+        youth_sdk::derived_node_id(&namespace, item, &role).map_err(|error| {
+            diagnostic(
+                path,
+                line,
+                source,
+                &format!("invalid derived selector: {error}"),
+            )
+        })?;
+        return Ok((
+            Selector::Derived {
+                namespace,
+                item,
+                role,
+            },
+            remainder,
+        ));
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let name = &input[..end];
+    validate_name(path, line, source, name)?;
+    Ok((Selector::Static(name.to_owned()), input[end..].trim_start()))
+}
+
+fn parse_u64_prefix<'a>(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &'a str,
+    label: &str,
+) -> Result<(u64, &'a str), TestError> {
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let value = &input[..end];
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            &format!("{label} must be an unsigned decimal integer"),
+        ));
+    }
+    let parsed = value
+        .parse()
+        .map_err(|error| diagnostic(path, line, source, &format!("invalid {label}: {error}")))?;
+    Ok((parsed, input[end..].trim_start()))
+}
+
+fn parse_usize_prefix<'a>(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &'a str,
+    label: &str,
+) -> Result<(usize, &'a str), TestError> {
+    let (value, remainder) = parse_u64_prefix(path, line, source, input, label)?;
+    let value = usize::try_from(value)
+        .map_err(|_| diagnostic(path, line, source, &format!("{label} is too large")))?;
+    Ok((value, remainder))
+}
+
+fn parse_usize(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &str,
+    label: &str,
+) -> Result<usize, TestError> {
+    let (value, remainder) = parse_usize_prefix(path, line, source, input, label)?;
+    require_empty(path, line, source, remainder)?;
+    Ok(value)
+}
+
+fn require_empty(path: &Path, line: usize, source: &str, remainder: &str) -> Result<(), TestError> {
+    if remainder.is_empty() {
+        Ok(())
+    } else {
+        Err(diagnostic(path, line, source, "unexpected trailing input"))
+    }
 }
 
 fn parse_json_string_prefix<'a>(
@@ -416,6 +600,15 @@ pub async fn run_directory(
     component: &Path,
     app_id: &AppId,
 ) -> Result<usize, TestError> {
+    run_directory_with_options(tests_directory, component, app_id, RunOptions::default()).await
+}
+
+pub async fn run_directory_with_options(
+    tests_directory: &Path,
+    component: &Path,
+    app_id: &AppId,
+    options: RunOptions,
+) -> Result<usize, TestError> {
     let mut files = fs::read_dir(tests_directory)
         .map_err(|source| TestError::Io {
             path: tests_directory.to_path_buf(),
@@ -447,12 +640,21 @@ pub async fn run_directory(
                 message: "test entries must be regular files, not symlinks".into(),
             });
         }
-        run_file(path, component, app_id).await?;
+        run_file_with_options(path, component, app_id, options).await?;
     }
     Ok(files.len())
 }
 
 pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(), TestError> {
+    run_file_with_options(path, component, app_id, RunOptions::default()).await
+}
+
+pub async fn run_file_with_options(
+    path: &Path,
+    component: &Path,
+    app_id: &AppId,
+    options: RunOptions,
+) -> Result<(), TestError> {
     let source = fs::read_to_string(path).map_err(|source| TestError::Io {
         path: path.to_path_buf(),
         source,
@@ -465,6 +667,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
     let state_file = state.path().join("state.sqlite3");
     seed_state(path, &script.commands, app_id, &state_file)?;
     let mut app = spawn(component, app_id, &state_file)?;
+    let mut events = app.subscribe();
     let mut snapshot = None;
     let mut interaction = InteractionState::default();
 
@@ -478,9 +681,12 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+                if options.verify_view_convergence {
+                    verify_view_convergence(path, &located, &app).await?;
+                }
             }
-            Command::Activate { name } => {
-                let node = named_id(name);
+            Command::Activate { selector } => {
+                let node = selector.node_id();
                 app.activate(node)
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
@@ -499,6 +705,7 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
                 app = spawn(component, app_id, &state_file)?;
+                events = app.subscribe();
                 snapshot = Some(
                     app.mount()
                         .await
@@ -506,6 +713,9 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                 );
                 interaction = InteractionState::default();
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+                if options.verify_view_convergence {
+                    verify_view_convergence(path, &located, &app).await?;
+                }
             }
             Command::Key { key, modifiers } => {
                 let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
@@ -522,40 +732,130 @@ pub async fn run_file(path: &Path, component: &Path, app_id: &AppId) -> Result<(
                     reconcile(&mut interaction, snapshot.as_ref().unwrap());
                 }
             }
-            Command::ExpectText { name, expected } => {
+            Command::ExpectText { selector, expected } => {
                 expect_text(
                     path,
                     &located,
                     snapshot.as_ref().expect("parser requires mount"),
-                    name,
+                    selector,
                     expected,
                 )?;
             }
-            Command::ExpectCountdown { name } => {
+            Command::ExpectCountdown { selector } => {
                 expect_countdown(
                     path,
                     &located,
                     snapshot.as_ref().expect("parser requires mount"),
-                    name,
+                    selector,
                 )?;
             }
-            Command::ExpectFocus { name } => {
-                let expected = name.as_deref().map(named_id);
+            Command::ExpectFocus { selector } => {
+                let expected = selector.as_ref().map(Selector::node_id);
                 if interaction.focused() != expected {
+                    let expected = selector
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "none".to_owned());
                     return Err(TestError::Diagnostic {
                         path: path.to_path_buf(),
                         line: located.line,
                         command: located.source.clone(),
                         message: format!(
-                            "expected focus {name:?}; observed {:?}",
+                            "expected focus {expected}; observed {:?}",
                             interaction.focused().map(NodeId::get)
                         ),
                     });
                 }
             }
+            Command::ExpectPresent { selector } => {
+                let snapshot = snapshot.as_ref().expect("parser requires mount");
+                let observed = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == selector.node_id());
+                if observed.is_none() {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!("expected {selector} to be present; observed no semantic node"),
+                    ));
+                }
+            }
+            Command::ExpectMissing { selector } => {
+                let snapshot = snapshot.as_ref().expect("parser requires mount");
+                let observed = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == selector.node_id());
+                if let Some(node) = observed {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected {selector} to be missing; observed {}",
+                            describe(Some(&node.data))
+                        ),
+                    ));
+                }
+            }
+            Command::ExpectChildCount { parent, expected } => {
+                let snapshot = snapshot.as_ref().expect("parser requires mount");
+                let observed = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == parent.node_id());
+                match observed {
+                    Some(node) if node.children.len() == *expected => {}
+                    Some(node) => {
+                        return Err(assertion_error(
+                            path,
+                            &located,
+                            format!(
+                                "expected {parent:?} to have {expected} children; observed {}",
+                                node.children.len()
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(assertion_error(
+                            path,
+                            &located,
+                            format!(
+                                "expected {parent:?} to have {expected} children; observed no semantic node"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Command::ExpectChild {
+                parent,
+                index,
+                child,
+            } => {
+                let snapshot = snapshot.as_ref().expect("parser requires mount");
+                let observed = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == parent.node_id());
+                let observed_child = observed.and_then(|node| node.children.get(*index)).copied();
+                let expected_child = child.node_id();
+                if observed_child != Some(expected_child) {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected child {index} of {parent:?} to be {child:?}; observed {:?}",
+                            observed_child.map(NodeId::get)
+                        ),
+                    ));
+                }
+            }
             Command::ExpectState { key, expected } => {
                 expect_state(path, &located, app_id, &state_file, key, expected)?;
             }
+        }
+        if options.verify_view_convergence {
+            verify_committed_events(path, &located, &app, &mut events).await?;
         }
     }
     app.stop().await.map_err(|error| TestError::Diagnostic {
@@ -664,6 +964,100 @@ fn state_error(
     }
 }
 
+async fn verify_committed_events(
+    path: &Path,
+    located: &LocatedCommand,
+    app: &YouthAppHandle,
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+) -> Result<(), TestError> {
+    loop {
+        match events.try_recv() {
+            Ok(RuntimeEvent::TurnCommitted(_)) => {
+                verify_view_convergence(path, located, app).await?;
+            }
+            Ok(RuntimeEvent::Faulted(_) | RuntimeEvent::SnapshotReplaced(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                return Err(assertion_error(
+                    path,
+                    located,
+                    "runtime observer stream closed during convergence verification".into(),
+                ));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                return Err(assertion_error(
+                    path,
+                    located,
+                    format!(
+                        "runtime observer lagged by {count} events during convergence verification"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+async fn verify_view_convergence(
+    path: &Path,
+    located: &LocatedCommand,
+    app: &YouthAppHandle,
+) -> Result<(), TestError> {
+    let verification = app
+        .verify_view()
+        .await
+        .map_err(|error| runtime(path, located, error))?;
+    compare_guest_semantics(&verification.retained, &verification.reconstructed).map_err(
+        |message| assertion_error(path, located, format!("view convergence failed: {message}")),
+    )
+}
+
+fn compare_guest_semantics(
+    retained: &TreeSnapshot,
+    reconstructed: &TreeSnapshot,
+) -> Result<(), String> {
+    let retained = retained
+        .nodes
+        .iter()
+        .filter(|node| !matches!(&node.data, NodeData::Root))
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let reconstructed = reconstructed
+        .nodes
+        .iter()
+        .filter(|node| !matches!(&node.data, NodeData::Root))
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let missing = retained
+        .keys()
+        .filter(|id| !reconstructed.contains_key(id))
+        .map(|id| id.get())
+        .collect::<Vec<_>>();
+    let extra = reconstructed
+        .keys()
+        .filter(|id| !retained.contains_key(id))
+        .map(|id| id.get())
+        .collect::<Vec<_>>();
+    let changed = retained
+        .iter()
+        .filter_map(|(id, retained)| {
+            reconstructed
+                .get(id)
+                .filter(|reconstructed| {
+                    retained.data != reconstructed.data
+                        || retained.children != reconstructed.children
+                })
+                .map(|_| id.get())
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() && extra.is_empty() && changed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing nodes {missing:?}; extra nodes {extra:?}; changed nodes {changed:?}"
+        ))
+    }
+}
+
 fn normalized_tree(snapshot: &TreeSnapshot) -> Tree {
     Tree::from_snapshot(snapshot.clone(), &youth_tree::Limits::default())
         .expect("runtime snapshots are already validated")
@@ -688,18 +1082,19 @@ fn spawn(component: &Path, app_id: &AppId, state_file: &Path) -> Result<YouthApp
     })
 }
 
+#[cfg(test)]
 fn named_id(name: &str) -> NodeId {
-    NodeId::new(youth_sdk::named_node_id(name)).expect("named IDs are nonzero")
+    Selector::Static(name.to_owned()).node_id()
 }
 
 fn expect_text(
     path: &Path,
     located: &LocatedCommand,
     snapshot: &TreeSnapshot,
-    name: &str,
+    selector: &Selector,
     expected: &str,
 ) -> Result<(), TestError> {
-    let id = named_id(name);
+    let id = selector.node_id();
     let node = snapshot.nodes.iter().find(|node| node.id == id);
     match node.map(|node| &node.data) {
         Some(data) if data.text_value().is_some_and(|value| value == expected) => Ok(()),
@@ -708,7 +1103,7 @@ fn expect_text(
             line: located.line,
             command: located.source.clone(),
             message: format!(
-                "expected text {name:?} to equal {expected:?}; observed {}",
+                "expected text {selector} to equal {expected:?}; observed {}",
                 describe(observed)
             ),
         }),
@@ -719,9 +1114,9 @@ fn expect_countdown(
     path: &Path,
     located: &LocatedCommand,
     snapshot: &TreeSnapshot,
-    name: &str,
+    selector: &Selector,
 ) -> Result<(), TestError> {
-    let id = named_id(name);
+    let id = selector.node_id();
     let node = snapshot.nodes.iter().find(|node| node.id == id);
     match node.map(|node| &node.data) {
         Some(data) if data.countdown_ref().is_some() => Ok(()),
@@ -730,7 +1125,7 @@ fn expect_countdown(
             line: located.line,
             command: located.source.clone(),
             message: format!(
-                "expected countdown {name:?}; observed {}",
+                "expected countdown {selector}; observed {}",
                 describe(observed)
             ),
         }),
@@ -764,7 +1159,16 @@ fn runtime(path: &Path, command: &LocatedCommand, error: youth_runtime::RuntimeE
         path: path.to_path_buf(),
         line: command.line,
         command: command.source.clone(),
-        message: error.to_string(),
+        message: format!("{:?}: {error}", error.category()),
+    }
+}
+
+fn assertion_error(path: &Path, command: &LocatedCommand, message: String) -> TestError {
+    TestError::Diagnostic {
+        path: path.to_path_buf(),
+        line: command.line,
+        command: command.source.clone(),
+        message,
     }
 }
 
@@ -809,7 +1213,7 @@ mod tests {
         assert_eq!(
             script.commands[1].command,
             Command::ExpectText {
-                name: "count".into(),
+                selector: Selector::Static("count".into()),
                 expected: "Count: #0\n".into()
             }
         );
@@ -889,8 +1293,49 @@ expect state missing "removed"
         assert_eq!(
             script.commands[1].command,
             Command::ExpectCountdown {
-                name: "remaining".into(),
+                selector: Selector::Static("remaining".into()),
             }
+        );
+    }
+
+    #[test]
+    fn parses_derived_selectors_and_structural_assertions() {
+        let script = parse(
+            Path::new("todo.youth-test"),
+            r#"mount
+activate derived "todo" 1 "toggle"
+expect text derived "todo" 1 "title" "Task 1"
+expect present derived "todo" 1 "row"
+expect missing derived "todo" 2 "row"
+expect child-count items 5
+expect child items 0 derived "todo" 1 "row"
+expect focus derived "todo" 1 "toggle"
+"#,
+        )
+        .unwrap();
+        let derived = Selector::Derived {
+            namespace: "todo".into(),
+            item: 1,
+            role: "toggle".into(),
+        };
+        assert_eq!(
+            script.commands[1].command,
+            Command::Activate {
+                selector: derived.clone()
+            }
+        );
+        assert_eq!(
+            script.commands[7].command,
+            Command::ExpectFocus {
+                selector: Some(derived)
+            }
+        );
+        assert!(
+            parse(
+                Path::new("bad.youth-test"),
+                "mount\nexpect present derived \"todo\" 0 \"row\"\n"
+            )
+            .is_err()
         );
     }
 
@@ -1057,5 +1502,76 @@ mount
         assert_eq!(named_id("count").get(), 0xf700_b2fe_97f6_53d6);
         assert_eq!(named_id("increment").get(), 0xd9e1_c44e_444d_fb74);
         assert_eq!(named_id("café").get(), 0xcab8_7ecf_2aee_1d93);
+        assert_eq!(
+            youth_sdk::derived_node_id("todo", 1, "row").unwrap(),
+            0xe4ea_3f45_0dc3_046f
+        );
+        assert_eq!(
+            youth_sdk::derived_node_id("todo", 42, "title").unwrap(),
+            0x872f_87fc_4c39_8fe4
+        );
+        assert_eq!(
+            youth_sdk::derived_command_id("todo", 1, "toggle").unwrap(),
+            0x8b5e_c3bc_b296_c4a5
+        );
+    }
+
+    #[test]
+    fn convergence_diagnostics_separate_missing_extra_and_changed_nodes() {
+        let id = |value| NodeId::new(value).unwrap();
+        let retained = TreeSnapshot {
+            revision: 1,
+            root: id(1),
+            nodes: vec![
+                youth_tree::Node {
+                    id: id(1),
+                    data: NodeData::Root,
+                    children: vec![id(2)],
+                },
+                youth_tree::Node {
+                    id: id(2),
+                    data: NodeData::Text {
+                        value: "old".into(),
+                    },
+                    children: vec![],
+                },
+                youth_tree::Node {
+                    id: id(3),
+                    data: NodeData::Text {
+                        value: "missing".into(),
+                    },
+                    children: vec![],
+                },
+            ],
+        };
+        let reconstructed = TreeSnapshot {
+            revision: 1,
+            root: id(1),
+            nodes: vec![
+                youth_tree::Node {
+                    id: id(1),
+                    data: NodeData::Root,
+                    children: vec![id(2)],
+                },
+                youth_tree::Node {
+                    id: id(2),
+                    data: NodeData::Text {
+                        value: "new".into(),
+                    },
+                    children: vec![],
+                },
+                youth_tree::Node {
+                    id: id(4),
+                    data: NodeData::Text {
+                        value: "extra".into(),
+                    },
+                    children: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            compare_guest_semantics(&retained, &reconstructed).unwrap_err(),
+            "missing nodes [3]; extra nodes [4]; changed nodes [2]"
+        );
     }
 }

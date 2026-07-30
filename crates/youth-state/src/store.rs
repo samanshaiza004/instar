@@ -413,6 +413,14 @@ impl StateStore {
         self.metrics
     }
 
+    /// Restores the last externally visible turn accounting after an internal
+    /// read-only verification call. This is reserved for Youth host tooling.
+    #[doc(hidden)]
+    pub fn restore_verification_metrics(&mut self, metrics: TurnStateMetrics) {
+        debug_assert!(!self.transaction_active);
+        self.metrics = metrics;
+    }
+
     pub fn begin(&mut self, phase: GuestCallPhase) -> Result<(), StateError> {
         let _span = tracing::info_span!("state.begin", phase = ?phase).entered();
         if self.transaction_active {
