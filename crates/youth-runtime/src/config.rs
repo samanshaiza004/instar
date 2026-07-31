@@ -11,6 +11,65 @@ pub trait NotificationDispatcher: Send + Sync {
     fn dispatch(&self, title: &str, body: &str);
 }
 
+/// Host clipboard access injected into the runtime.
+///
+/// A7 will provide native OS integration. Gate A4 defines the shared seam so
+/// headless runtimes and tests can supply deterministic clipboard contents.
+pub trait ClipboardService: Send + Sync {
+    fn read_text(&self) -> Result<Option<String>, ClipboardError>;
+    fn write_text(&self, text: &str) -> Result<(), ClipboardError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ClipboardError {
+    #[error("clipboard service is unavailable")]
+    Unavailable,
+}
+
+/// Placeholder clipboard used until A7 supplies native OS integration.
+/// Reads behave as an empty clipboard and writes are intentionally discarded.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClipboardService;
+
+impl ClipboardService for SystemClipboardService {
+    fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+        Ok(None)
+    }
+
+    fn write_text(&self, _text: &str) -> Result<(), ClipboardError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecordingClipboardService {
+    text: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl RecordingClipboardService {
+    #[must_use]
+    pub fn text(&self) -> Option<String> {
+        self.text
+            .lock()
+            .expect("recording clipboard-service mutex is not poisoned")
+            .clone()
+    }
+}
+
+impl ClipboardService for RecordingClipboardService {
+    fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+        Ok(self.text())
+    }
+
+    fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
+        *self
+            .text
+            .lock()
+            .expect("recording clipboard-service mutex is not poisoned") = Some(text.to_owned());
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemNotificationDispatcher;
 
@@ -133,6 +192,7 @@ pub struct RuntimeTimeSeams {
     pub wake_driver: Arc<dyn youth_state::WakeDriver>,
     pub guest_monotonic_clock: Arc<dyn GuestMonotonicClock>,
     pub notification_dispatcher: Arc<dyn NotificationDispatcher>,
+    pub clipboard_service: Arc<dyn ClipboardService>,
 }
 
 impl Default for RuntimeTimeSeams {
@@ -142,6 +202,7 @@ impl Default for RuntimeTimeSeams {
             wake_driver: Arc::new(youth_state::SystemWakeDriver::default()),
             guest_monotonic_clock: Arc::new(SystemGuestMonotonicClock::default()),
             notification_dispatcher: Arc::new(SystemNotificationDispatcher),
+            clipboard_service: Arc::new(SystemClipboardService),
         }
     }
 }
@@ -163,6 +224,7 @@ impl PartialEq for RuntimeTimeSeams {
                 &self.notification_dispatcher,
                 &other.notification_dispatcher,
             )
+            && Arc::ptr_eq(&self.clipboard_service, &other.clipboard_service)
     }
 }
 

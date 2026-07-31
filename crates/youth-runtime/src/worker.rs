@@ -53,6 +53,10 @@ enum AppCommand {
         request_id: RequestId,
         node: youth_tree::NodeId,
     },
+    EditorLocalEdit {
+        editor: youth_tree::NodeId,
+        edit: crate::EditorLocalEdit,
+    },
     Resync,
     VerifyView,
     Snapshot,
@@ -65,6 +69,7 @@ enum AppCommand {
 enum ReplySender {
     Snapshot(oneshot::Sender<Result<youth_tree::TreeSnapshot, RuntimeError>>),
     Turn(oneshot::Sender<Result<TurnReceipt, RuntimeError>>),
+    EditorLocalEdit(oneshot::Sender<Result<crate::EditorLocalEditResult, RuntimeError>>),
     Inspection(oneshot::Sender<Result<AppInspection, RuntimeError>>),
     ViewVerification(oneshot::Sender<Result<crate::ViewVerification, RuntimeError>>),
     Stop(oneshot::Sender<Result<(), RuntimeError>>),
@@ -235,6 +240,22 @@ impl YouthAppHandle {
         self.send_request(
             AppCommand::Activate { request_id, node },
             ReplySender::Turn(reply),
+        )
+        .await?;
+        response.await.map_err(|_| self.worker_stopped())?
+    }
+
+    /// Applies a host-local Editor mutation on the serialized worker without
+    /// invoking the guest or creating a turn receipt.
+    pub async fn edit_editor_locally(
+        &self,
+        editor: youth_tree::NodeId,
+        edit: crate::EditorLocalEdit,
+    ) -> Result<crate::EditorLocalEditResult, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send_request(
+            AppCommand::EditorLocalEdit { editor, edit },
+            ReplySender::EditorLocalEdit(reply),
         )
         .await?;
         response.await.map_err(|_| self.worker_stopped())?
@@ -455,6 +476,12 @@ fn handle_request(
                 publish_fault_if_any(app, event_tx, error);
             }
             let _ = reply.send(result);
+        }
+        (AppCommand::EditorLocalEdit { editor, edit }, ReplySender::EditorLocalEdit(reply)) => {
+            // This path deliberately touches only the live host-owned Editor
+            // registry. It creates no guest call, tree reconciliation, state
+            // transaction, turn event, or turn receipt.
+            let _ = reply.send(app.edit_editor_locally(editor, edit));
         }
         (AppCommand::Resync, ReplySender::Snapshot(reply)) => {
             let result = app.resync();

@@ -1,6 +1,18 @@
 use tokio::sync::mpsc;
-use youth_runtime::{RuntimeErrorCategory, TurnReceipt, YouthAppHandle};
+use youth_interaction::{EditorInput, EditorMovement};
+use youth_runtime::{Movement, RuntimeErrorCategory, TurnReceipt, YouthAppHandle};
 use youth_tree::{NodeId, TreeSnapshot};
+
+const fn to_engine_movement(movement: EditorMovement) -> Movement {
+    match movement {
+        EditorMovement::Left => Movement::Left,
+        EditorMovement::Right => Movement::Right,
+        EditorMovement::Up => Movement::Up,
+        EditorMovement::Down => Movement::Down,
+        EditorMovement::Home => Movement::Home,
+        EditorMovement::End => Movement::End,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppErrorSummary {
@@ -34,9 +46,10 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControllerCommand {
     Activate(NodeId),
+    EditorInput { editor: NodeId, input: EditorInput },
     Resync,
     Stop,
 }
@@ -74,6 +87,42 @@ impl Controller {
                                             category: error.category(),
                                         }));
                                     }
+                                }
+                            }
+                            ControllerCommand::EditorInput { editor, input } => {
+                                let edit = match input {
+                                    EditorInput::InsertText(text) => {
+                                        Some(youth_runtime::EditorLocalEdit::InsertText(text))
+                                    }
+                                    EditorInput::Backspace => {
+                                        Some(youth_runtime::EditorLocalEdit::Backspace)
+                                    }
+                                    EditorInput::Undo => Some(youth_runtime::EditorLocalEdit::Undo),
+                                    EditorInput::Redo => Some(youth_runtime::EditorLocalEdit::Redo),
+                                    EditorInput::Paste => {
+                                        Some(youth_runtime::EditorLocalEdit::Paste)
+                                    }
+                                    EditorInput::MoveCursor(movement) => {
+                                        Some(youth_runtime::EditorLocalEdit::MoveCursor(
+                                            to_engine_movement(movement),
+                                        ))
+                                    }
+                                    EditorInput::ExtendSelection(movement) => {
+                                        Some(youth_runtime::EditorLocalEdit::ExtendSelection(
+                                            to_engine_movement(movement),
+                                        ))
+                                    }
+                                    // No selection-consuming clipboard semantics yet
+                                    // -- deferred alongside real Cut/Copy behavior.
+                                    EditorInput::Cut | EditorInput::Copy => None,
+                                };
+                                if let Some(edit) = edit
+                                    && let Err(error) =
+                                        handle.edit_editor_locally(editor, edit).await
+                                {
+                                    sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
+                                        category: error.category(),
+                                    }));
                                 }
                             }
                             ControllerCommand::Resync => match handle.snapshot().await {

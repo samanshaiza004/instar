@@ -46,6 +46,8 @@ jobs:
           -p youth-bad-revision-after-state-write
           -p youth-app-error-after-state-write
           -p youth-countdown-presentation
+          -p youth-editor-v006
+          -p youth-editor-capability-v006
           -p youth-elapsed-invalid-patch
           -p youth-elapsed-trap
           -p youth-instant-now
@@ -208,6 +210,8 @@ jobs:
             target/wasm32-wasip2/release/youth_bad_revision_after_state_write.wasm
             target/wasm32-wasip2/release/youth_app_error_after_state_write.wasm
             target/wasm32-wasip2/release/youth_countdown_presentation.wasm
+            target/wasm32-wasip2/release/youth_editor_v006.wasm
+            target/wasm32-wasip2/release/youth_editor_capability_v006.wasm
             target/wasm32-wasip2/release/youth_elapsed_invalid_patch.wasm
             target/wasm32-wasip2/release/youth_elapsed_trap.wasm
             target/wasm32-wasip2/release/youth_instant_now.wasm

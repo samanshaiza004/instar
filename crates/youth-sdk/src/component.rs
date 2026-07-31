@@ -192,6 +192,13 @@ fn wire_node(node: &super::FlatNode) -> ui::Node {
                     super::TextAlign::End => ui::TextAlignment::End,
                 },
             }),
+            FlatNodeData::Editor {
+                document_revision,
+                text,
+            } => ui::NodeData::Editor(ui::EditorData {
+                document_revision: document_revision.get(),
+                text: text.clone(),
+            }),
             FlatNodeData::Button {
                 label,
                 enabled,

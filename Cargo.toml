@@ -8,6 +8,7 @@ members = [
     "crates/youth-test",
     "crates/youth-runtime",
     "crates/youth-interaction",
+    "crates/youth-editor-engine",
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",
@@ -33,6 +34,8 @@ members = [
     "test-components/app-error-after-state-write",
     "test-components/sdk-elapsed",
     "test-components/countdown-presentation",
+    "test-components/editor-v006",
+    "test-components/editor-capability-v006",
     "test-components/elapsed-trap",
     "test-components/elapsed-invalid-patch",
 ]

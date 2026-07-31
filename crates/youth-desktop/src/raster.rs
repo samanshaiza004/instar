@@ -223,6 +223,16 @@ pub fn render(
                     palette,
                 );
             }
+            NodeData::Editor { text, .. } => {
+                draw_text(
+                    &mut frame,
+                    rect,
+                    text,
+                    TextAlignment::Start,
+                    scale_factor,
+                    palette,
+                );
+            }
             NodeData::AlignedText { value, alignment } => {
                 draw_text(&mut frame, rect, value, *alignment, scale_factor, palette);
             }
@@ -603,6 +613,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(aligned_frame, literal_frame);
+    }
+
+    #[test]
+    fn editor_round_trip_preserves_revision_canonical_form_and_frame_hash() {
+        let editor = single_text(NodeData::Editor {
+            document_revision: 42,
+            text: "Scratchpad draft".into(),
+        });
+        let canonical_snapshot = editor.to_snapshot();
+        let round_trip =
+            Tree::from_snapshot(canonical_snapshot.clone(), &youth_tree::Limits::default())
+                .unwrap();
+        assert_eq!(round_trip.to_snapshot(), canonical_snapshot);
+        assert_eq!(
+            round_trip.node(id(2)).unwrap().data,
+            NodeData::Editor {
+                document_revision: 42,
+                text: "Scratchpad draft".into(),
+            }
+        );
+        assert_eq!(
+            round_trip.canonical(),
+            "root #1\n└── editor #2 document-revision=42 \"Scratchpad draft\"\n"
+        );
+
+        let first_layout = layout(&editor, LogicalSize::new(160.0, 32.0).unwrap()).unwrap();
+        let second_layout = layout(&round_trip, LogicalSize::new(160.0, 32.0).unwrap()).unwrap();
+        let first_frame = render(
+            &editor,
+            &first_layout,
+            160,
+            32,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        )
+        .unwrap();
+        let second_frame = render(
+            &round_trip,
+            &second_layout,
+            160,
+            32,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        )
+        .unwrap();
+        assert_eq!(first_frame, second_frame);
+        assert_eq!(frame_hash(&first_frame), 2_746_944_975_626_425_349);
     }
 
     #[test]

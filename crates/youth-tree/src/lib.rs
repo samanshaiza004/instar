@@ -111,6 +111,10 @@ pub enum NodeData {
         value: String,
         alignment: TextAlignment,
     },
+    Editor {
+        document_revision: u64,
+        text: String,
+    },
     Countdown {
         schedule: ScheduleRef,
         precision: TimePrecision,
@@ -147,7 +151,9 @@ impl NodeData {
     #[must_use]
     pub const fn text_alignment(&self) -> Option<TextAlignment> {
         match self {
-            Self::Text { .. } | Self::Countdown { .. } => Some(TextAlignment::Start),
+            Self::Text { .. } | Self::Editor { .. } | Self::Countdown { .. } => {
+                Some(TextAlignment::Start)
+            }
             Self::AlignedText { alignment, .. } | Self::AlignedCountdown { alignment, .. } => {
                 Some(*alignment)
             }
@@ -159,6 +165,7 @@ impl NodeData {
     pub fn text_value(&self) -> Option<&str> {
         match self {
             Self::Text { value } | Self::AlignedText { value, .. } => Some(value),
+            Self::Editor { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -208,6 +215,7 @@ impl NodeData {
             Self::Root
             | Self::Text { .. }
             | Self::AlignedText { .. }
+            | Self::Editor { .. }
             | Self::Countdown { .. }
             | Self::AlignedCountdown { .. } => true,
         }
@@ -216,6 +224,11 @@ impl NodeData {
     #[must_use]
     pub const fn is_button(&self) -> bool {
         matches!(self, Self::Button { .. } | Self::ShortcutButton { .. })
+    }
+
+    #[must_use]
+    pub const fn is_focusable(&self) -> bool {
+        self.is_button() || matches!(self, Self::Editor { .. })
     }
 }
 
@@ -504,6 +517,18 @@ impl Tree {
                         return Err(ValidationError::TextTooLong {
                             node: id,
                             actual: value.len(),
+                            max: limits.max_text_len,
+                        });
+                    }
+                }
+                NodeData::Editor { text, .. } => {
+                    if !node.children.is_empty() {
+                        return Err(ValidationError::LeafWithChildren { node: id });
+                    }
+                    if text.len() > limits.max_text_len {
+                        return Err(ValidationError::TextTooLong {
+                            node: id,
+                            actual: text.len(),
                             max: limits.max_text_len,
                         });
                     }
@@ -814,6 +839,7 @@ impl Tree {
                     NodeData::Root
                     | NodeData::Text { .. }
                     | NodeData::AlignedText { .. }
+                    | NodeData::Editor { .. }
                     | NodeData::Countdown { .. }
                     | NodeData::AlignedCountdown { .. } => {
                         return Err(PatchError::WrongNodeKind { patch_index, id });
@@ -1080,6 +1106,20 @@ fn append_node_description(output: &mut String, node: &Node) {
             }
             return;
         }
+        NodeData::Editor {
+            document_revision,
+            text,
+        } => {
+            output.push_str("editor");
+            output.push_str(" #");
+            output.push_str(&node.id.to_string());
+            output.push_str(" document-revision=");
+            output.push_str(&document_revision.to_string());
+            output.push_str(" \"");
+            output.extend(text.escape_debug());
+            output.push('"');
+            return;
+        }
         NodeData::Countdown {
             schedule,
             precision,
@@ -1289,6 +1329,42 @@ mod tests {
     }
 
     #[test]
+    fn editor_node_round_trips_with_document_revision_and_stable_canonical_output() {
+        let original = snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::Editor {
+                        document_revision: 42,
+                        text: "Scratchpad draft".into(),
+                    },
+                    &[],
+                ),
+            ],
+        );
+
+        let first = validate(original).unwrap();
+        let canonical_snapshot = first.to_snapshot();
+        let second = validate(canonical_snapshot.clone()).unwrap();
+
+        assert_eq!(second.to_snapshot(), canonical_snapshot);
+        assert_eq!(
+            second.node(id(2)).unwrap().data,
+            NodeData::Editor {
+                document_revision: 42,
+                text: "Scratchpad draft".into(),
+            }
+        );
+        assert_eq!(
+            first.canonical(),
+            "root #1\n└── editor #2 document-revision=42 \"Scratchpad draft\"\n"
+        );
+        assert_eq!(second.canonical(), first.canonical());
+    }
+
+    #[test]
     fn countdown_text_alignment_is_never_missing() {
         let countdown = NodeData::Countdown {
             schedule: ScheduleRef {
@@ -1355,6 +1431,10 @@ mod tests {
             NodeData::AlignedText {
                 value: "literal".into(),
                 alignment: TextAlignment::End,
+            },
+            NodeData::Editor {
+                document_revision: 42,
+                text: "draft".into(),
             },
             NodeData::Button {
                 label: "button".into(),
@@ -1617,6 +1697,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_editor_with_children() {
+        assert!(matches!(
+            validate(snapshot(
+                1,
+                vec![
+                    node(1, NodeData::Root, &[2]),
+                    node(
+                        2,
+                        NodeData::Editor {
+                            document_revision: 9,
+                            text: "draft".into(),
+                        },
+                        &[3],
+                    ),
+                    node(3, NodeData::Box { enabled: true }, &[]),
+                ]
+            )),
+            Err(ValidationError::LeafWithChildren { node: leaf }) if leaf == id(2)
+        ));
+    }
+
+    #[test]
     fn rejects_button_with_children() {
         assert!(matches!(
             validate(snapshot(
@@ -1704,6 +1806,39 @@ mod tests {
             &limits,
         );
         assert!(matches!(label, Err(ValidationError::LabelTooLong { .. })));
+    }
+
+    #[test]
+    fn rejects_overlong_editor_text() {
+        let limits = Limits {
+            max_text_len: 2,
+            ..Limits::default()
+        };
+        let editor = Tree::from_snapshot(
+            snapshot(
+                1,
+                vec![
+                    node(1, NodeData::Root, &[2]),
+                    node(
+                        2,
+                        NodeData::Editor {
+                            document_revision: 11,
+                            text: "abc".into(),
+                        },
+                        &[],
+                    ),
+                ],
+            ),
+            &limits,
+        );
+        assert!(matches!(
+            editor,
+            Err(ValidationError::TextTooLong {
+                node,
+                actual: 3,
+                max: 2,
+            }) if node == id(2)
+        ));
     }
 
     #[test]
