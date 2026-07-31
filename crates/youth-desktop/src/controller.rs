@@ -90,39 +90,64 @@ impl Controller {
                                 }
                             }
                             ControllerCommand::EditorInput { editor, input } => {
-                                let edit = match input {
+                                // `ImeCommit` becomes two local edits (set the
+                                // final compose text, then finish composing)
+                                // rather than one, since the host primitive
+                                // mirrors Parley's own two-step
+                                // `set_compose`/`finish_compose` driver calls;
+                                // `local_ime_finish_compose` groups them into
+                                // one undo unit regardless.
+                                let edits: Vec<youth_runtime::EditorLocalEdit> = match input {
                                     EditorInput::InsertText(text) => {
-                                        Some(youth_runtime::EditorLocalEdit::InsertText(text))
+                                        vec![youth_runtime::EditorLocalEdit::InsertText(text)]
                                     }
                                     EditorInput::Backspace => {
-                                        Some(youth_runtime::EditorLocalEdit::Backspace)
+                                        vec![youth_runtime::EditorLocalEdit::Backspace]
                                     }
-                                    EditorInput::Undo => Some(youth_runtime::EditorLocalEdit::Undo),
-                                    EditorInput::Redo => Some(youth_runtime::EditorLocalEdit::Redo),
+                                    EditorInput::Undo => vec![youth_runtime::EditorLocalEdit::Undo],
+                                    EditorInput::Redo => vec![youth_runtime::EditorLocalEdit::Redo],
                                     EditorInput::Paste => {
-                                        Some(youth_runtime::EditorLocalEdit::Paste)
+                                        vec![youth_runtime::EditorLocalEdit::Paste]
                                     }
                                     EditorInput::MoveCursor(movement) => {
-                                        Some(youth_runtime::EditorLocalEdit::MoveCursor(
+                                        vec![youth_runtime::EditorLocalEdit::MoveCursor(
                                             to_engine_movement(movement),
-                                        ))
+                                        )]
                                     }
                                     EditorInput::ExtendSelection(movement) => {
-                                        Some(youth_runtime::EditorLocalEdit::ExtendSelection(
+                                        vec![youth_runtime::EditorLocalEdit::ExtendSelection(
                                             to_engine_movement(movement),
-                                        ))
+                                        )]
                                     }
+                                    EditorInput::ImeSetCompose { text, cursor } => {
+                                        vec![youth_runtime::EditorLocalEdit::ImeSetCompose {
+                                            text,
+                                            cursor,
+                                        }]
+                                    }
+                                    EditorInput::ImeClearCompose => {
+                                        vec![youth_runtime::EditorLocalEdit::ImeClearCompose]
+                                    }
+                                    EditorInput::ImeCommit(text) => vec![
+                                        youth_runtime::EditorLocalEdit::ImeSetCompose {
+                                            text,
+                                            cursor: None,
+                                        },
+                                        youth_runtime::EditorLocalEdit::ImeFinishCompose,
+                                    ],
                                     // No selection-consuming clipboard semantics yet
                                     // -- deferred alongside real Cut/Copy behavior.
-                                    EditorInput::Cut | EditorInput::Copy => None,
+                                    EditorInput::Cut | EditorInput::Copy => Vec::new(),
                                 };
-                                if let Some(edit) = edit
-                                    && let Err(error) =
+                                for edit in edits {
+                                    if let Err(error) =
                                         handle.edit_editor_locally(editor, edit).await
-                                {
-                                    sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
-                                        category: error.category(),
-                                    }));
+                                    {
+                                        sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
+                                            category: error.category(),
+                                        }));
+                                        break;
+                                    }
                                 }
                             }
                             ControllerCommand::Resync => match handle.snapshot().await {

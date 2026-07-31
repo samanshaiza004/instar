@@ -13,7 +13,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
-use youth_editor_engine::{EditorEngine, EditorLayout, Movement, ParleyEditorEngine, TextPresentation};
+use youth_editor_engine::{
+    EditorEngine, EditorLayout, Movement, ParleyEditorEngine, TextPresentation,
+};
 use youth_tree::{NodeData, NodeId, Tree};
 
 pub(super) type EditorSessionRegistry = HashMap<NodeId, EditorSessionSlot>;
@@ -49,6 +51,16 @@ pub enum EditorLocalEdit {
     Paste,
     MoveCursor(Movement),
     ExtendSelection(Movement),
+    /// Sets or replaces the IME preedit text. `cursor` is a byte range
+    /// relative to `text`'s start, matching winit's `Ime::Preedit`.
+    ImeSetCompose {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Cancels IME composition, discarding the preedit text.
+    ImeClearCompose,
+    /// Commits the current IME preedit as ordinary buffer content.
+    ImeFinishCompose,
 }
 
 /// The guest-facing view of a session: whole-buffer text only. Cursor and
@@ -96,6 +108,12 @@ struct EditorSession {
     /// True only while the next `InsertText` may extend the newest
     /// insertion group. Every other operation closes the group.
     insert_group_open: bool,
+    /// The pre-composition snapshot, captured on the first
+    /// `ImeSetCompose` of a composition session. Composition is one undo
+    /// group regardless of how many intermediate preedit updates occur;
+    /// this is pushed onto `undo_stack` only on `ImeFinishCompose` (a
+    /// cancelled composition via `ImeClearCompose` has nothing to undo).
+    pending_compose_snapshot: Option<UndoSnapshot>,
 }
 
 impl Clone for EditorSession {
@@ -109,6 +127,7 @@ impl Clone for EditorSession {
             undo_stack: self.undo_stack.clone(),
             redo_stack: self.redo_stack.clone(),
             insert_group_open: self.insert_group_open,
+            pending_compose_snapshot: self.pending_compose_snapshot.clone(),
         }
     }
 }
@@ -215,6 +234,7 @@ fn new_session(document_revision: u64, text: &str) -> EditorSession {
         undo_stack: VecDeque::new(),
         redo_stack: VecDeque::new(),
         insert_group_open: false,
+        pending_compose_snapshot: None,
     }
 }
 
@@ -361,6 +381,69 @@ pub(super) fn local_extend_selection(
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
     session.engine.extend_selection(movement);
+    Ok(local_edit_result(session))
+}
+
+/// Sets or replaces the in-progress IME preedit text. The first call of a
+/// composition captures a pre-composition snapshot (so the whole composition
+/// can later become one undo group); repeated calls while still composing
+/// replace the preedit rather than accumulating snapshots. Never advances
+/// `edit_sequence` -- preedit content is not yet accepted buffer content.
+pub(super) fn local_ime_set_compose(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    text: &str,
+    cursor: Option<(usize, usize)>,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    // Mirrors `ParleyEditorEngine::ime_set_compose`'s own empty-text-clears
+    // policy: an empty update never started a real composition, so it must
+    // not capture (or leave dangling) a pending undo snapshot for
+    // `ImeFinishCompose` to spuriously commit.
+    if text.is_empty() {
+        session.engine.ime_clear_compose();
+        session.pending_compose_snapshot = None;
+        return Ok(local_edit_result(session));
+    }
+    if !session.engine.is_composing() && session.pending_compose_snapshot.is_none() {
+        let before = snapshot_of(&mut session.engine);
+        session.pending_compose_snapshot = Some(before);
+    }
+    session.engine.ime_set_compose(text, cursor);
+    Ok(local_edit_result(session))
+}
+
+/// Cancels IME composition, discarding the preedit text and the pending
+/// undo snapshot -- a cancelled composition never touched accepted content,
+/// so there is nothing to undo.
+pub(super) fn local_ime_clear_compose(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    session.engine.ime_clear_compose();
+    session.pending_compose_snapshot = None;
+    Ok(local_edit_result(session))
+}
+
+/// Commits the current IME preedit as ordinary buffer content. The whole
+/// composition -- however many `ImeSetCompose` updates it took -- becomes
+/// exactly one undo group, and this is the only IME operation that advances
+/// `edit_sequence`.
+pub(super) fn local_ime_finish_compose(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    session.engine.ime_finish_compose();
+    if let Some(before) = session.pending_compose_snapshot.take() {
+        session.redo_stack.clear();
+        push_bounded(&mut session.undo_stack, before);
+        advance_edit_sequence(session);
+    }
     Ok(local_edit_result(session))
 }
 

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use thiserror::Error;
 use youth_runtime::{PresentationReader, resolve_countdown_display};
@@ -56,6 +57,12 @@ pub struct RenderState<'a> {
     /// unchanged. `RefCell` because rasterization caches glyphs on read
     /// while `RenderState`'s other fields stay shared references.
     pub editor_rasterizer: Option<&'a RefCell<GlyphRasterizer>>,
+    /// Host-owned vertical scroll offset (logical pixels) per live Editor
+    /// node. Absent entries (and a `None` map) paint at zero offset --
+    /// scrolling is purely a paint-time transform, never guest-visible
+    /// state, so this has no bearing on the tree/layout revision this
+    /// function otherwise renders as a pure function of.
+    pub editor_scroll_offsets: Option<&'a HashMap<NodeId, f32>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,17 +258,22 @@ pub fn render(
                 );
             }
             NodeData::Editor { text, .. } => {
-                let live = state
-                    .presentation
-                    .and_then(|reader| reader.editor(*id));
+                let live = state.presentation.and_then(|reader| reader.editor(*id));
                 match (live, state.editor_rasterizer) {
                     (Some(presentation), Some(rasterizer)) => {
+                        let scroll_offset_y = state
+                            .editor_scroll_offsets
+                            .and_then(|offsets| offsets.get(id))
+                            .copied()
+                            .unwrap_or(0.0)
+                            * scale_factor as f32;
                         draw_editor_presentation(
                             &mut frame,
                             rect,
                             &presentation,
                             &mut rasterizer.borrow_mut(),
                             palette,
+                            scroll_offset_y,
                         );
                     }
                     _ => {
@@ -424,6 +436,7 @@ fn draw_editor_presentation(
     presentation: &youth_runtime::TextPresentation,
     rasterizer: &mut GlyphRasterizer,
     palette: Palette,
+    scroll_offset_y: f32,
 ) {
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -437,7 +450,7 @@ fn draw_editor_presentation(
             && (y as u32) >= rect.y
     };
     let origin_x = rect.x as f32;
-    let origin_y = rect.y as f32;
+    let origin_y = rect.y as f32 - scroll_offset_y;
 
     for selection_rect in &presentation.selection {
         let x0 = origin_x + selection_rect.x0 as f32;
@@ -815,7 +828,14 @@ mod tests {
             width: 120,
             height: 24,
         };
-        draw_editor_presentation(&mut frame, rect, &presentation, &mut rasterizer, palette);
+        draw_editor_presentation(
+            &mut frame,
+            rect,
+            &presentation,
+            &mut rasterizer,
+            palette,
+            0.0,
+        );
 
         let painted_pixels = frame
             .pixels()
@@ -849,6 +869,65 @@ mod tests {
     }
 
     #[test]
+    fn a_nonzero_scroll_offset_shifts_painted_content_upward_and_stays_clipped() {
+        use youth_editor_engine::{EditorLayout, ParleyEditorEngine};
+
+        let mut engine = ParleyEditorEngine::with_text("Hi");
+        let presentation: youth_runtime::TextPresentation = engine.presentation();
+        let rect = PixelRect {
+            x: 4,
+            y: 4,
+            width: 120,
+            height: 24,
+        };
+        let palette = Palette::default();
+
+        let mut unscrolled = FrameBuffer::new(160, 32).unwrap();
+        unscrolled.clear(palette.background);
+        let mut rasterizer = GlyphRasterizer::new();
+        draw_editor_presentation(
+            &mut unscrolled,
+            rect,
+            &presentation,
+            &mut rasterizer,
+            palette,
+            0.0,
+        );
+
+        let mut scrolled = FrameBuffer::new(160, 32).unwrap();
+        scrolled.clear(palette.background);
+        let mut rasterizer = GlyphRasterizer::new();
+        draw_editor_presentation(
+            &mut scrolled,
+            rect,
+            &presentation,
+            &mut rasterizer,
+            palette,
+            6.0,
+        );
+
+        assert_ne!(
+            unscrolled, scrolled,
+            "a nonzero scroll offset must change what gets painted"
+        );
+        for (index, &pixel) in scrolled.pixels().iter().enumerate() {
+            if pixel == palette.background {
+                continue;
+            }
+            let x = (index % scrolled.width() as usize) as u32;
+            let y = (index / scrolled.width() as usize) as u32;
+            assert!(
+                x >= rect.x && x < rect.x + rect.width,
+                "a scrolled paint must still stay within the clip rect's x bounds"
+            );
+            assert!(
+                y >= rect.y && y < rect.y + rect.height,
+                "a scrolled paint must still stay within the clip rect's y bounds"
+            );
+        }
+    }
+
+    #[test]
     fn an_empty_rect_paints_nothing_and_does_not_panic() {
         use youth_editor_engine::{EditorLayout, ParleyEditorEngine};
 
@@ -867,6 +946,7 @@ mod tests {
             &presentation,
             &mut rasterizer,
             Palette::default(),
+            0.0,
         );
     }
 
@@ -911,6 +991,7 @@ mod tests {
                 fault_category: None,
                 presentation: None,
                 editor_rasterizer: None,
+                editor_scroll_offsets: None,
             },
             palette,
         )

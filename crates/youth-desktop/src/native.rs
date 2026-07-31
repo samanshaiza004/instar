@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -5,8 +6,8 @@ use std::time::{Duration, Instant};
 use softbuffer::{Context, Surface};
 use thiserror::Error;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize as WinitLogicalSize;
-use winit::event::{ElementState, MouseButton, StartCause, WindowEvent};
+use winit::dpi::{LogicalPosition as WinitLogicalPosition, LogicalSize as WinitLogicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -16,6 +17,7 @@ use crate::{
     LogicalSize, Modifiers, Palette, PointerState, RenderState, RendererMirror, SemanticAction,
     layout, render,
 };
+use youth_interaction::EditorInput;
 use youth_runtime::{
     PresentationReader, RuntimeErrorCategory, YouthAppConfig, YouthAppHandle,
     next_display_boundary_epoch_millis,
@@ -64,6 +66,10 @@ struct NativeApp {
     controller: Option<Controller>,
     presentation: Option<PresentationReader>,
     editor_rasterizer: std::cell::RefCell<youth_text_render_cpu::GlyphRasterizer>,
+    /// Host-owned vertical scroll offset (logical pixels) per Editor node.
+    /// Purely a paint-time transform -- never sent to the guest, never
+    /// part of any revision.
+    editor_scroll_offsets: HashMap<NodeId, f32>,
     fault: Option<String>,
     smoke_presented: bool,
 }
@@ -113,6 +119,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         controller: None,
         presentation: None,
         editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
+        editor_scroll_offsets: HashMap::new(),
         fault: None,
         smoke_presented: false,
     };
@@ -191,6 +198,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
             WindowEvent::RedrawRequested => self.present(event_loop),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.relayout();
+                self.sync_ime(&window);
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } if self.fault.is_none() => {
@@ -241,9 +249,48 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 {
                     let _ = controller.send(ControllerCommand::Activate(node));
                 }
+                if state == ElementState::Pressed {
+                    self.sync_ime(&window);
+                }
                 if change.redraw {
                     window.request_redraw();
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.fault.is_none() => {
+                let (Some(mirror), Some(layout), Some(node)) =
+                    (&self.mirror, &self.layout, self.pointer.hovered)
+                else {
+                    return;
+                };
+                if !matches!(
+                    mirror.tree().node(node).map(|n| &n.data),
+                    Some(NodeData::Editor { .. })
+                ) {
+                    return;
+                }
+                let Some(rect) = layout.nodes.get(&node).map(|n| n.bounds) else {
+                    return;
+                };
+                let delta_y = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => lines * SCROLL_LINE_HEIGHT,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.y / window.scale_factor()) as f32
+                    }
+                };
+                let content_height = self
+                    .presentation
+                    .as_ref()
+                    .and_then(|reader| reader.editor(node))
+                    .map_or(0.0, |presentation| presentation.content_height);
+                let current = self
+                    .editor_scroll_offsets
+                    .get(&node)
+                    .copied()
+                    .unwrap_or(0.0);
+                let updated =
+                    clamp_scroll_offset(current - delta_y, rect.height as f32, content_height);
+                self.editor_scroll_offsets.insert(node, updated);
+                window.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if self.fault.is_none() => {
@@ -265,14 +312,37 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                     {
                         let _ = controller.send(ControllerCommand::Activate(node));
                     }
+                    let has_editor_input = change.editor_input.is_some();
                     if let Some((editor, input)) = change.editor_input
                         && let Some(controller) = &self.controller
                     {
                         let _ = controller.send(ControllerCommand::EditorInput { editor, input });
                     }
-                    if change.redraw || change.action.is_some() {
+                    self.sync_ime(&window);
+                    if change.redraw || change.action.is_some() || has_editor_input {
                         window.request_redraw();
                     }
+                }
+            }
+            WindowEvent::Ime(ime) if self.fault.is_none() => {
+                let (Some(mirror), Some(controller)) = (&self.mirror, &self.controller) else {
+                    return;
+                };
+                let Some(editor) = self.interaction.focused_editor(mirror.tree()) else {
+                    return;
+                };
+                let input = match ime {
+                    Ime::Enabled | Ime::Disabled => None,
+                    Ime::Preedit(text, cursor) => Some(if text.is_empty() {
+                        EditorInput::ImeClearCompose
+                    } else {
+                        EditorInput::ImeSetCompose { text, cursor }
+                    }),
+                    Ime::Commit(text) => Some(EditorInput::ImeCommit(text)),
+                };
+                if let Some(input) = input {
+                    let _ = controller.send(ControllerCommand::EditorInput { editor, input });
+                    window.request_redraw();
                 }
             }
             WindowEvent::Focused(false) if self.pointer.deactivate_window().redraw => {
@@ -327,6 +397,7 @@ impl NativeApp {
         self.context = Some(context);
         self.surface = Some(surface);
         self.relayout();
+        self.sync_ime(&window);
         window.request_redraw();
     }
 
@@ -396,8 +467,74 @@ impl NativeApp {
         }
     }
 
+    /// Tells the platform IME whether text input is currently possible, and
+    /// where its candidate window should avoid drawing. Called after any
+    /// event that could change which node is focused, or move the caret
+    /// within an already-focused Editor.
+    fn sync_ime(&self, window: &Window) {
+        let Some(mirror) = &self.mirror else {
+            window.set_ime_allowed(false);
+            return;
+        };
+        let Some(editor) = self.interaction.focused_editor(mirror.tree()) else {
+            window.set_ime_allowed(false);
+            return;
+        };
+        window.set_ime_allowed(true);
+        let Some(presentation) = self.presentation.as_ref().and_then(|p| p.editor(editor)) else {
+            return;
+        };
+        let area = presentation.ime_cursor_area;
+        window.set_ime_cursor_area(
+            WinitLogicalPosition::new(area.x0, area.y0),
+            WinitLogicalSize::new((area.x1 - area.x0).max(1.0), (area.y1 - area.y0).max(1.0)),
+        );
+    }
+
+    /// Adjusts the focused Editor's scroll offset to keep its caret in
+    /// view, then clamps it to the live content bounds. Purely a paint-time
+    /// concern -- no guest turn, no application-state write, no revision
+    /// change -- so it runs on every `present()` rather than only after
+    /// input, and is cheap enough to do so (a hash-map lookup plus a
+    /// couple of float comparisons).
+    fn sync_editor_scroll(&mut self) {
+        let Some(mirror) = &self.mirror else { return };
+        let Some(editor) = self.interaction.focused_editor(mirror.tree()) else {
+            return;
+        };
+        let Some(layout) = &self.layout else { return };
+        let Some(rect) = layout.nodes.get(&editor).map(|node| node.bounds) else {
+            return;
+        };
+        let Some(presentation) = self
+            .presentation
+            .as_ref()
+            .and_then(|reader| reader.editor(editor))
+        else {
+            return;
+        };
+
+        let viewport_height = rect.height as f32;
+        let mut offset = self
+            .editor_scroll_offsets
+            .get(&editor)
+            .copied()
+            .unwrap_or(0.0);
+        if let Some(cursor) = presentation.cursor {
+            offset = follow_cursor_scroll_offset(
+                offset,
+                viewport_height,
+                cursor.y0 as f32,
+                cursor.y1 as f32,
+            );
+        }
+        offset = clamp_scroll_offset(offset, viewport_height, presentation.content_height);
+        self.editor_scroll_offsets.insert(editor, offset);
+    }
+
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let _span = tracing::info_span!("desktop.present").entered();
+        self.sync_editor_scroll();
         let (Some(window), Some(surface), Some(mirror), Some(layout)) =
             (&self.window, &mut self.surface, &self.mirror, &self.layout)
         else {
@@ -416,6 +553,7 @@ impl NativeApp {
             fault_category: self.fault.as_deref(),
             presentation: self.presentation.as_ref(),
             editor_rasterizer: Some(&self.editor_rasterizer),
+            editor_scroll_offsets: Some(&self.editor_scroll_offsets),
         };
         let Ok(frame) = render(
             mirror.tree(),
@@ -478,6 +616,37 @@ impl NativeApp {
             Instant::now() + Duration::from_millis(delay),
         ));
     }
+}
+
+/// Logical pixels one wheel "line" scrolls, for platforms that report
+/// [`MouseScrollDelta::LineDelta`] instead of pixel deltas.
+const SCROLL_LINE_HEIGHT: f32 = 20.0;
+
+/// Clamps a scroll offset to `[0, max(0, content_height - viewport_height)]`
+/// -- scrolling can never move the viewport past either end of the content.
+fn clamp_scroll_offset(offset: f32, viewport_height: f32, content_height: f32) -> f32 {
+    let max_offset = (content_height - viewport_height).max(0.0);
+    offset.clamp(0.0, max_offset)
+}
+
+/// Adjusts `offset` by the minimum amount needed to bring
+/// `[cursor_top, cursor_bottom)` fully inside `[offset, offset +
+/// viewport_height)`, preferring to leave `offset` untouched when the
+/// caret is already visible.
+fn follow_cursor_scroll_offset(
+    offset: f32,
+    viewport_height: f32,
+    cursor_top: f32,
+    cursor_bottom: f32,
+) -> f32 {
+    if cursor_top < offset {
+        cursor_top
+    } else if cursor_bottom > offset + viewport_height {
+        cursor_bottom - viewport_height
+    } else {
+        offset
+    }
+    .max(0.0)
 }
 
 fn modifiers(state: ModifiersState) -> Modifiers {
@@ -664,5 +833,36 @@ mod tests {
             logical_key(&Key::Named(NamedKey::End)),
             Some(LogicalKey::End)
         );
+    }
+
+    #[test]
+    fn scroll_offset_clamps_to_content_bounds() {
+        assert_eq!(
+            clamp_scroll_offset(-5.0, 100.0, 400.0),
+            0.0,
+            "offset never goes negative"
+        );
+        assert_eq!(
+            clamp_scroll_offset(9_999.0, 100.0, 400.0),
+            300.0,
+            "offset never scrolls past the last page of content"
+        );
+        assert_eq!(
+            clamp_scroll_offset(50.0, 100.0, 40.0),
+            0.0,
+            "content shorter than the viewport cannot scroll at all"
+        );
+    }
+
+    #[test]
+    fn cursor_follow_scroll_only_moves_when_the_caret_leaves_the_viewport() {
+        // Caret already fully visible: offset is untouched.
+        assert_eq!(follow_cursor_scroll_offset(20.0, 100.0, 40.0, 56.0), 20.0);
+        // Caret above the viewport: scroll up to reveal it exactly.
+        assert_eq!(follow_cursor_scroll_offset(50.0, 100.0, 10.0, 26.0), 10.0);
+        // Caret below the viewport: scroll down the minimum amount.
+        assert_eq!(follow_cursor_scroll_offset(0.0, 100.0, 120.0, 136.0), 36.0);
+        // Never scrolls negative even for a caret near the very top.
+        assert_eq!(follow_cursor_scroll_offset(5.0, 100.0, 0.0, 16.0), 0.0);
     }
 }

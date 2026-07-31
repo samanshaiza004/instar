@@ -71,6 +71,17 @@ pub enum EditorInput {
     Cut,
     Copy,
     Paste,
+    /// Sets or replaces the in-progress IME preedit text. Delivered outside
+    /// ordinary key routing, from the platform's native IME event stream
+    /// rather than [`InteractionState::key`].
+    ImeSetCompose {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Cancels IME composition, discarding the preedit text.
+    ImeClearCompose,
+    /// Commits `text` as the final result of an IME composition.
+    ImeCommit(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -90,6 +101,15 @@ impl InteractionState {
     #[must_use]
     pub const fn focused(&self) -> Option<NodeId> {
         self.focused
+    }
+
+    /// The currently focused node, if it is an Editor. Used to route native
+    /// IME events, which arrive outside ordinary key input (winit's
+    /// `WindowEvent::Ime`, not a keyboard event) and so cannot go through
+    /// [`Self::key`].
+    #[must_use]
+    pub fn focused_editor(&self, tree: &Tree) -> Option<NodeId> {
+        focused_editor(tree, self.focused)
     }
 
     #[must_use]

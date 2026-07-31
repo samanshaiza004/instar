@@ -172,9 +172,7 @@ pub fn paint_presentation(
 ) {
     for run in &presentation.runs {
         for glyph in &run.glyphs {
-            let Some(mask) =
-                rasterizer.rasterize(&run.font, glyph.id, run.font_size)
-            else {
+            let Some(mask) = rasterizer.rasterize(&run.font, glyph.id, run.font_size) else {
                 continue;
             };
             if mask.is_empty() {
@@ -188,11 +186,7 @@ pub fn paint_presentation(
                 for col in 0..mask.width {
                     let coverage = mask.coverage_at(col, row);
                     if coverage > 0 {
-                        plot(
-                            base_x + col as i32,
-                            base_y + row as i32,
-                            coverage,
-                        );
+                        plot(base_x + col as i32, base_y + row as i32, coverage);
                     }
                 }
             }
@@ -258,7 +252,10 @@ mod tests {
             .rasterize(&run.font, glyph.id, run.font_size)
             .expect("rasterization succeeds for a real system font");
         assert!(!mask.is_empty(), "a visible letter must produce ink");
-        assert!(mask.alpha.iter().any(|&byte| byte > 0), "some pixel has coverage");
+        assert!(
+            mask.alpha.iter().any(|&byte| byte > 0),
+            "some pixel has coverage"
+        );
     }
 
     #[test]
@@ -285,9 +282,15 @@ mod tests {
 
         let mut rasterizer = GlyphRasterizer::new();
         let mut painted = Vec::new();
-        paint_presentation(&mut rasterizer, &presentation, 0.0, 0.0, |x, y, coverage| {
-            painted.push((x, y, coverage));
-        });
+        paint_presentation(
+            &mut rasterizer,
+            &presentation,
+            0.0,
+            0.0,
+            |x, y, coverage| {
+                painted.push((x, y, coverage));
+            },
+        );
 
         assert!(!painted.is_empty(), "painting visible text plots pixels");
         let max_x = painted.iter().map(|(x, ..)| *x).max().unwrap();
@@ -312,9 +315,15 @@ mod tests {
         let presentation = engine.presentation();
         let mut rasterizer = GlyphRasterizer::new();
         let mut painted = Vec::new();
-        paint_presentation(&mut rasterizer, &presentation, 0.0, 0.0, |x, y, coverage| {
-            painted.push((x, y, coverage));
-        });
+        paint_presentation(
+            &mut rasterizer,
+            &presentation,
+            0.0,
+            0.0,
+            |x, y, coverage| {
+                painted.push((x, y, coverage));
+            },
+        );
         assert!(painted.is_empty());
     }
 }

@@ -26,18 +26,66 @@ pub enum ClipboardError {
     Unavailable,
 }
 
-/// Placeholder clipboard used until A7 supplies native OS integration.
-/// Reads behave as an empty clipboard and writes are intentionally discarded.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClipboardService;
+/// Native OS clipboard access via `arboard`.
+///
+/// Clipboard handles hold platform resources that are not always available
+/// (e.g. a headless CI runner with no display server), so construction
+/// never fails outright: when the platform clipboard cannot be opened,
+/// this behaves as an always-empty clipboard (reads return `None`, writes
+/// return [`ClipboardError::Unavailable`]) rather than panicking or
+/// preventing the runtime from starting.
+pub struct SystemClipboardService {
+    clipboard: std::sync::Mutex<Option<arboard::Clipboard>>,
+}
+
+impl SystemClipboardService {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            clipboard: std::sync::Mutex::new(arboard::Clipboard::new().ok()),
+        }
+    }
+}
+
+impl Default for SystemClipboardService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for SystemClipboardService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SystemClipboardService")
+            .finish_non_exhaustive()
+    }
+}
 
 impl ClipboardService for SystemClipboardService {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        Ok(None)
+        let mut guard = self
+            .clipboard
+            .lock()
+            .expect("system clipboard mutex is not poisoned");
+        match guard.as_mut() {
+            // A non-text clipboard (e.g. an image) or a genuinely empty
+            // clipboard are the same "nothing to paste" case from an
+            // Editor's point of view.
+            Some(clipboard) => Ok(clipboard.get_text().ok()),
+            None => Ok(None),
+        }
     }
 
-    fn write_text(&self, _text: &str) -> Result<(), ClipboardError> {
-        Ok(())
+    fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
+        let mut guard = self
+            .clipboard
+            .lock()
+            .expect("system clipboard mutex is not poisoned");
+        match guard.as_mut() {
+            Some(clipboard) => clipboard
+                .set_text(text.to_owned())
+                .map_err(|_| ClipboardError::Unavailable),
+            None => Err(ClipboardError::Unavailable),
+        }
     }
 }
 
@@ -202,7 +250,7 @@ impl Default for RuntimeTimeSeams {
             wake_driver: Arc::new(youth_state::SystemWakeDriver::default()),
             guest_monotonic_clock: Arc::new(SystemGuestMonotonicClock::default()),
             notification_dispatcher: Arc::new(SystemNotificationDispatcher),
-            clipboard_service: Arc::new(SystemClipboardService),
+            clipboard_service: Arc::new(SystemClipboardService::new()),
         }
     }
 }
@@ -253,5 +301,22 @@ impl YouthAppConfig {
     pub fn with_time_seams(mut self, time: RuntimeTimeSeams) -> Self {
         self.limits.time = time;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_clipboard_construction_is_infallible_and_never_panics() {
+        // Deliberately does not exercise read_text/write_text here: those
+        // touch the real OS pasteboard, which would clobber whatever a
+        // developer running this test suite currently has copied. The
+        // graceful-degradation behavior when a platform clipboard is
+        // unavailable (headless CI, no display server) is exercised by
+        // construction alone succeeding regardless of environment.
+        let clipboard = SystemClipboardService::new();
+        let _ = format!("{clipboard:?}");
     }
 }

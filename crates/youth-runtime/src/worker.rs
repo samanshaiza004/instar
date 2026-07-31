@@ -47,7 +47,10 @@ impl PresentationReader {
     /// the worker after every mount/resync/handle-commit/local edit --
     /// host-local only, never derived from or exposed to the guest.
     #[must_use]
-    pub fn editor(&self, editor: youth_tree::NodeId) -> Option<youth_editor_engine::TextPresentation> {
+    pub fn editor(
+        &self,
+        editor: youth_tree::NodeId,
+    ) -> Option<youth_editor_engine::TextPresentation> {
         self.editor_presentations
             .read()
             .expect("presentation-record lock is not poisoned")

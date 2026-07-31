@@ -37,7 +37,7 @@ pub struct EngineSnapshot {
 }
 
 /// A rectangle in layout-local coordinates (logical pixels).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutRect {
     pub x0: f64,
     pub y0: f64,
@@ -94,6 +94,11 @@ pub struct TextPresentation {
     pub cursor: Option<LayoutRect>,
     pub content_width: f32,
     pub content_height: f32,
+    /// A rectangle bounding the area a platform IME candidate window should
+    /// avoid covering. Meaningful regardless of whether composition is
+    /// currently in progress, so a host can pass it to
+    /// `Window::set_ime_cursor_area` as soon as an Editor gains focus.
+    pub ime_cursor_area: LayoutRect,
 }
 
 /// The editing seam: Unicode/grapheme-correct insertion, deletion, and
@@ -146,6 +151,30 @@ pub trait EditorEngine {
     ///
     /// No-op if either bound is not a char boundary.
     fn select_byte_range(&mut self, start: usize, end: usize);
+
+    /// Sets or replaces the IME preedit (composing) text at the cursor,
+    /// starting composition if not already in progress. `cursor` is a
+    /// byte range relative to `text`'s start; `None` hides the cursor
+    /// during composition.
+    ///
+    /// The preedit text is provisionally part of the buffer (so it's
+    /// visible and participates in layout) but is not a committed edit --
+    /// callers should not treat repeated calls to this method as separate
+    /// undoable operations.
+    fn ime_set_compose(&mut self, text: &str, cursor: Option<(usize, usize)>);
+
+    /// Cancels IME composition, removing the preedit text entirely and
+    /// restoring the cursor to where composition started. A no-op if not
+    /// currently composing.
+    fn ime_clear_compose(&mut self);
+
+    /// Commits the current IME preedit text as ordinary buffer content,
+    /// ending composition without changing what's in the buffer. A no-op
+    /// if not currently composing.
+    fn ime_finish_compose(&mut self);
+
+    /// Whether an IME composition is currently in progress.
+    fn is_composing(&self) -> bool;
 }
 
 /// The layout/presentation seam: viewport-aware geometry, only meaningful
@@ -309,6 +338,30 @@ impl EditorEngine for ParleyEditorEngine {
     fn select_byte_range(&mut self, start: usize, end: usize) {
         self.driver().select_byte_range(start, end);
     }
+
+    fn ime_set_compose(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        if text.is_empty() {
+            // Parley's `set_compose` asserts non-empty text; an empty
+            // preedit update is winit's way of signaling the preedit was
+            // cleared (see `Ime::Preedit`'s documentation), so route it to
+            // clear instead.
+            self.ime_clear_compose();
+            return;
+        }
+        self.driver().set_compose(text, cursor);
+    }
+
+    fn ime_clear_compose(&mut self) {
+        self.driver().clear_compose();
+    }
+
+    fn ime_finish_compose(&mut self) {
+        self.driver().finish_compose();
+    }
+
+    fn is_composing(&self) -> bool {
+        self.editor.is_composing()
+    }
 }
 
 impl EditorLayout for ParleyEditorEngine {
@@ -356,7 +409,11 @@ impl EditorLayout for ParleyEditorEngine {
             .into_iter()
             .map(|(rect, _line)| rect.into())
             .collect();
-        let cursor = self.editor.cursor_geometry(DEFAULT_CURSOR_WIDTH).map(Into::into);
+        let cursor = self
+            .editor
+            .cursor_geometry(DEFAULT_CURSOR_WIDTH)
+            .map(Into::into);
+        let ime_cursor_area = self.editor.ime_cursor_area().into();
         let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
         let mut runs = Vec::new();
         for line in layout.lines() {
@@ -387,6 +444,7 @@ impl EditorLayout for ParleyEditorEngine {
             cursor,
             content_width: layout.width(),
             content_height: layout.height(),
+            ime_cursor_area,
         }
     }
 }
@@ -609,7 +667,10 @@ mod tests {
             first_run.font.data.id(),
             "the font handle's id is stable across repeated reads"
         );
-        assert!(!first_run.font.data.data().is_empty(), "font bytes are accessible");
+        assert!(
+            !first_run.font.data.data().is_empty(),
+            "font bytes are accessible"
+        );
     }
 
     #[test]
@@ -619,5 +680,88 @@ mod tests {
         let presentation = engine.presentation();
         assert!(!presentation.selection.is_empty());
     }
-}
 
+    /// Total glyph count across every run, as a cheap proxy for "how much
+    /// visible content is currently laid out" without needing a raw-text
+    /// accessor. `presentation()` lays out the buffer including any live
+    /// IME preedit content, unlike `snapshot()` (see below).
+    fn glyph_count(presentation: &TextPresentation) -> usize {
+        presentation.runs.iter().map(|run| run.glyphs.len()).sum()
+    }
+
+    #[test]
+    fn ime_compose_is_visible_in_presentation_but_excluded_from_snapshot() {
+        let mut engine = ParleyEditorEngine::with_text("ab");
+        engine.move_cursor(Movement::End);
+        assert!(!engine.is_composing());
+        let before = glyph_count(&engine.presentation());
+
+        engine.ime_set_compose("xyz", Some((0, 3)));
+        assert!(engine.is_composing());
+        assert_eq!(
+            glyph_count(&engine.presentation()),
+            before + 3,
+            "preedit text is visibly laid out while composing"
+        );
+        // Parley deliberately excludes in-progress preedit from `text()`:
+        // it is not yet what the user has committed to writing, and must
+        // not leak into undo history or the youth:editor capability's
+        // guest-visible snapshot while still cancellable.
+        assert_eq!(
+            engine.snapshot().text,
+            "ab",
+            "uncommitted preedit must not appear in the committed snapshot"
+        );
+
+        engine.ime_finish_compose();
+        assert!(!engine.is_composing(), "finishing ends composition");
+        assert_eq!(
+            engine.snapshot().text,
+            "abxyz",
+            "the committed text is exactly what was being composed"
+        );
+    }
+
+    #[test]
+    fn ime_clear_compose_removes_the_preedit_text_entirely() {
+        let mut engine = ParleyEditorEngine::with_text("ab");
+        engine.move_cursor(Movement::End);
+        let before = glyph_count(&engine.presentation());
+        engine.ime_set_compose("xyz", Some((0, 3)));
+        assert_eq!(glyph_count(&engine.presentation()), before + 3);
+
+        engine.ime_clear_compose();
+        assert!(!engine.is_composing());
+        assert_eq!(
+            glyph_count(&engine.presentation()),
+            before,
+            "cancelling composition removes the preedit text from layout"
+        );
+        assert_eq!(engine.snapshot().text, "ab");
+    }
+
+    #[test]
+    fn repeated_ime_set_compose_replaces_rather_than_accumulates() {
+        let mut engine = ParleyEditorEngine::with_text("");
+        engine.ime_set_compose("k", Some((0, 1)));
+        engine.ime_set_compose("ka", Some((0, 2)));
+        engine.ime_set_compose("kan", Some((0, 3)));
+        assert_eq!(
+            glyph_count(&engine.presentation()),
+            3,
+            "each update replaces the whole preedit run, not appends to it"
+        );
+        engine.ime_finish_compose();
+        assert_eq!(engine.snapshot().text, "kan");
+    }
+
+    #[test]
+    fn an_empty_compose_update_clears_preedit_instead_of_panicking() {
+        let mut engine = ParleyEditorEngine::with_text("ab");
+        engine.ime_set_compose("xyz", Some((0, 3)));
+        assert!(engine.is_composing());
+        engine.ime_set_compose("", None);
+        assert!(!engine.is_composing());
+        assert_eq!(engine.snapshot().text, "ab");
+    }
+}

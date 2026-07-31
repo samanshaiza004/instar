@@ -275,8 +275,14 @@ async fn cursor_movement_is_a_real_undo_group_boundary() {
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("exhausted undo is safe");
-    assert_eq!(extra_undo, undo_two, "pure cursor movement left nothing to undo");
-    assert_ne!(before_undo.text, INITIAL, "sanity: content existed before undoing");
+    assert_eq!(
+        extra_undo, undo_two,
+        "pure cursor movement left nothing to undo"
+    );
+    assert_ne!(
+        before_undo.text, INITIAL,
+        "sanity: content existed before undoing"
+    );
 
     app.stop().await.expect("worker stops");
 }
@@ -349,6 +355,147 @@ async fn extend_selection_produces_a_real_selection_range_end_to_end() {
 }
 
 #[tokio::test]
+async fn ime_composition_updates_are_guest_turn_free_and_do_not_advance_edit_sequence() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    let baseline = app.inspect().await.expect("baseline inspection succeeds");
+
+    let first = app
+        .edit_editor_locally(
+            id(2),
+            EditorLocalEdit::ImeSetCompose {
+                text: "n".to_owned(),
+                cursor: Some((0, 1)),
+            },
+        )
+        .await
+        .expect("first compose update succeeds");
+    assert_eq!(
+        first.edit_sequence, 0,
+        "preedit is not accepted content yet"
+    );
+    assert_eq!(
+        first.text, INITIAL,
+        "snapshot excludes in-progress preedit content"
+    );
+
+    let second = app
+        .edit_editor_locally(
+            id(2),
+            EditorLocalEdit::ImeSetCompose {
+                text: "ni".to_owned(),
+                cursor: Some((0, 2)),
+            },
+        )
+        .await
+        .expect("repeated compose update replaces rather than accumulates");
+    assert_eq!(second.edit_sequence, 0);
+    assert_eq!(second.text, INITIAL);
+
+    let after = app
+        .inspect()
+        .await
+        .expect("post-compose inspection succeeds");
+    assert_eq!(
+        after.guest_call_count, baseline.guest_call_count,
+        "IME preedit updates must never enter the guest"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn ime_clear_compose_discards_preedit_with_nothing_to_undo() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    app.edit_editor_locally(
+        id(2),
+        EditorLocalEdit::ImeSetCompose {
+            text: "n".to_owned(),
+            cursor: Some((0, 1)),
+        },
+    )
+    .await
+    .expect("compose update succeeds");
+    let cleared = app
+        .edit_editor_locally(id(2), EditorLocalEdit::ImeClearCompose)
+        .await
+        .expect("clearing composition succeeds");
+    assert_eq!(cleared.text, INITIAL);
+    assert_eq!(cleared.edit_sequence, 0);
+
+    let undone = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("undo after a cancelled composition is a safe no-op");
+    assert_eq!(
+        undone, cleared,
+        "a cancelled composition never touched accepted content, so there is nothing to undo"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn ime_finish_compose_commits_the_whole_composition_as_one_undo_group() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    let baseline = app.inspect().await.expect("baseline inspection succeeds");
+
+    app.edit_editor_locally(
+        id(2),
+        EditorLocalEdit::ImeSetCompose {
+            text: "n".to_owned(),
+            cursor: Some((0, 1)),
+        },
+    )
+    .await
+    .expect("first compose update succeeds");
+    app.edit_editor_locally(
+        id(2),
+        EditorLocalEdit::ImeSetCompose {
+            text: "ni".to_owned(),
+            cursor: Some((0, 2)),
+        },
+    )
+    .await
+    .expect("second compose update succeeds");
+    let finished = app
+        .edit_editor_locally(id(2), EditorLocalEdit::ImeFinishCompose)
+        .await
+        .expect("finishing composition succeeds");
+    assert_eq!(finished.text, format!("{INITIAL}ni"));
+    assert_eq!(
+        finished.edit_sequence, 1,
+        "committing a composition advances edit_sequence exactly once"
+    );
+
+    let after = app
+        .inspect()
+        .await
+        .expect("post-commit inspection succeeds");
+    assert_eq!(
+        after.guest_call_count, baseline.guest_call_count,
+        "committing an IME composition must never enter the guest"
+    );
+
+    let undone = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("undo succeeds");
+    assert_eq!(
+        undone.text, INITIAL,
+        "one undo removes the whole composition regardless of how many preedit updates it took"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
 async fn movement_and_selection_operations_are_guest_turn_free() {
     let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
         .expect("Editor worker starts");
@@ -364,7 +511,10 @@ async fn movement_and_selection_operations_are_guest_turn_free() {
             .expect("extend succeeds");
     }
 
-    let after = app.inspect().await.expect("post-movement inspection succeeds");
+    let after = app
+        .inspect()
+        .await
+        .expect("post-movement inspection succeeds");
     assert_eq!(
         after.guest_call_count, baseline.guest_call_count,
         "cursor and selection movement must never enter the guest"
@@ -374,7 +524,10 @@ async fn movement_and_selection_operations_are_guest_turn_free() {
         .await
         .expect("real Snapshot activation succeeds");
     let after_activation = app.inspect().await.expect("control inspection succeeds");
-    assert_eq!(after_activation.guest_call_count, baseline.guest_call_count + 1);
+    assert_eq!(
+        after_activation.guest_call_count,
+        baseline.guest_call_count + 1
+    );
 
     app.stop().await.expect("worker stops");
 }

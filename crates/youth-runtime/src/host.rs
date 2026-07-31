@@ -194,7 +194,9 @@ impl HostState {
     /// calls whose read requires refreshing the engine's internal layout
     /// cache (e.g. `snapshot`); does not itself stage a copy-on-write
     /// mutation the way [`Self::staged_editor_sessions_mut`] does.
-    fn editor_sessions_for_call_mut(&mut self) -> &mut crate::editor_session::EditorSessionRegistry {
+    fn editor_sessions_for_call_mut(
+        &mut self,
+    ) -> &mut crate::editor_session::EditorSessionRegistry {
         self.staged_editor_sessions
             .as_mut()
             .unwrap_or(&mut self.editor_sessions)
@@ -1018,12 +1020,9 @@ impl crate::bindings::v006::youth::editor::session::Host for HostState {
         crate::bindings::v006::youth::editor::session::EditorErrorCode,
     > {
         let editor = editor_node_id_v006(editor)?;
-        crate::editor_session::snapshot_editor_session(
-            self.editor_sessions_for_call_mut(),
-            editor,
-        )
-        .map(to_wire_editor_snapshot_v006)
-        .map_err(to_wire_editor_error_v006)
+        crate::editor_session::snapshot_editor_session(self.editor_sessions_for_call_mut(), editor)
+            .map(to_wire_editor_snapshot_v006)
+            .map_err(to_wire_editor_error_v006)
     }
 
     fn accept(
@@ -1485,6 +1484,26 @@ impl YouthApp {
                     &mut self.store.data_mut().editor_sessions,
                     editor,
                     movement,
+                )
+            }
+            crate::EditorLocalEdit::ImeSetCompose { text, cursor } => {
+                crate::editor_session::local_ime_set_compose(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    &text,
+                    cursor,
+                )
+            }
+            crate::EditorLocalEdit::ImeClearCompose => {
+                crate::editor_session::local_ime_clear_compose(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                )
+            }
+            crate::EditorLocalEdit::ImeFinishCompose => {
+                crate::editor_session::local_ime_finish_compose(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
                 )
             }
         };
