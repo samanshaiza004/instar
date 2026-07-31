@@ -8,6 +8,7 @@ members = [
     "crates/youth-test",
     "crates/youth-runtime",
     "crates/youth-interaction",
+    "crates/youth-editor-engine",
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",

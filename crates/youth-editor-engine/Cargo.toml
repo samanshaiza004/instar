@@ -1,0 +1,8 @@
+[package]
+name = "youth-editor-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parley = "0.11"

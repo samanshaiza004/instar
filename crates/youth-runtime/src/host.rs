@@ -190,6 +190,16 @@ impl HostState {
             .unwrap_or(&self.editor_sessions)
     }
 
+    /// As [`Self::editor_sessions_for_call`], but mutable. Only needed by
+    /// calls whose read requires refreshing the engine's internal layout
+    /// cache (e.g. `snapshot`); does not itself stage a copy-on-write
+    /// mutation the way [`Self::staged_editor_sessions_mut`] does.
+    fn editor_sessions_for_call_mut(&mut self) -> &mut crate::editor_session::EditorSessionRegistry {
+        self.staged_editor_sessions
+            .as_mut()
+            .unwrap_or(&mut self.editor_sessions)
+    }
+
     fn staged_editor_sessions_mut(&mut self) -> &mut crate::editor_session::EditorSessionRegistry {
         if self.staged_editor_sessions.is_none() {
             self.staged_editor_sessions = Some(self.editor_sessions.clone());
@@ -1008,9 +1018,12 @@ impl crate::bindings::v006::youth::editor::session::Host for HostState {
         crate::bindings::v006::youth::editor::session::EditorErrorCode,
     > {
         let editor = editor_node_id_v006(editor)?;
-        crate::editor_session::snapshot_editor_session(self.editor_sessions_for_call(), editor)
-            .map(to_wire_editor_snapshot_v006)
-            .map_err(to_wire_editor_error_v006)
+        crate::editor_session::snapshot_editor_session(
+            self.editor_sessions_for_call_mut(),
+            editor,
+        )
+        .map(to_wire_editor_snapshot_v006)
+        .map_err(to_wire_editor_error_v006)
     }
 
     fn accept(
@@ -1347,23 +1360,18 @@ impl YouthApp {
     /// Test-only introspection for live host Editor sessions.
     #[cfg(test)]
     pub(crate) fn editor_session_test_state(
-        &self,
+        &mut self,
     ) -> Vec<(youth_tree::NodeId, u64, u64, u64, String)> {
         let mut sessions = self
             .store
-            .data()
+            .data_mut()
             .editor_sessions
-            .iter()
+            .iter_mut()
             .filter_map(|(&node_id, slot)| {
+                let generation = slot.generation();
                 slot.session()
                     .map(|(document_revision, edit_sequence, text)| {
-                        (
-                            node_id,
-                            slot.generation(),
-                            document_revision,
-                            edit_sequence,
-                            text.to_owned(),
-                        )
+                        (node_id, generation, document_revision, edit_sequence, text)
                     })
             })
             .collect::<Vec<_>>();
@@ -1463,6 +1471,20 @@ impl YouthApp {
                     &mut self.store.data_mut().editor_sessions,
                     editor,
                     clipboard_text.as_deref().unwrap_or_default(),
+                )
+            }
+            crate::EditorLocalEdit::MoveCursor(movement) => {
+                crate::editor_session::local_move_cursor(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    movement,
+                )
+            }
+            crate::EditorLocalEdit::ExtendSelection(movement) => {
+                crate::editor_session::local_extend_selection(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    movement,
                 )
             }
         };

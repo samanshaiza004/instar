@@ -4,9 +4,16 @@
 //! corresponding live session for as long as that stable node remains in the
 //! installed tree. A slot remains after its session is destroyed so that a
 //! later Editor with the same node ID receives a distinct generation.
+//!
+//! Text editing itself (Unicode/grapheme correctness, cursor, selection,
+//! layout) is delegated to `youth_editor_engine::ParleyEditorEngine` -- this
+//! module owns only the session lifecycle, revision/sequence bookkeeping,
+//! and undo/redo grouping around it.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 
+use youth_editor_engine::{EditorEngine, Movement, ParleyEditorEngine};
 use youth_tree::{NodeData, NodeId, Tree};
 
 pub(super) type EditorSessionRegistry = HashMap<NodeId, EditorSessionSlot>;
@@ -17,7 +24,7 @@ pub(super) const EDIT_SEQUENCE_BASE: u64 = 0;
 /// Maximum reversible edit groups retained per live Editor session.
 ///
 /// 512 groups keeps ordinary scratchpad undo useful while placing a fixed
-/// bound on the number of retained edit deltas. The oldest group is discarded
+/// bound on the number of retained snapshots. The oldest group is discarded
 /// when the limit is reached.
 const UNDO_GROUP_LIMIT: usize = 512;
 
@@ -27,9 +34,12 @@ pub struct EditorLocalEditResult {
     pub document_revision: u64,
     pub edit_sequence: u64,
     pub text: String,
+    pub cursor: usize,
+    pub selection: Option<Range<usize>>,
 }
 
-/// The cursor-free local mutations supported by Scratchpad Gate A4.
+/// The local, guest-turn-free mutations supported against a host Editor
+/// session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditorLocalEdit {
     InsertText(String),
@@ -37,8 +47,13 @@ pub enum EditorLocalEdit {
     Undo,
     Redo,
     Paste,
+    MoveCursor(Movement),
+    ExtendSelection(Movement),
 }
 
+/// The guest-facing view of a session: whole-buffer text only. Cursor and
+/// selection are host-local UI state and never cross the `youth:editor`
+/// capability boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EditorSessionSnapshot {
     pub(super) document_revision: u64,
@@ -53,46 +68,60 @@ pub(super) enum EditorSessionError {
     StaleEditSequence,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub(super) struct EditorSessionSlot {
     generation: u64,
     session: Option<EditorSession>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct EditorSession {
     /// The guest declaration from which this generation was first created.
     /// Later declarations never overwrite host-owned session state.
     document_revision: u64,
-    /// Host-owned ordering of live buffer changes.
+    /// Host-owned ordering of live buffer changes. Pure cursor/selection
+    /// movement does not advance this -- only operations that mutate
+    /// content do, since this is what `accept`/`replace`'s staleness check
+    /// (and the derived `locally_dirty` fact) cares about.
     edit_sequence: u64,
     /// The latest host edit sequence acknowledged by a successful guest
     /// `accept`. Dirty state is derived rather than separately stored.
     accepted_edit_sequence: u64,
-    text: String,
+    /// The real Unicode-aware buffer, cursor, selection, and layout.
+    engine: ParleyEditorEngine,
     /// Most recent revision declared for this still-live node. A mismatch is
     /// remembered without replacing the session's creation payload.
     last_declared_document_revision: u64,
-    undo_stack: VecDeque<UndoGroup>,
-    redo_stack: VecDeque<UndoGroup>,
-    /// True only while the next `InsertText` may extend the newest insertion
-    /// group. Every other operation closes the group.
+    undo_stack: VecDeque<UndoSnapshot>,
+    redo_stack: VecDeque<UndoSnapshot>,
+    /// True only while the next `InsertText` may extend the newest
+    /// insertion group. Every other operation closes the group.
     insert_group_open: bool,
 }
 
-/// A reversible end-of-buffer delta. Whole buffers are deliberately not
-/// copied into history.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum UndoGroup {
-    InsertText(String),
-    Backspace(char),
-    Paste(String),
+impl Clone for EditorSession {
+    fn clone(&self) -> Self {
+        Self {
+            document_revision: self.document_revision,
+            edit_sequence: self.edit_sequence,
+            accepted_edit_sequence: self.accepted_edit_sequence,
+            engine: self.engine.clone(),
+            last_declared_document_revision: self.last_declared_document_revision,
+            undo_stack: self.undo_stack.clone(),
+            redo_stack: self.redo_stack.clone(),
+            insert_group_open: self.insert_group_open,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InsertKind {
-    Typing,
-    Paste,
+/// A full (text, cursor, selection) snapshot taken immediately before an
+/// undo group's edits, so undo/redo can restore exact prior state rather
+/// than reversing individual character deltas against a cursor-aware
+/// buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UndoSnapshot {
+    text: String,
+    cursor: usize,
+    selection: Option<Range<usize>>,
 }
 
 /// Reconciles host Editor sessions against a candidate committed tree.
@@ -105,10 +134,15 @@ pub(super) fn reconcile_editor_sessions(
     previous: &EditorSessionRegistry,
     tree: &Tree,
 ) -> EditorSessionRegistry {
-    let mut reconciled = previous.clone();
-
-    for slot in reconciled.values_mut() {
-        slot.session = None;
+    let mut reconciled = EditorSessionRegistry::new();
+    for (&node_id, slot) in previous {
+        reconciled.insert(
+            node_id,
+            EditorSessionSlot {
+                generation: slot.generation,
+                session: None,
+            },
+        );
     }
 
     for node in tree.to_snapshot().nodes {
@@ -120,50 +154,41 @@ pub(super) fn reconcile_editor_sessions(
             continue;
         };
 
-        match reconciled.get_mut(&node.id) {
-            Some(slot) if previous[&node.id].session.is_some() => {
+        match previous.get(&node.id) {
+            Some(previous_slot) if previous_slot.session.is_some() => {
                 // Stable node identity owns the live session. In particular,
                 // an out-of-band declaration revision change must not clobber
                 // host-owned state; replacement is only authorized through
                 // the youth:editor capability boundary.
-                let mut session = previous[&node.id]
+                let mut session = previous_slot
                     .session
                     .clone()
                     .expect("live Editor slot has a session");
                 session.last_declared_document_revision = document_revision;
-                slot.session = Some(session);
+                reconciled
+                    .get_mut(&node.id)
+                    .expect("slot copied from previous registry")
+                    .session = Some(session);
             }
-            Some(slot) => {
-                slot.generation = slot
+            Some(previous_slot) => {
+                let generation = previous_slot
                     .generation
                     .checked_add(1)
                     .expect("Editor session generation exhausted");
-                slot.session = Some(EditorSession {
-                    document_revision,
-                    edit_sequence: EDIT_SEQUENCE_BASE,
-                    accepted_edit_sequence: EDIT_SEQUENCE_BASE,
-                    text,
-                    last_declared_document_revision: document_revision,
-                    undo_stack: VecDeque::new(),
-                    redo_stack: VecDeque::new(),
-                    insert_group_open: false,
-                });
+                reconciled.insert(
+                    node.id,
+                    EditorSessionSlot {
+                        generation,
+                        session: Some(new_session(document_revision, &text)),
+                    },
+                );
             }
             None => {
                 reconciled.insert(
                     node.id,
                     EditorSessionSlot {
                         generation: 1,
-                        session: Some(EditorSession {
-                            document_revision,
-                            edit_sequence: EDIT_SEQUENCE_BASE,
-                            accepted_edit_sequence: EDIT_SEQUENCE_BASE,
-                            text,
-                            last_declared_document_revision: document_revision,
-                            undo_stack: VecDeque::new(),
-                            redo_stack: VecDeque::new(),
-                            insert_group_open: false,
-                        }),
+                        session: Some(new_session(document_revision, &text)),
                     },
                 );
             }
@@ -173,38 +198,60 @@ pub(super) fn reconcile_editor_sessions(
     reconciled
 }
 
+fn new_session(document_revision: u64, text: &str) -> EditorSession {
+    let mut engine = ParleyEditorEngine::with_text(text);
+    // `with_text` collapses to the start (the correct behavior for an
+    // authoritative `replace`, where the prior cursor position is
+    // meaningless). A freshly mounted session instead starts the cursor at
+    // the end of the guest's initial content, matching ordinary "continue
+    // where the document left off" editor behavior.
+    engine.move_to_byte(text.len());
+    EditorSession {
+        document_revision,
+        edit_sequence: EDIT_SEQUENCE_BASE,
+        accepted_edit_sequence: EDIT_SEQUENCE_BASE,
+        engine,
+        last_declared_document_revision: document_revision,
+        undo_stack: VecDeque::new(),
+        redo_stack: VecDeque::new(),
+        insert_group_open: false,
+    }
+}
+
 pub(super) fn snapshot_editor_session(
-    registry: &EditorSessionRegistry,
+    registry: &mut EditorSessionRegistry,
     editor: NodeId,
 ) -> Result<EditorSessionSnapshot, EditorSessionError> {
-    let session = registry
-        .get(&editor)
-        .and_then(|slot| slot.session.as_ref())
-        .ok_or(EditorSessionError::UnknownEditor)?;
+    let session = live_session_mut(registry, editor)?;
+    let text = session.engine.snapshot().text;
     Ok(EditorSessionSnapshot {
         document_revision: session.document_revision,
         edit_sequence: session.edit_sequence,
-        text: session.text.clone(),
+        text,
     })
 }
 
-/// Appends text to a live host-owned session without entering the guest.
-///
-/// Each accepted operation advances `edit_sequence` exactly once, including
-/// insertion of an empty string.
+/// Inserts `text` at the cursor (replacing the selection, if any) without
+/// entering the guest. Consecutive inserts merge into one undo group.
 pub(super) fn local_insert_text(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
     text: &str,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
-    local_insert_text_with_kind(registry, editor, text, InsertKind::Typing)
+    let session = live_session_mut(registry, editor)?;
+    session.redo_stack.clear();
+    if !session.insert_group_open {
+        let before = snapshot_of(&mut session.engine);
+        push_bounded(&mut session.undo_stack, before);
+        session.insert_group_open = true;
+    }
+    session.engine.insert(text);
+    advance_edit_sequence(session);
+    Ok(local_edit_result(session))
 }
 
-/// Removes the final Unicode scalar from a live host-owned session without
-/// entering the guest.
-///
-/// A backspace against an empty buffer is accepted and still advances
-/// `edit_sequence`; cursor-aware deletion belongs to A5.
+/// Deletes one Unicode-safe unit before the cursor (or the selection, if
+/// any) without entering the guest. Always its own undo group.
 pub(super) fn local_backspace(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
@@ -212,60 +259,30 @@ pub(super) fn local_backspace(
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
     session.redo_stack.clear();
-    if let Some(removed) = session.text.pop() {
-        push_bounded(&mut session.undo_stack, UndoGroup::Backspace(removed));
-    }
+    let before = snapshot_of(&mut session.engine);
+    push_bounded(&mut session.undo_stack, before);
+    session.engine.backspace();
     advance_edit_sequence(session);
     Ok(local_edit_result(session))
 }
 
 /// Inserts clipboard text as an isolated undo group. Empty clipboard text is
-/// a safe no-op, but still closes surrounding typing groups so later typing
-/// cannot merge across a paste command.
+/// a safe no-op (no history entry, no sequence advance), but still closes
+/// surrounding typing groups so later typing cannot merge across a paste.
 pub(super) fn local_paste_text(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
     text: &str,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
-    local_insert_text_with_kind(registry, editor, text, InsertKind::Paste)
-}
-
-fn local_insert_text_with_kind(
-    registry: &mut EditorSessionRegistry,
-    editor: NodeId,
-    text: &str,
-    kind: InsertKind,
-) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
-    match kind {
-        InsertKind::Typing => {
-            session.redo_stack.clear();
-            if !text.is_empty() {
-                if session.insert_group_open {
-                    let Some(UndoGroup::InsertText(group_text)) = session.undo_stack.back_mut()
-                    else {
-                        unreachable!("an open insertion group must be the newest undo group");
-                    };
-                    group_text.push_str(text);
-                } else {
-                    push_bounded(
-                        &mut session.undo_stack,
-                        UndoGroup::InsertText(text.to_owned()),
-                    );
-                    session.insert_group_open = true;
-                }
-            }
-        }
-        InsertKind::Paste => {
-            session.insert_group_open = false;
-            if text.is_empty() {
-                return Ok(local_edit_result(session));
-            }
-            session.redo_stack.clear();
-            push_bounded(&mut session.undo_stack, UndoGroup::Paste(text.to_owned()));
-        }
+    session.insert_group_open = false;
+    if text.is_empty() {
+        return Ok(local_edit_result(session));
     }
-    session.text.push_str(text);
+    session.redo_stack.clear();
+    let before = snapshot_of(&mut session.engine);
+    push_bounded(&mut session.undo_stack, before);
+    session.engine.insert(text);
     advance_edit_sequence(session);
     Ok(local_edit_result(session))
 }
@@ -276,11 +293,12 @@ pub(super) fn local_undo(
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
-    let Some(group) = session.undo_stack.pop_back() else {
+    let Some(before) = session.undo_stack.pop_back() else {
         return Ok(local_edit_result(session));
     };
-    apply_undo(session, &group);
-    push_bounded(&mut session.redo_stack, group);
+    let current = snapshot_of(&mut session.engine);
+    push_bounded(&mut session.redo_stack, current);
+    restore(&mut session.engine, &before);
     advance_edit_sequence(session);
     Ok(local_edit_result(session))
 }
@@ -291,12 +309,41 @@ pub(super) fn local_redo(
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
-    let Some(group) = session.redo_stack.pop_back() else {
+    let Some(after) = session.redo_stack.pop_back() else {
         return Ok(local_edit_result(session));
     };
-    apply_redo(session, &group);
-    push_bounded(&mut session.undo_stack, group);
+    let current = snapshot_of(&mut session.engine);
+    push_bounded(&mut session.undo_stack, current);
+    restore(&mut session.engine, &after);
     advance_edit_sequence(session);
+    Ok(local_edit_result(session))
+}
+
+/// Moves the cursor (collapsing any selection). Not itself undoable, but
+/// closes any open insertion group -- typing before and after a cursor
+/// move produces two separate undo groups. Does not advance `edit_sequence`
+/// since no content changes.
+pub(super) fn local_move_cursor(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    movement: Movement,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    session.engine.move_cursor(movement);
+    Ok(local_edit_result(session))
+}
+
+/// Extends the selection focus. Same group-boundary and non-content-mutating
+/// behavior as [`local_move_cursor`].
+pub(super) fn local_extend_selection(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    movement: Movement,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    session.engine.extend_selection(movement);
     Ok(local_edit_result(session))
 }
 
@@ -317,16 +364,18 @@ pub(super) fn accept_editor_session(
     expected_edit_sequence: u64,
     new_document_revision: u64,
 ) -> Result<(), EditorSessionError> {
-    let session = registry
-        .get_mut(&editor)
-        .and_then(|slot| slot.session.as_mut())
-        .ok_or(EditorSessionError::UnknownEditor)?;
+    let session = live_session_mut(registry, editor)?;
     validate_expected_session(session, expected_document_revision, expected_edit_sequence)?;
     session.document_revision = new_document_revision;
     session.accepted_edit_sequence = session.edit_sequence;
     Ok(())
 }
 
+/// Installs authoritative guest content. Per the frozen replace reset
+/// policy: cursor collapses to a defined valid position (buffer start, via
+/// the engine's own `set_text`), selection clears, edit sequence resets to
+/// base, and undo/redo history clears entirely (there is nothing coherent
+/// to undo back into once the buffer's identity has been replaced).
 pub(super) fn replace_editor_session(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
@@ -335,15 +384,12 @@ pub(super) fn replace_editor_session(
     new_document_revision: u64,
     authoritative_text: String,
 ) -> Result<(), EditorSessionError> {
-    let session = registry
-        .get_mut(&editor)
-        .and_then(|slot| slot.session.as_mut())
-        .ok_or(EditorSessionError::UnknownEditor)?;
+    let session = live_session_mut(registry, editor)?;
     validate_expected_session(session, expected_document_revision, expected_edit_sequence)?;
     session.document_revision = new_document_revision;
     session.edit_sequence = EDIT_SEQUENCE_BASE;
     session.accepted_edit_sequence = EDIT_SEQUENCE_BASE;
-    session.text = authoritative_text;
+    session.engine.set_text(&authoritative_text);
     session.undo_stack.clear();
     session.redo_stack.clear();
     session.insert_group_open = false;
@@ -381,38 +427,38 @@ fn advance_edit_sequence(session: &mut EditorSession) {
         .expect("Editor edit sequence exhausted");
 }
 
-fn push_bounded(stack: &mut VecDeque<UndoGroup>, group: UndoGroup) {
+fn push_bounded(stack: &mut VecDeque<UndoSnapshot>, snapshot: UndoSnapshot) {
     if stack.len() == UNDO_GROUP_LIMIT {
         stack.pop_front();
     }
-    stack.push_back(group);
+    stack.push_back(snapshot);
 }
 
-fn apply_undo(session: &mut EditorSession, group: &UndoGroup) {
-    match group {
-        UndoGroup::InsertText(text) | UndoGroup::Paste(text) => {
-            debug_assert!(session.text.ends_with(text));
-            session.text.truncate(session.text.len() - text.len());
-        }
-        UndoGroup::Backspace(removed) => session.text.push(*removed),
+fn snapshot_of(engine: &mut ParleyEditorEngine) -> UndoSnapshot {
+    let snapshot = engine.snapshot();
+    UndoSnapshot {
+        text: snapshot.text,
+        cursor: snapshot.cursor,
+        selection: snapshot.selection,
     }
 }
 
-fn apply_redo(session: &mut EditorSession, group: &UndoGroup) {
-    match group {
-        UndoGroup::InsertText(text) | UndoGroup::Paste(text) => session.text.push_str(text),
-        UndoGroup::Backspace(removed) => {
-            let redone = session.text.pop();
-            debug_assert_eq!(redone, Some(*removed));
-        }
+fn restore(engine: &mut ParleyEditorEngine, snapshot: &UndoSnapshot) {
+    engine.set_text(&snapshot.text);
+    match &snapshot.selection {
+        Some(range) => engine.select_byte_range(range.start, range.end),
+        None => engine.move_to_byte(snapshot.cursor),
     }
 }
 
-fn local_edit_result(session: &EditorSession) -> EditorLocalEditResult {
+fn local_edit_result(session: &mut EditorSession) -> EditorLocalEditResult {
+    let snapshot = session.engine.snapshot();
     EditorLocalEditResult {
         document_revision: session.document_revision,
         edit_sequence: session.edit_sequence,
-        text: session.text.clone(),
+        text: snapshot.text,
+        cursor: snapshot.cursor,
+        selection: snapshot.selection,
     }
 }
 
@@ -423,13 +469,10 @@ impl EditorSessionSlot {
     }
 
     #[cfg(test)]
-    pub(super) fn session(&self) -> Option<(u64, u64, &str)> {
-        self.session.as_ref().map(|session| {
-            (
-                session.document_revision,
-                session.edit_sequence,
-                session.text.as_str(),
-            )
+    pub(super) fn session(&mut self) -> Option<(u64, u64, String)> {
+        self.session.as_mut().map(|session| {
+            let text = session.engine.snapshot().text;
+            (session.document_revision, session.edit_sequence, text)
         })
     }
 

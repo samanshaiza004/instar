@@ -18,6 +18,7 @@ wasmtime = "46"
 wasmtime-wasi = "46"
 youth-tree = { path = "../youth-tree" }
 youth-state = { path = "../youth-state" }
+youth-editor-engine = { path = "../youth-editor-engine" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

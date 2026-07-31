@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use common::test_component;
 use youth_runtime::{
-    ClipboardService, EditorLocalEdit, RecordingClipboardService, YouthAppConfig, YouthAppHandle,
+    ClipboardService, EditorLocalEdit, Movement, RecordingClipboardService, YouthAppConfig,
+    YouthAppHandle,
 };
 use youth_tree::NodeId;
 
@@ -212,6 +213,168 @@ async fn absent_clipboard_paste_is_a_safe_no_op_without_an_empty_history_group()
         .await
         .expect("undo after empty paste succeeds");
     assert_eq!(undone, pasted);
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn insert_happens_at_the_real_cursor_position_not_always_at_the_end() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    // A freshly mounted session starts with the cursor at the end, so move
+    // it to the very start before inserting.
+    for _ in 0..INITIAL.len() {
+        app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+            .await
+            .expect("cursor moves left");
+    }
+    let inserted = app
+        .edit_editor_locally(id(2), EditorLocalEdit::InsertText(">>".to_owned()))
+        .await
+        .expect("insert at cursor succeeds");
+    assert_eq!(inserted.text, format!(">>{INITIAL}"));
+    assert_eq!(inserted.cursor, 2);
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn cursor_movement_is_a_real_undo_group_boundary() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    app.edit_editor_locally(id(2), EditorLocalEdit::InsertText("abc".to_owned()))
+        .await
+        .expect("first typing group");
+    app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+        .await
+        .expect("movement closes the group");
+    app.edit_editor_locally(id(2), EditorLocalEdit::InsertText("XY".to_owned()))
+        .await
+        .expect("second typing group");
+    let before_undo = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Home))
+        .await
+        .expect("movement is not itself undoable");
+
+    // Undoing once removes only the second group ("XY"), not "abc" too.
+    let undo_one = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("first undo removes only the second group");
+    assert_eq!(undo_one.text, format!("{INITIAL}abc"));
+    let undo_two = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("second undo removes the first group");
+    assert_eq!(undo_two.text, INITIAL);
+    let extra_undo = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("exhausted undo is safe");
+    assert_eq!(extra_undo, undo_two, "pure cursor movement left nothing to undo");
+    assert_ne!(before_undo.text, INITIAL, "sanity: content existed before undoing");
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn undo_restores_cursor_and_selection_not_just_text() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    // Move to the start (a defined, known position) before the edit whose
+    // undo we're about to verify.
+    for _ in 0..INITIAL.len() {
+        app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+            .await
+            .expect("cursor moves left");
+    }
+    let before_cursor = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+        .await
+        .expect("already-at-start movement is a safe no-op")
+        .cursor;
+    assert_eq!(before_cursor, 0);
+
+    app.edit_editor_locally(id(2), EditorLocalEdit::InsertText("Z".to_owned()))
+        .await
+        .expect("insert at start succeeds");
+
+    let undone = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("undo succeeds");
+    assert_eq!(undone.text, INITIAL);
+    assert_eq!(
+        undone.cursor, 0,
+        "undo must restore the cursor to where it was before the edit, not just the text"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn extend_selection_produces_a_real_selection_range_end_to_end() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    for _ in 0..INITIAL.len() {
+        app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+            .await
+            .expect("cursor moves left");
+    }
+    app.edit_editor_locally(id(2), EditorLocalEdit::ExtendSelection(Movement::Right))
+        .await
+        .expect("selection extends");
+    let selected = app
+        .edit_editor_locally(id(2), EditorLocalEdit::ExtendSelection(Movement::Right))
+        .await
+        .expect("selection extends further");
+    assert_eq!(selected.selection, Some(0..2));
+
+    // Typing with a live selection replaces it, exactly like a real editor.
+    let replaced = app
+        .edit_editor_locally(id(2), EditorLocalEdit::InsertText("Q".to_owned()))
+        .await
+        .expect("insert replaces the selection");
+    assert_eq!(replaced.text, format!("Q{}", &INITIAL[2..]));
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn movement_and_selection_operations_are_guest_turn_free() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    let baseline = app.inspect().await.expect("baseline inspection succeeds");
+
+    for _ in 0..50 {
+        app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Left))
+            .await
+            .expect("move succeeds");
+        app.edit_editor_locally(id(2), EditorLocalEdit::ExtendSelection(Movement::Right))
+            .await
+            .expect("extend succeeds");
+    }
+
+    let after = app.inspect().await.expect("post-movement inspection succeeds");
+    assert_eq!(
+        after.guest_call_count, baseline.guest_call_count,
+        "cursor and selection movement must never enter the guest"
+    );
+
+    app.activate(id(4))
+        .await
+        .expect("real Snapshot activation succeeds");
+    let after_activation = app.inspect().await.expect("control inspection succeeds");
+    assert_eq!(after_activation.guest_call_count, baseline.guest_call_count + 1);
 
     app.stop().await.expect("worker stops");
 }

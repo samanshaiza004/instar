@@ -1,7 +1,18 @@
 use tokio::sync::mpsc;
-use youth_interaction::EditorInput;
-use youth_runtime::{RuntimeErrorCategory, TurnReceipt, YouthAppHandle};
+use youth_interaction::{EditorInput, EditorMovement};
+use youth_runtime::{Movement, RuntimeErrorCategory, TurnReceipt, YouthAppHandle};
 use youth_tree::{NodeId, TreeSnapshot};
+
+const fn to_engine_movement(movement: EditorMovement) -> Movement {
+    match movement {
+        EditorMovement::Left => Movement::Left,
+        EditorMovement::Right => Movement::Right,
+        EditorMovement::Up => Movement::Up,
+        EditorMovement::Down => Movement::Down,
+        EditorMovement::Home => Movement::Home,
+        EditorMovement::End => Movement::End,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppErrorSummary {
@@ -91,10 +102,19 @@ impl Controller {
                                     EditorInput::Paste => {
                                         Some(youth_runtime::EditorLocalEdit::Paste)
                                     }
-                                    EditorInput::MoveCursor(_)
-                                    | EditorInput::ExtendSelection(_)
-                                    | EditorInput::Cut
-                                    | EditorInput::Copy => None,
+                                    EditorInput::MoveCursor(movement) => {
+                                        Some(youth_runtime::EditorLocalEdit::MoveCursor(
+                                            to_engine_movement(movement),
+                                        ))
+                                    }
+                                    EditorInput::ExtendSelection(movement) => {
+                                        Some(youth_runtime::EditorLocalEdit::ExtendSelection(
+                                            to_engine_movement(movement),
+                                        ))
+                                    }
+                                    // No selection-consuming clipboard semantics yet
+                                    // -- deferred alongside real Cut/Copy behavior.
+                                    EditorInput::Cut | EditorInput::Copy => None,
                                 };
                                 if let Some(edit) = edit
                                     && let Err(error) =
