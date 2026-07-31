@@ -39,6 +39,21 @@ fn config(
                 guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
                 ..RuntimeTimeSeams::default()
             },
+            // The production default's 100ms `handle` deadline is Wasmtime's
+            // real epoch-interruption budget (crates/youth-runtime/src/
+            // engine.rs), not the virtual DeadlineClock above -- it exists
+            // to trap a genuinely runaway guest, and this file's tests
+            // aren't testing that containment property. schedule_after does
+            // real SQLite I/O inside the guest call, which has been
+            // observed to exceed 100ms of real wall-clock time on a loaded
+            // Windows CI runner (unrelated to the virtual clock's value),
+            // tripping the trap as a false positive. Widened generously
+            // here, in tests only -- production still enforces the tight
+            // default via RuntimeLimits::default() elsewhere, unchanged.
+            handle: youth_runtime::CallBudget {
+                deadline: std::time::Duration::from_secs(5),
+                ..RuntimeLimits::default().handle
+            },
             ..RuntimeLimits::default()
         },
     }
