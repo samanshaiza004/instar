@@ -1144,6 +1144,12 @@ fn describe(observed: Option<&NodeData>) -> String {
         Some(NodeData::Text { value }) | Some(NodeData::AlignedText { value, .. }) => {
             format!("text({value:?})")
         }
+        Some(NodeData::Editor {
+            document_revision,
+            text,
+        }) => {
+            format!("editor(document_revision={document_revision}, text={text:?})")
+        }
         Some(NodeData::Countdown { .. }) | Some(NodeData::AlignedCountdown { .. }) => {
             "a countdown node".into()
         }

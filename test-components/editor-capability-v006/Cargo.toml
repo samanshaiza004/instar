@@ -1,0 +1,13 @@
+[package]
+name = "youth-editor-capability-v006"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Youth 0.0.6 editor capability and containment fixture."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51.0"

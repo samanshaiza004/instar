@@ -263,6 +263,11 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                     {
                         let _ = controller.send(ControllerCommand::Activate(node));
                     }
+                    if let Some((editor, input)) = change.editor_input
+                        && let Some(controller) = &self.controller
+                    {
+                        let _ = controller.send(ControllerCommand::EditorInput { editor, input });
+                    }
                     if change.redraw || change.action.is_some() {
                         window.request_redraw();
                     }
@@ -501,6 +506,8 @@ fn logical_key(key: &Key) -> Option<LogicalKey> {
         Key::Named(NamedKey::ArrowRight) => Some(LogicalKey::ArrowRight),
         Key::Named(NamedKey::ArrowUp) => Some(LogicalKey::ArrowUp),
         Key::Named(NamedKey::ArrowDown) => Some(LogicalKey::ArrowDown),
+        Key::Named(NamedKey::Home) => Some(LogicalKey::Home),
+        Key::Named(NamedKey::End) => Some(LogicalKey::End),
         Key::Named(_) | Key::Dead(_) | Key::Unidentified(_) => None,
     }
 }
@@ -645,6 +652,14 @@ mod tests {
         assert_eq!(
             logical_key(&Key::Named(NamedKey::ArrowLeft)),
             Some(LogicalKey::ArrowLeft)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::Home)),
+            Some(LogicalKey::Home)
+        );
+        assert_eq!(
+            logical_key(&Key::Named(NamedKey::End)),
+            Some(LogicalKey::End)
         );
     }
 }

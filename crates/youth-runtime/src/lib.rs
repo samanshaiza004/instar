@@ -8,6 +8,7 @@
 
 mod bindings;
 mod config;
+mod editor_session;
 mod engine;
 mod error;
 mod host;
@@ -18,10 +19,12 @@ mod wire;
 mod worker;
 
 pub use config::{
-    AppId, GuestMonotonicClock, NotificationDispatcher, RecordingNotificationDispatcher,
-    RuntimeTimeSeams, StateLocation, SystemGuestMonotonicClock, SystemNotificationDispatcher,
+    AppId, ClipboardError, ClipboardService, GuestMonotonicClock, NotificationDispatcher,
+    RecordingClipboardService, RecordingNotificationDispatcher, RuntimeTimeSeams, StateLocation,
+    SystemClipboardService, SystemGuestMonotonicClock, SystemNotificationDispatcher,
     VirtualGuestMonotonicClock, YouthAppConfig,
 };
+pub use editor_session::{EditorLocalEdit, EditorLocalEditResult};
 pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
 pub use host::{

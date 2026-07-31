@@ -37,6 +37,7 @@ fn config(
                 wake_driver: Arc::new(wakes.clone()),
                 guest_monotonic_clock: Arc::new(VirtualGuestMonotonicClock::new(0)),
                 notification_dispatcher: Arc::new(notifications.clone()),
+                ..RuntimeTimeSeams::default()
             },
             ..RuntimeLimits::default()
         },

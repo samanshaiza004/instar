@@ -574,6 +574,33 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Guest-owned revision of an Editor document's accepted meaning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentRevision(u64);
+
+impl DocumentRevision {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Host-issued ordering of changes to an Editor's live buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditSequence(u64);
+
+impl EditSequence {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Text;
 
@@ -621,6 +648,34 @@ impl Countdown {
                 precision: TimePrecision::Seconds,
                 format: CountdownFormat::MinutesSeconds,
                 alignment: TextAlign::Start,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Editor;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorElement {
+    key: NodeIdentity,
+    document_revision: DocumentRevision,
+    initial_text: String,
+}
+
+impl Editor {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(
+        key: impl Into<NodeIdentity>,
+        document_revision: DocumentRevision,
+        initial_text: impl Into<String>,
+    ) -> Element {
+        Element {
+            kind: ElementKind::Editor(EditorElement {
+                key: key.into(),
+                document_revision,
+                initial_text: initial_text.into(),
             }),
         }
     }
@@ -795,6 +850,7 @@ enum ElementKind {
     Box(BoxElement),
     Text(TextElement),
     Countdown(CountdownElement),
+    Editor(EditorElement),
     Button(ButtonElement),
 }
 
@@ -804,7 +860,7 @@ impl Element {
         match &mut self.kind {
             ElementKind::Box(value) => value.enabled = enabled,
             ElementKind::Button(value) => value.enabled = enabled,
-            ElementKind::Text(_) | ElementKind::Countdown(_) => {}
+            ElementKind::Text(_) | ElementKind::Countdown(_) | ElementKind::Editor(_) => {}
         }
         self
     }
@@ -814,7 +870,7 @@ impl Element {
         match &mut self.kind {
             ElementKind::Text(value) => value.alignment = alignment,
             ElementKind::Countdown(value) => value.alignment = alignment,
-            ElementKind::Box(_) | ElementKind::Button(_) => {}
+            ElementKind::Box(_) | ElementKind::Editor(_) | ElementKind::Button(_) => {}
         }
         self
     }
@@ -1113,6 +1169,77 @@ impl EventContext {
     pub const fn time(&mut self) -> TimeScheduler {
         TimeScheduler
     }
+
+    #[must_use]
+    pub const fn editor(&mut self) -> EditorCapability {
+        EditorCapability
+    }
+}
+
+/// Whole-buffer snapshot of a host-owned Editor session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorSnapshot {
+    document_revision: DocumentRevision,
+    edit_sequence: EditSequence,
+    text: String,
+}
+
+impl EditorSnapshot {
+    #[must_use]
+    pub const fn document_revision(&self) -> DocumentRevision {
+        self.document_revision
+    }
+
+    #[must_use]
+    pub const fn edit_sequence(&self) -> EditSequence {
+        self.edit_sequence
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EditorCapability;
+
+impl EditorCapability {
+    pub fn snapshot(self, editor: impl Into<NodeIdentity>) -> Result<EditorSnapshot> {
+        editor::snapshot(editor.into().id())
+    }
+
+    pub fn accept(
+        self,
+        editor: impl Into<NodeIdentity>,
+        expected_document_revision: DocumentRevision,
+        expected_edit_sequence: EditSequence,
+        new_document_revision: DocumentRevision,
+    ) -> Result<()> {
+        editor::accept(
+            editor.into().id(),
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+        )
+    }
+
+    pub fn replace(
+        self,
+        editor: impl Into<NodeIdentity>,
+        expected_document_revision: DocumentRevision,
+        expected_edit_sequence: EditSequence,
+        new_document_revision: DocumentRevision,
+        authoritative_text: impl Into<String>,
+    ) -> Result<()> {
+        editor::replace(
+            editor.into().id(),
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+            authoritative_text.into(),
+        )
+    }
 }
 
 /// A host-issued schedule identity.
@@ -1315,6 +1442,10 @@ enum FlatNodeData {
         precision: TimePrecision,
         format: CountdownFormat,
         alignment: TextAlign,
+    },
+    Editor {
+        document_revision: DocumentRevision,
+        text: String,
     },
     Button {
         label: String,
@@ -1703,6 +1834,18 @@ impl FlatTreeBuilder {
                 });
                 Ok(id)
             }
+            ElementKind::Editor(value) => {
+                let id = self.allocate_named(&value.key)?;
+                self.nodes.push(FlatNode {
+                    id,
+                    data: FlatNodeData::Editor {
+                        document_revision: value.document_revision,
+                        text: value.initial_text.clone(),
+                    },
+                    children: Vec::new(),
+                });
+                Ok(id)
+            }
             ElementKind::Button(value) => {
                 if value.shortcuts.len() > 4 {
                     return Err(Error::invalid_state()
@@ -1883,6 +2026,97 @@ mod state {
 }
 
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
+mod editor {
+    use super::{DocumentRevision, EditSequence, EditorSnapshot, Error, Result};
+    use crate::component::bindings::youth::editor::session::{self, EditorErrorCode};
+
+    pub fn snapshot(editor: u64) -> Result<EditorSnapshot> {
+        session::snapshot(editor)
+            .map(|snapshot| EditorSnapshot {
+                document_revision: DocumentRevision(snapshot.document_revision),
+                edit_sequence: EditSequence(snapshot.edit_sequence),
+                text: snapshot.text,
+            })
+            .map_err(map_error)
+    }
+
+    pub fn accept(
+        editor: u64,
+        expected_document_revision: DocumentRevision,
+        expected_edit_sequence: EditSequence,
+        new_document_revision: DocumentRevision,
+    ) -> Result<()> {
+        session::accept(
+            editor,
+            expected_document_revision.0,
+            expected_edit_sequence.0,
+            new_document_revision.0,
+        )
+        .map_err(map_error)
+    }
+
+    pub fn replace(
+        editor: u64,
+        expected_document_revision: DocumentRevision,
+        expected_edit_sequence: EditSequence,
+        new_document_revision: DocumentRevision,
+        authoritative_text: String,
+    ) -> Result<()> {
+        session::replace(
+            editor,
+            expected_document_revision.0,
+            expected_edit_sequence.0,
+            new_document_revision.0,
+            &authoritative_text,
+        )
+        .map_err(map_error)
+    }
+
+    fn map_error(error: EditorErrorCode) -> Error {
+        let message = match error {
+            EditorErrorCode::UnknownEditor => "host does not recognize the Editor node",
+            EditorErrorCode::StaleDocumentRevision => "Editor document revision is stale",
+            EditorErrorCode::StaleEditSequence => "Editor edit sequence is stale",
+            EditorErrorCode::Unavailable => "host Editor sessions are unavailable",
+            EditorErrorCode::Internal => return Error::internal(),
+        };
+        Error::invalid_state().with_message(message)
+    }
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+mod editor {
+    use super::{DocumentRevision, EditSequence, EditorSnapshot, Error, Result};
+
+    fn unavailable<T>() -> Result<T> {
+        Err(Error::internal().with_message("host Editor calls require wasm32-wasip2"))
+    }
+
+    pub fn snapshot(_editor: u64) -> Result<EditorSnapshot> {
+        unavailable()
+    }
+
+    pub fn accept(
+        _editor: u64,
+        _expected_document_revision: DocumentRevision,
+        _expected_edit_sequence: EditSequence,
+        _new_document_revision: DocumentRevision,
+    ) -> Result<()> {
+        unavailable()
+    }
+
+    pub fn replace(
+        _editor: u64,
+        _expected_document_revision: DocumentRevision,
+        _expected_edit_sequence: EditSequence,
+        _new_document_revision: DocumentRevision,
+        _authoritative_text: String,
+    ) -> Result<()> {
+        unavailable()
+    }
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
 mod time {
     use super::{Error, Result, Schedule, ScheduleOptions};
     use crate::component::bindings::youth::time::scheduler::{self, ScheduleErrorCode};
@@ -1971,9 +2205,10 @@ mod time {
 pub mod prelude {
     pub use crate::{
         ActivationKey, Application, BoxNode, Button, Column, CommandIdentity, CommandKey,
-        Countdown, CountdownFormat, ElapsedReason, Element, Error, ErrorKind, Event, EventContext,
-        Events, Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity,
-        NodeKey, Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
+        Countdown, CountdownFormat, DocumentRevision, EditSequence, Editor, EditorCapability,
+        EditorSnapshot, ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events,
+        Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity, NodeKey,
+        Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
         TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext, command,
         derived_command_id, derived_node_id, node, ui_ids,
     };
@@ -2019,6 +2254,24 @@ mod tests {
             id: 17,
             generation: 3,
         }
+    }
+
+    #[test]
+    fn editor_builder_emits_whole_buffer_document_data() {
+        let tree = Tree::root(Editor::new(
+            node!("scratchpad"),
+            DocumentRevision::new(7),
+            "Draft",
+        ))
+        .flatten()
+        .unwrap();
+        assert!(matches!(
+            &tree.nodes[1].data,
+            FlatNodeData::Editor {
+                document_revision,
+                text,
+            } if document_revision.get() == 7 && text == "Draft"
+        ));
     }
 
     #[test]

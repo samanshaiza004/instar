@@ -4809,6 +4809,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-editor-capability-v006"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "youth-editor-v006"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-elapsed-invalid-patch"
 version = "0.0.2"
 dependencies = [

@@ -91,6 +91,8 @@ pub struct AppInspection {
     pub node_count: usize,
     pub depth: usize,
     pub last_turn: Option<TurnReceipt>,
+    /// Number of lifecycle guest calls made after component instantiation.
+    pub guest_call_count: u64,
     pub fault: Option<AppFault>,
     pub canonical_tree: String,
 }
@@ -140,7 +142,10 @@ pub(crate) struct HostState {
     deadline_clock: Arc<dyn youth_state::DeadlineClock>,
     wake_driver: Arc<dyn youth_state::WakeDriver>,
     notification_dispatcher: Arc<dyn crate::NotificationDispatcher>,
+    clipboard_service: Arc<dyn crate::ClipboardService>,
     staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
+    editor_sessions: crate::editor_session::EditorSessionRegistry,
+    staged_editor_sessions: Option<crate::editor_session::EditorSessionRegistry>,
 }
 
 struct GuestClockAdapter(Arc<dyn crate::GuestMonotonicClock>);
@@ -177,6 +182,33 @@ impl HostState {
 
     fn discard_staged_schedule_outputs(&mut self) {
         self.staged_schedule_outputs.clear();
+    }
+
+    fn editor_sessions_for_call(&self) -> &crate::editor_session::EditorSessionRegistry {
+        self.staged_editor_sessions
+            .as_ref()
+            .unwrap_or(&self.editor_sessions)
+    }
+
+    fn staged_editor_sessions_mut(&mut self) -> &mut crate::editor_session::EditorSessionRegistry {
+        if self.staged_editor_sessions.is_none() {
+            self.staged_editor_sessions = Some(self.editor_sessions.clone());
+        }
+        self.staged_editor_sessions
+            .as_mut()
+            .expect("staged Editor registry was initialized")
+    }
+
+    fn install_editor_sessions(
+        &mut self,
+        editor_sessions: crate::editor_session::EditorSessionRegistry,
+    ) {
+        self.editor_sessions = editor_sessions;
+        self.staged_editor_sessions = None;
+    }
+
+    fn discard_staged_editor_sessions(&mut self) {
+        self.staged_editor_sessions = None;
     }
 }
 
@@ -877,6 +909,336 @@ fn to_wire_schedule_error_v005(
     }
 }
 
+impl crate::bindings::v006::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v006::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v006::youth::state::store::Value>,
+        crate::bindings::v006::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v006))
+            .map_err(to_wire_state_error_v006)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v006::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v006::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v006(value))
+            .map_err(to_wire_state_error_v006)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v006::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v006)
+    }
+}
+
+fn to_wire_state_value_v006(
+    value: youth_state::StateValue,
+) -> crate::bindings::v006::youth::state::store::Value {
+    use crate::bindings::v006::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v006(
+    value: crate::bindings::v006::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v006::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v006(
+    error: youth_state::StateError,
+) -> crate::bindings::v006::youth::state::store::StateError {
+    use crate::bindings::v006::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v006::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+impl crate::bindings::v006::youth::editor::session::Host for HostState {
+    fn snapshot(
+        &mut self,
+        editor: u64,
+    ) -> Result<
+        crate::bindings::v006::youth::editor::session::EditorSnapshot,
+        crate::bindings::v006::youth::editor::session::EditorErrorCode,
+    > {
+        let editor = editor_node_id_v006(editor)?;
+        crate::editor_session::snapshot_editor_session(self.editor_sessions_for_call(), editor)
+            .map(to_wire_editor_snapshot_v006)
+            .map_err(to_wire_editor_error_v006)
+    }
+
+    fn accept(
+        &mut self,
+        editor: u64,
+        expected_document_revision: u64,
+        expected_edit_sequence: u64,
+        new_document_revision: u64,
+    ) -> Result<(), crate::bindings::v006::youth::editor::session::EditorErrorCode> {
+        let editor = editor_node_id_v006(editor)?;
+        crate::editor_session::accept_editor_session(
+            self.staged_editor_sessions_mut(),
+            editor,
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+        )
+        .map_err(to_wire_editor_error_v006)
+    }
+
+    fn replace(
+        &mut self,
+        editor: u64,
+        expected_document_revision: u64,
+        expected_edit_sequence: u64,
+        new_document_revision: u64,
+        authoritative_text: String,
+    ) -> Result<(), crate::bindings::v006::youth::editor::session::EditorErrorCode> {
+        let editor = editor_node_id_v006(editor)?;
+        crate::editor_session::replace_editor_session(
+            self.staged_editor_sessions_mut(),
+            editor,
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+            authoritative_text,
+        )
+        .map_err(to_wire_editor_error_v006)
+    }
+}
+
+fn editor_node_id_v006(
+    value: u64,
+) -> Result<youth_tree::NodeId, crate::bindings::v006::youth::editor::session::EditorErrorCode> {
+    youth_tree::NodeId::new(value)
+        .ok_or(crate::bindings::v006::youth::editor::session::EditorErrorCode::UnknownEditor)
+}
+
+fn to_wire_editor_snapshot_v006(
+    snapshot: crate::editor_session::EditorSessionSnapshot,
+) -> crate::bindings::v006::youth::editor::session::EditorSnapshot {
+    crate::bindings::v006::youth::editor::session::EditorSnapshot {
+        document_revision: snapshot.document_revision,
+        edit_sequence: snapshot.edit_sequence,
+        text: snapshot.text,
+    }
+}
+
+fn to_wire_editor_error_v006(
+    error: crate::editor_session::EditorSessionError,
+) -> crate::bindings::v006::youth::editor::session::EditorErrorCode {
+    use crate::bindings::v006::youth::editor::session::EditorErrorCode;
+    match error {
+        crate::editor_session::EditorSessionError::UnknownEditor => EditorErrorCode::UnknownEditor,
+        crate::editor_session::EditorSessionError::StaleDocumentRevision => {
+            EditorErrorCode::StaleDocumentRevision
+        }
+        crate::editor_session::EditorSessionError::StaleEditSequence => {
+            EditorErrorCode::StaleEditSequence
+        }
+    }
+}
+
+impl crate::bindings::v006::youth::time::scheduler::Host for HostState {
+    fn schedule_after(
+        &mut self,
+        millis: u64,
+        options: crate::bindings::v006::youth::time::scheduler::ScheduleOptions,
+    ) -> Result<
+        crate::bindings::v006::youth::time::scheduler::Schedule,
+        crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let notification = options
+            .notification
+            .map(|notification| (notification.title, notification.body));
+        let record = self
+            .state
+            .schedule_create(now_epoch_millis, millis, notification)
+            .map_err(to_wire_schedule_error_v006)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Create {
+                app_id: self.state.app_id().clone(),
+                record: record.clone(),
+                now_epoch_millis,
+            },
+        ));
+        Ok(to_wire_schedule_v006(&record))
+    }
+
+    fn pause(
+        &mut self,
+        value: crate::bindings::v006::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v006::youth::time::scheduler::Schedule,
+        crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v006)?
+            .ok_or(
+                crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let paused = self
+            .state
+            .schedule_pause(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v006)?;
+        let wire_paused = to_wire_schedule_v006(&paused);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Pause {
+                app_id: self.state.app_id().clone(),
+                previous,
+                paused,
+            },
+        ));
+        Ok(wire_paused)
+    }
+
+    fn resume(
+        &mut self,
+        value: crate::bindings::v006::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v006::youth::time::scheduler::Schedule,
+        crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v006)?
+            .ok_or(
+                crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let resumed = self
+            .state
+            .schedule_resume(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v006)?;
+        let wire_resumed = to_wire_schedule_v006(&resumed);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Resume {
+                app_id: self.state.app_id().clone(),
+                previous,
+                resumed,
+                now_epoch_millis,
+            },
+        ));
+        Ok(wire_resumed)
+    }
+
+    fn cancel(
+        &mut self,
+        value: crate::bindings::v006::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode> {
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v006)?
+            .ok_or(
+                crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        self.state
+            .schedule_cancel(value.id, value.generation)
+            .map_err(to_wire_schedule_error_v006)?;
+        let cancelled = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v006)?
+            .ok_or(crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode::Internal)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Cancel {
+                app_id: self.state.app_id().clone(),
+                previous,
+                cancelled,
+            },
+        ));
+        Ok(())
+    }
+}
+
+fn to_wire_schedule_v006(
+    record: &youth_state::ScheduleRecord,
+) -> crate::bindings::v006::youth::time::scheduler::Schedule {
+    crate::bindings::v006::youth::time::scheduler::Schedule {
+        id: record.id,
+        generation: record.generation,
+    }
+}
+
+fn to_wire_schedule_error_v006(
+    error: youth_state::StateError,
+) -> crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode {
+    use crate::bindings::v006::youth::time::scheduler::ScheduleErrorCode;
+    match error {
+        youth_state::StateError::InvalidScheduleDuration => ScheduleErrorCode::InvalidDuration,
+        youth_state::StateError::TooManySchedules => ScheduleErrorCode::TooManySchedules,
+        youth_state::StateError::UnknownSchedule => ScheduleErrorCode::UnknownSchedule,
+        youth_state::StateError::StaleScheduleGeneration => ScheduleErrorCode::StaleGeneration,
+        youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::InvalidScheduleState => ScheduleErrorCode::InvalidState,
+        youth_state::StateError::ReadOnly
+        | youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ScheduleErrorCode::Unavailable,
+        ref error if error.is_busy() => ScheduleErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidKey
+        | youth_state::StateError::InvalidValue
+        | youth_state::StateError::QuotaExceeded
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
+    }
+}
+
 /// One synchronous, single-owner Youth component instance.
 pub struct YouthApp {
     component_id: String,
@@ -888,6 +1250,7 @@ pub struct YouthApp {
     lifecycle: AppLifecycle,
     last_event_sequence: Option<u64>,
     last_turn: Option<TurnReceipt>,
+    guest_call_count: u64,
     fault: Option<AppFault>,
 }
 
@@ -981,6 +1344,59 @@ impl YouthApp {
         self.tree.as_ref()
     }
 
+    /// Test-only introspection for live host Editor sessions.
+    #[cfg(test)]
+    pub(crate) fn editor_session_test_state(
+        &self,
+    ) -> Vec<(youth_tree::NodeId, u64, u64, u64, String)> {
+        let mut sessions = self
+            .store
+            .data()
+            .editor_sessions
+            .iter()
+            .filter_map(|(&node_id, slot)| {
+                slot.session()
+                    .map(|(document_revision, edit_sequence, text)| {
+                        (
+                            node_id,
+                            slot.generation(),
+                            document_revision,
+                            edit_sequence,
+                            text.to_owned(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_unstable_by_key(|(node_id, ..)| node_id.get());
+        sessions
+    }
+
+    /// Test-only introspection for retained per-node generation history.
+    #[cfg(test)]
+    pub(crate) fn editor_session_test_generation(
+        &self,
+        node_id: youth_tree::NodeId,
+    ) -> Option<u64> {
+        self.store
+            .data()
+            .editor_sessions
+            .get(&node_id)
+            .map(crate::editor_session::EditorSessionSlot::generation)
+    }
+
+    /// Test-only introspection for the latest declaration seen by a live slot.
+    #[cfg(test)]
+    pub(crate) fn editor_session_test_last_declared_revision(
+        &self,
+        node_id: youth_tree::NodeId,
+    ) -> Option<u64> {
+        self.store
+            .data()
+            .editor_sessions
+            .get(&node_id)
+            .and_then(crate::editor_session::EditorSessionSlot::last_declared_document_revision)
+    }
+
     pub fn snapshot(&self) -> Result<youth_tree::TreeSnapshot, RuntimeError> {
         self.tree
             .as_ref()
@@ -995,6 +1411,76 @@ impl YouthApp {
                     None,
                 ))
             })
+    }
+
+    /// Applies one cursor-free host-local Editor mutation without a guest turn,
+    /// tree reconciliation, or durable-state transaction.
+    pub fn edit_editor_locally(
+        &mut self,
+        editor: youth_tree::NodeId,
+        edit: crate::EditorLocalEdit,
+    ) -> Result<crate::EditorLocalEditResult, RuntimeError> {
+        if self.lifecycle != AppLifecycle::Mounted {
+            return Err(RuntimeError::InvalidLifecycle(self.context(
+                format!(
+                    "local Editor input is not allowed while the app is {}",
+                    self.lifecycle
+                ),
+                None,
+            )));
+        }
+        let result = match edit {
+            crate::EditorLocalEdit::InsertText(text) => crate::editor_session::local_insert_text(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+                &text,
+            ),
+            crate::EditorLocalEdit::Backspace => crate::editor_session::local_backspace(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+            ),
+            crate::EditorLocalEdit::Undo => crate::editor_session::local_undo(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+            ),
+            crate::EditorLocalEdit::Redo => crate::editor_session::local_redo(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+            ),
+            crate::EditorLocalEdit::Paste => {
+                let clipboard_text =
+                    self.store
+                        .data()
+                        .clipboard_service
+                        .read_text()
+                        .map_err(|source| {
+                            RuntimeError::Internal(
+                                self.context("host clipboard text could not be read", None)
+                                    .with_source(source),
+                            )
+                        })?;
+                crate::editor_session::local_paste_text(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    clipboard_text.as_deref().unwrap_or_default(),
+                )
+            }
+        };
+        result.map_err(|_| {
+            RuntimeError::InvalidLifecycle(self.context(
+                format!("node {} does not have a live Editor session", editor.get()),
+                None,
+            ))
+        })
+    }
+
+    /// Returns the host-owned dirty fact for a live Editor session.
+    ///
+    /// Dirty means the live edit sequence differs from the sequence most
+    /// recently acknowledged by a successful guest `accept`.
+    #[must_use]
+    pub fn editor_locally_dirty(&self, editor: youth_tree::NodeId) -> Option<bool> {
+        crate::editor_session::editor_locally_dirty(&self.store.data().editor_sessions, editor)
     }
 
     /// Revalidates a process-local wake against durable state without
@@ -1214,7 +1700,7 @@ impl YouthApp {
         if delivery.required_protocol == youth_state::DeliveryProtocol::V004
             && !matches!(
                 self.bindings.version(),
-                ProtocolVersion::V004 | ProtocolVersion::V005
+                ProtocolVersion::V004 | ProtocolVersion::V005 | ProtocolVersion::V006
             )
         {
             let error = RuntimeError::UnsupportedWorld(self.context(
@@ -1295,6 +1781,7 @@ impl YouthApp {
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
                 self.store.data_mut().discard_staged_schedule_outputs();
+                self.store.data_mut().discard_staged_editor_sessions();
                 self.record_state_metrics("rolled_back");
                 return if recoverable {
                     Err(error)
@@ -1377,6 +1864,10 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&staged_tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        let editor_sessions = crate::editor_session::reconcile_editor_sessions(
+            self.store.data().editor_sessions_for_call(),
+            &staged_tree,
+        );
 
         let state_writes = self.store.data().state.metrics().writes;
         if let Some(delivery) = delivery
@@ -1397,6 +1888,7 @@ impl YouthApp {
         }
         if let Err(source) = self.store.data_mut().state.commit() {
             self.store.data_mut().discard_staged_schedule_outputs();
+            self.store.data_mut().discard_staged_editor_sessions();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after patch validation", turn_id)
@@ -1405,6 +1897,9 @@ impl YouthApp {
             return Err(self.enter_fault(error));
         }
         self.store.data_mut().apply_committed_schedule_outputs();
+        self.store
+            .data_mut()
+            .install_editor_sessions(editor_sessions);
         self.record_state_metrics("committed");
         self.tree = Some(staged_tree);
         let elapsed = started.elapsed();
@@ -1491,6 +1986,7 @@ impl YouthApp {
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "resync"));
                 let _ = self.store.data_mut().state.rollback();
                 self.store.data_mut().discard_staged_schedule_outputs();
+                self.store.data_mut().discard_staged_editor_sessions();
                 self.record_state_metrics("rolled_back");
                 return Err(error);
             }
@@ -1541,8 +2037,15 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        let editor_sessions = install.then(|| {
+            crate::editor_session::reconcile_editor_sessions(
+                self.store.data().editor_sessions_for_call(),
+                &tree,
+            )
+        });
         if let Err(source) = self.store.data_mut().state.rollback() {
             self.store.data_mut().discard_staged_schedule_outputs();
+            self.store.data_mut().discard_staged_editor_sessions();
             let error = RuntimeError::StateUnavailable(
                 self.context("read-only resync transaction could not close", turn_id)
                     .with_source(source),
@@ -1553,6 +2056,11 @@ impl YouthApp {
         self.record_state_metrics("read_only");
         if install {
             self.tree = Some(tree);
+            self.store.data_mut().install_editor_sessions(
+                editor_sessions.expect("installing resync has staged sessions"),
+            );
+        } else {
+            self.store.data_mut().discard_staged_editor_sessions();
         }
         Ok(snapshot)
     }
@@ -1611,6 +2119,7 @@ impl YouthApp {
             node_count: tree.map_or(0, youth_tree::Tree::node_count),
             depth: tree.map_or(0, youth_tree::Tree::depth),
             last_turn: self.last_turn.clone(),
+            guest_call_count: self.guest_call_count,
             fault: self.fault.clone(),
             canonical_tree: tree.map_or_else(String::new, youth_tree::Tree::canonical),
         }
@@ -1692,8 +2201,13 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        let editor_sessions = crate::editor_session::reconcile_editor_sessions(
+            self.store.data().editor_sessions_for_call(),
+            &tree,
+        );
         if let Err(source) = self.store.data_mut().state.commit() {
             self.store.data_mut().discard_staged_schedule_outputs();
+            self.store.data_mut().discard_staged_editor_sessions();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after mount validation", turn_id)
@@ -1702,6 +2216,9 @@ impl YouthApp {
             return Err(self.enter_fault(error));
         }
         self.store.data_mut().apply_committed_schedule_outputs();
+        self.store
+            .data_mut()
+            .install_editor_sessions(editor_sessions);
         self.record_state_metrics("committed");
         self.tree = Some(tree);
         self.lifecycle = AppLifecycle::Mounted;
@@ -1817,6 +2334,7 @@ impl YouthApp {
     fn rollback_and_fault(&mut self, error: RuntimeError) -> RuntimeError {
         let _ = self.store.data_mut().state.rollback();
         self.store.data_mut().discard_staged_schedule_outputs();
+        self.store.data_mut().discard_staged_editor_sessions();
         self.record_state_metrics("rolled_back");
         self.enter_fault(error)
     }
@@ -1830,7 +2348,11 @@ impl YouthApp {
         tracing::Span::current().record("transaction_result", result);
     }
 
-    fn record_call_metrics(&self, elapsed: std::time::Duration) {
+    fn record_call_metrics(&mut self, elapsed: std::time::Duration) {
+        self.guest_call_count = self
+            .guest_call_count
+            .checked_add(1)
+            .expect("guest call count exhausted");
         tracing::Span::current().record("elapsed_microseconds", elapsed.as_micros() as u64);
         if let Ok(fuel_after) = self.store.get_fuel() {
             tracing::Span::current().record("fuel_after", fuel_after);
@@ -1899,6 +2421,7 @@ fn instantiate(
     let wake_driver = Arc::clone(&limits.time.wake_driver);
     let guest_monotonic_clock = Arc::clone(&limits.time.guest_monotonic_clock);
     let notification_dispatcher = Arc::clone(&limits.time.notification_dispatcher);
+    let clipboard_service = Arc::clone(&limits.time.clipboard_service);
     let protocol = detect_protocol(engine, &component).ok_or_else(|| {
         RuntimeError::UnsupportedWorld(ErrorContext::new(
             "component does not export a supported Youth application world",
@@ -1955,7 +2478,10 @@ fn instantiate(
         deadline_clock,
         wake_driver,
         notification_dispatcher,
+        clipboard_service,
         staged_schedule_outputs: Vec::new(),
+        editor_sessions: crate::editor_session::EditorSessionRegistry::new(),
+        staged_editor_sessions: None,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);
@@ -2049,6 +2575,24 @@ fn instantiate(
                 .map_err(|source| instantiation_error(&component_id, &store, source))?;
             ApplicationBindings::V005(value)
         }
+        ProtocolVersion::V006 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v006::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v006::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V006(value)
+        }
     };
     Ok(YouthApp {
         component_id,
@@ -2060,6 +2604,7 @@ fn instantiate(
         lifecycle: AppLifecycle::Loaded,
         last_event_sequence: None,
         last_turn: None,
+        guest_call_count: 0,
         fault: None,
     })
 }
@@ -2071,17 +2616,20 @@ fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVer
     let mut v003 = false;
     let mut v004 = false;
     let mut v005 = false;
+    let mut v006 = false;
     for (name, _) in exports {
         v002 |= name == "youth:app/lifecycle@0.0.2";
         v003 |= name == "youth:app/lifecycle@0.0.3";
         v004 |= name == "youth:app/lifecycle@0.0.4";
         v005 |= name == "youth:app/lifecycle@0.0.5";
+        v006 |= name == "youth:app/lifecycle@0.0.6";
     }
-    match (v002, v003, v004, v005) {
-        (false, false, false, true) => Some(ProtocolVersion::V005),
-        (false, false, true, false) => Some(ProtocolVersion::V004),
-        (false, true, false, false) => Some(ProtocolVersion::V003),
-        (true, false, false, false) => Some(ProtocolVersion::V002),
+    match (v002, v003, v004, v005, v006) {
+        (false, false, false, false, true) => Some(ProtocolVersion::V006),
+        (false, false, false, true, false) => Some(ProtocolVersion::V005),
+        (false, false, true, false, false) => Some(ProtocolVersion::V004),
+        (false, true, false, false, false) => Some(ProtocolVersion::V003),
+        (true, false, false, false, false) => Some(ProtocolVersion::V002),
         _ => None,
     }
 }

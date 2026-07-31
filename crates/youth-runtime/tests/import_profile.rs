@@ -17,6 +17,10 @@ const REQUIRED: &[&str] = &["youth:app/ui", "youth:state/store"];
 /// not globally required because older protocol components remain supported.
 const PERMITTED_V004: &[&str] = &["youth:time/scheduler"];
 
+/// Protocol 0.0.6 adds whole-buffer Editor session calls as an explicit
+/// capability. Current SDK components import it even when an app does not use it.
+const PERMITTED_V006: &[&str] = &["youth:editor/session"];
+
 /// Inert WASIp2 interfaces the Rust standard library pulls in on
 /// `wasm32-wasip2`. Permitted, but budgeted: adding to this list is a
 /// deliberate decision, never an accident of a toolchain bump.
@@ -70,12 +74,13 @@ fn counter_imports_match_the_guest_profile_exactly() {
 }
 
 #[test]
-fn sdk_time_imports_stay_inside_the_v004_guest_profile() {
+fn sdk_time_imports_stay_inside_the_current_guest_profile() {
     let imports = component_imports(test_component("youth-sdk-time"))
         .expect("component imports are readable");
     let mut allowed: Vec<&str> = REQUIRED
         .iter()
         .chain(PERMITTED_V004.iter())
+        .chain(PERMITTED_V006.iter())
         .chain(PERMITTED_INERT.iter())
         .copied()
         .collect();
@@ -87,7 +92,7 @@ fn sdk_time_imports_stay_inside_the_v004_guest_profile() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "0.0.4 SDK component imports interfaces outside the permitted budget: {unexpected:?}"
+        "current SDK component imports interfaces outside the permitted budget: {unexpected:?}"
     );
     assert!(
         imports

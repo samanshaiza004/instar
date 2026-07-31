@@ -184,6 +184,10 @@ fn measure(tree: &Tree, id: NodeId) -> Result<LogicalSize, GeometryError> {
             width: value.chars().count() as f64 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
         }),
+        NodeData::Editor { text, .. } => Ok(LogicalSize {
+            width: text.chars().count() as f64 * GLYPH_WIDTH,
+            height: GLYPH_HEIGHT,
+        }),
         NodeData::Countdown { .. } | NodeData::AlignedCountdown { .. } => Ok(LogicalSize {
             width: 5.0 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
@@ -267,6 +271,7 @@ fn place(
         NodeData::Root
         | NodeData::Text { .. }
         | NodeData::AlignedText { .. }
+        | NodeData::Editor { .. }
         | NodeData::Countdown { .. }
         | NodeData::AlignedCountdown { .. } => true,
     };
@@ -281,7 +286,7 @@ fn place(
                 height: measured.height,
             },
             effective_enabled,
-            interaction: if node.data.is_button() {
+            interaction: if node.data.is_focusable() {
                 InteractionKind::Button
             } else {
                 InteractionKind::None
@@ -533,6 +538,46 @@ mod tests {
                 }
             ),
             None
+        );
+    }
+
+    #[test]
+    fn editor_is_an_interactive_pointer_target() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Editor {
+                            document_revision: 1,
+                            text: "draft".into(),
+                        },
+                        children: vec![],
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let layout = layout(&tree, LogicalSize::new(320.0, 180.0).unwrap()).unwrap();
+        let editor = layout.nodes[&id(2)].bounds;
+
+        assert_eq!(
+            hit_test(
+                &layout,
+                LogicalPoint {
+                    x: editor.x + 1.0,
+                    y: editor.y + 1.0,
+                }
+            ),
+            Some(id(2))
         );
     }
 
