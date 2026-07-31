@@ -56,6 +56,46 @@ impl From<parley::BoundingBox> for LayoutRect {
     }
 }
 
+/// One glyph positioned within a [`GlyphRun`], in the run's font's units at
+/// `GlyphRun::font_size`. `x`/`y` are the pen (baseline) position, absolute
+/// within the layout's coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PositionedGlyph {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A run of glyphs sharing one font, size, and color, ready for a
+/// rasterizer to consume. `font` is a cheaply-`Clone`-able, `Send + Sync`
+/// shared handle to the font's bytes (a
+/// [`parley::FontData`]/`linebender_resource_handle::FontData`, re-exported
+/// here so downstream crates never need to depend on `parley` themselves
+/// just to hold this type) -- rasterization crates should key their glyph
+/// cache on `font.data.id()` rather than hashing font bytes.
+#[derive(Clone, Debug)]
+pub struct GlyphRun {
+    pub font: FontHandle,
+    pub font_size: f32,
+    pub glyphs: Vec<PositionedGlyph>,
+}
+
+/// A shared, `Send + Sync` handle to one font's bytes plus its collection
+/// index, with a stable identity (`.data.id()`) suitable for cache keys.
+pub type FontHandle = parley::FontData;
+
+/// Enough structured layout data for a renderer to paint text, selection,
+/// and a cursor -- glyph positions rather than raw text, so no renderer
+/// needs its own text-shaping logic. Produced by [`EditorLayout::presentation`].
+#[derive(Clone, Debug, Default)]
+pub struct TextPresentation {
+    pub runs: Vec<GlyphRun>,
+    pub selection: Vec<LayoutRect>,
+    pub cursor: Option<LayoutRect>,
+    pub content_width: f32,
+    pub content_height: f32,
+}
+
 /// The editing seam: Unicode/grapheme-correct insertion, deletion, and
 /// cursor/selection movement. Does not require a viewport.
 pub trait EditorEngine {
@@ -132,6 +172,11 @@ pub trait EditorLayout {
     /// A rectangle bounding the area a platform IME candidate window should
     /// avoid covering.
     fn ime_cursor_area(&mut self) -> LayoutRect;
+
+    /// The current layout as glyph runs plus selection/cursor geometry,
+    /// ready for a rasterizer. Does not include text a renderer would need
+    /// to re-shape.
+    fn presentation(&mut self) -> TextPresentation;
 }
 
 /// The real, Parley-backed implementation of both [`EditorEngine`] and
@@ -302,6 +347,47 @@ impl EditorLayout for ParleyEditorEngine {
     fn ime_cursor_area(&mut self) -> LayoutRect {
         self.driver().refresh_layout();
         self.editor.ime_cursor_area().into()
+    }
+
+    fn presentation(&mut self) -> TextPresentation {
+        let selection = self
+            .editor
+            .selection_geometry()
+            .into_iter()
+            .map(|(rect, _line)| rect.into())
+            .collect();
+        let cursor = self.editor.cursor_geometry(DEFAULT_CURSOR_WIDTH).map(Into::into);
+        let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
+        let mut runs = Vec::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let font = glyph_run.run().font().clone();
+                let font_size = glyph_run.run().font_size();
+                let glyphs = glyph_run
+                    .positioned_glyphs()
+                    .map(|glyph| PositionedGlyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: glyph.y,
+                    })
+                    .collect();
+                runs.push(GlyphRun {
+                    font,
+                    font_size,
+                    glyphs,
+                });
+            }
+        }
+        TextPresentation {
+            runs,
+            selection,
+            cursor,
+            content_width: layout.width(),
+            content_height: layout.height(),
+        }
     }
 }
 
@@ -502,6 +588,36 @@ mod tests {
     fn cursor_geometry_is_available_for_a_collapsed_caret() {
         let mut engine = ParleyEditorEngine::with_text("hello");
         assert!(engine.cursor_geometry().is_some());
+    }
+
+    #[test]
+    fn presentation_produces_one_glyph_per_character_with_a_stable_font_handle() {
+        let mut engine = ParleyEditorEngine::with_text("hi");
+        let presentation = engine.presentation();
+        assert!(!presentation.runs.is_empty(), "at least one glyph run");
+        let total_glyphs: usize = presentation.runs.iter().map(|run| run.glyphs.len()).sum();
+        assert_eq!(total_glyphs, 2, "one glyph per character for plain ASCII");
+        assert!(presentation.content_width > 0.0);
+        assert!(presentation.content_height > 0.0);
+        assert!(presentation.cursor.is_some());
+        assert!(presentation.selection.is_empty());
+
+        let first_run = &presentation.runs[0];
+        let first_id = first_run.font.data.id();
+        assert_eq!(
+            first_id,
+            first_run.font.data.id(),
+            "the font handle's id is stable across repeated reads"
+        );
+        assert!(!first_run.font.data.data().is_empty(), "font bytes are accessible");
+    }
+
+    #[test]
+    fn presentation_selection_is_populated_while_selecting() {
+        let mut engine = ParleyEditorEngine::with_text("hello");
+        engine.select_all();
+        let presentation = engine.presentation();
+        assert!(!presentation.selection.is_empty());
     }
 }
 

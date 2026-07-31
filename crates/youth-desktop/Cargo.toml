@@ -20,3 +20,10 @@ winit = "=0.30.12"
 youth-runtime = { path = "../youth-runtime" }
 youth-interaction = { path = "../youth-interaction" }
 youth-tree = { path = "../youth-tree" }
+youth-text-render-cpu = { path = "../youth-text-render-cpu" }
+
+[dev-dependencies]
+# Test-only: constructs a real TextPresentation to exercise draw_editor_presentation
+# end-to-end. Not a production dependency -- the youth-desktop binary itself never
+# imports youth-editor-engine (see raster.rs's editor_rasterizer field docs).
+youth-editor-engine = { path = "../youth-editor-engine" }

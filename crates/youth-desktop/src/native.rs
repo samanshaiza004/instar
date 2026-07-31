@@ -63,6 +63,7 @@ struct NativeApp {
     modifiers: ModifiersState,
     controller: Option<Controller>,
     presentation: Option<PresentationReader>,
+    editor_rasterizer: std::cell::RefCell<youth_text_render_cpu::GlyphRasterizer>,
     fault: Option<String>,
     smoke_presented: bool,
 }
@@ -111,6 +112,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         modifiers: ModifiersState::empty(),
         controller: None,
         presentation: None,
+        editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
         fault: None,
         smoke_presented: false,
     };
@@ -413,6 +415,7 @@ impl NativeApp {
             focused: self.interaction.focused(),
             fault_category: self.fault.as_deref(),
             presentation: self.presentation.as_ref(),
+            editor_rasterizer: Some(&self.editor_rasterizer),
         };
         let Ok(frame) = render(
             mirror.tree(),

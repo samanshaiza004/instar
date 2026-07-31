@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+
 use thiserror::Error;
 use youth_runtime::{PresentationReader, resolve_countdown_display};
+use youth_text_render_cpu::GlyphRasterizer;
 use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
 
 use crate::geometry::{LayoutSnapshot, LogicalRect};
@@ -46,6 +49,13 @@ pub struct RenderState<'a> {
     pub focused: Option<NodeId>,
     pub fault_category: Option<&'a str>,
     pub presentation: Option<&'a PresentationReader>,
+    /// Glyph rasterization cache for live Editor presentations. `None`
+    /// falls back to the crude bitmap font (used by callers, such as the
+    /// pure-geometry test suite, that don't need real text rendering) --
+    /// this keeps every existing snapshot test's expected output
+    /// unchanged. `RefCell` because rasterization caches glyphs on read
+    /// while `RenderState`'s other fields stay shared references.
+    pub editor_rasterizer: Option<&'a RefCell<GlyphRasterizer>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +114,23 @@ impl FrameBuffer {
 
     fn clear(&mut self, color: u32) {
         self.pixels.fill(color);
+    }
+
+    /// Alpha-blends `color` (0x00RRGGBB) over the existing pixel at `(x,
+    /// y)` weighted by `coverage` (0 = no-op, 255 = fully opaque). A no-op
+    /// outside the framebuffer's bounds.
+    fn blend_pixel(&mut self, x: i32, y: i32, color: u32, coverage: u8) {
+        if coverage == 0 {
+            return;
+        }
+        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+            return;
+        };
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        self.pixels[index] = blend_over(self.pixels[index], color, coverage);
     }
 
     fn fill(&mut self, rect: PixelRect, color: u32) {
@@ -224,14 +251,36 @@ pub fn render(
                 );
             }
             NodeData::Editor { text, .. } => {
-                draw_text(
-                    &mut frame,
-                    rect,
-                    text,
-                    TextAlignment::Start,
-                    scale_factor,
-                    palette,
-                );
+                let live = state
+                    .presentation
+                    .and_then(|reader| reader.editor(*id));
+                match (live, state.editor_rasterizer) {
+                    (Some(presentation), Some(rasterizer)) => {
+                        draw_editor_presentation(
+                            &mut frame,
+                            rect,
+                            &presentation,
+                            &mut rasterizer.borrow_mut(),
+                            palette,
+                        );
+                    }
+                    _ => {
+                        // No live host session yet (e.g. the very first
+                        // paint before the runtime's presentation cache
+                        // has synced), or a caller that doesn't wire real
+                        // text rendering (pure-geometry tests): fall back
+                        // to the guest-declared static text via the
+                        // existing bitmap font.
+                        draw_text(
+                            &mut frame,
+                            rect,
+                            text,
+                            TextAlignment::Start,
+                            scale_factor,
+                            palette,
+                        );
+                    }
+                }
             }
             NodeData::AlignedText { value, alignment } => {
                 draw_text(&mut frame, rect, value, *alignment, scale_factor, palette);
@@ -344,6 +393,91 @@ fn draw_text(
         TextAlignment::End => rect.x.saturating_add(rect.width.saturating_sub(text_width)),
     };
     frame.text(text_x, rect.y, value, palette.text, glyph_scale);
+}
+
+/// Standard "over" alpha compositing of one 0x00RRGGBB color onto another,
+/// weighted by an 8-bit coverage value.
+fn blend_over(background: u32, foreground: u32, coverage: u8) -> u32 {
+    let alpha = u32::from(coverage);
+    let inverse = 255 - alpha;
+    let mut out = 0u32;
+    for shift in [16, 8, 0] {
+        let bg_channel = (background >> shift) & 0xff;
+        let fg_channel = (foreground >> shift) & 0xff;
+        let channel = (fg_channel * alpha + bg_channel * inverse) / 255;
+        out |= channel << shift;
+    }
+    out
+}
+
+/// Paints a live, host-owned Editor presentation (real glyph runs plus
+/// selection/cursor geometry) into `frame`, clipped to `rect`. Falls back
+/// to nothing if `rect` has no area.
+///
+/// Painted at the engine's own logical pixel scale (not `scale_factor`-
+/// aware yet -- native per-node DPI-correct rasterization is a follow-up;
+/// see the crate-level notes). This keeps correctness (proportions,
+/// clipping, selection/cursor placement) while deferring HiDPI crispness.
+fn draw_editor_presentation(
+    frame: &mut FrameBuffer,
+    rect: PixelRect,
+    presentation: &youth_runtime::TextPresentation,
+    rasterizer: &mut GlyphRasterizer,
+    palette: Palette,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let clip = |x: i32, y: i32| -> bool {
+        x >= 0
+            && y >= 0
+            && (x as u32) < rect.x.saturating_add(rect.width)
+            && (y as u32) < rect.y.saturating_add(rect.height)
+            && (x as u32) >= rect.x
+            && (y as u32) >= rect.y
+    };
+    let origin_x = rect.x as f32;
+    let origin_y = rect.y as f32;
+
+    for selection_rect in &presentation.selection {
+        let x0 = origin_x + selection_rect.x0 as f32;
+        let y0 = origin_y + selection_rect.y0 as f32;
+        let x1 = origin_x + selection_rect.x1 as f32;
+        let y1 = origin_y + selection_rect.y1 as f32;
+        for y in y0.round() as i32..y1.round() as i32 {
+            for x in x0.round() as i32..x1.round() as i32 {
+                if clip(x, y) {
+                    frame.blend_pixel(x, y, palette.focus, 64);
+                }
+            }
+        }
+    }
+
+    youth_text_render_cpu::paint_presentation(
+        rasterizer,
+        presentation,
+        origin_x,
+        origin_y,
+        |x, y, coverage| {
+            if clip(x, y) {
+                frame.blend_pixel(x, y, palette.text, coverage);
+            }
+        },
+    );
+
+    if let Some(cursor) = &presentation.cursor {
+        let x0 = (origin_x + cursor.x0 as f32).round() as i32;
+        let y0 = (origin_y + cursor.y0 as f32).round() as i32;
+        let x1 = (origin_x + cursor.x1 as f32).round() as i32;
+        let y1 = (origin_y + cursor.y1 as f32).round() as i32;
+        for y in y0..y1 {
+            for x in x0..x1.max(x0 + 1) {
+                if clip(x, y) {
+                    frame.blend_pixel(x, y, palette.focus, 255);
+                }
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -665,6 +799,78 @@ mod tests {
     }
 
     #[test]
+    fn a_live_editor_presentation_paints_real_glyphs_within_bounds() {
+        use youth_editor_engine::{EditorLayout, ParleyEditorEngine};
+
+        let mut engine = ParleyEditorEngine::with_text("Hi");
+        let presentation: youth_runtime::TextPresentation = engine.presentation();
+
+        let mut frame = FrameBuffer::new(160, 32).unwrap();
+        let palette = Palette::default();
+        frame.clear(palette.background);
+        let mut rasterizer = GlyphRasterizer::new();
+        let rect = PixelRect {
+            x: 4,
+            y: 4,
+            width: 120,
+            height: 24,
+        };
+        draw_editor_presentation(&mut frame, rect, &presentation, &mut rasterizer, palette);
+
+        let painted_pixels = frame
+            .pixels()
+            .iter()
+            .filter(|&&pixel| pixel != palette.background)
+            .count();
+        assert!(
+            painted_pixels > 0,
+            "visible text must paint at least one non-background pixel"
+        );
+
+        // Bounded-region assertion (this platform's determinism policy tier
+        // -- see the crate-level testing notes -- rather than an exact
+        // pixel hash, which only a canonical CI environment asserts):
+        // every touched pixel stays inside the target rect.
+        for (index, &pixel) in frame.pixels().iter().enumerate() {
+            if pixel == palette.background {
+                continue;
+            }
+            let x = (index % frame.width() as usize) as u32;
+            let y = (index / frame.width() as usize) as u32;
+            assert!(
+                x >= rect.x && x < rect.x + rect.width,
+                "painted pixel x={x} must stay within the clip rect"
+            );
+            assert!(
+                y >= rect.y && y < rect.y + rect.height,
+                "painted pixel y={y} must stay within the clip rect"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_rect_paints_nothing_and_does_not_panic() {
+        use youth_editor_engine::{EditorLayout, ParleyEditorEngine};
+
+        let mut engine = ParleyEditorEngine::with_text("Hi");
+        let presentation: youth_runtime::TextPresentation = engine.presentation();
+        let mut frame = FrameBuffer::new(160, 32).unwrap();
+        let mut rasterizer = GlyphRasterizer::new();
+        draw_editor_presentation(
+            &mut frame,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            &presentation,
+            &mut rasterizer,
+            Palette::default(),
+        );
+    }
+
+    #[test]
     fn raw_frame_fixtures_are_deterministic() {
         let tree = counter();
         let layout = layout(&tree, LogicalSize::new(320.0, 180.0).unwrap()).unwrap();
@@ -704,6 +910,7 @@ mod tests {
                 focused: None,
                 fault_category: None,
                 presentation: None,
+                editor_rasterizer: None,
             },
             palette,
         )

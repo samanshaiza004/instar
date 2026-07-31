@@ -3230,6 +3230,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "swash"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
+dependencies = [
+ "skrifa",
+ "yazi",
+ "zeno",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4945,6 +4956,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
+name = "yazi"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
+
+[[package]]
 name = "yeslogic-fontconfig-sys"
 version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5035,8 +5052,10 @@ dependencies = [
  "tokio",
  "tracing",
  "winit",
+ "youth-editor-engine",
  "youth-interaction",
  "youth-runtime",
+ "youth-text-render-cpu",
  "youth-tree",
 ]
 
@@ -5254,6 +5273,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-text-render-cpu"
+version = "0.0.2"
+dependencies = [
+ "swash",
+ "youth-editor-engine",
+]
+
+[[package]]
 name = "youth-time-stub"
 version = "0.0.2"
 dependencies = [
@@ -5350,6 +5377,12 @@ dependencies = [
  "winnow 1.0.4",
  "zvariant",
 ]
+
+[[package]]
+name = "zeno"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"

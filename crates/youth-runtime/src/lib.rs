@@ -25,7 +25,7 @@ pub use config::{
     VirtualGuestMonotonicClock, YouthAppConfig,
 };
 pub use editor_session::{EditorLocalEdit, EditorLocalEditResult};
-pub use youth_editor_engine::Movement;
+pub use youth_editor_engine::{Movement, TextPresentation};
 pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
 pub use host::{

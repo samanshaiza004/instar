@@ -20,6 +20,8 @@ pub type Generation = u64;
 #[derive(Clone)]
 pub struct PresentationReader {
     records: Arc<std::sync::RwLock<HashMap<u64, youth_state::ScheduleRecord>>>,
+    editor_presentations:
+        Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, youth_editor_engine::TextPresentation>>>,
     deadline_clock: Arc<dyn youth_state::DeadlineClock>,
 }
 
@@ -38,6 +40,18 @@ impl PresentationReader {
             .read()
             .expect("presentation-record lock is not poisoned")
             .get(&id)
+            .cloned()
+    }
+
+    /// The live Editor presentation for `editor`, updated synchronously by
+    /// the worker after every mount/resync/handle-commit/local edit --
+    /// host-local only, never derived from or exposed to the guest.
+    #[must_use]
+    pub fn editor(&self, editor: youth_tree::NodeId) -> Option<youth_editor_engine::TextPresentation> {
+        self.editor_presentations
+            .read()
+            .expect("presentation-record lock is not poisoned")
+            .get(&editor)
             .cloned()
     }
 
@@ -140,6 +154,7 @@ impl YouthAppHandle {
         let (event_tx, _) = broadcast::channel(OBSERVER_CAPACITY);
         let presentation = PresentationReader {
             records: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            editor_presentations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             deadline_clock: Arc::clone(&config.limits.time.deadline_clock),
         };
         config
@@ -401,7 +416,7 @@ fn worker_main(
     if init_tx.send(Ok(())).is_err() {
         return;
     }
-    sync_presentation(&app, &presentation);
+    sync_presentation(&mut app, &presentation);
 
     while let Some(message) = mailbox_rx.blocking_recv() {
         match message {
@@ -418,11 +433,11 @@ fn worker_main(
             }
             WorkerMessage::Shutdown => break,
         }
-        sync_presentation(&app, &presentation);
+        sync_presentation(&mut app, &presentation);
     }
 }
 
-fn sync_presentation(app: &crate::YouthApp, presentation: &PresentationReader) {
+fn sync_presentation(app: &mut crate::YouthApp, presentation: &PresentationReader) {
     let records = app
         .tree()
         .into_iter()
@@ -438,6 +453,11 @@ fn sync_presentation(app: &crate::YouthApp, presentation: &PresentationReader) {
         .records
         .write()
         .expect("presentation-record lock is not poisoned") = records;
+    let editor_presentations = app.editor_presentations();
+    *presentation
+        .editor_presentations
+        .write()
+        .expect("presentation-record lock is not poisoned") = editor_presentations;
 }
 
 fn handle_request(

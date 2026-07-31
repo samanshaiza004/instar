@@ -1571,6 +1571,15 @@ impl YouthApp {
         })
     }
 
+    /// Extracts a paintable presentation for every live Editor session, for
+    /// synchronous consumption by a desktop renderer. See
+    /// [`crate::editor_session::editor_presentations`].
+    pub(crate) fn editor_presentations(
+        &mut self,
+    ) -> std::collections::HashMap<youth_tree::NodeId, youth_editor_engine::TextPresentation> {
+        crate::editor_session::editor_presentations(&mut self.store.data_mut().editor_sessions)
+    }
+
     #[must_use]
     pub fn now_epoch_millis(&self) -> u64 {
         self.store.data().deadline_clock.now_epoch_millis()

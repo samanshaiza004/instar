@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
-use youth_editor_engine::{EditorEngine, Movement, ParleyEditorEngine};
+use youth_editor_engine::{EditorEngine, EditorLayout, Movement, ParleyEditorEngine, TextPresentation};
 use youth_tree::{NodeData, NodeId, Tree};
 
 pub(super) type EditorSessionRegistry = HashMap<NodeId, EditorSessionSlot>;
@@ -216,6 +216,23 @@ fn new_session(document_revision: u64, text: &str) -> EditorSession {
         redo_stack: VecDeque::new(),
         insert_group_open: false,
     }
+}
+
+/// Extracts a paintable presentation (glyph runs plus selection/cursor
+/// geometry) for every live Editor session, for a desktop renderer to
+/// consume synchronously without going through the guest or the tree at
+/// all. Host-local only -- never exposed to the guest.
+pub(super) fn editor_presentations(
+    registry: &mut EditorSessionRegistry,
+) -> HashMap<NodeId, TextPresentation> {
+    registry
+        .iter_mut()
+        .filter_map(|(&node_id, slot)| {
+            slot.session
+                .as_mut()
+                .map(|session| (node_id, session.engine.presentation()))
+        })
+        .collect()
 }
 
 pub(super) fn snapshot_editor_session(

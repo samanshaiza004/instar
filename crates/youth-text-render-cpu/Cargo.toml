@@ -1,0 +1,9 @@
+[package]
+name = "youth-text-render-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+youth-editor-engine = { path = "../youth-editor-engine" }
+swash = "0.2"
