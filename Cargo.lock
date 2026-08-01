@@ -5523,6 +5523,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-sdk-editor"
+version = "0.0.2"
+dependencies = [
+ "youth-sdk",
+]
+
+[[package]]
 name = "youth-sdk-elapsed"
 version = "0.0.2"
 dependencies = [
@@ -5569,6 +5576,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "unicode-segmentation",
  "youth-interaction",
  "youth-runtime",
  "youth-sdk",

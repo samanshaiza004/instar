@@ -17,6 +17,7 @@ members = [
     "test-components/sdk-tally",
     "test-components/sdk-todo",
     "test-components/sdk-time",
+    "test-components/sdk-editor",
     "test-components/time-stub",
     "test-components/instant-now",
     "test-components/trap-on-mount",
