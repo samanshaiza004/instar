@@ -459,6 +459,25 @@ fn parse_selector_prefix<'a>(
             remainder,
         ));
     }
+    // The canonical form: a quoted exact name, which can hold whitespace,
+    // `#`, and any other UTF-8 the bare-identifier shorthand below cannot
+    // safely delimit -- Youth's own node-name identity model is not
+    // restricted to single tokens, so the DSL must not accidentally narrow
+    // what it can select.
+    if input.starts_with('"') {
+        let (name, remainder) = parse_json_string_prefix(path, line, source, input)?;
+        if name.is_empty() {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "node name must not be empty",
+            ));
+        }
+        return Ok((Selector::Static(name), remainder));
+    }
+    // The bare-identifier shorthand: convenient for the common case of an
+    // ASCII-identifier-shaped name with no whitespace.
     let end = input.find(char::is_whitespace).unwrap_or(input.len());
     let name = &input[..end];
     validate_name(path, line, source, name)?;
@@ -1720,6 +1739,48 @@ expect focus derived "todo" 1 "toggle"
         )
         .unwrap_err();
         assert!(absent.to_string().contains("is not present"), "{absent}");
+    }
+
+    #[test]
+    fn quoted_selectors_accept_whitespace_hashes_and_non_ascii() {
+        let script = parse(
+            Path::new("quoted.youth-test"),
+            "mount\nexpect present \"sidebar/current note\"\nexpect present \"\u{6587}\u{66f8}/\u{73fe}\u{5728} # not a comment\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectPresent {
+                selector: Selector::Static("sidebar/current note".into())
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectPresent {
+                selector: Selector::Static(
+                    "\u{6587}\u{66f8}/\u{73fe}\u{5728} # not a comment".into()
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn quoted_selector_named_none_is_not_the_no_focus_sentinel() {
+        let script = parse(
+            Path::new("quoted-focus.youth-test"),
+            "mount\nexpect focus \"none\"\nexpect focus none\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectFocus {
+                selector: Some(Selector::Static("none".into()))
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectFocus { selector: None }
+        );
     }
 
     #[test]

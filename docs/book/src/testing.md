@@ -30,6 +30,15 @@ ordinary typed state API and its normal quotas before the app is spawned.
 implicitly mounts the new instance. Strings use JSON quoting and escaping; `#`
 begins a comment outside a string.
 
+Node selectors are either a bare identifier (no whitespace, matching a
+`node!("...")` key) or a quoted exact name, which can hold whitespace, `#`,
+and any other UTF-8 the bare form cannot safely delimit:
+
+```text
+expect present "sidebar/current note"
+expect present "文書/現在"
+```
+
 The state seed grammar is:
 
 ```text
