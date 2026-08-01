@@ -19,3 +19,6 @@ hosting = "github"
 install-updater = false
 # Enable GitHub's artifact attestation feature for release artifacts
 github-attestations = true
+# TEMPORARY for verification: build+upload cross-platform artifacts on PRs
+# instead of just planning. Revert to the default ("plan") once confirmed.
+pr-run-mode = "upload"
