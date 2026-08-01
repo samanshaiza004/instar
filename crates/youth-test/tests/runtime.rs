@@ -184,3 +184,50 @@ expect countdown remaining
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn click_requires_presence_enabled_state_and_button_role() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-tally --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+
+    let success = directory.path().join("click.youth-test");
+    fs::write(
+        &success,
+        "mount\nexpect text count \"Count: 0\"\nclick increment\nexpect text count \"Count: 1\"\n",
+    )
+    .unwrap();
+    youth_test::run_file(
+        &success,
+        &component,
+        &AppId::parse("dev.youth.dsl-click-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let non_button = directory.path().join("click-non-button.youth-test");
+    fs::write(&non_button, "mount\nclick count\n").unwrap();
+    let error = youth_test::run_file(
+        &non_button,
+        &component,
+        &AppId::parse("dev.youth.dsl-click-non-button-fixture").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("no activatable role"), "{error}");
+
+    let absent = directory.path().join("click-absent.youth-test");
+    fs::write(&absent, "mount\nclick \"does-not-exist\"\n").unwrap();
+    let error = youth_test::run_file(
+        &absent,
+        &component,
+        &AppId::parse("dev.youth.dsl-click-absent-fixture").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("is not present"), "{error}");
+}

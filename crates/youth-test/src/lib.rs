@@ -76,7 +76,22 @@ pub enum Command {
         value: StateValue,
     },
     Mount,
+    /// Direct guest activation: sends the activation command straight to
+    /// the guest by `NodeId`, bypassing host interaction policy entirely
+    /// (no present/enabled/focus/role check). Useful for testing guest
+    /// command guards, and for targeting a control the host would refuse
+    /// to let a real user reach (e.g. a disabled button). Written `invoke`
+    /// in the DSL; `activate` parses to the same command as a
+    /// backward-compatible alias.
     Activate {
+        selector: Selector,
+    },
+    /// Semantic click: requires the target to be present, enabled, and an
+    /// activatable role (a button), exactly as `youth_interaction`'s host
+    /// policy would require of a real pointer click -- then activates it.
+    /// Real headless hit-testing/geometry is not implemented yet, so this
+    /// enforces only that semantic subset of click policy.
+    Click {
         selector: Selector,
     },
     Sleep {
@@ -177,6 +192,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
                 mounted = true;
             }
             Command::Activate { .. }
+            | Command::Click { .. }
             | Command::Sleep { .. }
             | Command::Key { .. }
             | Command::ExpectText { .. }
@@ -260,10 +276,18 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
     if source == "restart" {
         return Ok(Command::Restart);
     }
-    if let Some(name) = source.strip_prefix("activate ") {
+    if let Some(name) = source
+        .strip_prefix("invoke ")
+        .or_else(|| source.strip_prefix("activate "))
+    {
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
         return Ok(Command::Activate { selector });
+    }
+    if let Some(name) = source.strip_prefix("click ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::Click { selector });
     }
     if let Some(digits) = source.strip_prefix("sleep ") {
         let millis = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -395,7 +419,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, activate, sleep, key, restart, or an expect assertion",
+        "unknown command; expected state, mount, invoke, activate, click, sleep, key, restart, or an expect assertion",
     ))
 }
 
@@ -748,6 +772,21 @@ pub async fn run_file_with_options(
             }
             Command::Activate { selector } => {
                 let node = selector.node_id();
+                app.activate(node)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                snapshot = Some(
+                    app.snapshot()
+                        .await
+                        .map_err(|error| runtime(path, &located, error))?,
+                );
+                reconcile(&mut interaction, snapshot.as_ref().unwrap());
+            }
+            Command::Click { selector } => {
+                let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
+                let node = selector.node_id();
+                check_click_policy(path, &located, &tree, selector, node)?;
+                interaction.focus_pointer_target(&tree, node);
                 app.activate(node)
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
@@ -1148,6 +1187,49 @@ fn named_id(name: &str) -> NodeId {
     Selector::Static(name.to_owned()).node_id()
 }
 
+/// The semantic subset of real click policy: present, an activatable role
+/// (a button), and enabled (accounting for ancestor `enabled` state, same
+/// as `youth_interaction::InteractionState`'s focus/shortcut discovery).
+/// Real headless hit-testing/geometry is not implemented yet.
+fn check_click_policy(
+    path: &Path,
+    located: &LocatedCommand,
+    tree: &Tree,
+    selector: &Selector,
+    node: NodeId,
+) -> Result<(), TestError> {
+    let Some(entry) = tree.node(node) else {
+        return Err(assertion_error(
+            path,
+            located,
+            format!("click target {selector} is not present in the semantic tree"),
+        ));
+    };
+    if !entry.data.is_button() {
+        return Err(assertion_error(
+            path,
+            located,
+            format!(
+                "click target {selector} has no activatable role; observed {}",
+                describe(Some(&entry.data))
+            ),
+        ));
+    }
+    let probe = InteractionState::default();
+    if !probe
+        .snapshot(tree)
+        .enabled_actions
+        .contains(&SemanticAction::Activate(node))
+    {
+        return Err(assertion_error(
+            path,
+            located,
+            format!("click target {selector} is present but disabled"),
+        ));
+    }
+    Ok(())
+}
+
 fn expect_text(
     path: &Path,
     located: &LocatedCommand,
@@ -1457,6 +1539,124 @@ expect focus derived "todo" 1 "toggle"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn invoke_and_activate_parse_to_the_same_command() {
+        let script = parse(Path::new("invoke.youth-test"), "mount\ninvoke increment\n").unwrap();
+        let alias = parse(
+            Path::new("activate.youth-test"),
+            "mount\nactivate increment\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::Activate {
+                selector: Selector::Static("increment".into())
+            }
+        );
+        assert_eq!(script.commands[1].command, alias.commands[1].command);
+    }
+
+    #[test]
+    fn click_parses_to_its_own_command() {
+        let script = parse(Path::new("click.youth-test"), "mount\nclick increment\n").unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::Click {
+                selector: Selector::Static("increment".into())
+            }
+        );
+    }
+
+    #[test]
+    fn click_policy_rejects_absent_disabled_and_non_button_targets() {
+        let id = |value| NodeId::new(value).unwrap();
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    youth_tree::Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2), id(3), id(4)],
+                    },
+                    youth_tree::Node {
+                        id: id(2),
+                        data: NodeData::Button {
+                            label: "Go".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    youth_tree::Node {
+                        id: id(3),
+                        data: NodeData::Button {
+                            label: "Disabled".into(),
+                            enabled: false,
+                        },
+                        children: vec![],
+                    },
+                    youth_tree::Node {
+                        id: id(4),
+                        data: NodeData::Text {
+                            value: "not a button".into(),
+                        },
+                        children: vec![],
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let located = LocatedCommand {
+            line: 1,
+            source: "click go".into(),
+            command: Command::Click {
+                selector: Selector::Static("go".into()),
+            },
+        };
+        let path = Path::new("click.youth-test");
+
+        check_click_policy(path, &located, &tree, &Selector::Static("go".into()), id(2))
+            .expect("enabled button target is clickable");
+
+        let disabled = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("disabled".into()),
+            id(3),
+        )
+        .unwrap_err();
+        assert!(
+            disabled.to_string().contains("present but disabled"),
+            "{disabled}"
+        );
+
+        let non_button = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("label".into()),
+            id(4),
+        )
+        .unwrap_err();
+        assert!(
+            non_button.to_string().contains("no activatable role"),
+            "{non_button}"
+        );
+
+        let absent = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("missing".into()),
+            id(99),
+        )
+        .unwrap_err();
+        assert!(absent.to_string().contains("is not present"), "{absent}");
     }
 
     #[test]

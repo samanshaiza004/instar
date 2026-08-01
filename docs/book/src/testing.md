@@ -59,6 +59,24 @@ expect countdown <node-name>
 `expect countdown` checks that the node contains a host-owned schedule reference;
 it does not resolve the countdown to a display value.
 
+Activation has two forms with different policy:
+
+```text
+invoke <selector>      # direct guest activation: bypasses host interaction
+                        # policy entirely (no present/enabled/focus/role
+                        # check). Tests guest command guards, and can target
+                        # a control the host would refuse a real user access
+                        # to (e.g. a disabled button). `activate` is a
+                        # backward-compatible alias of `invoke`.
+click <selector>        # semantic click: requires the target be present,
+                         # enabled, and an activatable role (a button) --
+                         # the same host policy a real pointer click would
+                         # require. Real headless hit-testing/geometry is
+                         # not implemented yet, so this enforces only that
+                         # semantic subset of click policy.
+key <key>                # passes through focus, shortcut, and editor policy.
+```
+
 Harness timing uses:
 
 ```text
@@ -95,7 +113,7 @@ Dynamic collection tests can address a derived identity without knowing its
 numeric representation:
 
 ```text
-activate derived "todo" 1 "toggle"
+invoke derived "todo" 1 "toggle"
 expect present derived "todo" 1 "row"
 expect text derived "todo" 1 "title" "Task 1"
 expect child-count items 5
