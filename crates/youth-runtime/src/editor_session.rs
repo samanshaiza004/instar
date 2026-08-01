@@ -75,6 +75,11 @@ pub enum EditorLocalEdit {
         x: f32,
         y: f32,
     },
+    /// Applies a selection reported by an AccessKit `SetTextSelection`
+    /// action, e.g. from a screen reader. `ReplaceSelectedText` (also an
+    /// AccessKit action) needs no separate variant -- it is exactly
+    /// `InsertText`, which already replaces any active selection.
+    SetSelectionFromAccessKit(accesskit::TextSelection),
 }
 
 /// The guest-facing view of a session: whole-buffer text only. Cursor and
@@ -269,6 +274,71 @@ pub(super) fn editor_presentations(
         .collect()
 }
 
+/// One Editor's accessibility contribution, computed once per worker cycle
+/// (mirroring [`editor_presentations`]) since it requires mutable access to
+/// the live engine that only the worker actor has.
+///
+/// Coordinates on `node` and `extra_nodes` are in the engine's own
+/// rect/scroll-independent space -- exactly like `TextPresentation`'s glyph
+/// positions -- so a desktop caller must apply its own window rect and
+/// scroll translation before merging this into a real window-relative
+/// accessibility tree.
+#[derive(Clone, Debug)]
+pub struct EditorAccessibility {
+    /// This Editor's own node: role, the `Focus` and `SetTextSelection`
+    /// actions, children (pointing at `extra_nodes`), and text selection
+    /// are already populated. Bounds are the caller's responsibility, since
+    /// only the caller knows the Editor's on-screen rect.
+    pub node: accesskit::Node,
+    /// Per-run `TextRun`-role child nodes Parley allocated while populating
+    /// `node`.
+    pub extra_nodes: Vec<(accesskit::NodeId, accesskit::Node)>,
+}
+
+/// Builds one [`EditorAccessibility`] snapshot per live Editor session.
+///
+/// Each session's `TextRun` child node ids are namespaced by shifting the
+/// Editor's own `NodeId` into the high 32 bits, guaranteeing they can never
+/// collide with a plain `youth_tree::NodeId` (always small in practice) or
+/// with another Editor's child ids.
+pub(super) fn editor_accessibility_snapshots(
+    registry: &mut EditorSessionRegistry,
+) -> HashMap<NodeId, EditorAccessibility> {
+    let mut next_ordinal: u64 = 0;
+    registry
+        .iter_mut()
+        .filter_map(|(&node_id, slot)| {
+            let session = slot.session.as_mut()?;
+            let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+            node.add_action(accesskit::Action::Focus);
+            let mut update = accesskit::TreeUpdate {
+                nodes: Vec::new(),
+                tree: None,
+                tree_id: accesskit::TreeId::ROOT,
+                focus: accesskit::NodeId(0),
+            };
+            let editor_high_bits = node_id.get() << 32;
+            session.engine.accessibility_update(
+                &mut update,
+                &mut node,
+                || {
+                    next_ordinal += 1;
+                    accesskit::NodeId(editor_high_bits | next_ordinal)
+                },
+                0.0,
+                0.0,
+            );
+            Some((
+                node_id,
+                EditorAccessibility {
+                    node,
+                    extra_nodes: update.nodes,
+                },
+            ))
+        })
+        .collect()
+}
+
 pub(super) fn snapshot_editor_session(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
@@ -432,6 +502,20 @@ pub(super) fn local_extend_selection_to_point(
     let anchor = session.engine.hit_test(anchor_x, anchor_y);
     let focus = session.engine.hit_test(x, y);
     session.engine.select_byte_range(anchor, focus);
+    Ok(local_edit_result(session))
+}
+
+/// Applies a selection reported by an AccessKit `SetTextSelection` action.
+/// Same group-boundary and non-content-mutating behavior as
+/// [`local_move_cursor`].
+pub(super) fn local_set_selection_from_accesskit(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    selection: &accesskit::TextSelection,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    session.engine.select_from_accesskit(selection);
     Ok(local_edit_result(session))
 }
 

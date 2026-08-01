@@ -198,8 +198,14 @@ async fn paste_is_an_isolated_undo_unit_between_typing_groups() {
 
 #[tokio::test]
 async fn absent_clipboard_paste_is_a_safe_no_op_without_an_empty_history_group() {
-    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
-        .expect("Editor worker starts");
+    // Uses a deterministic empty `RecordingClipboardService` rather than
+    // `spawn_ephemeral`'s real `SystemClipboardService` -- this test
+    // specifically wants an empty clipboard, and the real OS pasteboard's
+    // contents are outside this test's control (a developer running the
+    // suite may well have something copied).
+    let mut config = YouthAppConfig::ephemeral(test_component("youth-editor-capability-v006"));
+    config.limits.time.clipboard_service = Arc::new(RecordingClipboardService::default());
+    let app = YouthAppHandle::spawn(config).expect("Editor worker starts");
     app.mount().await.expect("Editor fixture mounts");
 
     let pasted = app

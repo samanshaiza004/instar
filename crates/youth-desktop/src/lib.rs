@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod controller;
 pub mod geometry;
 pub mod input;

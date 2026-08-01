@@ -49,7 +49,19 @@ where
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControllerCommand {
     Activate(NodeId),
-    EditorInput { editor: NodeId, input: EditorInput },
+    EditorInput {
+        editor: NodeId,
+        input: EditorInput,
+    },
+    /// A `youth_runtime::EditorLocalEdit` constructed directly by a caller
+    /// that isn't ordinary device input -- currently only AccessKit action
+    /// handling, which has no natural fit in `youth_interaction::EditorInput`
+    /// (a device-input-shaped abstraction) and would otherwise force that
+    /// renderer-independent crate to depend on `accesskit` for one variant.
+    EditorLocalEdit {
+        editor: NodeId,
+        edit: youth_runtime::EditorLocalEdit,
+    },
     Resync,
     Stop,
 }
@@ -164,6 +176,13 @@ impl Controller {
                                         }));
                                         break;
                                     }
+                                }
+                            }
+                            ControllerCommand::EditorLocalEdit { editor, edit } => {
+                                if let Err(error) = handle.edit_editor_locally(editor, edit).await {
+                                    sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
+                                        category: error.category(),
+                                    }));
                                 }
                             }
                             ControllerCommand::Resync => match handle.snapshot().await {

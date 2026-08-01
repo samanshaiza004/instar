@@ -206,6 +206,39 @@ pub trait EditorLayout {
     /// ready for a rasterizer. Does not include text a renderer would need
     /// to re-shape.
     fn presentation(&mut self) -> TextPresentation;
+
+    /// Populates `node` with this editor's live text content and selection
+    /// via Parley's own AccessKit integration, so a screen reader gets real
+    /// per-character run/word boundaries and selection rather than a
+    /// hand-rolled approximation.
+    ///
+    /// `node` is expected to already have its role, bounds, and any
+    /// window-level actions (e.g. `Focus`) set by the caller -- this only
+    /// adds the text-specific parts (children, selection, the
+    /// `SetTextSelection` action). Each contiguous styled run of text
+    /// becomes one `TextRun`-role child node, written into both `update`
+    /// and `node`'s children; `next_node_id` allocates ids for those child
+    /// nodes only and must never collide with ids already used elsewhere in
+    /// the caller's tree. `x_offset`/`y_offset` position the child nodes'
+    /// bounds in whatever coordinate space the caller wants -- this crate
+    /// has no notion of a window, so it does not assume a convention.
+    fn accessibility_update(
+        &mut self,
+        update: &mut accesskit::TreeUpdate,
+        node: &mut accesskit::Node,
+        next_node_id: impl FnMut() -> accesskit::NodeId,
+        x_offset: f64,
+        y_offset: f64,
+    );
+
+    /// Applies a selection expressed in AccessKit's own terms (a
+    /// `TextRun`-child-node id plus a character index within that run's
+    /// text) -- the inverse of what [`Self::accessibility_update`]
+    /// reports. Resolving this correctly depends on the current run
+    /// layout, which is why it lives here rather than as a byte-offset
+    /// primitive on [`EditorEngine`]: only this crate knows how AccessKit
+    /// run ids map back to buffer positions.
+    fn select_from_accesskit(&mut self, selection: &accesskit::TextSelection);
 }
 
 /// The real, Parley-backed implementation of both [`EditorEngine`] and
@@ -446,6 +479,22 @@ impl EditorLayout for ParleyEditorEngine {
             content_height: layout.height(),
             ime_cursor_area,
         }
+    }
+
+    fn accessibility_update(
+        &mut self,
+        update: &mut accesskit::TreeUpdate,
+        node: &mut accesskit::Node,
+        next_node_id: impl FnMut() -> accesskit::NodeId,
+        x_offset: f64,
+        y_offset: f64,
+    ) {
+        self.driver()
+            .accessibility(update, node, next_node_id, x_offset, y_offset, |_, _| {});
+    }
+
+    fn select_from_accesskit(&mut self, selection: &accesskit::TextSelection) {
+        self.driver().select_from_accesskit(selection);
     }
 }
 
@@ -763,5 +812,102 @@ mod tests {
         engine.ime_set_compose("", None);
         assert!(!engine.is_composing());
         assert_eq!(engine.snapshot().text, "ab");
+    }
+
+    fn scratch_update() -> accesskit::TreeUpdate {
+        accesskit::TreeUpdate {
+            nodes: Vec::new(),
+            tree: None,
+            tree_id: accesskit::TreeId::ROOT,
+            focus: accesskit::NodeId(0),
+        }
+    }
+
+    #[test]
+    fn accessibility_update_populates_run_children_and_selection() {
+        let mut engine = ParleyEditorEngine::with_text("hello world");
+        engine.select_byte_range(0, 5);
+        let mut update = scratch_update();
+        let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+        let mut next_id = 1_u64;
+        engine.accessibility_update(
+            &mut update,
+            &mut node,
+            || {
+                let id = accesskit::NodeId(next_id);
+                next_id += 1;
+                id
+            },
+            0.0,
+            0.0,
+        );
+
+        assert!(
+            !update.nodes.is_empty(),
+            "at least one TextRun child node is produced for non-empty text"
+        );
+        assert_eq!(
+            node.children().len(),
+            update.nodes.len(),
+            "every produced node is linked as a child of the editor's own node"
+        );
+        let selection = node
+            .text_selection()
+            .expect("a non-collapsed selection is reported");
+        assert_eq!(selection.anchor.character_index, 0);
+        assert_eq!(selection.focus.character_index, 5);
+        assert!(
+            node.supports_action(accesskit::Action::SetTextSelection),
+            "the editor node must advertise that it accepts selection changes"
+        );
+    }
+
+    #[test]
+    fn accessibility_update_on_empty_text_does_not_panic() {
+        let mut engine = ParleyEditorEngine::with_text("");
+        let mut update = scratch_update();
+        let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+        engine.accessibility_update(&mut update, &mut node, || accesskit::NodeId(1), 0.0, 0.0);
+    }
+
+    #[test]
+    fn select_from_accesskit_round_trips_a_reported_selection() {
+        let mut engine = ParleyEditorEngine::with_text("hello world");
+        let mut update = scratch_update();
+        let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+        let mut next_id = 1_u64;
+        engine.accessibility_update(
+            &mut update,
+            &mut node,
+            || {
+                let id = accesskit::NodeId(next_id);
+                next_id += 1;
+                id
+            },
+            0.0,
+            0.0,
+        );
+        let (run_id, _) = update
+            .nodes
+            .first()
+            .expect("a non-empty buffer produces at least one run node");
+
+        engine.select_from_accesskit(&accesskit::TextSelection {
+            anchor: accesskit::TextPosition {
+                node: *run_id,
+                character_index: 0,
+            },
+            focus: accesskit::TextPosition {
+                node: *run_id,
+                character_index: 5,
+            },
+        });
+
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.selection,
+            Some(0..5),
+            "the accesskit-reported run-relative selection resolves to the matching buffer bytes"
+        );
     }
 }

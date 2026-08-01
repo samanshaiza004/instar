@@ -12,6 +12,8 @@ name = "youth-desktop"
 path = "src/main.rs"
 
 [dependencies]
+accesskit = "0.24"
+accesskit_winit = "0.33"
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "sync"] }
 tracing = "0.1.44"

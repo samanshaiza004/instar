@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-parley = "0.11"
+accesskit = "0.24"
+parley = { version = "0.11", features = ["accesskit"] }

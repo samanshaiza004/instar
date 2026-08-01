@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use accesskit_winit::Adapter as AccessAdapter;
 use softbuffer::{Context, Surface};
 use thiserror::Error;
 use winit::application::ApplicationHandler;
@@ -15,7 +16,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::{
     Controller, ControllerCommand, DesktopEvent, InteractionState, LogicalKey, LogicalPoint,
     LogicalSize, Modifiers, Palette, PointerState, RenderState, RendererMirror, SemanticAction,
-    layout, render,
+    access, layout, render,
 };
 use youth_interaction::EditorInput;
 use youth_runtime::{
@@ -43,7 +44,14 @@ enum NativeEvent {
     Mounted(YouthAppHandle, TreeSnapshot),
     Runtime(DesktopEvent),
     StartupFault(RuntimeErrorCategory),
+    Access(accesskit_winit::Event),
     Shutdown,
+}
+
+impl From<accesskit_winit::Event> for NativeEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Access(event)
+    }
 }
 
 enum Mode {
@@ -75,6 +83,10 @@ struct NativeApp {
     /// coordinate space (see [`Self::editor_content_point`]). `None` when
     /// no primary-button drag is in progress over an Editor.
     text_drag_anchor: Option<(NodeId, f32, f32)>,
+    /// `None` until the window exists (it needs a live `Window` to
+    /// construct). Feeds tree updates to, and receives action requests
+    /// from, whatever assistive technology is listening.
+    access_adapter: Option<AccessAdapter>,
     fault: Option<String>,
     smoke_presented: bool,
 }
@@ -126,6 +138,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
         editor_scroll_offsets: HashMap::new(),
         text_drag_anchor: None,
+        access_adapter: None,
         fault: None,
         smoke_presented: false,
     };
@@ -173,6 +186,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 self.create_window(event_loop, "Youth fault");
             }
             NativeEvent::Runtime(event) => self.runtime_event(event, event_loop),
+            NativeEvent::Access(event) => self.handle_access_event(event),
             NativeEvent::Shutdown => {
                 if let Some(controller) = &self.controller {
                     let _ = controller.send(ControllerCommand::Stop);
@@ -193,6 +207,9 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
         };
         if window.id() != window_id {
             return;
+        }
+        if let Some(adapter) = &mut self.access_adapter {
+            adapter.process_event(&window, &event);
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -431,11 +448,17 @@ impl NativeApp {
             event_loop.exit();
             return;
         };
+        self.access_adapter = Some(AccessAdapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
+        ));
         self.window = Some(window.clone());
         self.context = Some(context);
         self.surface = Some(surface);
         self.relayout();
         self.sync_ime(&window);
+        self.sync_access();
         window.request_redraw();
     }
 
@@ -595,9 +618,92 @@ impl NativeApp {
         Some((content_x, content_y))
     }
 
+    /// Rebuilds the accessibility tree from current state and pushes it to
+    /// the platform adapter. Cheap enough (a handful of nodes for a small
+    /// UI) to call unconditionally on every redraw rather than tracked
+    /// incrementally; `update_if_active` itself is a no-op until an actual
+    /// assistive technology has activated accessibility.
+    fn sync_access(&mut self) {
+        let (Some(mirror), Some(layout), Some(window)) = (&self.mirror, &self.layout, &self.window)
+        else {
+            return;
+        };
+        let update = access::build_tree_update(
+            mirror.tree(),
+            layout,
+            &self.interaction,
+            self.presentation.as_ref(),
+            window.scale_factor(),
+            &self.editor_scroll_offsets,
+        );
+        if let Some(adapter) = &mut self.access_adapter {
+            adapter.update_if_active(|| update);
+        }
+    }
+
+    fn handle_access_event(&mut self, event: accesskit_winit::Event) {
+        match event.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => self.sync_access(),
+            accesskit_winit::WindowEvent::ActionRequested(request) => {
+                self.handle_access_action(request);
+            }
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+        }
+    }
+
+    fn handle_access_action(&mut self, request: accesskit::ActionRequest) {
+        let Some(target) = youth_tree::NodeId::new(request.target_node.0) else {
+            return;
+        };
+        let Some(mirror) = &self.mirror else { return };
+        let is_editor = matches!(
+            mirror.tree().node(target).map(|node| &node.data),
+            Some(NodeData::Editor { .. })
+        );
+        match request.action {
+            accesskit::Action::Focus => {
+                let change = self.interaction.focus_pointer_target(mirror.tree(), target);
+                if change.redraw
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
+            accesskit::Action::Click if !is_editor => {
+                if let Some(controller) = &self.controller {
+                    let _ = controller.send(ControllerCommand::Activate(target));
+                }
+            }
+            accesskit::Action::SetTextSelection if is_editor => {
+                let Some(accesskit::ActionData::SetTextSelection(selection)) = request.data else {
+                    return;
+                };
+                if let Some(controller) = &self.controller {
+                    let _ = controller.send(ControllerCommand::EditorLocalEdit {
+                        editor: target,
+                        edit: youth_runtime::EditorLocalEdit::SetSelectionFromAccessKit(selection),
+                    });
+                }
+            }
+            accesskit::Action::ReplaceSelectedText if is_editor => {
+                let Some(accesskit::ActionData::Value(text)) = request.data else {
+                    return;
+                };
+                if let Some(controller) = &self.controller {
+                    let _ = controller.send(ControllerCommand::EditorInput {
+                        editor: target,
+                        input: EditorInput::InsertText(text.into()),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let _span = tracing::info_span!("desktop.present").entered();
         self.sync_editor_scroll();
+        self.sync_access();
         let (Some(window), Some(surface), Some(mirror), Some(layout)) =
             (&self.window, &mut self.surface, &self.mirror, &self.layout)
         else {

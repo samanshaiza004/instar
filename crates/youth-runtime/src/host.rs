@@ -1527,6 +1527,13 @@ impl YouthApp {
                 x,
                 y,
             ),
+            crate::EditorLocalEdit::SetSelectionFromAccessKit(selection) => {
+                crate::editor_session::local_set_selection_from_accesskit(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    &selection,
+                )
+            }
         };
         result.map_err(|_| {
             RuntimeError::InvalidLifecycle(self.context(
@@ -1618,6 +1625,17 @@ impl YouthApp {
         &mut self,
     ) -> std::collections::HashMap<youth_tree::NodeId, youth_editor_engine::TextPresentation> {
         crate::editor_session::editor_presentations(&mut self.store.data_mut().editor_sessions)
+    }
+
+    /// Builds one accessibility snapshot per live Editor session, for
+    /// synchronous consumption by a desktop renderer. See
+    /// [`crate::editor_session::editor_accessibility_snapshots`].
+    pub(crate) fn editor_accessibility_snapshots(
+        &mut self,
+    ) -> std::collections::HashMap<youth_tree::NodeId, crate::EditorAccessibility> {
+        crate::editor_session::editor_accessibility_snapshots(
+            &mut self.store.data_mut().editor_sessions,
+        )
     }
 
     #[must_use]

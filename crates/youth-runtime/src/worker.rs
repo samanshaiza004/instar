@@ -22,6 +22,8 @@ pub struct PresentationReader {
     records: Arc<std::sync::RwLock<HashMap<u64, youth_state::ScheduleRecord>>>,
     editor_presentations:
         Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, youth_editor_engine::TextPresentation>>>,
+    editor_accessibility:
+        Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, crate::EditorAccessibility>>>,
     deadline_clock: Arc<dyn youth_state::DeadlineClock>,
 }
 
@@ -52,6 +54,20 @@ impl PresentationReader {
         editor: youth_tree::NodeId,
     ) -> Option<youth_editor_engine::TextPresentation> {
         self.editor_presentations
+            .read()
+            .expect("presentation-record lock is not poisoned")
+            .get(&editor)
+            .cloned()
+    }
+
+    /// The live Editor accessibility snapshot for `editor`, updated
+    /// synchronously by the worker alongside [`Self::editor`].
+    #[must_use]
+    pub fn editor_accessibility(
+        &self,
+        editor: youth_tree::NodeId,
+    ) -> Option<crate::EditorAccessibility> {
+        self.editor_accessibility
             .read()
             .expect("presentation-record lock is not poisoned")
             .get(&editor)
@@ -158,6 +174,7 @@ impl YouthAppHandle {
         let presentation = PresentationReader {
             records: Arc::new(std::sync::RwLock::new(HashMap::new())),
             editor_presentations: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            editor_accessibility: Arc::new(std::sync::RwLock::new(HashMap::new())),
             deadline_clock: Arc::clone(&config.limits.time.deadline_clock),
         };
         config
@@ -461,6 +478,11 @@ fn sync_presentation(app: &mut crate::YouthApp, presentation: &PresentationReade
         .editor_presentations
         .write()
         .expect("presentation-record lock is not poisoned") = editor_presentations;
+    let editor_accessibility = app.editor_accessibility_snapshots();
+    *presentation
+        .editor_accessibility
+        .write()
+        .expect("presentation-record lock is not poisoned") = editor_accessibility;
 }
 
 fn handle_request(
@@ -503,8 +525,13 @@ fn handle_request(
         (AppCommand::EditorLocalEdit { editor, edit }, ReplySender::EditorLocalEdit(reply)) => {
             // This path deliberately touches only the live host-owned Editor
             // registry. It creates no guest call, tree reconciliation, state
-            // transaction, turn event, or turn receipt.
-            let _ = reply.send(app.edit_editor_locally(editor, edit));
+            // transaction, turn event, or turn receipt -- but a renderer's
+            // cached presentation and accessibility snapshot must still
+            // reflect the mutated buffer, so this still resyncs those two
+            // host-local caches.
+            let result = app.edit_editor_locally(editor, edit);
+            sync_presentation(app, presentation);
+            let _ = reply.send(result);
         }
         (AppCommand::Resync, ReplySender::Snapshot(reply)) => {
             let result = app.resync();
