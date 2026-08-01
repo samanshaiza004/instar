@@ -37,8 +37,15 @@ state boolean "key" true
 state boolean "key" false
 state integer "key" 42
 state text "key" "a JSON string value"
-state bytes "key" "a JSON string, UTF-8 encoded to bytes"
+state utf8-bytes "key" "a JSON string, UTF-8 encoded to bytes"
+state bytes-hex "key" "00ff7f80"
+state bytes-base64 "key" "AP9/gA=="
 ```
+
+`bytes` is kept as a compatibility alias of `utf8-bytes`: despite the name, it
+can only represent well-formed UTF-8 text encoded as bytes. `bytes-hex` and
+`bytes-base64` can represent every value the typed state API's
+`StateValue::Bytes(Vec<u8>)` actually supports, including invalid UTF-8.
 
 State assertions open the isolated state file independently of the running app:
 

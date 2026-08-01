@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use thiserror::Error;
 use youth_runtime::{RuntimeLimits, YouthAppConfig, YouthAppHandle};
 use youth_state::{AppId, GuestCallPhase, StateLimits, StateLocation, StateStore, StateValue};
@@ -319,7 +320,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
                 path,
                 line,
                 source,
-                "expected: state <boolean|integer|text|bytes> <JSON-string-key> <value>",
+                "expected: state <boolean|integer|text|bytes|utf8-bytes|bytes-hex|bytes-base64> <JSON-string-key> <value>",
             )
         })?;
         let (key, encoded) = parse_json_string_prefix(path, line, source, arguments)?;
@@ -579,23 +580,85 @@ fn parse_state_value(
                     &format!("invalid 64-bit integer: {error}"),
                 )
             }),
-        "text" | "bytes" => {
+        "text" => {
             let value: String = serde_json::from_str(encoded).map_err(|error| {
                 diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
             })?;
-            if kind == "text" {
-                Ok(StateValue::Text(value))
-            } else {
-                Ok(StateValue::Bytes(value.into_bytes()))
-            }
+            Ok(StateValue::Text(value))
+        }
+        // `bytes` is kept as a compatibility alias of `utf8-bytes`: despite
+        // the name, it can only represent well-formed UTF-8 text encoded as
+        // bytes, not arbitrary binary or invalid UTF-8. `bytes-hex` and
+        // `bytes-base64` below can represent every value the typed state
+        // API's `StateValue::Bytes(Vec<u8>)` actually supports.
+        "bytes" | "utf8-bytes" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            Ok(StateValue::Bytes(value.into_bytes()))
+        }
+        "bytes-hex" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            let bytes = decode_hex(&value).map_err(|error| {
+                diagnostic(
+                    path,
+                    line,
+                    source,
+                    &format!("invalid hex-encoded bytes: {error}"),
+                )
+            })?;
+            Ok(StateValue::Bytes(bytes))
+        }
+        "bytes-base64" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value.as_bytes())
+                .map_err(|error| {
+                    diagnostic(
+                        path,
+                        line,
+                        source,
+                        &format!("invalid base64-encoded bytes: {error}"),
+                    )
+                })?;
+            Ok(StateValue::Bytes(bytes))
         }
         _ => Err(diagnostic(
             path,
             line,
             source,
-            "state kind must be boolean, integer, text, or bytes",
+            "state kind must be boolean, integer, text, bytes (legacy alias of utf8-bytes), utf8-bytes, bytes-hex, or bytes-base64",
         )),
     }
+}
+
+/// Decodes ASCII hex digits into bytes, able to represent every byte
+/// sequence including invalid UTF-8 -- unlike `bytes`/`utf8-bytes`, which
+/// can only represent well-formed UTF-8 text.
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.is_ascii() {
+        return Err("hex-encoded bytes must be ASCII".into());
+    }
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err("hex-encoded bytes must have an even number of digits".into());
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid hex digit {:?}", pair[0] as char))?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid hex digit {:?}", pair[1] as char))?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
 }
 
 fn parse_key(
@@ -1657,6 +1720,52 @@ expect focus derived "todo" 1 "toggle"
         )
         .unwrap_err();
         assert!(absent.to_string().contains("is not present"), "{absent}");
+    }
+
+    #[test]
+    fn parses_extended_bytes_seed_encodings() {
+        let script = parse(
+            Path::new("bytes.youth-test"),
+            r#"
+state utf8-bytes "text" "héllo"
+state bytes-hex "binary" "00ff7f80"
+state bytes-base64 "based" "AP9/gA=="
+mount
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[0].command,
+            Command::State {
+                key: "text".into(),
+                value: StateValue::Bytes("héllo".as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            script.commands[1].command,
+            Command::State {
+                key: "binary".into(),
+                value: StateValue::Bytes(vec![0x00, 0xff, 0x7f, 0x80]),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::State {
+                key: "based".into(),
+                value: StateValue::Bytes(vec![0x00, 0xff, 0x7f, 0x80]),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_hex_and_base64_seeds() {
+        for source in [
+            "state bytes-hex \"k\" \"0ff\"\nmount\n",
+            "state bytes-hex \"k\" \"zz\"\nmount\n",
+            "state bytes-base64 \"k\" \"not base64!!\"\nmount\n",
+        ] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
     }
 
     #[test]
