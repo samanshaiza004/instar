@@ -95,7 +95,29 @@ pub enum Command {
     Click {
         selector: Selector,
     },
+    /// Real wall-clock sleep in the test process. Kept for backward
+    /// compatibility: a file with no `advance time` command runs entirely
+    /// against the production system clock/wake-driver, exactly as before,
+    /// so `sleep` still means a genuine wait. A file that also uses
+    /// `advance time` must spell a real wait as `sleep real`/`wall-sleep`
+    /// instead -- see [`Command::SleepReal`].
     Sleep {
+        millis: u64,
+    },
+    /// Advances the file's injected virtual `DeadlineClock` and
+    /// `WakeDriver`, fires every schedule that becomes due, drains the
+    /// resulting host work (including any newly rearmed schedule), and
+    /// stops once quiescent. Present anywhere in a file switches that
+    /// file's entire run to a virtual clock/wake-driver instead of the
+    /// production ones (see [`Command::Sleep`]'s note).
+    AdvanceTime {
+        millis: u64,
+    },
+    /// Real wall-clock sleep, explicit and independent of the virtual
+    /// clock -- for production-clock smoke evidence in a file that also
+    /// uses `advance time`. Written `sleep real` or `wall-sleep` in the
+    /// DSL.
+    SleepReal {
         millis: u64,
     },
     Restart,
@@ -195,6 +217,8 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             Command::Activate { .. }
             | Command::Click { .. }
             | Command::Sleep { .. }
+            | Command::AdvanceTime { .. }
+            | Command::SleepReal { .. }
             | Command::Key { .. }
             | Command::ExpectText { .. }
             | Command::ExpectCountdown { .. }
@@ -227,6 +251,21 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             1,
             "<end of file>",
             "every test must contain exactly one explicit initial mount",
+        ));
+    }
+    let uses_virtual_time = commands
+        .iter()
+        .any(|located| matches!(located.command, Command::AdvanceTime { .. }));
+    if uses_virtual_time
+        && let Some(bare_sleep) = commands
+            .iter()
+            .find(|located| matches!(located.command, Command::Sleep { .. }))
+    {
+        return Err(diagnostic(
+            path,
+            bare_sleep.line,
+            &bare_sleep.source,
+            "this file also uses `advance time`, which runs against a virtual clock; `sleep` would only block the test process without advancing it, so use `sleep real`/`wall-sleep` for a genuine wall-clock wait instead",
         ));
     }
     Ok(Script {
@@ -289,6 +328,17 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
         return Ok(Command::Click { selector });
+    }
+    if let Some(rest) = source.strip_prefix("advance time ") {
+        let millis = parse_millis_with_unit_suffix(path, line, source, rest)?;
+        return Ok(Command::AdvanceTime { millis });
+    }
+    if let Some(rest) = source
+        .strip_prefix("sleep real ")
+        .or_else(|| source.strip_prefix("wall-sleep "))
+    {
+        let millis = parse_millis_with_unit_suffix(path, line, source, rest)?;
+        return Ok(Command::SleepReal { millis });
     }
     if let Some(digits) = source.strip_prefix("sleep ") {
         let millis = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -530,6 +580,32 @@ fn parse_usize(
     let (value, remainder) = parse_usize_prefix(path, line, source, input, label)?;
     require_empty(path, line, source, remainder)?;
     Ok(value)
+}
+
+/// Parses a duration written as a decimal integer immediately followed by
+/// `ms` (e.g. `100ms`), with no separating whitespace and no other unit --
+/// the exact spelling `advance time` and `sleep real` use.
+fn parse_millis_with_unit_suffix(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &str,
+) -> Result<u64, TestError> {
+    let invalid = || {
+        diagnostic(
+            path,
+            line,
+            source,
+            "duration must be a non-negative decimal integer immediately followed by ms, e.g. 100ms",
+        )
+    };
+    let digits = input.strip_suffix("ms").ok_or_else(invalid)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    digits
+        .parse()
+        .map_err(|error| diagnostic(path, line, source, &format!("invalid duration: {error}")))
 }
 
 fn require_empty(path: &Path, line: usize, source: &str, remainder: &str) -> Result<(), TestError> {
@@ -833,7 +909,12 @@ pub async fn run_file_with_options(
     })?;
     let state_file = state.path().join("state.sqlite3");
     seed_state(path, &script.commands, app_id, &state_file)?;
-    let mut app = spawn(component, app_id, &state_file)?;
+    let uses_virtual_time = script
+        .commands
+        .iter()
+        .any(|located| matches!(located.command, Command::AdvanceTime { .. }));
+    let virtual_time = uses_virtual_time.then(VirtualTime::new);
+    let mut app = spawn(component, app_id, &state_file, virtual_time.as_ref())?;
     let mut events = app.subscribe();
     let mut snapshot = None;
     let mut interaction = InteractionState::default();
@@ -879,14 +960,61 @@ pub async fn run_file_with_options(
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
             }
-            Command::Sleep { millis } => {
+            Command::Sleep { millis } | Command::SleepReal { millis } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
+            }
+            Command::AdvanceTime { millis } => {
+                let virtual_time = virtual_time
+                    .as_ref()
+                    .expect("parser requires advance time to run in a virtual-time file");
+                let duration = std::time::Duration::from_millis(*millis);
+                virtual_time.clock.advance(duration);
+                virtual_time.wake.advance(duration);
+                let mut iterations = 0_u32;
+                loop {
+                    let due = virtual_time.wake.due();
+                    if due.is_empty() {
+                        break;
+                    }
+                    for token in due {
+                        // `due()` just reported this token as armed and
+                        // overdue, and only this loop mutates the driver,
+                        // so `fire` returning `false` here would mean the
+                        // seams disagree with themselves.
+                        assert!(
+                            virtual_time.wake.fire(&token),
+                            "a token `due()` just reported was not fired"
+                        );
+                    }
+                    // Barrier: the mailbox is a strict FIFO processed by one
+                    // dedicated worker thread, so this round-trip guarantees
+                    // every wake fired above -- and any host work it
+                    // triggered, including a newly rearmed schedule -- is
+                    // fully applied before the next `due()` check.
+                    snapshot = Some(
+                        app.snapshot()
+                            .await
+                            .map_err(|error| runtime(path, &located, error))?,
+                    );
+                    iterations += 1;
+                    if iterations > 10_000 {
+                        return Err(assertion_error(
+                            path,
+                            &located,
+                            "advance time did not settle: a schedule kept rearming after 10,000 drain iterations".into(),
+                        ));
+                    }
+                }
+                reconcile(
+                    &mut interaction,
+                    snapshot.as_ref().expect("parser requires mount"),
+                );
             }
             Command::Restart => {
                 app.stop()
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
-                app = spawn(component, app_id, &state_file)?;
+                app = spawn(component, app_id, &state_file, virtual_time.as_ref())?;
                 events = app.subscribe();
                 snapshot = Some(
                     app.mount()
@@ -1249,12 +1377,52 @@ fn reconcile(interaction: &mut InteractionState, snapshot: &TreeSnapshot) {
     interaction.reconcile(&normalized_tree(snapshot));
 }
 
-fn spawn(component: &Path, app_id: &AppId, state_file: &Path) -> Result<YouthAppHandle, TestError> {
+/// The injected virtual `DeadlineClock` and `WakeDriver` for a file that
+/// uses `advance time`. Held for the file's entire run, including across
+/// `restart`, since state (and thus how much virtual time has already
+/// elapsed) is meant to persist across a restart exactly like it would
+/// against the production clock.
+struct VirtualTime {
+    clock: std::sync::Arc<youth_state::VirtualDeadlineClock>,
+    wake: std::sync::Arc<youth_state::VirtualWakeDriver>,
+}
+
+impl VirtualTime {
+    /// Seeds the virtual deadline clock with the real current time, purely
+    /// so absolute epoch-millisecond values stay realistic (useful for
+    /// debugging output); nothing depends on this exact starting value.
+    fn new() -> Self {
+        Self {
+            clock: std::sync::Arc::new(youth_state::VirtualDeadlineClock::new(real_epoch_millis())),
+            wake: std::sync::Arc::new(youth_state::VirtualWakeDriver::default()),
+        }
+    }
+}
+
+fn real_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn spawn(
+    component: &Path,
+    app_id: &AppId,
+    state_file: &Path,
+    virtual_time: Option<&VirtualTime>,
+) -> Result<YouthAppHandle, TestError> {
+    let mut limits = RuntimeLimits::default();
+    if let Some(virtual_time) = virtual_time {
+        limits.time.deadline_clock = virtual_time.clock.clone();
+        limits.time.wake_driver = virtual_time.wake.clone();
+    }
     YouthAppHandle::spawn(YouthAppConfig {
         component_path: component.to_path_buf(),
         app_id: app_id.clone(),
         state: StateLocation::File(state_file.to_path_buf()),
-        limits: RuntimeLimits::default(),
+        limits,
     })
     .map_err(|error| TestError::Diagnostic {
         path: component.to_path_buf(),
@@ -1843,6 +2011,75 @@ mount
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn parses_advance_time_and_sleep_real_and_wall_sleep() {
+        let script = parse(
+            Path::new("advance.youth-test"),
+            "mount\nadvance time 100ms\nsleep real 150ms\nwall-sleep 25ms\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::AdvanceTime { millis: 100 }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::SleepReal { millis: 150 }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::SleepReal { millis: 25 }
+        );
+    }
+
+    #[test]
+    fn rejects_advance_time_and_sleep_durations_missing_the_ms_suffix() {
+        for source in [
+            "mount\nadvance time 100\n",
+            "mount\nsleep real 100\n",
+            "mount\nadvance time 100s\n",
+            "mount\nadvance time ms\n",
+        ] {
+            let error = parse(Path::new("bad.youth-test"), source).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("immediately followed by ms, e.g. 100ms"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bare_sleep_mixed_with_advance_time_in_the_same_file() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nadvance time 100ms\nsleep 50\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("also uses `advance time`"),
+            "{error}"
+        );
+        // Order does not matter -- the bare `sleep` still runs against the
+        // production clock either way.
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nsleep 50\nadvance time 100ms\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("also uses `advance time`"),
+            "{error}"
+        );
+        // `sleep real`/`wall-sleep` remain fine alongside `advance time`.
+        parse(
+            Path::new("ok.youth-test"),
+            "mount\nadvance time 100ms\nsleep real 50ms\nwall-sleep 50ms\n",
+        )
+        .unwrap();
     }
 
     #[test]

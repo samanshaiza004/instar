@@ -186,6 +186,79 @@ expect countdown remaining
 }
 
 #[tokio::test]
+async fn advance_time_delivers_a_due_schedule_without_a_wall_clock_wait() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_countdown_presentation.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-countdown-presentation --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("advance-time.youth-test");
+    fs::write(
+        &test,
+        r#"youth-test 1
+
+mount
+expect text remaining "--:--"
+invoke start
+restart
+expect countdown remaining
+expect state missing "elapsed-count"
+advance time 300000ms
+expect state integer "elapsed-count" 1
+"#,
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    youth_test::run_file(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-advance-time-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+    // The fixture's schedule is 300 real seconds out. This bound is
+    // deliberately loose (contended CI machines can be slow even for
+    // in-process work) -- its only job is to catch a regression back to
+    // an actual ~300s real wait, not to assert a tight latency budget.
+    assert!(
+        started.elapsed() < Duration::from_secs(200),
+        "advance time took {:?}; it must not wait on real elapsed time",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn sleep_real_also_blocks_real_runtime_progress() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-tally --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("sleep-real.youth-test");
+    fs::write(&test, "mount\nsleep real 50ms\n").unwrap();
+
+    let started = Instant::now();
+    youth_test::run_file(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-sleep-real-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "sleep real command returned after {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn click_requires_presence_enabled_state_and_button_role() {
     let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");

@@ -10,7 +10,7 @@ state integer "count" 4
 mount
 expect text count "Count: 4"
 expect state integer "count" 4
-activate increment
+invoke increment
 restart
 expect text count "Count: 5"
 expect state integer "count" 5
@@ -96,12 +96,36 @@ key <key>                # passes through focus, shortcut, and editor policy.
 Harness timing uses:
 
 ```text
-sleep <milliseconds>
+sleep <milliseconds>          # real wall-clock sleep, legacy spelling
+sleep real <n>ms              # real wall-clock sleep, explicit
+wall-sleep <n>ms              # same as `sleep real`
+advance time <n>ms            # advances a virtual DeadlineClock/WakeDriver
 ```
 
-`sleep` is a real wall-clock sleep in the test process. It is intended for short
-durations paired with the platform's minimum schedule duration (100 ms), not as
-a general-purpose delay primitive.
+A file with no `advance time` command runs entirely against the production
+system clock and wake-driver, exactly as before -- `sleep <milliseconds>`
+still means a genuine wall-clock wait, unchanged. Adding any `advance time`
+command switches that file's *entire* run to an injected virtual clock and
+wake-driver instead (state persists across `restart` exactly like it would
+against the production clock), and the bare `sleep` spelling is then rejected
+at parse time -- it would silently do nothing to the virtual clock and just
+waste real wall time. Use `sleep real`/`wall-sleep` for a genuine wait inside
+a virtual-time file, e.g. production-clock smoke evidence alongside a
+virtual-time schedule test.
+
+`advance time <n>ms` advances the virtual clock, fires every schedule that
+becomes due, drains the resulting host work (including any newly rearmed
+schedule), and stops once quiescent -- so a schedule minutes or hours out
+settles immediately instead of the test waiting on real elapsed time:
+
+```text
+mount
+invoke start
+restart
+expect countdown remaining
+advance time 300000ms
+expect state integer "elapsed-count" 1
+```
 
 `youth test` builds and validates the component once, runs files in lexical
 order, and reports the file, line, command, expected value, and observed
