@@ -20,6 +20,17 @@ pub struct RunOptions {
     pub verify_view_convergence: bool,
 }
 
+/// Oldest `.youth-test` format version this runner still accepts.
+pub const MIN_FORMAT_VERSION: u32 = 1;
+/// Newest `.youth-test` format version this runner understands. A file
+/// with no `youth-test <n>` header is treated as version 1 (legacy).
+///
+/// Versions the *test language* grammar, independently of the Youth
+/// application protocol (`youth:app@0.0.6` etc.) that the driven
+/// component implements -- one test-language version can drive many
+/// supported component profiles.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Selector {
     Static(String),
@@ -116,6 +127,9 @@ pub struct LocatedCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Script {
+    /// The declared `youth-test <n>` format version, or 1 if the file has
+    /// no version header (legacy).
+    pub version: u32,
     pub commands: Vec<LocatedCommand>,
 }
 
@@ -123,11 +137,20 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
     let mut commands = Vec::new();
     let mut mounted = false;
     let mut mount_seen = false;
+    let mut version = None;
+    let mut first_content_line = true;
     for (offset, raw) in source.lines().enumerate() {
         let line = offset + 1;
         let source_line = strip_comment(raw).trim();
         if source_line.is_empty() {
             continue;
+        }
+        if first_content_line {
+            first_content_line = false;
+            if let Some(declared) = source_line.strip_prefix("youth-test ") {
+                version = Some(parse_format_version(path, line, source_line, declared)?);
+                continue;
+            }
         }
         let command = parse_command(path, line, source_line)?;
         match command {
@@ -189,7 +212,45 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             "every test must contain exactly one explicit initial mount",
         ));
     }
-    Ok(Script { commands })
+    Ok(Script {
+        version: version.unwrap_or(1),
+        commands,
+    })
+}
+
+fn parse_format_version(
+    path: &Path,
+    line: usize,
+    source: &str,
+    declared: &str,
+) -> Result<u32, TestError> {
+    if declared.is_empty() || !declared.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "expected: youth-test <format version, a decimal integer>",
+        ));
+    }
+    let version: u32 = declared.parse().map_err(|error| {
+        diagnostic(
+            path,
+            line,
+            source,
+            &format!("invalid format version: {error}"),
+        )
+    })?;
+    if !(MIN_FORMAT_VERSION..=CURRENT_FORMAT_VERSION).contains(&version) {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            &format!(
+                "unsupported .youth-test format version {version}; this runner supports {MIN_FORMAT_VERSION}..={CURRENT_FORMAT_VERSION}"
+            ),
+        ));
+    }
+    Ok(version)
 }
 
 fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, TestError> {
@@ -1207,6 +1268,59 @@ pub enum TestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_header_defaults_to_format_version_one() {
+        let script = parse(Path::new("legacy.youth-test"), "mount\n").unwrap();
+        assert_eq!(script.version, 1);
+    }
+
+    #[test]
+    fn explicit_header_is_parsed_and_excluded_from_commands() {
+        let script = parse(Path::new("versioned.youth-test"), "youth-test 1\nmount\n").unwrap();
+        assert_eq!(script.version, 1);
+        assert_eq!(script.commands.len(), 1);
+        assert_eq!(script.commands[0].command, Command::Mount);
+    }
+
+    #[test]
+    fn header_may_follow_leading_comments_and_blank_lines() {
+        let script = parse(
+            Path::new("versioned.youth-test"),
+            "# leading comment\n\nyouth-test 1\nmount\n",
+        )
+        .unwrap();
+        assert_eq!(script.version, 1);
+        assert_eq!(script.commands.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_format_version_newer_than_this_runner_supports() {
+        let error = parse(Path::new("future.youth-test"), "youth-test 2\nmount\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported .youth-test format version 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_format_version() {
+        for source in ["youth-test\nmount\n", "youth-test abc\nmount\n"] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
+    }
+
+    #[test]
+    fn header_is_only_recognized_as_the_first_content_line() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nyouth-test 1\nrestart\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown command"), "{error}");
+    }
 
     #[test]
     fn parses_comments_json_strings_and_restart() {

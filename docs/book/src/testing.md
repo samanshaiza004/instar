@@ -4,6 +4,8 @@ Tests are lexical `tests/*.youth-test` files and execute against the real
 headless runtime with isolated state per file:
 
 ```text
+youth-test 1
+
 state integer "count" 4
 mount
 expect text count "Count: 4"
@@ -13,6 +15,12 @@ restart
 expect text count "Count: 5"
 expect state integer "count" 5
 ```
+
+The first non-comment, non-blank line may declare the file's format version:
+`youth-test <n>`. A file with no header is treated as version 1 (legacy). This
+versions the *test language* grammar, independent of the Youth application
+protocol (`youth:app@0.0.6` etc.) the driven component implements -- one
+language version can drive many supported component profiles.
 
 Every file has exactly one explicit initial `mount`, preceded only by zero or
 more `state` commands. A `state` command after the initial mount and any other
