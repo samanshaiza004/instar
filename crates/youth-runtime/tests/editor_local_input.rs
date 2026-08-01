@@ -496,6 +496,79 @@ async fn ime_finish_compose_commits_the_whole_composition_as_one_undo_group() {
 }
 
 #[tokio::test]
+async fn move_to_point_positions_the_cursor_without_a_guest_turn() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    let baseline = app.inspect().await.expect("baseline inspection succeeds");
+
+    let at_start = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveToPoint { x: 0.0, y: 0.0 })
+        .await
+        .expect("click near the start succeeds");
+    assert_eq!(at_start.cursor, 0);
+    assert_eq!(at_start.selection, None);
+
+    let at_end = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveToPoint { x: 1_000.0, y: 0.0 })
+        .await
+        .expect("click far to the right succeeds");
+    assert!(
+        at_end.cursor > at_start.cursor,
+        "a far-right click must land further into the text than a click at the start"
+    );
+
+    let after = app.inspect().await.expect("post-click inspection succeeds");
+    assert_eq!(
+        after.guest_call_count, baseline.guest_call_count,
+        "pointer-driven cursor placement must never enter the guest"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn extend_selection_to_point_selects_from_the_anchor_to_the_current_point() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    let baseline = app.inspect().await.expect("baseline inspection succeeds");
+
+    let dragged = app
+        .edit_editor_locally(
+            id(2),
+            EditorLocalEdit::ExtendSelectionToPoint {
+                anchor_x: 0.0,
+                anchor_y: 0.0,
+                x: 1_000.0,
+                y: 0.0,
+            },
+        )
+        .await
+        .expect("drag from the start to far right succeeds");
+    let selection = dragged
+        .selection
+        .expect("dragging across text produces a real selection");
+    assert_eq!(selection.start, 0, "the anchor is the selection's start");
+    assert!(
+        selection.end > selection.start,
+        "the drag's current point extends the selection forward"
+    );
+    assert_eq!(
+        dragged.cursor, selection.end,
+        "the reported cursor tracks the moving end of the drag, not the anchor"
+    );
+
+    let after = app.inspect().await.expect("post-drag inspection succeeds");
+    assert_eq!(
+        after.guest_call_count, baseline.guest_call_count,
+        "pointer-driven selection must never enter the guest"
+    );
+
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
 async fn movement_and_selection_operations_are_guest_turn_free() {
     let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
         .expect("Editor worker starts");

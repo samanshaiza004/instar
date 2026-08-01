@@ -42,7 +42,7 @@ pub struct EditorLocalEditResult {
 
 /// The local, guest-turn-free mutations supported against a host Editor
 /// session.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditorLocalEdit {
     InsertText(String),
     Backspace,
@@ -61,6 +61,20 @@ pub enum EditorLocalEdit {
     ImeClearCompose,
     /// Commits the current IME preedit as ordinary buffer content.
     ImeFinishCompose,
+    /// Collapses the cursor to the text position nearest `(x, y)` in the
+    /// engine's own content coordinate space (a pointer click).
+    MoveToPoint {
+        x: f32,
+        y: f32,
+    },
+    /// Selects from `(anchor_x, anchor_y)` to `(x, y)`, both in the
+    /// engine's own content coordinate space (a pointer drag).
+    ExtendSelectionToPoint {
+        anchor_x: f32,
+        anchor_y: f32,
+        x: f32,
+        y: f32,
+    },
 }
 
 /// The guest-facing view of a session: whole-buffer text only. Cursor and
@@ -381,6 +395,43 @@ pub(super) fn local_extend_selection(
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
     session.engine.extend_selection(movement);
+    Ok(local_edit_result(session))
+}
+
+/// Collapses the cursor to the text position nearest a pointer click. Same
+/// group-boundary and non-content-mutating behavior as
+/// [`local_move_cursor`].
+pub(super) fn local_move_to_point(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    x: f32,
+    y: f32,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    let offset = session.engine.hit_test(x, y);
+    session.engine.move_to_byte(offset);
+    Ok(local_edit_result(session))
+}
+
+/// Selects from `(anchor_x, anchor_y)` to `(x, y)`, the host-local effect
+/// of a click-and-drag text selection. The anchor is re-hit-tested on every
+/// call rather than cached as a byte offset, since the caller (native
+/// pointer input) only knows the anchor as a content-space point, not a
+/// byte position.
+pub(super) fn local_extend_selection_to_point(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    anchor_x: f32,
+    anchor_y: f32,
+    x: f32,
+    y: f32,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    session.insert_group_open = false;
+    let anchor = session.engine.hit_test(anchor_x, anchor_y);
+    let focus = session.engine.hit_test(x, y);
+    session.engine.select_byte_range(anchor, focus);
     Ok(local_edit_result(session))
 }
 

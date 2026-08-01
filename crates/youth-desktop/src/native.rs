@@ -70,6 +70,11 @@ struct NativeApp {
     /// Purely a paint-time transform -- never sent to the guest, never
     /// part of any revision.
     editor_scroll_offsets: HashMap<NodeId, f32>,
+    /// The fixed end of an in-progress pointer text-selection drag: which
+    /// Editor, and its click-down position in that Editor's own content
+    /// coordinate space (see [`Self::editor_content_point`]). `None` when
+    /// no primary-button drag is in progress over an Editor.
+    text_drag_anchor: Option<(NodeId, f32, f32)>,
     fault: Option<String>,
     smoke_presented: bool,
 }
@@ -120,6 +125,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         presentation: None,
         editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
         editor_scroll_offsets: HashMap::new(),
+        text_drag_anchor: None,
         fault: None,
         smoke_presented: false,
     };
@@ -203,17 +209,30 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
             }
             WindowEvent::CursorMoved { position, .. } if self.fault.is_none() => {
                 let scale = window.scale_factor();
+                let logical_point = LogicalPoint {
+                    x: position.x / scale,
+                    y: position.y / scale,
+                };
                 if let Some(layout) = &self.layout {
-                    let change = self.pointer.move_to(
-                        LogicalPoint {
-                            x: position.x / scale,
-                            y: position.y / scale,
-                        },
-                        layout,
-                    );
+                    let change = self.pointer.move_to(logical_point, layout);
                     if change.redraw {
                         window.request_redraw();
                     }
+                }
+                if let (Some((editor, anchor_x, anchor_y)), Some(controller)) =
+                    (self.text_drag_anchor, &self.controller)
+                    && let Some((x, y)) = self.editor_content_point(editor, &window, logical_point)
+                {
+                    let _ = controller.send(ControllerCommand::EditorInput {
+                        editor,
+                        input: EditorInput::ExtendSelectionToPoint {
+                            anchor_x,
+                            anchor_y,
+                            x,
+                            y,
+                        },
+                    });
+                    window.request_redraw();
                 }
             }
             WindowEvent::CursorLeft { .. } if self.fault.is_none() => {
@@ -234,15 +253,33 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                             if focus.redraw {
                                 window.request_redraw();
                             }
+                            let is_editor = matches!(
+                                mirror.tree().node(armed).map(|n| &n.data),
+                                Some(NodeData::Editor { .. })
+                            );
+                            if is_editor
+                                && let Some(cursor) = self.pointer.cursor
+                                && let Some((x, y)) =
+                                    self.editor_content_point(armed, &window, cursor)
+                                && let Some(controller) = &self.controller
+                            {
+                                self.text_drag_anchor = Some((armed, x, y));
+                                let _ = controller.send(ControllerCommand::EditorInput {
+                                    editor: armed,
+                                    input: EditorInput::MoveToPoint { x, y },
+                                });
+                            }
                         }
                         change
                     }
-                    ElementState::Released => self
-                        .layout
-                        .as_ref()
-                        .map_or_else(crate::InputChange::default, |layout| {
-                            self.pointer.release_primary(layout)
-                        }),
+                    ElementState::Released => {
+                        self.text_drag_anchor = None;
+                        self.layout
+                            .as_ref()
+                            .map_or_else(crate::InputChange::default, |layout| {
+                                self.pointer.release_primary(layout)
+                            })
+                    }
                 };
                 if let Some(node) = change.activation
                     && let Some(controller) = &self.controller
@@ -251,6 +288,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 }
                 if state == ElementState::Pressed {
                     self.sync_ime(&window);
+                    window.request_redraw();
                 }
                 if change.redraw {
                     window.request_redraw();
@@ -530,6 +568,31 @@ impl NativeApp {
         }
         offset = clamp_scroll_offset(offset, viewport_height, presentation.content_height);
         self.editor_scroll_offsets.insert(editor, offset);
+    }
+
+    /// Converts a window-logical pointer position to `node`'s own text
+    /// content coordinate space -- the same space the engine's `hit_test`
+    /// and a presentation's glyph positions use. Mirrors
+    /// `draw_editor_presentation`'s paint-time origin math exactly (physical
+    /// rect origin, minus the physical scroll offset) so a click lands on
+    /// the glyph the user is actually looking at.
+    fn editor_content_point(
+        &self,
+        node: NodeId,
+        window: &Window,
+        point: LogicalPoint,
+    ) -> Option<(f32, f32)> {
+        let rect = self.layout.as_ref()?.nodes.get(&node)?.bounds;
+        let scale = window.scale_factor();
+        let scroll_offset_y = self
+            .editor_scroll_offsets
+            .get(&node)
+            .copied()
+            .unwrap_or(0.0)
+            * scale as f32;
+        let content_x = ((point.x - rect.x) * scale) as f32;
+        let content_y = ((point.y - rect.y) * scale) as f32 + scroll_offset_y;
+        Some((content_x, content_y))
     }
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {

@@ -60,7 +60,7 @@ pub enum EditorMovement {
 ///
 /// Insert, backspace, undo, redo, and paste have host-local mutation effects in
 /// A4. Movement, selection, copy, and cut remain routing-only claims.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditorInput {
     InsertText(String),
     Backspace,
@@ -82,9 +82,25 @@ pub enum EditorInput {
     ImeClearCompose,
     /// Commits `text` as the final result of an IME composition.
     ImeCommit(String),
+    /// Collapses the cursor to the text position nearest a pointer click, in
+    /// the Editor's own content coordinate space. Delivered from pointer
+    /// input, not [`InteractionState::key`].
+    MoveToPoint {
+        x: f32,
+        y: f32,
+    },
+    /// Selects from `(anchor_x, anchor_y)` to `(x, y)`, both in the Editor's
+    /// content coordinate space -- the host-local effect of a
+    /// click-and-drag text selection.
+    ExtendSelectionToPoint {
+        anchor_x: f32,
+        anchor_y: f32,
+        x: f32,
+        y: f32,
+    },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct InteractionChange {
     pub redraw: bool,
     pub action: Option<SemanticAction>,

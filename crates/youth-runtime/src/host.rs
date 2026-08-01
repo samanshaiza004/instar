@@ -1506,6 +1506,27 @@ impl YouthApp {
                     editor,
                 )
             }
+            crate::EditorLocalEdit::MoveToPoint { x, y } => {
+                crate::editor_session::local_move_to_point(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    x,
+                    y,
+                )
+            }
+            crate::EditorLocalEdit::ExtendSelectionToPoint {
+                anchor_x,
+                anchor_y,
+                x,
+                y,
+            } => crate::editor_session::local_extend_selection_to_point(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+                anchor_x,
+                anchor_y,
+                x,
+                y,
+            ),
         };
         result.map_err(|_| {
             RuntimeError::InvalidLifecycle(self.context(

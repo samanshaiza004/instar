@@ -46,7 +46,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ControllerCommand {
     Activate(NodeId),
     EditorInput { editor: NodeId, input: EditorInput },
@@ -134,6 +134,22 @@ impl Controller {
                                             cursor: None,
                                         },
                                         youth_runtime::EditorLocalEdit::ImeFinishCompose,
+                                    ],
+                                    EditorInput::MoveToPoint { x, y } => {
+                                        vec![youth_runtime::EditorLocalEdit::MoveToPoint { x, y }]
+                                    }
+                                    EditorInput::ExtendSelectionToPoint {
+                                        anchor_x,
+                                        anchor_y,
+                                        x,
+                                        y,
+                                    } => vec![
+                                        youth_runtime::EditorLocalEdit::ExtendSelectionToPoint {
+                                            anchor_x,
+                                            anchor_y,
+                                            x,
+                                            y,
+                                        },
                                     ],
                                     // No selection-consuming clipboard semantics yet
                                     // -- deferred alongside real Cut/Copy behavior.
