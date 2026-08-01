@@ -16,6 +16,7 @@ pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui", "youth:state/store
 
 pub const PERMITTED_GUEST_IMPORTS: &[&str] = &[
     "youth:time/scheduler",
+    "youth:editor/session",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stderr",
@@ -120,10 +121,11 @@ mod tests {
 
         let legacy_imports = imports
             .iter()
-            .filter(|value| *value != "youth:time/scheduler")
+            .filter(|value| *value != "youth:time/scheduler" && *value != "youth:editor/session")
             .cloned()
             .collect::<Vec<_>>();
-        validate_imports(&legacy_imports).expect("legacy protocols need not import scheduling");
+        validate_imports(&legacy_imports)
+            .expect("legacy protocols need not import scheduling or Editor sessions");
 
         let mut widened = imports.clone();
         widened.push("wasi:filesystem/types".into());
