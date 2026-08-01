@@ -301,8 +301,15 @@ pub fn build_project(release: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-pub async fn test_project(verify_view_convergence: bool) -> Result<(), CliError> {
+pub async fn test_project(override_convergence: Option<bool>) -> Result<(), CliError> {
     let (project, _) = build_and_validate(false)?;
+    let verify_view_convergence =
+        override_convergence.unwrap_or(project.manifest.test.verify_view_convergence);
+    if !verify_view_convergence {
+        println!(
+            "tests: view convergence verification is disabled -- guest-view reconstruction is not being cross-checked against the retained tree"
+        );
+    }
     let count = youth_test::run_directory_with_options(
         &project.root().join("tests"),
         &project.cargo_component(false),

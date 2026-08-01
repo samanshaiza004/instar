@@ -48,9 +48,16 @@ enum Command {
     },
     /// Run all semantic `tests/*.youth-test` files headlessly.
     Test {
-        /// Reconstruct and compare the guest view after every committed turn.
-        #[arg(long)]
+        /// Force reconstruct-and-compare view convergence checking on,
+        /// overriding `Youth.toml`'s `[test]` section.
+        #[arg(long, conflicts_with = "no_verify_view_convergence")]
         verify_view_convergence: bool,
+        /// Force view convergence checking off, overriding `Youth.toml`'s
+        /// `[test]` section -- for named exceptions (perf measurements,
+        /// deliberately-divergent fixtures, fault-injection tests,
+        /// guest-call-counting tests).
+        #[arg(long)]
+        no_verify_view_convergence: bool,
     },
     /// Rebuild and restart the current project when its inputs change.
     Dev {
@@ -215,7 +222,17 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Build { release } => project_commands::build_project(release)?,
         Command::Test {
             verify_view_convergence,
-        } => project_commands::test_project(verify_view_convergence).await?,
+            no_verify_view_convergence,
+        } => {
+            let override_convergence = if no_verify_view_convergence {
+                Some(false)
+            } else if verify_view_convergence {
+                Some(true)
+            } else {
+                None
+            };
+            project_commands::test_project(override_convergence).await?
+        }
         Command::Dev {
             headless_supervisor,
         } => project_commands::dev_project(headless_supervisor).await?,

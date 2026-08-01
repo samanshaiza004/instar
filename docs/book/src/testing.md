@@ -101,7 +101,36 @@ expect text derived "todo" 1 "title" "Task 1"
 expect child-count items 5
 ```
 
-Run `youth test --verify-view-convergence` to reconstruct the guest view after
-mount, restart, and every committed turn. The checker compares guest-owned
-semantics and reports missing, extra, and changed nodes without installing the
-verification snapshot or publishing another turn.
+`youth test` reconstructs the guest view after mount, restart, and every
+committed turn, and compares guest-owned semantics -- reporting missing,
+extra, and changed nodes -- without installing the verification snapshot or
+publishing another turn. This is controlled by `Youth.toml`'s `[test]`
+section:
+
+```toml
+[test]
+verify_view_convergence = true
+```
+
+and defaults to `true` (including for a `Youth.toml` with no `[test]`
+section at all), so weaker evidence must be opted into by name, not fallen
+into silently. `youth test --verify-view-convergence` and
+`youth test --no-verify-view-convergence` override the manifest for one run
+-- for named exceptions (perf measurements, deliberately-divergent fixtures,
+fault-injection tests, guest-call-counting tests). The runner prints when
+convergence checking is disabled.
+
+**Known gap with Editor nodes**: `context.editor().accept()`/`replace()`
+(the `youth:editor` capability) advance the live host-owned Editor session's
+`document_revision` directly; there is no `Patch::SetEditorRevision`-shaped
+patch, so the retained tree's `Editor` node keeps whatever `document_revision`
+the guest last declared in a full `view()`-derived tree until the next mount,
+restart, or resync. A resync-based reconstruction, in contrast, always
+reflects the current state -- so convergence checking reports a "changed
+node" for any Editor node `accept()`/`replace()` touched since the tree was
+last fully installed, even though nothing is actually wrong. An app that
+relies on `accept()`/`replace()` (Scratchpad is the first) needs
+`verify_view_convergence = false` with a comment explaining why until this
+is resolved -- either by adding a real patch for the Editor node's
+declared revision, or by teaching the convergence checker to treat Editor
+document-revision drift since the last full install as expected.

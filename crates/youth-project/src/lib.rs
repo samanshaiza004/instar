@@ -84,6 +84,8 @@ pub struct Manifest {
     pub app: App,
     pub build: Build,
     pub development: Development,
+    #[serde(default)]
+    pub test: Test,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -106,6 +108,24 @@ pub struct Build {
 #[serde(deny_unknown_fields)]
 pub struct Development {
     pub state: PathBuf,
+}
+
+/// Optional `[test]` manifest section controlling `youth test`'s default
+/// behavior. Absent from an older `Youth.toml` entirely deserializes as
+/// [`Test::default`], which keeps convergence verification on -- weaker
+/// evidence must be opted into by name, not fallen into silently.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Test {
+    pub verify_view_convergence: bool,
+}
+
+impl Default for Test {
+    fn default() -> Self {
+        Self {
+            verify_view_convergence: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
