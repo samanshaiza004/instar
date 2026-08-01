@@ -149,6 +149,45 @@ Named keys are `enter`, `escape`, `backspace`, `space`, `tab`, `shift-tab`,
 These commands exercise host focus and shortcut policy; the component still
 receives only semantic button activation.
 
+The editor interaction family drives a host-owned Editor node's live buffer
+directly (`youth_runtime::EditorLocalEdit`), the same host-local, guest-turn-
+free primitives real typing uses -- not `key` iterated character by character,
+which would test keyboard shortcut handling instead of the editor contract:
+
+```text
+type <selector> <JSON-string>              # committed text input
+replace-selection <selector> <JSON-string> # same primitive as `type`; a
+                                            # separate command only to
+                                            # document intent
+paste <selector> <JSON-string>             # writes the isolated test
+                                            # clipboard, then pastes it
+compose <selector> start <JSON-string>     # IME preedit lifecycle;
+compose <selector> update <JSON-string>    # `start`/`update` are the same
+                                            # host call
+compose <selector> commit <JSON-string>    # sets the preedit, then commits
+                                            # it as ordinary content
+compose <selector> cancel                  # discards the preedit
+```
+
+Assertions read the live session, since host-local edits are never tree
+patches (`expect text` keeps reading whatever the last full `view()`-derived
+install declared, which does not change):
+
+```text
+expect editor text <selector> <JSON-string>
+expect editor selection <selector> graphemes <start>..<end>
+```
+
+Positions are explicit grapheme-cluster indices (UAX #29 extended grapheme
+clusters -- the "user-perceived character" unit, not bytes, UTF-16 units, or
+Unicode scalar values), converted at the assertion layer from the byte
+offsets `EditorLocalEditResult` actually returns. A collapsed cursor at
+grapheme position `n` is `graphemes n..n`. Setting an arbitrary selection
+range (`select <selector> graphemes <start>..<end>`) is not implemented yet --
+no host primitive exposes it outside pointer/point-based movement and
+AccessKit's own selection model; only the read side (`expect editor
+selection`) is available today.
+
 Dynamic collection tests can address a derived identity without knowing its
 numeric representation:
 

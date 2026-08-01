@@ -11,6 +11,7 @@ serde_json = "1.0.150"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "macros", "time"] }
+unicode-segmentation = "1.13.3"
 youth-runtime = { path = "../youth-runtime" }
 youth-interaction = { path = "../youth-interaction" }
 youth-sdk = { path = "../youth-sdk" }

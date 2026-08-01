@@ -304,3 +304,82 @@ async fn click_requires_presence_enabled_state_and_button_role() {
     .unwrap_err();
     assert!(error.to_string().contains("is not present"), "{error}");
 }
+
+#[tokio::test]
+async fn type_replace_selection_paste_and_compose_drive_a_real_editor_session() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_editor.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-editor --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("editor.youth-test");
+    fs::write(
+        &test,
+        r#"youth-test 1
+
+mount
+expect text document ""
+expect editor text document ""
+
+type document "Hello"
+expect editor text document "Hello"
+expect editor selection document graphemes 5..5
+# Host-local edits never touch the retained tree -- it stays whatever
+# the last full view()-derived install declared, proving the two reads
+# are genuinely independent.
+expect text document ""
+
+replace-selection document " World"
+expect editor text document "Hello World"
+
+paste document "!!"
+expect editor text document "Hello World!!"
+
+compose document start "~"
+compose document cancel
+expect editor text document "Hello World!!"
+
+compose document commit "?"
+expect editor text document "Hello World!!?"
+"#,
+    )
+    .unwrap();
+
+    youth_test::run_file(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-editor-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn editor_selection_is_reported_in_grapheme_clusters_not_bytes() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_editor.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-editor --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("editor-graphemes.youth-test");
+    fs::write(
+        &test,
+        // "Hi, 世界" is 6 grapheme clusters but 10 UTF-8 bytes; asserting
+        // graphemes 6..6 (not bytes 10..10) is the whole point of this
+        // test -- a naive byte-offset comparison here would be wrong.
+        "mount\ntype document \"Hi, \u{4e16}\u{754c}\"\nexpect editor selection document graphemes 6..6\nexpect editor text document \"Hi, \u{4e16}\u{754c}\"\n",
+    )
+    .unwrap();
+
+    youth_test::run_file(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-editor-grapheme-fixture").unwrap(),
+    )
+    .await
+    .unwrap();
+}

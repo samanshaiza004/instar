@@ -2,14 +2,18 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use thiserror::Error;
-use youth_runtime::{RuntimeLimits, YouthAppConfig, YouthAppHandle};
+use unicode_segmentation::UnicodeSegmentation;
+use youth_runtime::{
+    ClipboardService, EditorLocalEdit, EditorLocalEditResult, RecordingClipboardService,
+    RuntimeLimits, YouthAppConfig, YouthAppHandle,
+};
 use youth_state::{AppId, GuestCallPhase, StateLimits, StateLocation, StateStore, StateValue};
 use youth_tree::{NodeData, NodeId, Tree, TreeSnapshot};
 
@@ -154,6 +158,76 @@ pub enum Command {
         key: String,
         expected: Option<StateValue>,
     },
+    /// Committed text input against a host-owned Editor session --
+    /// `youth_runtime::EditorLocalEdit::InsertText`, the whole string in
+    /// one host-local edit (not iterated key-by-key, which would test
+    /// keyboard shortcut handling rather than the editor contract).
+    TypeText {
+        selector: Selector,
+        text: String,
+    },
+    /// Replaces the current selection with `text`. No separate host
+    /// primitive exists for this -- it is exactly `InsertText`, which
+    /// already replaces an active selection -- kept as its own DSL command
+    /// only to document a test's intent.
+    ReplaceSelection {
+        selector: Selector,
+        text: String,
+    },
+    /// Writes `text` to the injected host clipboard test double, then
+    /// applies `EditorLocalEdit::Paste`.
+    Paste {
+        selector: Selector,
+        text: String,
+    },
+    /// Sets or replaces the IME preedit text
+    /// (`EditorLocalEdit::ImeSetCompose`). `start` and `update` parse to
+    /// the same host call -- the session itself distinguishes a fresh
+    /// composition from a continued one by whether a composition is
+    /// already pending, not by a different call -- kept as two DSL verbs
+    /// only to document a test's intent.
+    ComposeStart {
+        selector: Selector,
+        text: String,
+    },
+    ComposeUpdate {
+        selector: Selector,
+        text: String,
+    },
+    /// Sets the preedit to `text`, then commits it as ordinary buffer
+    /// content in the same step (`ImeSetCompose` followed by
+    /// `ImeFinishCompose`) -- so a test can commit a composition without a
+    /// separate preceding `update`.
+    ComposeCommit {
+        selector: Selector,
+        text: String,
+    },
+    /// Cancels IME composition, discarding the preedit text
+    /// (`EditorLocalEdit::ImeClearCompose`).
+    ComposeCancel {
+        selector: Selector,
+    },
+    /// Asserts the Editor's current live buffer text. Distinct from
+    /// `expect text`, which reads the retained tree's `Editor.text` field
+    /// -- accurate right after mount/resync/restart, but not kept in sync
+    /// with host-local edits (`type`, `paste`, `compose`, `undo`/`redo`
+    /// aren't tree patches). This reads the live session instead, via the
+    /// same result every host-local edit already returns.
+    ExpectEditorText {
+        selector: Selector,
+        expected: String,
+    },
+    /// Asserts the Editor's current selection as a grapheme-cluster
+    /// range (not bytes, UTF-16 units, or Unicode scalar values) --
+    /// `youth_editor_engine`'s `EditorLocalEditResult::{cursor,selection}`
+    /// are byte offsets; converted here at the assertion layer, mirroring
+    /// the byte-to-char-index conversion AccessKit support already does. A
+    /// collapsed cursor at grapheme position `n` is `n..n`.
+    ExpectEditorSelection {
+        selector: Selector,
+        start: usize,
+        end: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,6 +302,15 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             | Command::ExpectChildCount { .. }
             | Command::ExpectChild { .. }
             | Command::ExpectState { .. }
+            | Command::TypeText { .. }
+            | Command::ReplaceSelection { .. }
+            | Command::Paste { .. }
+            | Command::ComposeStart { .. }
+            | Command::ComposeUpdate { .. }
+            | Command::ComposeCommit { .. }
+            | Command::ComposeCancel { .. }
+            | Command::ExpectEditorText { .. }
+            | Command::ExpectEditorSelection { .. }
             | Command::Restart => {
                 if !mounted {
                     return Err(diagnostic(
@@ -329,6 +412,45 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         require_empty(path, line, source, remainder)?;
         return Ok(Command::Click { selector });
     }
+    if let Some(rest) = source.strip_prefix("type ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::TypeText { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("replace-selection ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::ReplaceSelection { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("paste ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::Paste { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("compose ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, rest)?;
+        if let Some(text_input) = remainder.strip_prefix("start ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeStart { selector, text });
+        }
+        if let Some(text_input) = remainder.strip_prefix("update ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeUpdate { selector, text });
+        }
+        if let Some(text_input) = remainder.strip_prefix("commit ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeCommit { selector, text });
+        }
+        if remainder == "cancel" {
+            return Ok(Command::ComposeCancel { selector });
+        }
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "expected: compose <selector> start|update|commit <JSON-string>, or compose <selector> cancel",
+        ));
+    }
     if let Some(rest) = source.strip_prefix("advance time ") {
         let millis = parse_millis_with_unit_suffix(path, line, source, rest)?;
         return Ok(Command::AdvanceTime { millis });
@@ -425,6 +547,31 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         })?;
         return Ok(Command::ExpectText { selector, expected });
     }
+    if let Some(arguments) = source.strip_prefix("expect editor text ") {
+        let (selector, encoded) = parse_selector_prefix(path, line, source, arguments)?;
+        if encoded.is_empty() {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "expected: expect editor text <selector> <JSON-string>",
+            ));
+        }
+        let expected: String = serde_json::from_str(encoded).map_err(|error| {
+            diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+        })?;
+        return Ok(Command::ExpectEditorText { selector, expected });
+    }
+    if let Some(arguments) = source.strip_prefix("expect editor selection ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, arguments)?;
+        let (start, end, remainder) = parse_grapheme_range(path, line, source, remainder)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectEditorSelection {
+            selector,
+            start,
+            end,
+        });
+    }
     if let Some(name) = source.strip_prefix("expect countdown ") {
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
@@ -470,7 +617,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, invoke, activate, click, sleep, key, restart, or an expect assertion",
+        "unknown command; expected state, mount, invoke, activate, click, sleep, advance, key, type, replace-selection, paste, compose, restart, or an expect assertion",
     ))
 }
 
@@ -532,6 +679,53 @@ fn parse_selector_prefix<'a>(
     let name = &input[..end];
     validate_name(path, line, source, name)?;
     Ok((Selector::Static(name.to_owned()), input[end..].trim_start()))
+}
+
+/// The shared `<selector> <JSON-string>` shape behind `type`,
+/// `replace-selection`, and `paste`.
+fn parse_selector_then_text(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &str,
+) -> Result<(Selector, String), TestError> {
+    let (selector, remainder) = parse_selector_prefix(path, line, source, input)?;
+    let (text, remainder) = parse_json_string_prefix(path, line, source, remainder)?;
+    require_empty(path, line, source, remainder)?;
+    Ok((selector, text))
+}
+
+/// Parses `graphemes <start>..<end>`, the explicit position unit
+/// `expect editor selection` requires.
+fn parse_grapheme_range<'a>(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &'a str,
+) -> Result<(usize, usize, &'a str), TestError> {
+    let invalid = || {
+        diagnostic(
+            path,
+            line,
+            source,
+            "expected: graphemes <start>..<end> (unsigned decimal grapheme-cluster indices)",
+        )
+    };
+    let input = input.strip_prefix("graphemes ").ok_or_else(invalid)?;
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let range_text = &input[..end];
+    let (start_text, end_text) = range_text.split_once("..").ok_or_else(invalid)?;
+    let start: usize = start_text.parse().map_err(|_| invalid())?;
+    let end_value: usize = end_text.parse().map_err(|_| invalid())?;
+    if end_value < start {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "grapheme range end must not be before its start",
+        ));
+    }
+    Ok((start, end_value, input[end..].trim_start()))
 }
 
 fn parse_u64_prefix<'a>(
@@ -914,9 +1108,25 @@ pub async fn run_file_with_options(
         .iter()
         .any(|located| matches!(located.command, Command::AdvanceTime { .. }));
     let virtual_time = uses_virtual_time.then(VirtualTime::new);
-    let mut app = spawn(component, app_id, &state_file, virtual_time.as_ref())?;
+    // Every run gets an isolated, deterministic clipboard test double --
+    // headless tests must never read or write the real developer's OS
+    // clipboard -- and it's what `paste` writes through.
+    let clipboard = RecordingClipboardService::default();
+    let mut app = spawn(
+        component,
+        app_id,
+        &state_file,
+        virtual_time.as_ref(),
+        &clipboard,
+    )?;
     let mut events = app.subscribe();
     let mut snapshot = None;
+    // The live Editor session state as of the most recent host-local edit
+    // against each node, for `expect editor text`/`expect editor
+    // selection` -- host-local edits touch only the live Editor registry,
+    // never the retained tree, so this is the only place that state is
+    // observable from the runner.
+    let mut editor_state: HashMap<NodeId, EditorLocalEditResult> = HashMap::new();
     let mut interaction = InteractionState::default();
 
     for located in script.commands {
@@ -959,6 +1169,135 @@ pub async fn run_file_with_options(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
+            }
+            Command::TypeText { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::InsertText(text.clone()))
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ReplaceSelection { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::InsertText(text.clone()))
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::Paste { selector, text } => {
+                let node = selector.node_id();
+                clipboard.write_text(text).map_err(|error| {
+                    assertion_error(
+                        path,
+                        &located,
+                        format!("could not write the test clipboard: {error}"),
+                    )
+                })?;
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::Paste)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeStart { selector, text }
+            | Command::ComposeUpdate { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(
+                        node,
+                        EditorLocalEdit::ImeSetCompose {
+                            text: text.clone(),
+                            cursor: None,
+                        },
+                    )
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeCommit { selector, text } => {
+                let node = selector.node_id();
+                app.edit_editor_locally(
+                    node,
+                    EditorLocalEdit::ImeSetCompose {
+                        text: text.clone(),
+                        cursor: None,
+                    },
+                )
+                .await
+                .map_err(|error| runtime(path, &located, error))?;
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::ImeFinishCompose)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeCancel { selector } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::ImeClearCompose)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ExpectEditorText { selector, expected } => {
+                let node = selector.node_id();
+                let observed = editor_state
+                    .get(&node)
+                    .map(|result| result.text.as_str())
+                    .or_else(|| {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                snapshot.nodes.iter().find(|entry| entry.id == node)
+                            })
+                            .and_then(|entry| entry.data.text_value())
+                    });
+                if observed != Some(expected.as_str()) {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor text {selector} to equal {expected:?}; observed {}",
+                            observed.map_or_else(
+                                || "no live Editor session or semantic node".to_owned(),
+                                |value| format!("{value:?}")
+                            )
+                        ),
+                    ));
+                }
+            }
+            Command::ExpectEditorSelection {
+                selector,
+                start,
+                end,
+            } => {
+                let node = selector.node_id();
+                let Some(result) = editor_state.get(&node) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor selection for {selector}; observed no live Editor session (no host-local edit against it yet)"
+                        ),
+                    ));
+                };
+                let byte_range = result
+                    .selection
+                    .clone()
+                    .unwrap_or(result.cursor..result.cursor);
+                let observed_start = byte_to_grapheme_index(&result.text, byte_range.start);
+                let observed_end = byte_to_grapheme_index(&result.text, byte_range.end);
+                if (observed_start, observed_end) != (*start, *end) {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor selection {selector} to be graphemes {start}..{end}; observed graphemes {observed_start}..{observed_end}"
+                        ),
+                    ));
+                }
             }
             Command::Sleep { millis } | Command::SleepReal { millis } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
@@ -1014,7 +1353,13 @@ pub async fn run_file_with_options(
                 app.stop()
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
-                app = spawn(component, app_id, &state_file, virtual_time.as_ref())?;
+                app = spawn(
+                    component,
+                    app_id,
+                    &state_file,
+                    virtual_time.as_ref(),
+                    &clipboard,
+                )?;
                 events = app.subscribe();
                 snapshot = Some(
                     app.mount()
@@ -1022,6 +1367,10 @@ pub async fn run_file_with_options(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 interaction = InteractionState::default();
+                // A restart drops the whole runtime, including every live
+                // Editor session; any cached local-edit result now
+                // describes a session that no longer exists.
+                editor_state.clear();
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
                 if options.verify_view_convergence {
                     verify_view_convergence(path, &located, &app).await?;
@@ -1407,17 +1756,34 @@ fn real_epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Converts a byte offset into `text` to a grapheme-cluster index -- the
+/// count of extended grapheme cluster boundaries (UAX #29) strictly before
+/// it. `.youth-test`'s editor assertions are written in grapheme clusters,
+/// not bytes, UTF-16 units, or Unicode scalar values, so this is the
+/// conversion at the assertion layer that
+/// `EditorLocalEditResult::{cursor,selection}` (byte offsets) need before
+/// they can be compared against a DSL-level grapheme position. `byte_offset`
+/// is assumed to already land on a grapheme boundary, true of every offset
+/// the editor engine itself produces.
+fn byte_to_grapheme_index(text: &str, byte_offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .take_while(|(index, _)| *index < byte_offset)
+        .count()
+}
+
 fn spawn(
     component: &Path,
     app_id: &AppId,
     state_file: &Path,
     virtual_time: Option<&VirtualTime>,
+    clipboard: &RecordingClipboardService,
 ) -> Result<YouthAppHandle, TestError> {
     let mut limits = RuntimeLimits::default();
     if let Some(virtual_time) = virtual_time {
         limits.time.deadline_clock = virtual_time.clock.clone();
         limits.time.wake_driver = virtual_time.wake.clone();
     }
+    limits.time.clipboard_service = std::sync::Arc::new(clipboard.clone());
     YouthAppHandle::spawn(YouthAppConfig {
         component_path: component.to_path_buf(),
         app_id: app_id.clone(),
@@ -2011,6 +2377,134 @@ mount
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn parses_type_replace_selection_and_paste() {
+        let script = parse(
+            Path::new("editor.youth-test"),
+            "mount\ntype document \"Hello, 世界\"\nreplace-selection document \"Hi\"\npaste document \"clipped\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::TypeText {
+                selector: Selector::Static("document".into()),
+                text: "Hello, 世界".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ReplaceSelection {
+                selector: Selector::Static("document".into()),
+                text: "Hi".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::Paste {
+                selector: Selector::Static("document".into()),
+                text: "clipped".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_the_compose_family() {
+        let script = parse(
+            Path::new("compose.youth-test"),
+            "mount\ncompose document start \"n\"\ncompose document update \"\u{f1}\"\ncompose document commit \"\u{f1}\"\ncompose document cancel\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ComposeStart {
+                selector: Selector::Static("document".into()),
+                text: "n".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ComposeUpdate {
+                selector: Selector::Static("document".into()),
+                text: "\u{f1}".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::ComposeCommit {
+                selector: Selector::Static("document".into()),
+                text: "\u{f1}".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[4].command,
+            Command::ComposeCancel {
+                selector: Selector::Static("document".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_compose_verb() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\ncompose document nonsense\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected: compose <selector> start|update|commit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_expect_editor_text_and_selection() {
+        let script = parse(
+            Path::new("editor-expect.youth-test"),
+            "mount\nexpect editor text document \"Hi, 世界\"\nexpect editor selection document graphemes 2..2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectEditorText {
+                selector: Selector::Static("document".into()),
+                expected: "Hi, 世界".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectEditorSelection {
+                selector: Selector::Static("document".into()),
+                start: 2,
+                end: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_grapheme_range() {
+        for source in [
+            "mount\nexpect editor selection document 2..2\n",
+            "mount\nexpect editor selection document graphemes 2\n",
+            "mount\nexpect editor selection document graphemes two..three\n",
+            "mount\nexpect editor selection document graphemes 5..2\n",
+        ] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
+    }
+
+    #[test]
+    fn byte_to_grapheme_index_counts_extended_grapheme_clusters_not_bytes_or_scalars() {
+        // "Hi, 世界" -- "世" and "界" are each one grapheme cluster but
+        // three UTF-8 bytes; a naive byte-offset comparison would be wrong.
+        let text = "Hi, 世界";
+        assert_eq!(byte_to_grapheme_index(text, 0), 0);
+        assert_eq!(byte_to_grapheme_index(text, 4), 4); // just after "Hi, "
+        assert_eq!(byte_to_grapheme_index(text, 7), 5); // just after "世" (3 bytes)
+        assert_eq!(byte_to_grapheme_index(text, 10), 6); // end of string
     }
 
     #[test]
