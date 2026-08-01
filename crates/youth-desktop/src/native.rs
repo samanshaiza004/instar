@@ -426,12 +426,22 @@ impl NativeApp {
         if self.window.is_some() {
             return;
         }
+        // Created hidden and shown only after the AccessKit adapter is
+        // attached below: accesskit_winit requires the adapter to exist
+        // before the window is first made visible (see its own docs/
+        // examples), and winit's default window attributes already show
+        // the window as soon as `create_window` returns -- constructing
+        // the adapter any later than that is a real, platform-observable
+        // startup crash on macOS and Windows (a non-unwinding panic inside
+        // winit's own event dispatch), not just a missed accessibility
+        // update.
         let attributes = WindowAttributes::default()
             .with_title(title)
             .with_inner_size(WinitLogicalSize::new(
                 f64::from(self.initial_size.0),
                 f64::from(self.initial_size.1),
-            ));
+            ))
+            .with_visible(false);
         let Ok(window) = event_loop.create_window(attributes) else {
             self.fault = Some("window_creation".to_owned());
             event_loop.exit();
@@ -459,6 +469,7 @@ impl NativeApp {
         self.relayout();
         self.sync_ime(&window);
         self.sync_access();
+        window.set_visible(true);
         window.request_redraw();
     }
 
