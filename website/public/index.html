@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Youth</title>
+<meta name="description" content="Youth is a native host for untrusted, architecture-independent WebAssembly application components.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --border: #e2e2e2;
+    --code-bg: #f4f4f4;
+    --accent: #6d28d9;
+    --badge-bg: #f2eefc;
+    --badge-fg: #5b21b6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f0f11;
+      --fg: #ededed;
+      --muted: #a3a3a3;
+      --border: #2a2a2e;
+      --code-bg: #1a1a1d;
+      --accent: #a78bfa;
+      --badge-bg: #241a38;
+      --badge-fg: #c4b5fd;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+  h1 {
+    font-size: 2.25rem;
+    margin: 0 0 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--badge-fg);
+    background: var(--badge-bg);
+    border-radius: 999px;
+    padding: 0.2rem 0.65rem;
+    margin-bottom: 1.25rem;
+  }
+  p.lede {
+    font-size: 1.1rem;
+    color: var(--muted);
+    max-width: 56ch;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin: 2rem 0;
+  }
+  .actions a {
+    display: inline-block;
+    padding: 0.6rem 1.1rem;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+    border: 1px solid var(--border);
+    color: var(--fg);
+  }
+  .actions a.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  section {
+    margin-top: 3rem;
+  }
+  h2 {
+    font-size: 1.1rem;
+    margin-bottom: 0.75rem;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-size: 0.9rem;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .note {
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <span class="badge">Developer Preview</span>
+  <h1>Youth</h1>
+  <p class="lede">
+    A native host for untrusted, architecture-independent WebAssembly
+    application components. Applications describe semantic retained UI
+    through a typed WIT contract; the host owns rendering, input, durable
+    state, and the transaction boundary around every guest turn.
+  </p>
+
+  <div class="actions">
+    <a class="primary" href="/docs/">Documentation</a>
+    <a href="https://github.com/samanshaiza004/youth">GitHub</a>
+  </div>
+
+  <section>
+    <h2>Try it</h2>
+    <pre><code>cargo install youth-cli --git https://github.com/samanshaiza004/youth
+youth doctor
+youth new tally --id dev.yourname.tally
+cd tally &amp;&amp; youth dev</code></pre>
+    <p class="note">
+      Requires a Rust toolchain with the <code>wasm32-wasip2</code> target;
+      <code>youth doctor</code> checks and tells you what's missing. A
+      packaged installer (<code>curl | sh</code>, no Rust toolchain to
+      build the CLI itself) is planned for the first tagged release.
+    </p>
+  </section>
+
+  <footer>
+    <a href="https://github.com/samanshaiza004/youth">samanshaiza004/youth</a>
+  </footer>
+</main>
+</body>
+</html>

@@ -20,7 +20,8 @@ native display is available and you want to verify window presentation.
 
 `--tag developer-preview-0` pins the exact, frozen DP0 workflow this page
 documents. Youth has no tagged CLI release newer than that yet (no `dist`
-release has been cut — see [docs/DISTRIBUTION.md](../../DISTRIBUTION.md)),
+release has been cut — see
+[docs/DISTRIBUTION.md](https://github.com/samanshaiza004/youth/blob/master/docs/DISTRIBUTION.md)),
 so to try current platform features not covered by this page — the Editor
 capability, modifier-aware shortcuts, `dist`-packaged install scripts — drop
 `--tag developer-preview-0` to build `cargo-install`'s default (the `master`

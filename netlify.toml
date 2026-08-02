@@ -1,0 +1,18 @@
+[build]
+  command = "bash website/build.sh"
+  publish = "website/dist"
+  # Skip the build entirely unless something under website/ or docs/ (the
+  # mdbook source the build pulls in) actually changed. Netlify's documented
+  # monorepo pattern: the ignore command's exit code decides whether this
+  # deploy proceeds -- nonzero (a real diff) proceeds, zero (no diff) skips.
+  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- website/ docs/"
+
+[[redirects]]
+  from = "/install"
+  to = "/install.sh"
+  status = 200
+
+[[headers]]
+  for = "/install.sh"
+  [headers.values]
+    Content-Type = "text/x-shellscript; charset=utf-8"

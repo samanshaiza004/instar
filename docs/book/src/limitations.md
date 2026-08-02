@@ -28,7 +28,8 @@ platform, not a general application platform.
   profile.
 - Guests are Rust-only and target `wasm32-wasip2`.
 - `youth build` emits a bare validated component; `youth-cli` itself is
-  packaged for release via `dist` (see [docs/DISTRIBUTION.md](../../DISTRIBUTION.md)),
+  packaged for release via `dist` (see
+  [docs/DISTRIBUTION.md](https://github.com/samanshaiza004/youth/blob/master/docs/DISTRIBUTION.md)),
   but application components have no installable-package or registry story.
 - Publishing, registries, and SDK upgrade tooling for applications are absent.
 

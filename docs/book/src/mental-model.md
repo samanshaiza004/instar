@@ -29,4 +29,5 @@ ordinary command like Save. This is a deliberate, narrow exception to the
 treats live text editing as host presentation state, the same way it treats
 scrolling or pointer hover, and only asks the guest to agree on accepted
 document content at explicit checkpoints. See
-[docs/MILESTONE-2.md](../../MILESTONE-2.md) for the full ownership contract.
+[docs/MILESTONE-2.md](https://github.com/samanshaiza004/youth/blob/master/docs/MILESTONE-2.md)
+for the full ownership contract.
