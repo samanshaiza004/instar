@@ -163,7 +163,25 @@ async fn one_mebibyte_document_opens_edits_saves_and_restarts() {
         component_path: test_component("youth-sdk-text-document"),
         app_id: AppId::parse("dev.youth.text-document-large").unwrap(),
         state: StateLocation::Memory,
-        limits: youth_runtime::RuntimeLimits::default(),
+        // The production default's 100ms `handle` deadline is Wasmtime's
+        // real epoch-interruption budget (crates/youth-runtime/src/
+        // engine.rs); it exists to trap a genuinely runaway guest, and this
+        // test isn't testing that containment property. A 1 MiB document's
+        // coalesced dirty-notification turn re-lays out the full Parley
+        // buffer, which in an unoptimized debug build has been observed to
+        // exceed 100ms of real wall-clock time (release-build evidence in
+        // docs/metrics/scratchpad-gate-b-local.md stays well under it),
+        // tripping the trap as a false positive and faulting the app before
+        // the test's own Save assertion runs. Widened generously here, in
+        // this test only -- production still enforces the tight default via
+        // RuntimeLimits::default() elsewhere, unchanged.
+        limits: youth_runtime::RuntimeLimits {
+            handle: youth_runtime::CallBudget {
+                deadline: Duration::from_secs(5),
+                ..youth_runtime::RuntimeLimits::default().handle
+            },
+            ..youth_runtime::RuntimeLimits::default()
+        },
         workspace: Some(WorkspaceGrant::text_document(&root, "large.txt")),
     };
     let open_started = std::time::Instant::now();
