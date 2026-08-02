@@ -9,7 +9,7 @@
   # configuration changed. Netlify's documented monorepo pattern: the ignore
   # command's exit code decides whether this deploy proceeds -- nonzero (a
   # real diff) proceeds, zero (no diff) skips.
-  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- website/ docs/ netlify.toml"
+  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- ':(top)website/' ':(top)docs/' ':(top)netlify.toml'"
 
 [[redirects]]
   from = "/install"
