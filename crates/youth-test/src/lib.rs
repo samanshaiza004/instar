@@ -228,6 +228,26 @@ pub enum Command {
         start: usize,
         end: usize,
     },
+    /// Records the current lifetime guest-call count
+    /// (`AppInspection::guest_call_count`) under `label`, for a later
+    /// `measure expect` to diff against. Namespaced under harness
+    /// observation, not the ordinary semantic-tree `expect` vocabulary --
+    /// these are facts about the host's own behavior, not app semantics.
+    /// Does not span a `restart`: the counter is per process instance.
+    MeasureBegin {
+        label: String,
+    },
+    /// Asserts that the lifetime guest-call count has advanced by exactly
+    /// `expected` since the matching `measure begin label`. This is the
+    /// only counter implemented today -- state-calls, state-writes,
+    /// commits, rollbacks, host-repaints, observer-outcomes, and
+    /// pending-deliveries are deferred; none of them are a cumulative
+    /// counter already exposed via `YouthAppHandle::inspect`, unlike
+    /// guest-turns.
+    MeasureExpectGuestTurns {
+        label: String,
+        expected: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,6 +331,8 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             | Command::ComposeCancel { .. }
             | Command::ExpectEditorText { .. }
             | Command::ExpectEditorSelection { .. }
+            | Command::MeasureBegin { .. }
+            | Command::MeasureExpectGuestTurns { .. }
             | Command::Restart => {
                 if !mounted {
                     return Err(diagnostic(
@@ -572,6 +594,32 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
             end,
         });
     }
+    if let Some(rest) = source.strip_prefix("measure begin ") {
+        let (label, remainder) = parse_json_string_prefix(path, line, source, rest)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::MeasureBegin { label });
+    }
+    if let Some(rest) = source.strip_prefix("measure expect ") {
+        let (label, remainder) = parse_json_string_prefix(path, line, source, rest)?;
+        let counter_error = || {
+            diagnostic(
+                path,
+                line,
+                source,
+                "expected: measure expect <JSON-string-label> guest-turns <count> (the only measure counter implemented today)",
+            )
+        };
+        let remainder = remainder
+            .strip_prefix("guest-turns ")
+            .ok_or_else(counter_error)?;
+        if remainder.is_empty() || !remainder.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(counter_error());
+        }
+        let expected: u64 = remainder
+            .parse()
+            .map_err(|error| diagnostic(path, line, source, &format!("invalid count: {error}")))?;
+        return Ok(Command::MeasureExpectGuestTurns { label, expected });
+    }
     if let Some(name) = source.strip_prefix("expect countdown ") {
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
@@ -617,7 +665,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, invoke, activate, click, sleep, advance, key, type, replace-selection, paste, compose, restart, or an expect assertion",
+        "unknown command; expected state, mount, invoke, activate, click, sleep, advance, key, type, replace-selection, paste, compose, measure, restart, or an expect assertion",
     ))
 }
 
@@ -1127,6 +1175,11 @@ pub async fn run_file_with_options(
     // never the retained tree, so this is the only place that state is
     // observable from the runner.
     let mut editor_state: HashMap<NodeId, EditorLocalEditResult> = HashMap::new();
+    // The lifetime `guest_call_count` observed at each active `measure
+    // begin <label>`, for `measure expect <label> guest-turns <n>` to diff
+    // against. Does not survive a `restart` -- the counter is per process
+    // instance -- so it is cleared there, same as `editor_state`.
+    let mut measure_baselines: HashMap<String, u64> = HashMap::new();
     let mut interaction = InteractionState::default();
 
     for located in script.commands {
@@ -1299,6 +1352,46 @@ pub async fn run_file_with_options(
                     ));
                 }
             }
+            Command::MeasureBegin { label } => {
+                let inspection = app
+                    .inspect()
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                measure_baselines.insert(label.clone(), inspection.guest_call_count);
+            }
+            Command::MeasureExpectGuestTurns { label, expected } => {
+                let Some(baseline) = measure_baselines.get(label) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected a measurement named {label:?}; observed no matching `measure begin` (or it was cleared by an intervening `restart`)"
+                        ),
+                    ));
+                };
+                let inspection = app
+                    .inspect()
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                let Some(observed) = inspection.guest_call_count.checked_sub(*baseline) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "measurement {label:?}'s guest-call count went backwards since `measure begin`; a `measure` span cannot cross a `restart`"
+                        ),
+                    ));
+                };
+                if observed != *expected {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected measurement {label:?} to record {expected} guest turns; observed {observed}"
+                        ),
+                    ));
+                }
+            }
             Command::Sleep { millis } | Command::SleepReal { millis } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
             }
@@ -1371,6 +1464,10 @@ pub async fn run_file_with_options(
                 // Editor session; any cached local-edit result now
                 // describes a session that no longer exists.
                 editor_state.clear();
+                // The new process instance's guest_call_count starts back
+                // at zero; a baseline from before the restart is no longer
+                // meaningful.
+                measure_baselines.clear();
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
                 if options.verify_view_convergence {
                     verify_view_convergence(path, &located, &app).await?;
@@ -2494,6 +2591,43 @@ mount
         ] {
             assert!(parse(Path::new("bad.youth-test"), source).is_err());
         }
+    }
+
+    #[test]
+    fn parses_measure_begin_and_expect_guest_turns() {
+        let script = parse(
+            Path::new("measure.youth-test"),
+            "mount\nmeasure begin \"typing\"\nmeasure expect \"typing\" guest-turns 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::MeasureBegin {
+                label: "typing".into()
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::MeasureExpectGuestTurns {
+                label: "typing".into(),
+                expected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_measure_expect_naming_an_unsupported_counter() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nmeasure expect \"typing\" state-writes 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the only measure counter implemented today"),
+            "{error}"
+        );
     }
 
     #[test]

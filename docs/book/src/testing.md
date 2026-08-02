@@ -188,6 +188,28 @@ no host primitive exposes it outside pointer/point-based movement and
 AccessKit's own selection model; only the read side (`expect editor
 selection`) is available today.
 
+`measure` proves harness-observed facts about the host's own behavior --
+namespaced separately from the ordinary semantic-tree `expect` vocabulary,
+since these are not app semantics:
+
+```text
+measure begin "typing"
+type document "10,000 characters..."
+measure expect "typing" guest-turns 0
+```
+
+`measure begin <JSON-string-label>` records the current lifetime guest-call
+count (`YouthAppHandle::inspect`'s `guest_call_count`); `measure expect
+<label> guest-turns <n>` asserts it has advanced by exactly `n` since. This
+proves, from an app repo's own `.youth-test` suite, exactly the zero-guest-
+turn architectural property that used to be provable only from inside
+`youth-runtime`'s own Rust integration tests. A `measure` span cannot cross
+a `restart` -- the counter is per process instance -- and is a clear error
+if it does. `guest-turns` is the only counter implemented today; `state-
+calls`, `state-writes`, `commits`, `rollbacks`, `host-repaints`, `observer-
+outcomes`, and `pending-deliveries` are deferred (none of them are already a
+cumulative-since-mount counter the way `guest_call_count` is).
+
 Dynamic collection tests can address a derived identity without knowing its
 numeric representation:
 
