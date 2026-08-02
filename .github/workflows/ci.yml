@@ -242,6 +242,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # windows-latest runners have repeatedly shown DeadlineExceeded false
+      # positives on legitimate guest calls (SQLite I/O, Parley layout)
+      # under scheduling contention -- never on ubuntu-latest/macos-latest.
+      # This widens only the wall-clock deadline (never fuel) on that one
+      # leg; see crates/youth-runtime/src/limits.rs's call_deadline_scale.
+      YOUTH_CALL_DEADLINE_SCALE: ${{ matrix.os == 'windows-latest' && '10' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
