@@ -146,6 +146,7 @@ pub(crate) struct HostState {
     staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
     editor_sessions: crate::editor_session::EditorSessionRegistry,
     staged_editor_sessions: Option<crate::editor_session::EditorSessionRegistry>,
+    max_editor_bytes: usize,
 }
 
 struct GuestClockAdapter(Arc<dyn crate::GuestMonotonicClock>);
@@ -1052,6 +1053,7 @@ impl crate::bindings::v006::youth::editor::session::Host for HostState {
         authoritative_text: String,
     ) -> Result<(), crate::bindings::v006::youth::editor::session::EditorErrorCode> {
         let editor = editor_node_id_v006(editor)?;
+        let max_editor_bytes = self.max_editor_bytes;
         crate::editor_session::replace_editor_session(
             self.staged_editor_sessions_mut(),
             editor,
@@ -1059,6 +1061,7 @@ impl crate::bindings::v006::youth::editor::session::Host for HostState {
             expected_edit_sequence,
             new_document_revision,
             authoritative_text,
+            max_editor_bytes,
         )
         .map_err(to_wire_editor_error_v006)
     }
@@ -1072,7 +1075,7 @@ fn editor_node_id_v006(
 }
 
 fn to_wire_editor_snapshot_v006(
-    snapshot: crate::editor_session::EditorSessionSnapshot,
+    snapshot: crate::editor_session::EditorSnapshot,
 ) -> crate::bindings::v006::youth::editor::session::EditorSnapshot {
     crate::bindings::v006::youth::editor::session::EditorSnapshot {
         document_revision: snapshot.document_revision,
@@ -1092,6 +1095,10 @@ fn to_wire_editor_error_v006(
         }
         crate::editor_session::EditorSessionError::StaleEditSequence => {
             EditorErrorCode::StaleEditSequence
+        }
+        crate::editor_session::EditorSessionError::BufferTooLarge
+        | crate::editor_session::EditorSessionError::PreeditTooLarge => {
+            EditorErrorCode::Unavailable
         }
     }
 }
@@ -1437,10 +1444,18 @@ impl YouthApp {
             )));
         }
         let result = match edit {
+            crate::EditorLocalEdit::SetViewportWidth { width } => {
+                crate::editor_session::local_set_viewport_width(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    width,
+                )
+            }
             crate::EditorLocalEdit::InsertText(text) => crate::editor_session::local_insert_text(
                 &mut self.store.data_mut().editor_sessions,
                 editor,
                 &text,
+                self.limits.tree.max_editor_text_len,
             ),
             crate::EditorLocalEdit::Backspace => crate::editor_session::local_backspace(
                 &mut self.store.data_mut().editor_sessions,
@@ -1470,6 +1485,7 @@ impl YouthApp {
                     &mut self.store.data_mut().editor_sessions,
                     editor,
                     clipboard_text.as_deref().unwrap_or_default(),
+                    self.limits.tree.max_editor_text_len,
                 )
             }
             crate::EditorLocalEdit::MoveCursor(movement) => {
@@ -1492,6 +1508,7 @@ impl YouthApp {
                     editor,
                     &text,
                     cursor,
+                    self.limits.max_ime_preedit_bytes,
                 )
             }
             crate::EditorLocalEdit::ImeClearCompose => {
@@ -1504,6 +1521,7 @@ impl YouthApp {
                 crate::editor_session::local_ime_finish_compose(
                     &mut self.store.data_mut().editor_sessions,
                     editor,
+                    self.limits.tree.max_editor_text_len,
                 )
             }
             crate::EditorLocalEdit::MoveToPoint { x, y } => {
@@ -1535,7 +1553,44 @@ impl YouthApp {
                 )
             }
         };
-        result.map_err(|_| {
+        if let Ok(outcome) = &result {
+            crate::editor_session::bump_editor_generations(
+                &mut self.store.data_mut().editor_sessions,
+                editor,
+                outcome.content_changed,
+                outcome.interaction_changed,
+                outcome.presentation_changed,
+            );
+        }
+        result.map_err(|error| match error {
+            crate::editor_session::EditorSessionError::BufferTooLarge
+            | crate::editor_session::EditorSessionError::PreeditTooLarge => {
+                RuntimeError::EditorInputRejected(self.context(
+                    "Editor input exceeds the configured host buffer or preedit limit",
+                    None,
+                ))
+            }
+            crate::editor_session::EditorSessionError::UnknownEditor
+            | crate::editor_session::EditorSessionError::StaleDocumentRevision
+            | crate::editor_session::EditorSessionError::StaleEditSequence => {
+                RuntimeError::InvalidLifecycle(self.context(
+                    format!("node {} does not have a live Editor session", editor.get()),
+                    None,
+                ))
+            }
+        })
+    }
+
+    /// Materializes a complete host-owned Editor buffer on explicit request.
+    pub fn editor_snapshot(
+        &mut self,
+        editor: youth_tree::NodeId,
+    ) -> Result<crate::EditorSnapshot, RuntimeError> {
+        crate::editor_session::snapshot_editor_session(
+            &mut self.store.data_mut().editor_sessions,
+            editor,
+        )
+        .map_err(|_| {
             RuntimeError::InvalidLifecycle(self.context(
                 format!("node {} does not have a live Editor session", editor.get()),
                 None,
@@ -1627,14 +1682,49 @@ impl YouthApp {
         crate::editor_session::editor_presentations(&mut self.store.data_mut().editor_sessions)
     }
 
+    pub(crate) fn editor_presentation(
+        &mut self,
+        editor: youth_tree::NodeId,
+    ) -> Option<youth_editor_engine::TextPresentation> {
+        crate::editor_session::editor_presentation(
+            &mut self.store.data_mut().editor_sessions,
+            editor,
+        )
+    }
+
+    pub(crate) fn editor_presentation_generation(&self, editor: youth_tree::NodeId) -> Option<u64> {
+        crate::editor_session::editor_presentation_generation(
+            &self.store.data().editor_sessions,
+            editor,
+        )
+    }
+
     /// Builds one accessibility snapshot per live Editor session, for
     /// synchronous consumption by a desktop renderer. See
     /// [`crate::editor_session::editor_accessibility_snapshots`].
     pub(crate) fn editor_accessibility_snapshots(
         &mut self,
-    ) -> std::collections::HashMap<youth_tree::NodeId, crate::EditorAccessibility> {
+        ids: &mut crate::editor_session::AccessibilityIdRegistry,
+    ) -> Result<
+        std::collections::HashMap<youth_tree::NodeId, crate::EditorAccessibility>,
+        crate::editor_session::AccessibilityIdError,
+    > {
         crate::editor_session::editor_accessibility_snapshots(
             &mut self.store.data_mut().editor_sessions,
+            ids,
+        )
+    }
+
+    pub(crate) fn editor_accessibility_snapshot(
+        &mut self,
+        editor: youth_tree::NodeId,
+        ids: &mut crate::editor_session::AccessibilityIdRegistry,
+    ) -> Result<Option<crate::EditorAccessibility>, crate::editor_session::AccessibilityIdError>
+    {
+        crate::editor_session::editor_accessibility_snapshot(
+            &mut self.store.data_mut().editor_sessions,
+            editor,
+            ids,
         )
     }
 
@@ -2571,6 +2661,7 @@ fn instantiate(
         staged_schedule_outputs: Vec::new(),
         editor_sessions: crate::editor_session::EditorSessionRegistry::new(),
         staged_editor_sessions: None,
+        max_editor_bytes: limits.tree.max_editor_text_len,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limiter);

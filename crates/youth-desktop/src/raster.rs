@@ -265,8 +265,7 @@ pub fn render(
                             .editor_scroll_offsets
                             .and_then(|offsets| offsets.get(id))
                             .copied()
-                            .unwrap_or(0.0)
-                            * scale_factor as f32;
+                            .unwrap_or(0.0);
                         draw_editor_presentation(
                             &mut frame,
                             rect,
@@ -274,6 +273,7 @@ pub fn render(
                             &mut rasterizer.borrow_mut(),
                             palette,
                             scroll_offset_y,
+                            scale_factor as f32,
                         );
                     }
                     _ => {
@@ -426,10 +426,8 @@ fn blend_over(background: u32, foreground: u32, coverage: u8) -> u32 {
 /// selection/cursor geometry) into `frame`, clipped to `rect`. Falls back
 /// to nothing if `rect` has no area.
 ///
-/// Painted at the engine's own logical pixel scale (not `scale_factor`-
-/// aware yet -- native per-node DPI-correct rasterization is a follow-up;
-/// see the crate-level notes). This keeps correctness (proportions,
-/// clipping, selection/cursor placement) while deferring HiDPI crispness.
+/// Engine geometry is logical; glyph masks and rectangles are converted to
+/// physical pixels exactly once using the window scale factor.
 fn draw_editor_presentation(
     frame: &mut FrameBuffer,
     rect: PixelRect,
@@ -437,6 +435,7 @@ fn draw_editor_presentation(
     rasterizer: &mut GlyphRasterizer,
     palette: Palette,
     scroll_offset_y: f32,
+    scale: f32,
 ) {
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -450,13 +449,13 @@ fn draw_editor_presentation(
             && (y as u32) >= rect.y
     };
     let origin_x = rect.x as f32;
-    let origin_y = rect.y as f32 - scroll_offset_y;
+    let origin_y = rect.y as f32 - scroll_offset_y * scale;
 
     for selection_rect in &presentation.selection {
-        let x0 = origin_x + selection_rect.x0 as f32;
-        let y0 = origin_y + selection_rect.y0 as f32;
-        let x1 = origin_x + selection_rect.x1 as f32;
-        let y1 = origin_y + selection_rect.y1 as f32;
+        let x0 = origin_x + selection_rect.x0 as f32 * scale;
+        let y0 = origin_y + selection_rect.y0 as f32 * scale;
+        let x1 = origin_x + selection_rect.x1 as f32 * scale;
+        let y1 = origin_y + selection_rect.y1 as f32 * scale;
         for y in y0.round() as i32..y1.round() as i32 {
             for x in x0.round() as i32..x1.round() as i32 {
                 if clip(x, y) {
@@ -471,6 +470,7 @@ fn draw_editor_presentation(
         presentation,
         origin_x,
         origin_y,
+        scale,
         |x, y, coverage| {
             if clip(x, y) {
                 frame.blend_pixel(x, y, palette.text, coverage);
@@ -479,10 +479,10 @@ fn draw_editor_presentation(
     );
 
     if let Some(cursor) = &presentation.cursor {
-        let x0 = (origin_x + cursor.x0 as f32).round() as i32;
-        let y0 = (origin_y + cursor.y0 as f32).round() as i32;
-        let x1 = (origin_x + cursor.x1 as f32).round() as i32;
-        let y1 = (origin_y + cursor.y1 as f32).round() as i32;
+        let x0 = (origin_x + cursor.x0 as f32 * scale).round() as i32;
+        let y0 = (origin_y + cursor.y0 as f32 * scale).round() as i32;
+        let x1 = (origin_x + cursor.x1 as f32 * scale).round() as i32;
+        let y1 = (origin_y + cursor.y1 as f32 * scale).round() as i32;
         for y in y0..y1 {
             for x in x0..x1.max(x0 + 1) {
                 if clip(x, y) {
@@ -835,6 +835,7 @@ mod tests {
             &mut rasterizer,
             palette,
             0.0,
+            1.0,
         );
 
         let painted_pixels = frame
@@ -892,6 +893,7 @@ mod tests {
             &mut rasterizer,
             palette,
             0.0,
+            1.0,
         );
 
         let mut scrolled = FrameBuffer::new(160, 32).unwrap();
@@ -904,6 +906,7 @@ mod tests {
             &mut rasterizer,
             palette,
             6.0,
+            1.0,
         );
 
         assert_ne!(
@@ -947,6 +950,7 @@ mod tests {
             &mut rasterizer,
             Palette::default(),
             0.0,
+            1.0,
         );
     }
 

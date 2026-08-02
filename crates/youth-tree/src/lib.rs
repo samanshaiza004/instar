@@ -255,6 +255,11 @@ pub struct Limits {
     pub max_depth: usize,
     pub max_children: usize,
     pub max_text_len: usize,
+    /// Maximum UTF-8 byte length of one host-owned Editor buffer.
+    ///
+    /// Editor text is transported as a whole-buffer value at the protocol
+    /// boundary, so it has a separate (larger) budget than ordinary labels.
+    pub max_editor_text_len: usize,
     pub max_label_len: usize,
     pub max_patches: usize,
     pub max_grid_columns: u8,
@@ -270,6 +275,7 @@ impl Default for Limits {
             max_depth: 64,
             max_children: 4_096,
             max_text_len: 64 * 1024,
+            max_editor_text_len: 1024 * 1024,
             max_label_len: 4 * 1024,
             max_patches: 10_000,
             max_grid_columns: 16,
@@ -525,11 +531,11 @@ impl Tree {
                     if !node.children.is_empty() {
                         return Err(ValidationError::LeafWithChildren { node: id });
                     }
-                    if text.len() > limits.max_text_len {
+                    if text.len() > limits.max_editor_text_len {
                         return Err(ValidationError::TextTooLong {
                             node: id,
                             actual: text.len(),
-                            max: limits.max_text_len,
+                            max: limits.max_editor_text_len,
                         });
                     }
                 }
@@ -1811,7 +1817,7 @@ mod tests {
     #[test]
     fn rejects_overlong_editor_text() {
         let limits = Limits {
-            max_text_len: 2,
+            max_editor_text_len: 2,
             ..Limits::default()
         };
         let editor = Tree::from_snapshot(

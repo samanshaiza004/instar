@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use common::test_component;
 use youth_runtime::{
@@ -17,7 +17,15 @@ fn id(value: u64) -> NodeId {
     NodeId::new(value).expect("test IDs are nonzero")
 }
 
+async fn editor_text(app: &YouthAppHandle) -> String {
+    app.editor_snapshot(id(2))
+        .await
+        .expect("explicit editor snapshot succeeds")
+        .text
+}
+
 #[tokio::test]
+#[ignore = "run in the release editor stress suite; debug timing is not a performance contract"]
 async fn ten_thousand_local_edits_make_zero_guest_calls() {
     let clipboard = RecordingClipboardService::default();
     clipboard
@@ -31,6 +39,7 @@ async fn ten_thousand_local_edits_make_zero_guest_calls() {
     let baseline = app.inspect().await.expect("baseline inspection succeeds");
     let baseline_guest_calls = baseline.guest_call_count;
     let mut result = None;
+    let started = Instant::now();
     for _ in 0..10_000 {
         result = Some(
             app.edit_editor_locally(id(2), EditorLocalEdit::InsertText("x".to_owned()))
@@ -38,12 +47,16 @@ async fn ten_thousand_local_edits_make_zero_guest_calls() {
                 .expect("host-local insert succeeds"),
         );
     }
+    eprintln!(
+        "editor_local_baseline edits=10000 elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
 
     let result = result.expect("the edit loop produces a result");
     assert_eq!(result.document_revision, 42);
     assert_eq!(result.edit_sequence, 10_000);
     assert_eq!(
-        result.text,
+        editor_text(&app).await,
         format!("Scratchpad draft{}", "x".repeat(10_000))
     );
     let after_local_edits = app.inspect().await.expect("post-edit inspection succeeds");
@@ -54,21 +67,24 @@ async fn ten_thousand_local_edits_make_zero_guest_calls() {
     assert_eq!(after_local_edits.last_event_sequence, None);
     assert!(after_local_edits.last_turn.is_none());
 
-    let undone = app
+    let _undone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("host-local undo succeeds");
-    assert_eq!(undone.text, INITIAL);
-    let redone = app
+    assert_eq!(editor_text(&app).await, INITIAL);
+    let _redone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Redo)
         .await
         .expect("host-local redo succeeds");
-    assert_eq!(redone.text, result.text);
-    let pasted = app
+    assert_eq!(
+        editor_text(&app).await,
+        format!("Scratchpad draft{}", "x".repeat(10_000))
+    );
+    let _pasted = app
         .edit_editor_locally(id(2), EditorLocalEdit::Paste)
         .await
         .expect("host-local paste succeeds");
-    assert!(pasted.text.ends_with(" from clipboard"));
+    assert!(editor_text(&app).await.ends_with(" from clipboard"));
     let after_history_edits = app.inspect().await.expect("history inspection succeeds");
     assert_eq!(
         after_history_edits.guest_call_count, baseline_guest_calls,
@@ -89,6 +105,133 @@ async fn ten_thousand_local_edits_make_zero_guest_calls() {
 }
 
 #[tokio::test]
+async fn no_op_edits_do_not_create_history_or_advance_content_sequence() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    let at_start = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Home))
+        .await
+        .expect("moving to the start succeeds");
+    assert!(!at_start.content_changed);
+    assert!(at_start.interaction_changed);
+    assert_eq!(at_start.edit_sequence, 0);
+
+    let empty_insert = app
+        .edit_editor_locally(id(2), EditorLocalEdit::InsertText(String::new()))
+        .await
+        .expect("empty insertion is a safe no-op");
+    assert!(!empty_insert.content_changed);
+    assert_eq!(empty_insert.edit_sequence, 0);
+
+    let at_start_backspace = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Backspace)
+        .await
+        .expect("backspace at the start is a safe no-op");
+    assert!(!at_start_backspace.content_changed);
+    assert!(!at_start_backspace.interaction_changed);
+    assert_eq!(at_start_backspace.edit_sequence, 0);
+
+    let undo = app
+        .edit_editor_locally(id(2), EditorLocalEdit::Undo)
+        .await
+        .expect("undo after no-op edits is safe");
+    assert_eq!(undo, at_start_backspace);
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn replacing_a_selection_with_the_same_text_is_a_no_op() {
+    let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
+        .expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+    app.edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::Home))
+        .await
+        .expect("move to the document start succeeds");
+    app.edit_editor_locally(id(2), EditorLocalEdit::ExtendSelection(Movement::End))
+        .await
+        .expect("selecting the document succeeds");
+    let equal_replacement = app
+        .edit_editor_locally(id(2), EditorLocalEdit::InsertText(INITIAL.to_owned()))
+        .await
+        .expect("equal replacement succeeds");
+    assert!(!equal_replacement.content_changed);
+    assert_eq!(equal_replacement.edit_sequence, 0);
+    assert!(
+        !app.edit_editor_locally(id(2), EditorLocalEdit::Undo)
+            .await
+            .expect("undo after equal replacement succeeds")
+            .content_changed
+    );
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
+async fn committed_buffer_and_ime_preedit_limits_are_enforced_before_mutation() {
+    let mut config = YouthAppConfig::ephemeral(test_component("youth-editor-capability-v006"));
+    config.limits.tree.max_editor_text_len = INITIAL.len();
+    config.limits.max_ime_preedit_bytes = 2;
+    let app = YouthAppHandle::spawn(config).expect("Editor worker starts");
+    app.mount().await.expect("Editor fixture mounts");
+
+    let rejected = app
+        .edit_editor_locally(id(2), EditorLocalEdit::InsertText("!".to_owned()))
+        .await
+        .expect_err("insertion past the committed buffer limit is rejected");
+    assert_eq!(
+        rejected.category(),
+        youth_runtime::RuntimeErrorCategory::EditorInputRejected
+    );
+    let unchanged = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::End))
+        .await
+        .expect("cursor movement still succeeds");
+    assert_eq!(editor_text(&app).await, INITIAL);
+    assert_eq!(unchanged.edit_sequence, 0);
+
+    let preedit_rejected = app
+        .edit_editor_locally(
+            id(2),
+            EditorLocalEdit::ImeSetCompose {
+                text: "abc".to_owned(),
+                cursor: Some((0, 3)),
+            },
+        )
+        .await
+        .expect_err("oversized IME preedit is rejected");
+    assert_eq!(
+        preedit_rejected.category(),
+        youth_runtime::RuntimeErrorCategory::EditorInputRejected
+    );
+
+    app.edit_editor_locally(
+        id(2),
+        EditorLocalEdit::ImeSetCompose {
+            text: "ab".to_owned(),
+            cursor: Some((0, 2)),
+        },
+    )
+    .await
+    .expect("a bounded preedit is accepted before commit");
+    let commit_rejected = app
+        .edit_editor_locally(id(2), EditorLocalEdit::ImeFinishCompose)
+        .await
+        .expect_err("the committed buffer limit is enforced at IME commit");
+    assert_eq!(
+        commit_rejected.category(),
+        youth_runtime::RuntimeErrorCategory::EditorInputRejected
+    );
+    let unchanged = app
+        .edit_editor_locally(id(2), EditorLocalEdit::MoveCursor(Movement::End))
+        .await
+        .expect("cursor movement still succeeds after rejected commit");
+    assert_eq!(editor_text(&app).await, INITIAL);
+    assert_eq!(unchanged.edit_sequence, 0);
+    app.stop().await.expect("worker stops");
+}
+
+#[tokio::test]
 async fn consecutive_inserts_merge_and_undo_redo_are_exact_and_bounded_by_history() {
     let app = YouthAppHandle::spawn_ephemeral(test_component("youth-editor-capability-v006"))
         .expect("Editor worker starts");
@@ -103,25 +246,33 @@ async fn consecutive_inserts_merge_and_undo_redo_are_exact_and_bounded_by_histor
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("merged typing undoes");
-    assert_eq!(undone.text, INITIAL, "one undo removes the whole abc group");
+    assert_eq!(
+        editor_text(&app).await,
+        INITIAL,
+        "one undo removes the whole abc group"
+    );
     assert_eq!(undone.edit_sequence, 4);
 
     let extra_undo = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("undo past history is safe");
-    assert_eq!(extra_undo, undone, "exhausted undo is a complete no-op");
+    assert_eq!(editor_text(&app).await, INITIAL);
+    assert_eq!(extra_undo.edit_sequence, undone.edit_sequence);
+    assert!(!extra_undo.content_changed);
 
     let redone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Redo)
         .await
         .expect("redo restores typing");
-    assert_eq!(redone.text, format!("{INITIAL}abc"));
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}abc"));
     let extra_redo = app
         .edit_editor_locally(id(2), EditorLocalEdit::Redo)
         .await
         .expect("redo past history is safe");
-    assert_eq!(extra_redo, redone, "exhausted redo is a complete no-op");
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}abc"));
+    assert_eq!(extra_redo.edit_sequence, redone.edit_sequence);
+    assert!(!extra_redo.content_changed);
 
     app.stop().await.expect("worker stops");
 }
@@ -138,20 +289,20 @@ async fn backspace_is_separate_and_a_new_edit_after_undo_clears_redo() {
     app.edit_editor_locally(id(2), EditorLocalEdit::Backspace)
         .await
         .expect("backspace succeeds");
-    let undone = app
+    let _undone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("backspace undo succeeds");
-    assert_eq!(undone.text, format!("{INITIAL}abc"));
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}abc"));
 
     app.edit_editor_locally(id(2), EditorLocalEdit::InsertText("!".to_owned()))
         .await
         .expect("fresh edit succeeds");
-    let redo = app
+    let _redo = app
         .edit_editor_locally(id(2), EditorLocalEdit::Redo)
         .await
         .expect("cleared redo is safe");
-    assert_eq!(redo.text, format!("{INITIAL}abc!"));
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}abc!"));
 
     app.stop().await.expect("worker stops");
 }
@@ -177,21 +328,21 @@ async fn paste_is_an_isolated_undo_unit_between_typing_groups() {
         .await
         .unwrap();
 
-    let without_b = app
+    let _without_b = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .unwrap();
-    assert_eq!(without_b.text, format!("{INITIAL}aPASTE"));
-    let without_paste = app
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}aPASTE"));
+    let _without_paste = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .unwrap();
-    assert_eq!(without_paste.text, format!("{INITIAL}a"));
-    let without_a = app
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}a"));
+    let _without_a = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .unwrap();
-    assert_eq!(without_a.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
 
     app.stop().await.expect("worker stops");
 }
@@ -213,7 +364,7 @@ async fn absent_clipboard_paste_is_a_safe_no_op_without_an_empty_history_group()
         .await
         .expect("empty clipboard paste succeeds");
     assert_eq!(pasted.edit_sequence, 0);
-    assert_eq!(pasted.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
     let undone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
@@ -240,7 +391,7 @@ async fn insert_happens_at_the_real_cursor_position_not_always_at_the_end() {
         .edit_editor_locally(id(2), EditorLocalEdit::InsertText(">>".to_owned()))
         .await
         .expect("insert at cursor succeeds");
-    assert_eq!(inserted.text, format!(">>{INITIAL}"));
+    assert_eq!(editor_text(&app).await, format!(">>{INITIAL}"));
     assert_eq!(inserted.cursor, 2);
 
     app.stop().await.expect("worker stops");
@@ -267,26 +418,28 @@ async fn cursor_movement_is_a_real_undo_group_boundary() {
         .expect("movement is not itself undoable");
 
     // Undoing once removes only the second group ("XY"), not "abc" too.
-    let undo_one = app
+    let _undo_one = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("first undo removes only the second group");
-    assert_eq!(undo_one.text, format!("{INITIAL}abc"));
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}abc"));
     let undo_two = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("second undo removes the first group");
-    assert_eq!(undo_two.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
     let extra_undo = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("exhausted undo is safe");
-    assert_eq!(
-        extra_undo, undo_two,
+    assert_eq!(editor_text(&app).await, INITIAL);
+    assert_eq!(extra_undo.edit_sequence, undo_two.edit_sequence);
+    assert!(
+        !extra_undo.content_changed,
         "pure cursor movement left nothing to undo"
     );
-    assert_ne!(
-        before_undo.text, INITIAL,
+    assert!(
+        before_undo.edit_sequence > 0,
         "sanity: content existed before undoing"
     );
 
@@ -321,7 +474,7 @@ async fn undo_restores_cursor_and_selection_not_just_text() {
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("undo succeeds");
-    assert_eq!(undone.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
     assert_eq!(
         undone.cursor, 0,
         "undo must restore the cursor to where it was before the edit, not just the text"
@@ -351,11 +504,11 @@ async fn extend_selection_produces_a_real_selection_range_end_to_end() {
     assert_eq!(selected.selection, Some(0..2));
 
     // Typing with a live selection replaces it, exactly like a real editor.
-    let replaced = app
+    let _replaced = app
         .edit_editor_locally(id(2), EditorLocalEdit::InsertText("Q".to_owned()))
         .await
         .expect("insert replaces the selection");
-    assert_eq!(replaced.text, format!("Q{}", &INITIAL[2..]));
+    assert_eq!(editor_text(&app).await, format!("Q{}", &INITIAL[2..]));
 
     app.stop().await.expect("worker stops");
 }
@@ -382,7 +535,8 @@ async fn ime_composition_updates_are_guest_turn_free_and_do_not_advance_edit_seq
         "preedit is not accepted content yet"
     );
     assert_eq!(
-        first.text, INITIAL,
+        editor_text(&app).await,
+        INITIAL,
         "snapshot excludes in-progress preedit content"
     );
 
@@ -397,7 +551,7 @@ async fn ime_composition_updates_are_guest_turn_free_and_do_not_advance_edit_seq
         .await
         .expect("repeated compose update replaces rather than accumulates");
     assert_eq!(second.edit_sequence, 0);
-    assert_eq!(second.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
 
     let after = app
         .inspect()
@@ -430,17 +584,16 @@ async fn ime_clear_compose_discards_preedit_with_nothing_to_undo() {
         .edit_editor_locally(id(2), EditorLocalEdit::ImeClearCompose)
         .await
         .expect("clearing composition succeeds");
-    assert_eq!(cleared.text, INITIAL);
+    assert_eq!(editor_text(&app).await, INITIAL);
     assert_eq!(cleared.edit_sequence, 0);
 
     let undone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("undo after a cancelled composition is a safe no-op");
-    assert_eq!(
-        undone, cleared,
-        "a cancelled composition never touched accepted content, so there is nothing to undo"
-    );
+    assert_eq!(editor_text(&app).await, INITIAL);
+    assert_eq!(undone.edit_sequence, cleared.edit_sequence);
+    assert!(!undone.content_changed);
 
     app.stop().await.expect("worker stops");
 }
@@ -474,7 +627,7 @@ async fn ime_finish_compose_commits_the_whole_composition_as_one_undo_group() {
         .edit_editor_locally(id(2), EditorLocalEdit::ImeFinishCompose)
         .await
         .expect("finishing composition succeeds");
-    assert_eq!(finished.text, format!("{INITIAL}ni"));
+    assert_eq!(editor_text(&app).await, format!("{INITIAL}ni"));
     assert_eq!(
         finished.edit_sequence, 1,
         "committing a composition advances edit_sequence exactly once"
@@ -489,12 +642,13 @@ async fn ime_finish_compose_commits_the_whole_composition_as_one_undo_group() {
         "committing an IME composition must never enter the guest"
     );
 
-    let undone = app
+    let _undone = app
         .edit_editor_locally(id(2), EditorLocalEdit::Undo)
         .await
         .expect("undo succeeds");
     assert_eq!(
-        undone.text, INITIAL,
+        editor_text(&app).await,
+        INITIAL,
         "one undo removes the whole composition regardless of how many preedit updates it took"
     );
 

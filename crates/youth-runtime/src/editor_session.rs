@@ -10,7 +10,7 @@
 //! module owns only the session lifecycle, revision/sequence bookkeeping,
 //! and undo/redo grouping around it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use youth_editor_engine::{
@@ -20,22 +20,105 @@ use youth_tree::{NodeData, NodeId, Tree};
 
 pub(super) type EditorSessionRegistry = HashMap<NodeId, EditorSessionSlot>;
 
+/// Allocates the AccessKit IDs used by Parley's text-run children.
+///
+/// Youth semantic IDs are arbitrary nonzero `u64`s, so arithmetic namespace
+/// tricks cannot make editor descendants disjoint. This allocator reserves
+/// every currently installed semantic ID and then monotonically allocates
+/// unused IDs for editor-owned objects. IDs are never reused for the lifetime
+/// of the worker's accessibility generation.
+#[derive(Default)]
+pub(super) struct AccessibilityIdRegistry {
+    next: u64,
+    allocated: HashSet<u64>,
+    forward: HashMap<AccessibilityKey, u64>,
+    reverse: HashMap<u64, AccessibilityKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AccessibilityKey {
+    Semantic(NodeId),
+    EditorTextRun { editor: NodeId, run: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AccessibilityIdError {
+    SemanticCollision(u64),
+    Exhausted,
+}
+
+impl AccessibilityIdRegistry {
+    pub(super) fn reserve_semantic_ids(
+        &mut self,
+        ids: impl IntoIterator<Item = NodeId>,
+    ) -> Result<(), AccessibilityIdError> {
+        for id in ids {
+            let value = id.get();
+            let key = AccessibilityKey::Semantic(id);
+            if let Some(existing) = self.reverse.get(&value)
+                && *existing != key
+            {
+                return Err(AccessibilityIdError::SemanticCollision(value));
+            }
+            self.allocated.insert(value);
+            self.forward.insert(key, value);
+            self.reverse.insert(value, key);
+        }
+        Ok(())
+    }
+
+    fn allocate(
+        &mut self,
+        key: AccessibilityKey,
+    ) -> Result<accesskit::NodeId, AccessibilityIdError> {
+        if let Some(&value) = self.forward.get(&key) {
+            return Ok(accesskit::NodeId(value));
+        }
+        loop {
+            let candidate = self
+                .next
+                .checked_add(1)
+                .ok_or(AccessibilityIdError::Exhausted)?;
+            self.next = candidate;
+            if candidate == 0 || !self.allocated.insert(candidate) {
+                continue;
+            }
+            self.forward.insert(key, candidate);
+            self.reverse.insert(candidate, key);
+            return Ok(accesskit::NodeId(candidate));
+        }
+    }
+}
+
 /// Every newly created process-local session starts at this edit sequence.
 pub(super) const EDIT_SEQUENCE_BASE: u64 = 0;
 
 /// Maximum reversible edit groups retained per live Editor session.
 ///
 /// 512 groups keeps ordinary scratchpad undo useful while placing a fixed
-/// bound on the number of retained snapshots. The oldest group is discarded
-/// when the limit is reached.
+/// bound on retained delta history. The oldest group is discarded when the
+/// limit is reached.
 const UNDO_GROUP_LIMIT: usize = 512;
+/// Aggregate UTF-8 budget for one undo or redo stack. The count limit alone
+/// would permit hundreds of large replacement deltas to accumulate.
+const UNDO_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 
-/// The host-owned Editor state after one accepted local edit operation.
+/// Metadata returned by one accepted host-local Editor operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditorLocalEditResult {
     pub document_revision: u64,
     pub edit_sequence: u64,
-    pub text: String,
+    /// Whether accepted buffer content changed. Only this field advances the
+    /// document sequence, undo history, and dirty-since-accept state.
+    pub content_changed: bool,
+    /// Whether cursor or selection state changed.
+    pub interaction_changed: bool,
+    /// Whether the renderer should refresh this editor's presentation.
+    pub presentation_changed: bool,
+    /// The UTF-8 byte range affected in the pre-edit document, when content
+    /// changed. Consumers that only need metadata can avoid materializing the
+    /// complete buffer.
+    pub changed_range: Option<Range<usize>>,
     pub cursor: usize,
     pub selection: Option<Range<usize>>,
 }
@@ -44,6 +127,11 @@ pub struct EditorLocalEditResult {
 /// session.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditorLocalEdit {
+    /// Updates the host-local logical wrapping width for an Editor. This is
+    /// presentation policy only and never enters the guest.
+    SetViewportWidth {
+        width: f32,
+    },
     InsertText(String),
     Backspace,
     Undo,
@@ -82,14 +170,13 @@ pub enum EditorLocalEdit {
     SetSelectionFromAccessKit(accesskit::TextSelection),
 }
 
-/// The guest-facing view of a session: whole-buffer text only. Cursor and
-/// selection are host-local UI state and never cross the `youth:editor`
-/// capability boundary.
+/// An explicit, owned editor snapshot. Local edits return metadata only;
+/// callers use this request when they deliberately need the full buffer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct EditorSessionSnapshot {
-    pub(super) document_revision: u64,
-    pub(super) edit_sequence: u64,
-    pub(super) text: String,
+pub struct EditorSnapshot {
+    pub document_revision: u64,
+    pub edit_sequence: u64,
+    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +184,8 @@ pub(super) enum EditorSessionError {
     UnknownEditor,
     StaleDocumentRevision,
     StaleEditSequence,
+    BufferTooLarge,
+    PreeditTooLarge,
 }
 
 #[derive(Clone)]
@@ -114,6 +203,16 @@ struct EditorSession {
     /// content do, since this is what `accept`/`replace`'s staleness check
     /// (and the derived `locally_dirty` fact) cares about.
     edit_sequence: u64,
+    /// Monotonic text generation for host-owned consumers. It advances only
+    /// when accepted buffer content changes.
+    text_generation: u64,
+    /// Monotonic layout generation. Content and viewport changes invalidate
+    /// layout; interaction-only changes do not.
+    layout_generation: u64,
+    /// Monotonic generation for the raster presentation cache.
+    presentation_generation: u64,
+    /// Monotonic generation for the accessibility subtree cache.
+    accessibility_generation: u64,
     /// The latest host edit sequence acknowledged by a successful guest
     /// `accept`. Dirty state is derived rather than separately stored.
     accepted_edit_sequence: u64,
@@ -122,8 +221,8 @@ struct EditorSession {
     /// Most recent revision declared for this still-live node. A mismatch is
     /// remembered without replacing the session's creation payload.
     last_declared_document_revision: u64,
-    undo_stack: VecDeque<UndoSnapshot>,
-    redo_stack: VecDeque<UndoSnapshot>,
+    undo_stack: VecDeque<UndoEdit>,
+    redo_stack: VecDeque<UndoEdit>,
     /// True only while the next `InsertText` may extend the newest
     /// insertion group. Every other operation closes the group.
     insert_group_open: bool,
@@ -140,6 +239,10 @@ impl Clone for EditorSession {
         Self {
             document_revision: self.document_revision,
             edit_sequence: self.edit_sequence,
+            text_generation: self.text_generation,
+            layout_generation: self.layout_generation,
+            presentation_generation: self.presentation_generation,
+            accessibility_generation: self.accessibility_generation,
             accepted_edit_sequence: self.accepted_edit_sequence,
             engine: self.engine.clone(),
             last_declared_document_revision: self.last_declared_document_revision,
@@ -151,10 +254,22 @@ impl Clone for EditorSession {
     }
 }
 
-/// A full (text, cursor, selection) snapshot taken immediately before an
-/// undo group's edits, so undo/redo can restore exact prior state rather
-/// than reversing individual character deltas against a cursor-aware
-/// buffer.
+/// A reversible content change. History stores only the replaced bytes and
+/// selection metadata, never a complete document copy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UndoEdit {
+    range_before: Range<usize>,
+    deleted: String,
+    inserted: String,
+    selection_before: Option<Range<usize>>,
+    cursor_before: usize,
+    selection_after: Option<Range<usize>>,
+    cursor_after: usize,
+}
+
+/// A complete pre-composition state is retained only while an IME composition
+/// is active. It is not placed in the undo/redo stacks unless the composition
+/// commits, where it is immediately converted into an `UndoEdit`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UndoSnapshot {
     text: String,
@@ -247,6 +362,10 @@ fn new_session(document_revision: u64, text: &str) -> EditorSession {
     EditorSession {
         document_revision,
         edit_sequence: EDIT_SEQUENCE_BASE,
+        text_generation: 0,
+        layout_generation: 0,
+        presentation_generation: 0,
+        accessibility_generation: 0,
         accepted_edit_sequence: EDIT_SEQUENCE_BASE,
         engine,
         last_declared_document_revision: document_revision,
@@ -274,6 +393,55 @@ pub(super) fn editor_presentations(
         .collect()
 }
 
+pub(super) fn editor_presentation(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+) -> Option<TextPresentation> {
+    registry
+        .get_mut(&editor)
+        .and_then(|slot| slot.session.as_mut())
+        .map(|session| session.engine.presentation())
+}
+
+pub(super) fn editor_presentation_generation(
+    registry: &EditorSessionRegistry,
+    editor: NodeId,
+) -> Option<u64> {
+    registry.get(&editor).and_then(|slot| {
+        slot.session.as_ref().map(|session| {
+            slot.generation
+                .wrapping_shl(32)
+                .wrapping_add(session.presentation_generation)
+        })
+    })
+}
+
+pub(super) fn bump_editor_generations(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    content_changed: bool,
+    interaction_changed: bool,
+    presentation_changed: bool,
+) {
+    if let Some(session) = registry
+        .get_mut(&editor)
+        .and_then(|slot| slot.session.as_mut())
+    {
+        if content_changed {
+            session.text_generation = session.text_generation.wrapping_add(1);
+        }
+        if content_changed || interaction_changed {
+            session.accessibility_generation = session.accessibility_generation.wrapping_add(1);
+        }
+        if content_changed || presentation_changed {
+            session.layout_generation = session.layout_generation.wrapping_add(1);
+        }
+        if presentation_changed {
+            session.presentation_generation = session.presentation_generation.wrapping_add(1);
+        }
+    }
+}
+
 /// One Editor's accessibility contribution, computed once per worker cycle
 /// (mirroring [`editor_presentations`]) since it requires mutable access to
 /// the live engine that only the worker actor has.
@@ -297,55 +465,85 @@ pub struct EditorAccessibility {
 
 /// Builds one [`EditorAccessibility`] snapshot per live Editor session.
 ///
-/// Each session's `TextRun` child node ids are namespaced by shifting the
-/// Editor's own `NodeId` into the high 32 bits, guaranteeing they can never
-/// collide with a plain `youth_tree::NodeId` (always small in practice) or
-/// with another Editor's child ids.
+/// Text-run IDs come from the installed accessibility generation's checked
+/// allocator. They are not derived from semantic IDs or Parley run ordinals.
 pub(super) fn editor_accessibility_snapshots(
     registry: &mut EditorSessionRegistry,
-) -> HashMap<NodeId, EditorAccessibility> {
-    let mut next_ordinal: u64 = 0;
+    ids: &mut AccessibilityIdRegistry,
+) -> Result<HashMap<NodeId, EditorAccessibility>, AccessibilityIdError> {
     registry
         .iter_mut()
-        .filter_map(|(&node_id, slot)| {
-            let session = slot.session.as_mut()?;
-            let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
-            node.add_action(accesskit::Action::Focus);
-            let mut update = accesskit::TreeUpdate {
-                nodes: Vec::new(),
-                tree: None,
-                tree_id: accesskit::TreeId::ROOT,
-                focus: accesskit::NodeId(0),
+        .try_fold(HashMap::new(), |mut snapshots, (&node_id, slot)| {
+            let Some(session) = slot.session.as_mut() else {
+                return Ok(snapshots);
             };
-            let editor_high_bits = node_id.get() << 32;
-            session.engine.accessibility_update(
-                &mut update,
-                &mut node,
-                || {
-                    next_ordinal += 1;
-                    accesskit::NodeId(editor_high_bits | next_ordinal)
-                },
-                0.0,
-                0.0,
-            );
-            Some((
-                node_id,
-                EditorAccessibility {
-                    node,
-                    extra_nodes: update.nodes,
-                },
-            ))
+            snapshots.insert(node_id, build_editor_accessibility(session, ids, node_id)?);
+            Ok(snapshots)
         })
-        .collect()
+}
+
+pub(super) fn editor_accessibility_snapshot(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    ids: &mut AccessibilityIdRegistry,
+) -> Result<Option<EditorAccessibility>, AccessibilityIdError> {
+    let Some(session) = registry
+        .get_mut(&editor)
+        .and_then(|slot| slot.session.as_mut())
+    else {
+        return Ok(None);
+    };
+    build_editor_accessibility(session, ids, editor).map(Some)
+}
+
+fn build_editor_accessibility(
+    session: &mut EditorSession,
+    ids: &mut AccessibilityIdRegistry,
+    editor: NodeId,
+) -> Result<EditorAccessibility, AccessibilityIdError> {
+    let mut node = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+    node.add_action(accesskit::Action::Focus);
+    let mut update = accesskit::TreeUpdate {
+        nodes: Vec::new(),
+        tree: None,
+        tree_id: accesskit::TreeId::ROOT,
+        focus: accesskit::NodeId(0),
+    };
+    let mut allocation_error = None;
+    let mut run = 0_u32;
+    session.engine.accessibility_update(
+        &mut update,
+        &mut node,
+        || {
+            let key = AccessibilityKey::EditorTextRun { editor, run };
+            run = run.saturating_add(1);
+            match ids.allocate(key) {
+                Ok(id) => id,
+                Err(error) => {
+                    allocation_error = Some(error);
+                    accesskit::NodeId(0)
+                }
+            }
+        },
+        0.0,
+        0.0,
+    );
+    if let Some(error) = allocation_error {
+        return Err(error);
+    }
+    Ok(EditorAccessibility {
+        node,
+        extra_nodes: update.nodes,
+    })
 }
 
 pub(super) fn snapshot_editor_session(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
-) -> Result<EditorSessionSnapshot, EditorSessionError> {
+) -> Result<EditorSnapshot, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
-    let text = session.engine.snapshot().text;
-    Ok(EditorSessionSnapshot {
+    let text = session.engine.state_snapshot().text;
+    Ok(EditorSnapshot {
         document_revision: session.document_revision,
         edit_sequence: session.edit_sequence,
         text,
@@ -358,17 +556,97 @@ pub(super) fn local_insert_text(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
     text: &str,
+    max_editor_bytes: usize,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
-    session.redo_stack.clear();
-    if !session.insert_group_open {
-        let before = snapshot_of(&mut session.engine);
-        push_bounded(&mut session.undo_stack, before);
-        session.insert_group_open = true;
+    if text.is_empty() {
+        let (cursor, selection) = session.engine.selection_state();
+        return Ok(local_edit_result_from_parts(
+            session,
+            false,
+            None,
+            cursor,
+            selection.clone(),
+            cursor,
+            selection,
+        ));
+    }
+    let (before_cursor, before_selection) = session.engine.selection_state();
+    let range_before = before_selection
+        .clone()
+        .unwrap_or(before_cursor..before_cursor);
+    let deleted = session.engine.raw_text()[range_before.clone()].to_owned();
+    let resulting_bytes = session
+        .engine
+        .raw_text()
+        .len()
+        .saturating_sub(deleted.len())
+        .saturating_add(text.len());
+    if resulting_bytes > max_editor_bytes {
+        return Err(EditorSessionError::BufferTooLarge);
     }
     session.engine.insert(text);
-    advance_edit_sequence(session);
-    Ok(local_edit_result(session))
+    let (after_cursor, after_selection) = session.engine.selection_state();
+    let content_changed = deleted != text;
+    if content_changed {
+        session.redo_stack.clear();
+        let edit = UndoEdit {
+            range_before: range_before.clone(),
+            deleted,
+            inserted: text.to_owned(),
+            selection_before: before_selection.clone(),
+            cursor_before: before_cursor,
+            selection_after: after_selection.clone(),
+            cursor_after: after_cursor,
+        };
+        let merge = session.insert_group_open
+            && edit.deleted.is_empty()
+            && session.undo_stack.back().is_some_and(|last| {
+                last.deleted.is_empty()
+                    && last.range_before.start + last.inserted.len() == edit.range_before.start
+            });
+        if merge {
+            let last = session.undo_stack.back_mut().expect("merge edit exists");
+            last.inserted.push_str(&edit.inserted);
+            last.selection_after = edit.selection_after;
+            last.cursor_after = edit.cursor_after;
+        } else {
+            push_bounded(&mut session.undo_stack, edit);
+        }
+        session.insert_group_open = true;
+        advance_edit_sequence(session);
+    }
+    Ok(local_edit_result_from_parts(
+        session,
+        content_changed,
+        content_changed.then_some(range_before),
+        before_cursor,
+        before_selection,
+        after_cursor,
+        after_selection,
+    ))
+}
+
+pub(super) fn local_set_viewport_width(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    width: f32,
+) -> Result<EditorLocalEditResult, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
+    session.engine.set_width(Some(width.max(0.0)));
+    let (cursor, selection) = session.engine.selection_state();
+    let mut result = local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    );
+    result.presentation_changed = true;
+    Ok(result)
 }
 
 /// Deletes one Unicode-safe unit before the cursor (or the selection, if
@@ -379,12 +657,39 @@ pub(super) fn local_backspace(
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
-    session.redo_stack.clear();
-    let before = snapshot_of(&mut session.engine);
-    push_bounded(&mut session.undo_stack, before);
+    let (before_cursor, before_selection) = session.engine.selection_state();
+    let range_before = before_selection.clone().unwrap_or_else(|| {
+        previous_char_boundary(session.engine.raw_text(), before_cursor)..before_cursor
+    });
+    let deleted = session.engine.raw_text()[range_before.clone()].to_owned();
     session.engine.backspace();
-    advance_edit_sequence(session);
-    Ok(local_edit_result(session))
+    let (after_cursor, after_selection) = session.engine.selection_state();
+    let content_changed = !deleted.is_empty();
+    if content_changed {
+        session.redo_stack.clear();
+        push_bounded(
+            &mut session.undo_stack,
+            make_undo_edit(
+                range_before.clone(),
+                deleted,
+                String::new(),
+                before_cursor,
+                before_selection.clone(),
+                after_cursor,
+                after_selection.clone(),
+            ),
+        );
+        advance_edit_sequence(session);
+    }
+    Ok(local_edit_result_from_parts(
+        session,
+        content_changed,
+        content_changed.then_some(range_before),
+        before_cursor,
+        before_selection,
+        after_cursor,
+        after_selection,
+    ))
 }
 
 /// Inserts clipboard text as an isolated undo group. Empty clipboard text is
@@ -394,18 +699,29 @@ pub(super) fn local_paste_text(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
     text: &str,
+    max_editor_bytes: usize,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
     if text.is_empty() {
-        return Ok(local_edit_result(session));
+        let (cursor, selection) = session.engine.selection_state();
+        return Ok(local_edit_result_from_parts(
+            session,
+            false,
+            None,
+            cursor,
+            selection.clone(),
+            cursor,
+            selection,
+        ));
     }
-    session.redo_stack.clear();
-    let before = snapshot_of(&mut session.engine);
-    push_bounded(&mut session.undo_stack, before);
-    session.engine.insert(text);
-    advance_edit_sequence(session);
-    Ok(local_edit_result(session))
+    let result = local_insert_text(registry, editor, text, max_editor_bytes)?;
+    registry
+        .get_mut(&editor)
+        .and_then(|slot| slot.session.as_mut())
+        .expect("editor session remains live")
+        .insert_group_open = false;
+    Ok(result)
 }
 
 pub(super) fn local_undo(
@@ -414,14 +730,31 @@ pub(super) fn local_undo(
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
-    let Some(before) = session.undo_stack.pop_back() else {
-        return Ok(local_edit_result(session));
+    let (before_cursor, before_selection) = session.engine.selection_state();
+    let Some(edit) = session.undo_stack.pop_back() else {
+        return Ok(local_edit_result_from_parts(
+            session,
+            false,
+            None,
+            before_cursor,
+            before_selection.clone(),
+            before_cursor,
+            before_selection,
+        ));
     };
-    let current = snapshot_of(&mut session.engine);
-    push_bounded(&mut session.redo_stack, current);
-    restore(&mut session.engine, &before);
+    push_bounded(&mut session.redo_stack, edit.clone());
+    apply_undo_edit(&mut session.engine, &edit, true);
     advance_edit_sequence(session);
-    Ok(local_edit_result(session))
+    let (after_cursor, after_selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        true,
+        Some(edit.range_before.clone()),
+        before_cursor,
+        before_selection,
+        after_cursor,
+        after_selection,
+    ))
 }
 
 pub(super) fn local_redo(
@@ -430,14 +763,31 @@ pub(super) fn local_redo(
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     session.insert_group_open = false;
-    let Some(after) = session.redo_stack.pop_back() else {
-        return Ok(local_edit_result(session));
+    let (before_cursor, before_selection) = session.engine.selection_state();
+    let Some(edit) = session.redo_stack.pop_back() else {
+        return Ok(local_edit_result_from_parts(
+            session,
+            false,
+            None,
+            before_cursor,
+            before_selection.clone(),
+            before_cursor,
+            before_selection,
+        ));
     };
-    let current = snapshot_of(&mut session.engine);
-    push_bounded(&mut session.undo_stack, current);
-    restore(&mut session.engine, &after);
+    push_bounded(&mut session.undo_stack, edit.clone());
+    apply_undo_edit(&mut session.engine, &edit, false);
     advance_edit_sequence(session);
-    Ok(local_edit_result(session))
+    let (after_cursor, after_selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        true,
+        Some(edit.range_before),
+        before_cursor,
+        before_selection,
+        after_cursor,
+        after_selection,
+    ))
 }
 
 /// Moves the cursor (collapsing any selection). Not itself undoable, but
@@ -450,9 +800,19 @@ pub(super) fn local_move_cursor(
     movement: Movement,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     session.engine.move_cursor(movement);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Extends the selection focus. Same group-boundary and non-content-mutating
@@ -463,9 +823,19 @@ pub(super) fn local_extend_selection(
     movement: Movement,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     session.engine.extend_selection(movement);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Collapses the cursor to the text position nearest a pointer click. Same
@@ -478,10 +848,20 @@ pub(super) fn local_move_to_point(
     y: f32,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     let offset = session.engine.hit_test(x, y);
     session.engine.move_to_byte(offset);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Selects from `(anchor_x, anchor_y)` to `(x, y)`, the host-local effect
@@ -498,11 +878,21 @@ pub(super) fn local_extend_selection_to_point(
     y: f32,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     let anchor = session.engine.hit_test(anchor_x, anchor_y);
     let focus = session.engine.hit_test(x, y);
     session.engine.select_byte_range(anchor, focus);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Applies a selection reported by an AccessKit `SetTextSelection` action.
@@ -514,9 +904,19 @@ pub(super) fn local_set_selection_from_accesskit(
     selection: &accesskit::TextSelection,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     session.engine.select_from_accesskit(selection);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Sets or replaces the in-progress IME preedit text. The first call of a
@@ -529,8 +929,10 @@ pub(super) fn local_ime_set_compose(
     editor: NodeId,
     text: &str,
     cursor: Option<(usize, usize)>,
+    max_preedit_bytes: usize,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     // Mirrors `ParleyEditorEngine::ime_set_compose`'s own empty-text-clears
     // policy: an empty update never started a real composition, so it must
@@ -539,14 +941,35 @@ pub(super) fn local_ime_set_compose(
     if text.is_empty() {
         session.engine.ime_clear_compose();
         session.pending_compose_snapshot = None;
-        return Ok(local_edit_result(session));
+        let (cursor, selection) = session.engine.selection_state();
+        return Ok(local_edit_result_from_parts(
+            session,
+            false,
+            None,
+            before_cursor,
+            before_selection,
+            cursor,
+            selection,
+        ));
+    }
+    if text.len() > max_preedit_bytes {
+        return Err(EditorSessionError::PreeditTooLarge);
     }
     if !session.engine.is_composing() && session.pending_compose_snapshot.is_none() {
-        let before = snapshot_of(&mut session.engine);
-        session.pending_compose_snapshot = Some(before);
+        let before = session.engine.state_snapshot();
+        session.pending_compose_snapshot = Some(undo_snapshot(&before));
     }
     session.engine.ime_set_compose(text, cursor);
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Cancels IME composition, discarding the preedit text and the pending
@@ -557,10 +980,20 @@ pub(super) fn local_ime_clear_compose(
     editor: NodeId,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
     session.engine.ime_clear_compose();
     session.pending_compose_snapshot = None;
-    Ok(local_edit_result(session))
+    let (cursor, selection) = session.engine.selection_state();
+    Ok(local_edit_result_from_parts(
+        session,
+        false,
+        None,
+        before_cursor,
+        before_selection,
+        cursor,
+        selection,
+    ))
 }
 
 /// Commits the current IME preedit as ordinary buffer content. The whole
@@ -570,16 +1003,50 @@ pub(super) fn local_ime_clear_compose(
 pub(super) fn local_ime_finish_compose(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
+    max_editor_bytes: usize,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
+    let before_state = session.engine.state_snapshot();
     session.insert_group_open = false;
+    if before_state.text.len() > max_editor_bytes {
+        return Err(EditorSessionError::BufferTooLarge);
+    }
     session.engine.ime_finish_compose();
-    if let Some(before) = session.pending_compose_snapshot.take() {
+    let after = session.engine.state_snapshot();
+    if after.text.len() > max_editor_bytes {
+        if let Some(compose_before) = session.pending_compose_snapshot.take() {
+            restore(&mut session.engine, &compose_before);
+        } else {
+            restore(
+                &mut session.engine,
+                &UndoSnapshot {
+                    text: before_state.text.clone(),
+                    cursor: before_state.cursor,
+                    selection: before_state.selection.clone(),
+                },
+            );
+        }
+        return Err(EditorSessionError::BufferTooLarge);
+    }
+    let content_changed = after.text != before_state.text;
+    if let Some(undo_before) = session.pending_compose_snapshot.take()
+        && content_changed
+    {
         session.redo_stack.clear();
-        push_bounded(&mut session.undo_stack, before);
+        let before_compose = youth_editor_engine::EngineSnapshot {
+            text: undo_before.text,
+            cursor: undo_before.cursor,
+            selection: undo_before.selection,
+        };
+        push_bounded(&mut session.undo_stack, undo_edit(&before_compose, &after));
         advance_edit_sequence(session);
     }
-    Ok(local_edit_result(session))
+    Ok(local_edit_result_with_snapshot(
+        session,
+        content_changed,
+        Some(&before_state),
+        after,
+    ))
 }
 
 pub(super) fn editor_locally_dirty(
@@ -618,7 +1085,11 @@ pub(super) fn replace_editor_session(
     expected_edit_sequence: u64,
     new_document_revision: u64,
     authoritative_text: String,
+    max_editor_bytes: usize,
 ) -> Result<(), EditorSessionError> {
+    if authoritative_text.len() > max_editor_bytes {
+        return Err(EditorSessionError::BufferTooLarge);
+    }
     let session = live_session_mut(registry, editor)?;
     validate_expected_session(session, expected_document_revision, expected_edit_sequence)?;
     session.document_revision = new_document_revision;
@@ -662,19 +1133,85 @@ fn advance_edit_sequence(session: &mut EditorSession) {
         .expect("Editor edit sequence exhausted");
 }
 
-fn push_bounded(stack: &mut VecDeque<UndoSnapshot>, snapshot: UndoSnapshot) {
-    if stack.len() == UNDO_GROUP_LIMIT {
+fn push_bounded(stack: &mut VecDeque<UndoEdit>, edit: UndoEdit) {
+    stack.push_back(edit);
+    while stack.len() > UNDO_GROUP_LIMIT
+        || stack
+            .iter()
+            .map(|edit| edit.deleted.len().saturating_add(edit.inserted.len()))
+            .sum::<usize>()
+            > UNDO_BYTES_LIMIT
+    {
         stack.pop_front();
     }
-    stack.push_back(snapshot);
 }
 
-fn snapshot_of(engine: &mut ParleyEditorEngine) -> UndoSnapshot {
-    let snapshot = engine.snapshot();
+fn undo_snapshot(snapshot: &youth_editor_engine::EngineSnapshot) -> UndoSnapshot {
     UndoSnapshot {
-        text: snapshot.text,
+        text: snapshot.text.clone(),
         cursor: snapshot.cursor,
-        selection: snapshot.selection,
+        selection: snapshot.selection.clone(),
+    }
+}
+
+fn undo_edit(
+    before: &youth_editor_engine::EngineSnapshot,
+    after: &youth_editor_engine::EngineSnapshot,
+) -> UndoEdit {
+    let range = changed_range(Some(before), after);
+    let suffix = before.text.len().saturating_sub(range.end);
+    make_undo_edit(
+        range.clone(),
+        before.text[range.clone()].to_owned(),
+        after.text[range.start..after.text.len().saturating_sub(suffix)].to_owned(),
+        before.cursor,
+        before.selection.clone(),
+        after.cursor,
+        after.selection.clone(),
+    )
+}
+
+fn make_undo_edit(
+    range_before: Range<usize>,
+    deleted: String,
+    inserted: String,
+    cursor_before: usize,
+    selection_before: Option<Range<usize>>,
+    cursor_after: usize,
+    selection_after: Option<Range<usize>>,
+) -> UndoEdit {
+    UndoEdit {
+        range_before,
+        deleted,
+        inserted,
+        selection_before,
+        cursor_before,
+        selection_after,
+        cursor_after,
+    }
+}
+
+fn apply_undo_edit(engine: &mut ParleyEditorEngine, edit: &UndoEdit, undo: bool) {
+    let (range, replacement, selection, cursor) = if undo {
+        (
+            edit.range_before.start..edit.range_before.start + edit.inserted.len(),
+            edit.deleted.as_str(),
+            edit.selection_before.clone(),
+            edit.cursor_before,
+        )
+    } else {
+        (
+            edit.range_before.clone(),
+            edit.inserted.as_str(),
+            edit.selection_after.clone(),
+            edit.cursor_after,
+        )
+    };
+    engine.select_byte_range(range.start, range.end);
+    engine.insert(replacement);
+    match selection {
+        Some(range) => engine.select_byte_range(range.start, range.end),
+        None => engine.move_to_byte(cursor),
     }
 }
 
@@ -686,15 +1223,80 @@ fn restore(engine: &mut ParleyEditorEngine, snapshot: &UndoSnapshot) {
     }
 }
 
-fn local_edit_result(session: &mut EditorSession) -> EditorLocalEditResult {
-    let snapshot = session.engine.snapshot();
+fn local_edit_result_from_parts(
+    session: &EditorSession,
+    content_changed: bool,
+    changed_range: Option<Range<usize>>,
+    before_cursor: usize,
+    before_selection: Option<Range<usize>>,
+    cursor: usize,
+    selection: Option<Range<usize>>,
+) -> EditorLocalEditResult {
     EditorLocalEditResult {
         document_revision: session.document_revision,
         edit_sequence: session.edit_sequence,
-        text: snapshot.text,
+        content_changed,
+        interaction_changed: before_cursor != cursor || before_selection != selection,
+        presentation_changed: content_changed
+            || before_cursor != cursor
+            || before_selection != selection,
+        changed_range,
+        cursor,
+        selection,
+    }
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor.min(text.len())]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn local_edit_result_with_snapshot(
+    session: &EditorSession,
+    content_changed: bool,
+    before: Option<&youth_editor_engine::EngineSnapshot>,
+    snapshot: youth_editor_engine::EngineSnapshot,
+) -> EditorLocalEditResult {
+    let interaction_changed = before.is_some_and(|before| {
+        before.cursor != snapshot.cursor || before.selection != snapshot.selection
+    });
+    EditorLocalEditResult {
+        document_revision: session.document_revision,
+        edit_sequence: session.edit_sequence,
+        content_changed,
+        interaction_changed,
+        presentation_changed: content_changed || interaction_changed,
+        changed_range: content_changed.then(|| changed_range(before, &snapshot)),
         cursor: snapshot.cursor,
         selection: snapshot.selection,
     }
+}
+
+fn changed_range(
+    before: Option<&youth_editor_engine::EngineSnapshot>,
+    after: &youth_editor_engine::EngineSnapshot,
+) -> Range<usize> {
+    let Some(before) = before else {
+        return 0..after.text.len();
+    };
+    let mut prefix = before
+        .text
+        .bytes()
+        .zip(after.text.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while prefix > 0 && !before.text.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let suffix = before.text[prefix..]
+        .bytes()
+        .rev()
+        .zip(after.text[prefix..].bytes().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    prefix..before.text.len().saturating_sub(suffix)
 }
 
 impl EditorSessionSlot {
@@ -721,11 +1323,14 @@ impl EditorSessionSlot {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use youth_tree::NodeId;
 
-    use super::EDIT_SEQUENCE_BASE;
+    use super::{
+        AccessibilityIdError, AccessibilityIdRegistry, AccessibilityKey, EDIT_SEQUENCE_BASE,
+    };
     use crate::{EditorLocalEdit, RuntimeErrorCategory, YouthApp};
 
     fn fixture() -> PathBuf {
@@ -755,6 +1360,54 @@ mod tests {
     }
 
     #[test]
+    fn accessibility_ids_skip_semantic_nodes_and_retire_allocations() {
+        let mut ids = AccessibilityIdRegistry::default();
+        ids.reserve_semantic_ids([id(1), id(3)]).unwrap();
+        assert_eq!(
+            ids.allocate(AccessibilityKey::EditorTextRun {
+                editor: id(1),
+                run: 0,
+            })
+            .unwrap(),
+            accesskit::NodeId(2)
+        );
+        assert_eq!(
+            ids.allocate(AccessibilityKey::EditorTextRun {
+                editor: id(1),
+                run: 1,
+            })
+            .unwrap(),
+            accesskit::NodeId(4)
+        );
+        assert_eq!(
+            ids.reserve_semantic_ids([id(2)]),
+            Err(AccessibilityIdError::SemanticCollision(2))
+        );
+    }
+
+    #[test]
+    fn accessibility_id_exhaustion_is_explicit() {
+        let mut ids = AccessibilityIdRegistry {
+            next: u64::MAX - 1,
+            allocated: HashSet::new(),
+            forward: HashMap::new(),
+            reverse: HashMap::new(),
+        };
+        let key = AccessibilityKey::EditorTextRun {
+            editor: id(1),
+            run: 0,
+        };
+        assert_eq!(ids.allocate(key).unwrap(), accesskit::NodeId(u64::MAX));
+        assert_eq!(
+            ids.allocate(AccessibilityKey::EditorTextRun {
+                editor: id(1),
+                run: 1,
+            }),
+            Err(AccessibilityIdError::Exhausted)
+        );
+    }
+
+    #[test]
     fn first_mount_creates_generation_one_session() {
         let mut app = YouthApp::load(fixture()).expect("Editor fixture loads");
         app.mount().expect("Editor fixture mounts");
@@ -780,13 +1433,19 @@ mod tests {
             .edit_editor_locally(id(2), EditorLocalEdit::InsertText("!".into()))
             .expect("local insert succeeds");
         assert_eq!(inserted.edit_sequence, 1);
-        assert_eq!(inserted.text, "Scratchpad draft!");
+        assert_eq!(
+            app.editor_snapshot(id(2)).expect("snapshot succeeds").text,
+            "Scratchpad draft!"
+        );
 
         let deleted = app
             .edit_editor_locally(id(2), EditorLocalEdit::Backspace)
             .expect("local backspace succeeds");
         assert_eq!(deleted.edit_sequence, 2);
-        assert_eq!(deleted.text, "Scratchpad draft");
+        assert_eq!(
+            app.editor_snapshot(id(2)).expect("snapshot succeeds").text,
+            "Scratchpad draft"
+        );
         assert_eq!(app.inspect().guest_call_count, 1, "only mount called guest");
     }
 

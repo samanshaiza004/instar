@@ -120,7 +120,12 @@ fn replace_current_clears_both_undo_and_redo_history() {
         .edit_editor_locally(NodeId::new(2).unwrap(), EditorLocalEdit::Undo)
         .expect("post-replace undo is safe");
     assert_eq!(undone.edit_sequence, 0);
-    assert_eq!(undone.text, "Current authoritative text");
+    assert_eq!(
+        app.editor_snapshot(NodeId::new(2).unwrap())
+            .expect("explicit editor snapshot succeeds")
+            .text,
+        "Current authoritative text"
+    );
     let redone = app
         .edit_editor_locally(NodeId::new(2).unwrap(), EditorLocalEdit::Redo)
         .expect("post-replace redo is safe");

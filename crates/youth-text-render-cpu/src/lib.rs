@@ -168,18 +168,20 @@ pub fn paint_presentation(
     presentation: &TextPresentation,
     origin_x: f32,
     origin_y: f32,
+    scale: f32,
     mut plot: impl FnMut(i32, i32, u8),
 ) {
     for run in &presentation.runs {
         for glyph in &run.glyphs {
-            let Some(mask) = rasterizer.rasterize(&run.font, glyph.id, run.font_size) else {
+            let Some(mask) = rasterizer.rasterize(&run.font, glyph.id, run.font_size * scale)
+            else {
                 continue;
             };
             if mask.is_empty() {
                 continue;
             }
-            let pen_x = (origin_x + glyph.x).round() as i32;
-            let pen_y = (origin_y + glyph.y).round() as i32;
+            let pen_x = (origin_x + glyph.x * scale).round() as i32;
+            let pen_y = (origin_y + glyph.y * scale).round() as i32;
             let base_x = pen_x + mask.left;
             let base_y = pen_y - mask.top;
             for row in 0..mask.height {
@@ -287,6 +289,7 @@ mod tests {
             &presentation,
             0.0,
             0.0,
+            1.0,
             |x, y, coverage| {
                 painted.push((x, y, coverage));
             },
@@ -320,6 +323,7 @@ mod tests {
             &presentation,
             0.0,
             0.0,
+            1.0,
             |x, y, coverage| {
                 painted.push((x, y, coverage));
             },

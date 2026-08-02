@@ -655,6 +655,7 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
         RuntimeErrorCategory::StateUnavailable => "state_unavailable",
         RuntimeErrorCategory::StateCommitFailed => "state_commit_failed",
         RuntimeErrorCategory::WorkerStopped => "worker_stopped",
+        RuntimeErrorCategory::EditorInputRejected => "editor_input_rejected",
         RuntimeErrorCategory::Internal => "internal",
     }
 }

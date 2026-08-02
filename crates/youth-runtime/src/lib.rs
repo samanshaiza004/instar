@@ -24,7 +24,9 @@ pub use config::{
     SystemClipboardService, SystemGuestMonotonicClock, SystemNotificationDispatcher,
     VirtualGuestMonotonicClock, YouthAppConfig,
 };
-pub use editor_session::{EditorAccessibility, EditorLocalEdit, EditorLocalEditResult};
+pub use editor_session::{
+    EditorAccessibility, EditorLocalEdit, EditorLocalEditResult, EditorSnapshot,
+};
 pub use engine::{configured_engine, shared_engine};
 pub use error::{ErrorContext, RuntimeError, RuntimeErrorCategory};
 pub use host::{

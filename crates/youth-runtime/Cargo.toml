@@ -23,8 +23,13 @@ youth-state = { path = "../youth-state" }
 youth-editor-engine = { path = "../youth-editor-engine" }
 
 [dev-dependencies]
+criterion = "0.5.1"
 tempfile = "3.27.0"
 tracing-subscriber = "0.3.23"
 wat = "1.253.0"
 youth-sdk = { path = "../youth-sdk" }
 youth-interaction = { path = "../youth-interaction" }
+
+[[bench]]
+name = "editor_performance"
+harness = false

@@ -25,6 +25,7 @@ pub enum RuntimeErrorCategory {
     StateUnavailable,
     StateCommitFailed,
     WorkerStopped,
+    EditorInputRejected,
     Internal,
 }
 
@@ -137,5 +138,6 @@ runtime_errors!(
     StateUnavailable,
     StateCommitFailed,
     WorkerStopped,
+    EditorInputRejected,
     Internal,
 );

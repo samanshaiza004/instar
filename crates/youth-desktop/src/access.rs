@@ -1,12 +1,9 @@
 //! Maps Youth's semantic tree to an AccessKit accessibility tree.
 //!
 //! Every `youth_tree::NodeId` becomes the numerically identical
-//! `accesskit::NodeId`, so no lookup table is needed between the two id
-//! spaces. An Editor's own node additionally gets `TextRun`-role children
-//! (allocated by Parley via [`youth_runtime::EditorAccessibility`]) in a
-//! disjoint namespace -- see
-//! `youth_runtime::editor_session::editor_accessibility_snapshots`'s docs
-//! for the id scheme.
+//! `accesskit::NodeId`. Editor text-run descendants use the host-owned
+//! allocator maintained by the runtime; their IDs are never derived by
+//! truncating or shifting a Youth semantic ID.
 
 use std::collections::HashMap;
 
@@ -198,7 +195,12 @@ fn build_editor_node(
     let origin_y = bounds.map_or(0.0, |bounds| bounds.y0) - scroll_offset_y;
     for (child_id, mut child) in extra_nodes {
         if let Some(child_bounds) = child.bounds() {
-            child.set_bounds(translate_bounds(child_bounds, origin_x, origin_y));
+            child.set_bounds(translate_bounds(
+                child_bounds,
+                origin_x,
+                origin_y,
+                context.scale_factor,
+            ));
         }
         nodes.push((child_id, child));
     }
@@ -207,14 +209,14 @@ fn build_editor_node(
 /// Shifts `bounds` (in the engine's own rect/scroll-independent space) by
 /// `(origin_x, origin_y)`, matching `draw_editor_presentation`'s paint-time
 /// origin math exactly: it adds the physical rect origin (already
-/// scroll-adjusted) directly to unscaled engine-space coordinates, with no
-/// further DPI scaling of the text content itself.
-fn translate_bounds(bounds: AccessRect, origin_x: f64, origin_y: f64) -> AccessRect {
+/// scroll-adjusted) logical engine-space coordinates into physical window
+/// coordinates using the active scale factor.
+fn translate_bounds(bounds: AccessRect, origin_x: f64, origin_y: f64, scale: f64) -> AccessRect {
     AccessRect {
-        x0: origin_x + bounds.x0,
-        y0: origin_y + bounds.y0,
-        x1: origin_x + bounds.x1,
-        y1: origin_y + bounds.y1,
+        x0: origin_x + bounds.x0 * scale,
+        y0: origin_y + bounds.y0 * scale,
+        x1: origin_x + bounds.x1 * scale,
+        y1: origin_y + bounds.y1 * scale,
     }
 }
 
@@ -381,16 +383,18 @@ mod tests {
     #[test]
     fn bounds_scale_with_the_window_scale_factor() {
         let tree = fixture();
-        let update = build(&tree, &InteractionState::default(), 2.0);
-        let root = update
-            .nodes
-            .iter()
-            .find(|(node_id, _)| *node_id == AccessNodeId(1))
-            .map(|(_, node)| node)
-            .unwrap();
-        let bounds = root.bounds().expect("the root has layout bounds");
-        assert_eq!(bounds.x1, 320.0 * 2.0);
-        assert_eq!(bounds.y1, 180.0 * 2.0);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let update = build(&tree, &InteractionState::default(), scale);
+            let root = update
+                .nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == AccessNodeId(1))
+                .map(|(_, node)| node)
+                .unwrap();
+            let bounds = root.bounds().expect("the root has layout bounds");
+            assert_eq!(bounds.x1, 320.0 * scale);
+            assert_eq!(bounds.y1, 180.0 * scale);
+        }
     }
 
     #[test]
@@ -401,7 +405,7 @@ mod tests {
             x1: 5.0,
             y1: 9.0,
         };
-        let translated = translate_bounds(bounds, 10.0, 20.0);
+        let translated = translate_bounds(bounds, 10.0, 20.0, 1.0);
         assert_eq!(
             translated,
             AccessRect {

@@ -16,6 +16,9 @@ pub struct RuntimeLimits {
     pub max_event_batch: usize,
     pub max_guest_error_message: usize,
     pub max_guest_to_host_transfer: usize,
+    /// Maximum UTF-8 byte length of an in-progress host IME preedit.
+    /// Committed Editor text is bounded by `tree.max_editor_text_len`.
+    pub max_ime_preedit_bytes: usize,
     pub tree: youth_tree::Limits,
     pub mount: CallBudget,
     pub handle: CallBudget,
@@ -35,6 +38,7 @@ impl Default for RuntimeLimits {
             max_event_batch: 256,
             max_guest_error_message: 4 * 1024,
             max_guest_to_host_transfer: 8 * 1024 * 1024,
+            max_ime_preedit_bytes: 16 * 1024,
             tree: youth_tree::Limits::default(),
             mount: CallBudget {
                 fuel: 100_000_000,

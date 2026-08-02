@@ -29,6 +29,7 @@ pub enum DesktopEvent {
     TurnCommitted(TurnReceipt),
     Resynced(TreeSnapshot),
     AppRejected(AppErrorSummary),
+    EditorInputRejected(RuntimeErrorSummary),
     AppFaulted(RuntimeErrorSummary),
     Stopped,
 }
@@ -171,18 +172,36 @@ impl Controller {
                                     if let Err(error) =
                                         handle.edit_editor_locally(editor, edit).await
                                     {
-                                        sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
-                                            category: error.category(),
-                                        }));
+                                        if error.category()
+                                            == RuntimeErrorCategory::EditorInputRejected
+                                        {
+                                            sink.send(DesktopEvent::EditorInputRejected(
+                                                RuntimeErrorSummary {
+                                                    category: error.category(),
+                                                },
+                                            ));
+                                        } else {
+                                            sink.send(DesktopEvent::AppFaulted(
+                                                RuntimeErrorSummary {
+                                                    category: error.category(),
+                                                },
+                                            ));
+                                        }
                                         break;
                                     }
                                 }
                             }
                             ControllerCommand::EditorLocalEdit { editor, edit } => {
                                 if let Err(error) = handle.edit_editor_locally(editor, edit).await {
-                                    sink.send(DesktopEvent::AppFaulted(RuntimeErrorSummary {
+                                    let summary = RuntimeErrorSummary {
                                         category: error.category(),
-                                    }));
+                                    };
+                                    if error.category() == RuntimeErrorCategory::EditorInputRejected
+                                    {
+                                        sink.send(DesktopEvent::EditorInputRejected(summary));
+                                    } else {
+                                        sink.send(DesktopEvent::AppFaulted(summary));
+                                    }
                                 }
                             }
                             ControllerCommand::Resync => match handle.snapshot().await {

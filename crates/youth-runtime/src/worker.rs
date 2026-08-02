@@ -22,8 +22,10 @@ pub struct PresentationReader {
     records: Arc<std::sync::RwLock<HashMap<u64, youth_state::ScheduleRecord>>>,
     editor_presentations:
         Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, youth_editor_engine::TextPresentation>>>,
+    editor_presentation_generations: Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, u64>>>,
     editor_accessibility:
         Arc<std::sync::RwLock<HashMap<youth_tree::NodeId, crate::EditorAccessibility>>>,
+    accessibility_ids: Arc<std::sync::Mutex<crate::editor_session::AccessibilityIdRegistry>>,
     deadline_clock: Arc<dyn youth_state::DeadlineClock>,
 }
 
@@ -90,6 +92,9 @@ enum AppCommand {
         editor: youth_tree::NodeId,
         edit: crate::EditorLocalEdit,
     },
+    EditorSnapshot {
+        editor: youth_tree::NodeId,
+    },
     Resync,
     VerifyView,
     Snapshot,
@@ -103,6 +108,7 @@ enum ReplySender {
     Snapshot(oneshot::Sender<Result<youth_tree::TreeSnapshot, RuntimeError>>),
     Turn(oneshot::Sender<Result<TurnReceipt, RuntimeError>>),
     EditorLocalEdit(oneshot::Sender<Result<crate::EditorLocalEditResult, RuntimeError>>),
+    EditorSnapshot(oneshot::Sender<Result<crate::EditorSnapshot, RuntimeError>>),
     Inspection(oneshot::Sender<Result<AppInspection, RuntimeError>>),
     ViewVerification(oneshot::Sender<Result<crate::ViewVerification, RuntimeError>>),
     Stop(oneshot::Sender<Result<(), RuntimeError>>),
@@ -174,7 +180,11 @@ impl YouthAppHandle {
         let presentation = PresentationReader {
             records: Arc::new(std::sync::RwLock::new(HashMap::new())),
             editor_presentations: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            editor_presentation_generations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             editor_accessibility: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            accessibility_ids: Arc::new(std::sync::Mutex::new(
+                crate::editor_session::AccessibilityIdRegistry::default(),
+            )),
             deadline_clock: Arc::clone(&config.limits.time.deadline_clock),
         };
         config
@@ -291,6 +301,20 @@ impl YouthAppHandle {
         self.send_request(
             AppCommand::EditorLocalEdit { editor, edit },
             ReplySender::EditorLocalEdit(reply),
+        )
+        .await?;
+        response.await.map_err(|_| self.worker_stopped())?
+    }
+
+    /// Materializes one complete host-owned Editor buffer on explicit request.
+    pub async fn editor_snapshot(
+        &self,
+        editor: youth_tree::NodeId,
+    ) -> Result<crate::EditorSnapshot, RuntimeError> {
+        let (reply, response) = oneshot::channel();
+        self.send_request(
+            AppCommand::EditorSnapshot { editor },
+            ReplySender::EditorSnapshot(reply),
         )
         .await?;
         response.await.map_err(|_| self.worker_stopped())?
@@ -439,6 +463,7 @@ fn worker_main(
     sync_presentation(&mut app, &presentation);
 
     while let Some(message) = mailbox_rx.blocking_recv() {
+        let request = matches!(&message, WorkerMessage::Request { .. });
         match message {
             WorkerMessage::Request { command, reply } => {
                 if handle_request(&mut app, command, reply, &event_tx, &presentation) {
@@ -453,7 +478,9 @@ fn worker_main(
             }
             WorkerMessage::Shutdown => break,
         }
-        sync_presentation(&mut app, &presentation);
+        if !request {
+            sync_presentation(&mut app, &presentation);
+        }
     }
 }
 
@@ -478,11 +505,125 @@ fn sync_presentation(app: &mut crate::YouthApp, presentation: &PresentationReade
         .editor_presentations
         .write()
         .expect("presentation-record lock is not poisoned") = editor_presentations;
-    let editor_accessibility = app.editor_accessibility_snapshots();
+    let editor_generations = app
+        .tree()
+        .into_iter()
+        .flat_map(|tree| tree.to_snapshot().nodes)
+        .filter_map(|node| {
+            matches!(node.data, youth_tree::NodeData::Editor { .. })
+                .then(|| {
+                    app.editor_presentation_generation(node.id)
+                        .map(|generation| (node.id, generation))
+                })
+                .flatten()
+        })
+        .collect();
     *presentation
-        .editor_accessibility
+        .editor_presentation_generations
         .write()
-        .expect("presentation-record lock is not poisoned") = editor_accessibility;
+        .expect("presentation-generation lock is not poisoned") = editor_generations;
+    let editor_accessibility = {
+        let mut ids = presentation
+            .accessibility_ids
+            .lock()
+            .expect("accessibility-id lock is not poisoned");
+        let semantic_ids = app
+            .tree()
+            .into_iter()
+            .flat_map(|tree| tree.to_snapshot().nodes)
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        match ids
+            .reserve_semantic_ids(semantic_ids)
+            .and_then(|()| app.editor_accessibility_snapshots(&mut ids))
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::error!(?error, "accessibility ID allocation failed");
+                None
+            }
+        }
+    };
+    if let Some(editor_accessibility) = editor_accessibility {
+        *presentation
+            .editor_accessibility
+            .write()
+            .expect("presentation-record lock is not poisoned") = editor_accessibility;
+    }
+}
+
+fn sync_editor_presentation(
+    app: &mut crate::YouthApp,
+    presentation: &PresentationReader,
+    editor: youth_tree::NodeId,
+) {
+    let generation = app.editor_presentation_generation(editor);
+    let presentation_current = generation.is_some_and(|generation| {
+        presentation
+            .editor_presentation_generations
+            .read()
+            .expect("presentation-generation lock is not poisoned")
+            .get(&editor)
+            .copied()
+            == Some(generation)
+    });
+    if presentation_current {
+        return;
+    }
+    let editor_presentation = app.editor_presentation(editor);
+    {
+        let mut presentations = presentation
+            .editor_presentations
+            .write()
+            .expect("presentation-record lock is not poisoned");
+        match editor_presentation {
+            Some(presentation) => {
+                presentations.insert(editor, presentation);
+            }
+            None => {
+                presentations.remove(&editor);
+            }
+        }
+    }
+    {
+        let mut generations = presentation
+            .editor_presentation_generations
+            .write()
+            .expect("presentation-generation lock is not poisoned");
+        match generation {
+            Some(generation) => {
+                generations.insert(editor, generation);
+            }
+            None => {
+                generations.remove(&editor);
+            }
+        }
+    }
+
+    let editor_accessibility = {
+        let mut ids = presentation
+            .accessibility_ids
+            .lock()
+            .expect("accessibility-id lock is not poisoned");
+        app.editor_accessibility_snapshot(editor, &mut ids)
+    };
+    match editor_accessibility {
+        Ok(Some(snapshot)) => {
+            presentation
+                .editor_accessibility
+                .write()
+                .expect("presentation-record lock is not poisoned")
+                .insert(editor, snapshot);
+        }
+        Ok(None) => {
+            presentation
+                .editor_accessibility
+                .write()
+                .expect("presentation-record lock is not poisoned")
+                .remove(&editor);
+        }
+        Err(error) => tracing::error!(?error, "accessibility ID allocation failed"),
+    }
 }
 
 fn handle_request(
@@ -530,8 +671,13 @@ fn handle_request(
             // reflect the mutated buffer, so this still resyncs those two
             // host-local caches.
             let result = app.edit_editor_locally(editor, edit);
-            sync_presentation(app, presentation);
+            if result.is_ok() {
+                sync_editor_presentation(app, presentation, editor);
+            }
             let _ = reply.send(result);
+        }
+        (AppCommand::EditorSnapshot { editor }, ReplySender::EditorSnapshot(reply)) => {
+            let _ = reply.send(app.editor_snapshot(editor));
         }
         (AppCommand::Resync, ReplySender::Snapshot(reply)) => {
             let result = app.resync();

@@ -78,6 +78,8 @@ struct NativeApp {
     /// Purely a paint-time transform -- never sent to the guest, never
     /// part of any revision.
     editor_scroll_offsets: HashMap<NodeId, f32>,
+    /// Last logical wrapping width sent to each live Editor session.
+    editor_viewport_widths: HashMap<NodeId, f32>,
     /// The fixed end of an in-progress pointer text-selection drag: which
     /// Editor, and its click-down position in that Editor's own content
     /// coordinate space (see [`Self::editor_content_point`]). `None` when
@@ -137,6 +139,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         presentation: None,
         editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
         editor_scroll_offsets: HashMap::new(),
+        editor_viewport_widths: HashMap::new(),
         text_drag_anchor: None,
         access_adapter: None,
         fault: None,
@@ -474,6 +477,7 @@ impl NativeApp {
     }
 
     fn install_snapshot(&mut self, snapshot: TreeSnapshot) {
+        self.editor_viewport_widths.clear();
         match &mut self.mirror {
             Some(mirror) => {
                 if mirror.replace(snapshot).is_err() {
@@ -508,6 +512,7 @@ impl NativeApp {
                 self.install_snapshot(snapshot);
             }
             DesktopEvent::AppRejected(_) => {}
+            DesktopEvent::EditorInputRejected(_) => {}
             DesktopEvent::AppFaulted(error) => {
                 self.fault = Some(category_name(error.category).to_owned());
             }
@@ -537,6 +542,40 @@ impl NativeApp {
         if let Some(mirror) = &self.mirror {
             self.interaction.reconcile(mirror.tree());
         }
+        let Some(controller) = self.controller.clone() else {
+            return;
+        };
+        let Some(layout) = &self.layout else {
+            return;
+        };
+        let updates = layout
+            .nodes
+            .iter()
+            .filter_map(|(&node, layout_node)| {
+                let is_editor = self
+                    .mirror
+                    .as_ref()
+                    .and_then(|mirror| mirror.tree().node(node))
+                    .is_some_and(|node| matches!(node.data, NodeData::Editor { .. }));
+                is_editor.then_some((node, layout_node.bounds.width as f32))
+            })
+            .filter(|(node, width)| {
+                self.editor_viewport_widths
+                    .get(node)
+                    .is_none_or(|previous| (previous - width).abs() > f32::EPSILON)
+            })
+            .collect::<Vec<_>>();
+        let viewport_changed = !updates.is_empty();
+        for (node, width) in updates {
+            self.editor_viewport_widths.insert(node, width);
+            let _ = controller.send(ControllerCommand::EditorLocalEdit {
+                editor: node,
+                edit: youth_runtime::EditorLocalEdit::SetViewportWidth { width },
+            });
+        }
+        if viewport_changed {
+            window.request_redraw();
+        }
     }
 
     /// Tells the platform IME whether text input is currently possible, and
@@ -557,8 +596,21 @@ impl NativeApp {
             return;
         };
         let area = presentation.ime_cursor_area;
+        let origin = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.nodes.get(&editor))
+            .map(|node| node.bounds);
+        let scroll = self
+            .editor_scroll_offsets
+            .get(&editor)
+            .copied()
+            .unwrap_or_default();
         window.set_ime_cursor_area(
-            WinitLogicalPosition::new(area.x0, area.y0),
+            WinitLogicalPosition::new(
+                origin.map_or(area.x0, |rect| rect.x + area.x0),
+                origin.map_or(area.y0, |rect| rect.y + area.y0) - f64::from(scroll),
+            ),
             WinitLogicalSize::new((area.x1 - area.x0).max(1.0), (area.y1 - area.y0).max(1.0)),
         );
     }
@@ -604,12 +656,9 @@ impl NativeApp {
         self.editor_scroll_offsets.insert(editor, offset);
     }
 
-    /// Converts a window-logical pointer position to `node`'s own text
-    /// content coordinate space -- the same space the engine's `hit_test`
-    /// and a presentation's glyph positions use. Mirrors
-    /// `draw_editor_presentation`'s paint-time origin math exactly (physical
-    /// rect origin, minus the physical scroll offset) so a click lands on
-    /// the glyph the user is actually looking at.
+    /// Converts a window-logical pointer position to the Editor's logical
+    /// content coordinate space. Physical pixels are converted to logical
+    /// pixels exactly once at the Winit event boundary.
     fn editor_content_point(
         &self,
         node: NodeId,
@@ -617,15 +666,14 @@ impl NativeApp {
         point: LogicalPoint,
     ) -> Option<(f32, f32)> {
         let rect = self.layout.as_ref()?.nodes.get(&node)?.bounds;
-        let scale = window.scale_factor();
+        let _ = window;
         let scroll_offset_y = self
             .editor_scroll_offsets
             .get(&node)
             .copied()
-            .unwrap_or(0.0)
-            * scale as f32;
-        let content_x = ((point.x - rect.x) * scale) as f32;
-        let content_y = ((point.y - rect.y) * scale) as f32 + scroll_offset_y;
+            .unwrap_or(0.0);
+        let content_x = (point.x - rect.x) as f32;
+        let content_y = (point.y - rect.y) as f32 + scroll_offset_y;
         Some((content_x, content_y))
     }
 
@@ -952,6 +1000,7 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
         RuntimeErrorCategory::StateUnavailable => "state_unavailable",
         RuntimeErrorCategory::StateCommitFailed => "state_commit_failed",
         RuntimeErrorCategory::WorkerStopped => "worker_stopped",
+        RuntimeErrorCategory::EditorInputRejected => "editor_input_rejected",
         RuntimeErrorCategory::Internal => "internal",
     }
 }

@@ -104,8 +104,21 @@ pub struct TextPresentation {
 /// The editing seam: Unicode/grapheme-correct insertion, deletion, and
 /// cursor/selection movement. Does not require a viewport.
 pub trait EditorEngine {
+    /// Borrows the live buffer, including an active IME preedit.
+    fn raw_text(&self) -> &str;
+
+    /// Returns cursor and selection without materializing the buffer.
+    fn selection_state(&self) -> (usize, Option<Range<usize>>);
+
     /// Returns the current text, cursor, and selection state.
     fn snapshot(&mut self) -> EngineSnapshot;
+
+    /// Returns editing state without refreshing viewport-dependent layout.
+    /// Host-local typing uses this path; presentation is refreshed once by
+    /// the renderer after the mutation has been accepted.
+    fn state_snapshot(&mut self) -> EngineSnapshot {
+        self.snapshot()
+    }
 
     /// Replaces the whole buffer and collapses the cursor to its start.
     ///
@@ -296,8 +309,25 @@ impl Default for ParleyEditorEngine {
 }
 
 impl EditorEngine for ParleyEditorEngine {
+    fn raw_text(&self) -> &str {
+        self.editor.raw_text()
+    }
+
+    fn selection_state(&self) -> (usize, Option<Range<usize>>) {
+        let selection = self.editor.raw_selection();
+        let range = selection.text_range();
+        (
+            selection.focus().index(),
+            (!selection.is_collapsed()).then_some(range),
+        )
+    }
+
     fn snapshot(&mut self) -> EngineSnapshot {
         self.driver().refresh_layout();
+        self.state_snapshot()
+    }
+
+    fn state_snapshot(&mut self) -> EngineSnapshot {
         let text = self.editor.text().to_string();
         let selection = self.editor.raw_selection();
         let range = selection.text_range();
