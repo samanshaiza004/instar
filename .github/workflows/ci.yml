@@ -55,6 +55,7 @@ jobs:
           -p youth-sdk-elapsed
           -p youth-sdk-time
           -p youth-sdk-editor
+          -p youth-shortcut-primary-v007
           -p youth-time-stub
           --target wasm32-wasip2 --release
       - name: Record SHA-256
@@ -220,6 +221,7 @@ jobs:
             target/wasm32-wasip2/release/youth_sdk_elapsed.wasm
             target/wasm32-wasip2/release/youth_sdk_time.wasm
             target/wasm32-wasip2/release/youth_sdk_editor.wasm
+            target/wasm32-wasip2/release/youth_shortcut_primary_v007.wasm
             target/wasm32-wasip2/release/youth_time_stub.wasm
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
