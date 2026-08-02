@@ -69,6 +69,7 @@ fn parse_options(
             })?,
             state,
             limits: RuntimeLimits::default(),
+            workspace: None,
         },
         width: 640,
         height: 360,

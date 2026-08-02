@@ -61,19 +61,19 @@ fn v002_v003_and_v004_components_coexist() {
     // youth-sdk-tally and youth-sdk-time are local-path youth-sdk fixtures,
     // not raw wit-bindgen guests like youth-legacy-v003/youth-time-stub --
     // they always track whatever protocol the SDK crate in this workspace
-    // currently targets (0.0.7, since the modifier-aware shortcut record),
+    // currently targets (0.0.8, since the text-document capability),
     // not a version frozen at this file's original name. The point of this
     // test is that multiple *distinct* protocol worlds coexist in one
     // runtime, which still holds regardless of which one the SDK's own
     // current version happens to be.
     let mut tally =
         YouthApp::load(test_component("youth-sdk-tally")).expect("current SDK tally loads");
-    assert_eq!(tally.inspect().world, "youth:app/application@0.0.7");
+    assert_eq!(tally.inspect().world, "youth:app/application@0.0.8");
     tally.mount().expect("current SDK tally mounts");
 
     let mut sdk_time =
         YouthApp::load(test_component("youth-sdk-time")).expect("current SDK time guest loads");
-    assert_eq!(sdk_time.inspect().world, "youth:app/application@0.0.7");
+    assert_eq!(sdk_time.inspect().world, "youth:app/application@0.0.8");
     sdk_time.mount().expect("current SDK time guest mounts");
 }
 
@@ -83,6 +83,7 @@ fn sdk_time_config(database: &std::path::Path) -> YouthAppConfig {
         app_id: AppId::parse("dev.youth.time").unwrap(),
         state: StateLocation::File(database.to_owned()),
         limits: RuntimeLimits::default(),
+        workspace: None,
     }
 }
 

@@ -56,6 +56,7 @@ fn config(
             },
             ..RuntimeLimits::default()
         },
+        workspace: None,
     }
 }
 
@@ -445,6 +446,7 @@ async fn worker_spawn_dispatches_notification_for_an_overdue_schedule_on_open() 
             },
             ..RuntimeLimits::default()
         },
+        workspace: None,
     };
     let app = YouthAppHandle::spawn(config).unwrap();
 

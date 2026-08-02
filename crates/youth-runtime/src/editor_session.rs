@@ -121,6 +121,8 @@ pub struct EditorLocalEditResult {
     pub changed_range: Option<Range<usize>>,
     pub cursor: usize,
     pub selection: Option<Range<usize>>,
+    pub locally_dirty: bool,
+    pub dirty_changed: Option<bool>,
 }
 
 /// The local, guest-turn-free mutations supported against a host Editor
@@ -177,6 +179,7 @@ pub struct EditorSnapshot {
     pub document_revision: u64,
     pub edit_sequence: u64,
     pub text: String,
+    pub locally_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +201,7 @@ struct EditorSession {
     /// The guest declaration from which this generation was first created.
     /// Later declarations never overwrite host-owned session state.
     document_revision: u64,
+    text_document: Option<crate::DocumentHandle>,
     /// Host-owned ordering of live buffer changes. Pure cursor/selection
     /// movement does not advance this -- only operations that mutate
     /// content do, since this is what `accept`/`replace`'s staleness check
@@ -238,6 +242,7 @@ impl Clone for EditorSession {
     fn clone(&self) -> Self {
         Self {
             document_revision: self.document_revision,
+            text_document: self.text_document,
             edit_sequence: self.edit_sequence,
             text_generation: self.text_generation,
             layout_generation: self.layout_generation,
@@ -286,6 +291,7 @@ struct UndoSnapshot {
 pub(super) fn reconcile_editor_sessions(
     previous: &EditorSessionRegistry,
     tree: &Tree,
+    text_document: Option<&crate::text_document::TextDocumentSession>,
 ) -> EditorSessionRegistry {
     let mut reconciled = EditorSessionRegistry::new();
     for (&node_id, slot) in previous {
@@ -299,16 +305,41 @@ pub(super) fn reconcile_editor_sessions(
     }
 
     for node in tree.to_snapshot().nodes {
-        let NodeData::Editor {
-            document_revision,
-            text,
-        } = node.data
-        else {
-            continue;
+        let (document_revision, text, binding) = match node.data {
+            NodeData::Editor {
+                document_revision,
+                text,
+            } => (document_revision, text, None),
+            NodeData::TextDocumentEditor {
+                document_id,
+                document_generation,
+                version_generation,
+                ..
+            } => {
+                let handle = crate::DocumentHandle {
+                    id: document_id,
+                    generation: document_generation,
+                };
+                let Some((revision, text)) =
+                    text_document.and_then(|document| document.editor_text(handle))
+                else {
+                    continue;
+                };
+                if revision != version_generation {
+                    continue;
+                }
+                (revision, text.to_string(), Some(handle))
+            }
+            _ => continue,
         };
 
         match previous.get(&node.id) {
-            Some(previous_slot) if previous_slot.session.is_some() => {
+            Some(previous_slot)
+                if previous_slot
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.text_document == binding) =>
+            {
                 // Stable node identity owns the live session. In particular,
                 // an out-of-band declaration revision change must not clobber
                 // host-owned state; replacement is only authorized through
@@ -332,7 +363,7 @@ pub(super) fn reconcile_editor_sessions(
                     node.id,
                     EditorSessionSlot {
                         generation,
-                        session: Some(new_session(document_revision, &text)),
+                        session: Some(new_session(document_revision, &text, binding)),
                     },
                 );
             }
@@ -341,7 +372,7 @@ pub(super) fn reconcile_editor_sessions(
                     node.id,
                     EditorSessionSlot {
                         generation: 1,
-                        session: Some(new_session(document_revision, &text)),
+                        session: Some(new_session(document_revision, &text, binding)),
                     },
                 );
             }
@@ -351,7 +382,11 @@ pub(super) fn reconcile_editor_sessions(
     reconciled
 }
 
-fn new_session(document_revision: u64, text: &str) -> EditorSession {
+fn new_session(
+    document_revision: u64,
+    text: &str,
+    text_document: Option<crate::DocumentHandle>,
+) -> EditorSession {
     let mut engine = ParleyEditorEngine::with_text(text);
     // `with_text` collapses to the start (the correct behavior for an
     // authoritative `replace`, where the prior cursor position is
@@ -361,6 +396,7 @@ fn new_session(document_revision: u64, text: &str) -> EditorSession {
     engine.move_to_byte(text.len());
     EditorSession {
         document_revision,
+        text_document,
         edit_sequence: EDIT_SEQUENCE_BASE,
         text_generation: 0,
         layout_generation: 0,
@@ -547,6 +583,7 @@ pub(super) fn snapshot_editor_session(
         document_revision: session.document_revision,
         edit_sequence: session.edit_sequence,
         text,
+        locally_dirty: session.edit_sequence != session.accepted_edit_sequence,
     })
 }
 
@@ -1073,6 +1110,22 @@ pub(super) fn accept_editor_session(
     Ok(())
 }
 
+pub(super) fn accept_saved_text_document(
+    registry: &mut EditorSessionRegistry,
+    editor: NodeId,
+    document: crate::DocumentHandle,
+    saved_edit_sequence: u64,
+    version: crate::DocumentVersion,
+) -> Result<bool, EditorSessionError> {
+    let session = live_session_mut(registry, editor)?;
+    if session.text_document != Some(document) || saved_edit_sequence > session.edit_sequence {
+        return Err(EditorSessionError::StaleEditSequence);
+    }
+    session.document_revision = version.generation;
+    session.accepted_edit_sequence = saved_edit_sequence;
+    Ok(session.edit_sequence != session.accepted_edit_sequence)
+}
+
 /// Installs authoritative guest content. Per the frozen replace reset
 /// policy: cursor collapses to a defined valid position (buffer start, via
 /// the engine's own `set_text`), selection clears, edit sequence resets to
@@ -1243,6 +1296,8 @@ fn local_edit_result_from_parts(
         changed_range,
         cursor,
         selection,
+        locally_dirty: session.edit_sequence != session.accepted_edit_sequence,
+        dirty_changed: None,
     }
 }
 
@@ -1271,6 +1326,8 @@ fn local_edit_result_with_snapshot(
         changed_range: content_changed.then(|| changed_range(before, &snapshot)),
         cursor: snapshot.cursor,
         selection: snapshot.selection,
+        locally_dirty: session.edit_sequence != session.accepted_edit_sequence,
+        dirty_changed: None,
     }
 }
 
@@ -1300,6 +1357,12 @@ fn changed_range(
 }
 
 impl EditorSessionSlot {
+    pub(super) fn text_document_binding(&self) -> Option<crate::DocumentHandle> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.text_document)
+    }
+
     #[cfg(test)]
     pub(super) const fn generation(&self) -> u64 {
         self.generation

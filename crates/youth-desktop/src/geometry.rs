@@ -188,6 +188,10 @@ fn measure(tree: &Tree, id: NodeId) -> Result<LogicalSize, GeometryError> {
             width: text.chars().count() as f64 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
         }),
+        NodeData::TextDocumentEditor { .. } => Ok(LogicalSize {
+            width: GLYPH_WIDTH,
+            height: GLYPH_HEIGHT,
+        }),
         NodeData::Countdown { .. } | NodeData::AlignedCountdown { .. } => Ok(LogicalSize {
             width: 5.0 * GLYPH_WIDTH,
             height: GLYPH_HEIGHT,
@@ -272,6 +276,7 @@ fn place(
         | NodeData::Text { .. }
         | NodeData::AlignedText { .. }
         | NodeData::Editor { .. }
+        | NodeData::TextDocumentEditor { .. }
         | NodeData::Countdown { .. }
         | NodeData::AlignedCountdown { .. } => true,
     };

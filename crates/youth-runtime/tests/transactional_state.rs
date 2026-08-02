@@ -12,6 +12,7 @@ fn config(path: &std::path::Path) -> YouthAppConfig {
         app_id: AppId::parse("dev.youth.counter").unwrap(),
         state: StateLocation::File(path.to_owned()),
         limits: RuntimeLimits::default(),
+        workspace: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn fixture_config(component: &str, database: &std::path::Path) -> YouthAppConfig
         app_id: AppId::parse("dev.youth.counter").unwrap(),
         state: StateLocation::File(database.to_owned()),
         limits: RuntimeLimits::default(),
+        workspace: None,
     }
 }
 
@@ -156,6 +158,7 @@ async fn todo_structural_commit_failure_retains_legacy_or_current_state_tree_foc
             app_id: app_id.clone(),
             state: StateLocation::File(database.clone()),
             limits: RuntimeLimits::default(),
+            workspace: None,
         })
         .unwrap();
         let mut events = app.subscribe();

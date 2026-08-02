@@ -49,6 +49,7 @@ fn countdown_redraw_is_guestless_and_due_delivery_occurs_once() {
             },
             ..RuntimeLimits::default()
         },
+        workspace: None,
     };
     let mut app = YouthApp::load_config(config).unwrap();
     let mounted = app.mount().unwrap();

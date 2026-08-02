@@ -62,7 +62,9 @@ impl<A: Application> Guest for Adapter<A> {
                 .iter()
                 .filter_map(|event| match event {
                     Event::Activated(id) => Some(*id),
-                    Event::ScheduleElapsed { .. } => None,
+                    Event::ScheduleElapsed { .. }
+                    | Event::EditorDirtyChanged { .. }
+                    | Event::TextDocumentSaveCompleted(_) => None,
                 })
                 .filter_map(|id| {
                     tree.nodes.iter().find_map(|node| {
@@ -129,6 +131,54 @@ fn decode_event(event: &ui::Event) -> IncomingEvent {
                 ui::ElapsedReason::RecoveredOverdue => ElapsedReason::RecoveredOverdue,
             },
         },
+        ui::EventKind::EditorDirtyChanged(change) => IncomingEvent::EditorDirtyChanged {
+            editor: change.editor,
+            dirty: change.dirty,
+        },
+        ui::EventKind::TextDocumentSaveCompleted(completion) => {
+            IncomingEvent::TextDocumentSaveCompleted(super::TextDocumentSaveCompletion {
+                request: super::SaveRequest {
+                    id: completion.request.id,
+                    generation: completion.request.generation,
+                },
+                outcome: match &completion.outcome {
+                    ui::SaveOutcome::Saved(saved) => super::TextDocumentSaveOutcome::Saved {
+                        document: super::DocumentHandle {
+                            id: saved.document.id,
+                            generation: saved.document.generation,
+                        },
+                        version: super::DocumentVersion {
+                            id: saved.version.id,
+                            generation: saved.version.generation,
+                        },
+                        saved_edit_sequence: super::EditSequence(saved.saved_edit_sequence),
+                        still_dirty: saved.still_dirty,
+                    },
+                    ui::SaveOutcome::Failed(error) => {
+                        super::TextDocumentSaveOutcome::Failed(match error {
+                            ui::TextDocumentErrorCode::Conflict => {
+                                super::TextDocumentFailure::Conflict
+                            }
+                            ui::TextDocumentErrorCode::Missing => {
+                                super::TextDocumentFailure::Missing
+                            }
+                            ui::TextDocumentErrorCode::WrongType => {
+                                super::TextDocumentFailure::WrongType
+                            }
+                            ui::TextDocumentErrorCode::PermissionDenied => {
+                                super::TextDocumentFailure::PermissionDenied
+                            }
+                            ui::TextDocumentErrorCode::Unavailable => {
+                                super::TextDocumentFailure::Unavailable
+                            }
+                            ui::TextDocumentErrorCode::Internal => {
+                                super::TextDocumentFailure::Internal
+                            }
+                        })
+                    }
+                },
+            })
+        }
     }
 }
 
@@ -195,10 +245,22 @@ fn wire_node(node: &super::FlatNode) -> ui::Node {
             FlatNodeData::Editor {
                 document_revision,
                 text,
-            } => ui::NodeData::Editor(ui::EditorData {
+            } => ui::NodeData::Editor(ui::EditorData::Inline(ui::InlineEditorData {
                 document_revision: document_revision.get(),
                 text: text.clone(),
-            }),
+            })),
+            FlatNodeData::TextDocumentEditor { handle, version } => {
+                ui::NodeData::Editor(ui::EditorData::TextDocument(ui::TextDocumentEditorData {
+                    document: ui::DocumentHandle {
+                        id: handle.id,
+                        generation: handle.generation,
+                    },
+                    version: ui::DocumentVersion {
+                        id: version.id,
+                        generation: version.generation,
+                    },
+                }))
+            }
             FlatNodeData::Button {
                 label,
                 enabled,
@@ -267,6 +329,19 @@ fn wire_patch(operation: super::AppliedPatch) -> ui::Patch {
         super::AppliedPatch::Label(id, value) => ui::Patch::SetLabel(ui::SetLabel { id, value }),
         super::AppliedPatch::Enabled(id, enabled) => {
             ui::Patch::SetEnabled(ui::SetEnabled { id, value: enabled })
+        }
+        super::AppliedPatch::EditorDocumentVersion(id, document, version) => {
+            ui::Patch::SetEditorDocumentVersion(ui::SetEditorDocumentVersion {
+                id,
+                document: ui::DocumentHandle {
+                    id: document.id,
+                    generation: document.generation,
+                },
+                version: ui::DocumentVersion {
+                    id: version.id,
+                    generation: version.generation,
+                },
+            })
         }
         super::AppliedPatch::InsertChild {
             parent,

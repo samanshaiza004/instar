@@ -709,8 +709,19 @@ pub struct Editor;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EditorElement {
     key: NodeIdentity,
-    document_revision: DocumentRevision,
-    initial_text: String,
+    source: EditorSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EditorSource {
+    Inline {
+        document_revision: DocumentRevision,
+        initial_text: String,
+    },
+    TextDocument {
+        handle: DocumentHandle,
+        version: DocumentVersion,
+    },
 }
 
 impl Editor {
@@ -724,8 +735,23 @@ impl Editor {
         Element {
             kind: ElementKind::Editor(EditorElement {
                 key: key.into(),
-                document_revision,
-                initial_text: initial_text.into(),
+                source: EditorSource::Inline {
+                    document_revision,
+                    initial_text: initial_text.into(),
+                },
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn document(key: impl Into<NodeIdentity>, document: &Document) -> Element {
+        Element {
+            kind: ElementKind::Editor(EditorElement {
+                key: key.into(),
+                source: EditorSource::TextDocument {
+                    handle: document.handle,
+                    version: document.version,
+                },
             }),
         }
     }
@@ -975,12 +1001,89 @@ pub type ScheduleId = u64;
 pub type Generation = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentHandle {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentVersion {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Document {
+    handle: DocumentHandle,
+    version: DocumentVersion,
+    relative_path: String,
+    filename: String,
+}
+
+impl Document {
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SaveRequest {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextDocumentFailure {
+    Conflict,
+    Missing,
+    WrongType,
+    PermissionDenied,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextDocumentSaveOutcome {
+    Saved {
+        document: DocumentHandle,
+        version: DocumentVersion,
+        saved_edit_sequence: EditSequence,
+        still_dirty: bool,
+    },
+    Failed(TextDocumentFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextDocumentSaveCompletion {
+    request: SaveRequest,
+    outcome: TextDocumentSaveOutcome,
+}
+
+impl TextDocumentSaveCompletion {
+    #[must_use]
+    pub const fn request(self) -> SaveRequest {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn outcome(self) -> TextDocumentSaveOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ElapsedReason {
     Deadline,
     RecoveredOverdue,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     Activated(NodeId),
     ScheduleElapsed {
@@ -988,11 +1091,16 @@ pub enum Event {
         generation: Generation,
         reason: ElapsedReason,
     },
+    EditorDirtyChanged {
+        editor: NodeId,
+        dirty: bool,
+    },
+    TextDocumentSaveCompleted(TextDocumentSaveCompletion),
 }
 
 #[cfg(any(test, all(target_os = "wasi", target_env = "p2")))]
 #[cfg_attr(test, allow(dead_code))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IncomingEvent {
     Activated(NodeId),
     ScheduleElapsed {
@@ -1000,6 +1108,11 @@ pub(crate) enum IncomingEvent {
         generation: Generation,
         reason: ElapsedReason,
     },
+    EditorDirtyChanged {
+        editor: NodeId,
+        dirty: bool,
+    },
+    TextDocumentSaveCompleted(TextDocumentSaveCompletion),
     #[cfg(test)]
     Unsupported,
 }
@@ -1027,6 +1140,16 @@ pub(crate) fn decode_incoming_events(
             IncomingEvent::ScheduleElapsed { .. } => {
                 Err(Error::invalid_state()
                     .with_message("event contains an invalid schedule identity"))
+            }
+            IncomingEvent::EditorDirtyChanged { editor, dirty } if editor != 0 => {
+                Ok(Event::EditorDirtyChanged { editor, dirty })
+            }
+            IncomingEvent::EditorDirtyChanged { .. } => {
+                Err(Error::invalid_state()
+                    .with_message("dirty event contains an invalid editor ID"))
+            }
+            IncomingEvent::TextDocumentSaveCompleted(completion) => {
+                Ok(Event::TextDocumentSaveCompleted(completion))
             }
             #[cfg(test)]
             IncomingEvent::Unsupported => {
@@ -1070,7 +1193,25 @@ impl Events {
                 generation,
                 reason,
             } => Some((*schedule, *generation, *reason)),
-            Event::Activated(_) => None,
+            Event::Activated(_)
+            | Event::EditorDirtyChanged { .. }
+            | Event::TextDocumentSaveCompleted(_) => None,
+        })
+    }
+
+    pub fn editor_dirty_changes(&self) -> impl Iterator<Item = (NodeId, bool)> + '_ {
+        self.events.iter().filter_map(|event| match event {
+            Event::EditorDirtyChanged { editor, dirty } => Some((*editor, *dirty)),
+            _ => None,
+        })
+    }
+
+    pub fn text_document_save_completions(
+        &self,
+    ) -> impl Iterator<Item = TextDocumentSaveCompletion> + '_ {
+        self.events.iter().filter_map(|event| match event {
+            Event::TextDocumentSaveCompleted(completion) => Some(*completion),
+            _ => None,
         })
     }
 }
@@ -1090,6 +1231,7 @@ enum UpdateOperation {
     Countdown(NodeIdentity, Schedule, TimePrecision, CountdownFormat),
     Label(NodeIdentity, String),
     Enabled(NodeIdentity, bool),
+    EditorDocumentVersion(NodeIdentity, DocumentHandle, DocumentVersion),
     InsertChild(NodeIdentity, usize, Element),
     RemoveSubtree(NodeIdentity, NodeIdentity),
     MoveChild(NodeIdentity, NodeIdentity, usize),
@@ -1151,6 +1293,21 @@ impl Update {
         self
     }
 
+    #[must_use]
+    pub fn set_editor_document_version(
+        mut self,
+        key: impl Into<NodeIdentity>,
+        document: DocumentHandle,
+        version: DocumentVersion,
+    ) -> Self {
+        self.operations.push(UpdateOperation::EditorDocumentVersion(
+            key.into(),
+            document,
+            version,
+        ));
+        self
+    }
+
     /// Inserts a fully named subtree at `index` in the parent's staged children.
     #[must_use]
     pub fn insert_child(
@@ -1202,6 +1359,11 @@ impl ViewContext {
         StateReader
     }
 
+    #[must_use]
+    pub const fn text_document(&self) -> TextDocumentReader {
+        TextDocumentReader
+    }
+
     // Deliberately no `time()` method: rendering a view must remain
     // side-effect free, while every scheduler operation mutates host state.
 }
@@ -1223,6 +1385,37 @@ impl EventContext {
     #[must_use]
     pub const fn editor(&mut self) -> EditorCapability {
         EditorCapability
+    }
+
+    #[must_use]
+    pub const fn text_document(&mut self) -> TextDocumentWriter {
+        TextDocumentWriter
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextDocumentReader;
+
+impl TextDocumentReader {
+    pub fn current(self) -> Result<Document> {
+        text_document::current()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextDocumentWriter;
+
+impl TextDocumentWriter {
+    pub fn current(self) -> Result<Document> {
+        text_document::current()
+    }
+
+    pub fn request_save(
+        self,
+        document: &Document,
+        editor: impl Into<NodeIdentity>,
+    ) -> Result<SaveRequest> {
+        text_document::request_save(document.handle, editor.into().id())
     }
 }
 
@@ -1497,6 +1690,10 @@ enum FlatNodeData {
         document_revision: DocumentRevision,
         text: String,
     },
+    TextDocumentEditor {
+        handle: DocumentHandle,
+        version: DocumentVersion,
+    },
     Button {
         label: String,
         enabled: bool,
@@ -1531,6 +1728,7 @@ enum AppliedPatch {
     Countdown(u64, Schedule, TimePrecision, CountdownFormat),
     Label(u64, String),
     Enabled(u64, bool),
+    EditorDocumentVersion(u64, DocumentHandle, DocumentVersion),
     InsertChild {
         parent: u64,
         index: usize,
@@ -1566,7 +1764,8 @@ impl FlatTree {
                 UpdateOperation::Text(key, _)
                 | UpdateOperation::Countdown(key, ..)
                 | UpdateOperation::Label(key, _)
-                | UpdateOperation::Enabled(key, _) => Some(key),
+                | UpdateOperation::Enabled(key, _)
+                | UpdateOperation::EditorDocumentVersion(key, ..) => Some(key),
                 UpdateOperation::InsertChild(..)
                 | UpdateOperation::RemoveSubtree(..)
                 | UpdateOperation::MoveChild(..) => None,
@@ -1636,6 +1835,26 @@ impl FlatTree {
                         _ => {
                             return Err(Error::invalid_state()
                                 .with_message("an update does not match the named node type"));
+                        }
+                    }
+                }
+                UpdateOperation::EditorDocumentVersion(key, document, version) => {
+                    match &mut self.node_mut(key.id())?.data {
+                        FlatNodeData::TextDocumentEditor {
+                            handle,
+                            version: current,
+                        } if *handle == *document => {
+                            *current = *version;
+                            patches.push(AppliedPatch::EditorDocumentVersion(
+                                key.id(),
+                                *document,
+                                *version,
+                            ));
+                        }
+                        _ => {
+                            return Err(Error::invalid_state().with_message(
+                                "a document-version update does not match the bound Editor",
+                            ));
                         }
                     }
                 }
@@ -1886,12 +2105,24 @@ impl FlatTreeBuilder {
             }
             ElementKind::Editor(value) => {
                 let id = self.allocate_named(&value.key)?;
+                let data = match &value.source {
+                    EditorSource::Inline {
+                        document_revision,
+                        initial_text,
+                    } => FlatNodeData::Editor {
+                        document_revision: *document_revision,
+                        text: initial_text.clone(),
+                    },
+                    EditorSource::TextDocument { handle, version } => {
+                        FlatNodeData::TextDocumentEditor {
+                            handle: *handle,
+                            version: *version,
+                        }
+                    }
+                };
                 self.nodes.push(FlatNode {
                     id,
-                    data: FlatNodeData::Editor {
-                        document_revision: value.document_revision,
-                        text: value.initial_text.clone(),
-                    },
+                    data,
                     children: Vec::new(),
                 });
                 Ok(id)
@@ -2076,6 +2307,71 @@ mod state {
 }
 
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
+mod text_document {
+    use super::{Document, DocumentHandle, DocumentVersion, Error, Result, SaveRequest};
+    use crate::component::bindings::youth::text_document::document::{self, ErrorCode};
+
+    pub fn current() -> Result<Document> {
+        document::current()
+            .map(|info| Document {
+                handle: DocumentHandle {
+                    id: info.handle.id,
+                    generation: info.handle.generation,
+                },
+                version: DocumentVersion {
+                    id: info.version.id,
+                    generation: info.version.generation,
+                },
+                relative_path: info.relative_path,
+                filename: info.filename,
+            })
+            .map_err(map_error)
+    }
+
+    pub fn request_save(value: DocumentHandle, editor: u64) -> Result<SaveRequest> {
+        document::request_save(
+            document::DocumentHandle {
+                id: value.id,
+                generation: value.generation,
+            },
+            editor,
+        )
+        .map(|request| SaveRequest {
+            id: request.id,
+            generation: request.generation,
+        })
+        .map_err(map_error)
+    }
+
+    fn map_error(error: ErrorCode) -> Error {
+        match error {
+            ErrorCode::Busy => Error::rejected_event(),
+            ErrorCode::InvalidDocument | ErrorCode::InvalidEditor | ErrorCode::WrongPhase => {
+                Error::invalid_state()
+            }
+            ErrorCode::Unavailable | ErrorCode::Internal => Error::internal(),
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+mod text_document {
+    use super::{Document, DocumentHandle, Error, Result, SaveRequest};
+
+    fn unavailable<T>() -> Result<T> {
+        Err(Error::internal().with_message("text-document calls require wasm32-wasip2"))
+    }
+
+    pub fn current() -> Result<Document> {
+        unavailable()
+    }
+
+    pub fn request_save(_value: DocumentHandle, _editor: u64) -> Result<SaveRequest> {
+        unavailable()
+    }
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
 mod editor {
     use super::{DocumentRevision, EditSequence, EditorSnapshot, Error, Result};
     use crate::component::bindings::youth::editor::session::{self, EditorErrorCode};
@@ -2255,11 +2551,13 @@ mod time {
 pub mod prelude {
     pub use crate::{
         ActivationKey, Application, BoxNode, Button, Column, CommandIdentity, CommandKey,
-        Countdown, CountdownFormat, DocumentRevision, EditSequence, Editor, EditorCapability,
-        EditorSnapshot, ElapsedReason, Element, Error, ErrorKind, Event, EventContext, Events,
-        Generation, Grid, ItemCommandKey, ItemKey, ItemNodeKey, NodeId, NodeIdentity, NodeKey,
-        Notification, Result, Row, Schedule, ScheduleId, ScheduleOptions, Shortcut, Text,
-        TextAlign, TimePrecision, TimeScheduler, Tree, Update, ViewContext, command,
+        Countdown, CountdownFormat, Document, DocumentHandle, DocumentRevision, DocumentVersion,
+        EditSequence, Editor, EditorCapability, EditorSnapshot, ElapsedReason, Element, Error,
+        ErrorKind, Event, EventContext, Events, Generation, Grid, ItemCommandKey, ItemKey,
+        ItemNodeKey, NodeId, NodeIdentity, NodeKey, Notification, Result, Row, SaveRequest,
+        Schedule, ScheduleId, ScheduleOptions, Shortcut, Text, TextAlign, TextDocumentFailure,
+        TextDocumentReader, TextDocumentSaveCompletion, TextDocumentSaveOutcome,
+        TextDocumentWriter, TimePrecision, TimeScheduler, Tree, Update, ViewContext, command,
         derived_command_id, derived_node_id, node, ui_ids,
     };
 }

@@ -39,6 +39,7 @@ members = [
     "test-components/editor-v006",
     "test-components/editor-capability-v006",
     "test-components/shortcut-primary-v007",
+    "test-components/sdk-text-document",
     "test-components/elapsed-trap",
     "test-components/elapsed-invalid-patch",
 ]

@@ -294,6 +294,27 @@ pub fn render(
                     }
                 }
             }
+            NodeData::TextDocumentEditor { .. } => {
+                if let (Some(presentation), Some(rasterizer)) = (
+                    state.presentation.and_then(|reader| reader.editor(*id)),
+                    state.editor_rasterizer,
+                ) {
+                    let scroll_offset_y = state
+                        .editor_scroll_offsets
+                        .and_then(|offsets| offsets.get(id))
+                        .copied()
+                        .unwrap_or(0.0);
+                    draw_editor_presentation(
+                        &mut frame,
+                        rect,
+                        &presentation,
+                        &mut rasterizer.borrow_mut(),
+                        palette,
+                        scroll_offset_y,
+                        scale_factor as f32,
+                    );
+                }
+            }
             NodeData::AlignedText { value, alignment } => {
                 draw_text(&mut frame, rect, value, *alignment, scale_factor, palette);
             }

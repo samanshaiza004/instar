@@ -165,6 +165,12 @@ pub enum NodeData {
         document_revision: u64,
         text: String,
     },
+    TextDocumentEditor {
+        document_id: u64,
+        document_generation: u64,
+        version_id: u64,
+        version_generation: u64,
+    },
     Countdown {
         schedule: ScheduleRef,
         precision: TimePrecision,
@@ -201,9 +207,10 @@ impl NodeData {
     #[must_use]
     pub const fn text_alignment(&self) -> Option<TextAlignment> {
         match self {
-            Self::Text { .. } | Self::Editor { .. } | Self::Countdown { .. } => {
-                Some(TextAlignment::Start)
-            }
+            Self::Text { .. }
+            | Self::Editor { .. }
+            | Self::TextDocumentEditor { .. }
+            | Self::Countdown { .. } => Some(TextAlignment::Start),
             Self::AlignedText { alignment, .. } | Self::AlignedCountdown { alignment, .. } => {
                 Some(*alignment)
             }
@@ -216,6 +223,7 @@ impl NodeData {
         match self {
             Self::Text { value } | Self::AlignedText { value, .. } => Some(value),
             Self::Editor { text, .. } => Some(text),
+            Self::TextDocumentEditor { .. } => None,
             _ => None,
         }
     }
@@ -266,6 +274,7 @@ impl NodeData {
             | Self::Text { .. }
             | Self::AlignedText { .. }
             | Self::Editor { .. }
+            | Self::TextDocumentEditor { .. }
             | Self::Countdown { .. }
             | Self::AlignedCountdown { .. } => true,
         }
@@ -278,7 +287,7 @@ impl NodeData {
 
     #[must_use]
     pub const fn is_focusable(&self) -> bool {
-        self.is_button() || matches!(self, Self::Editor { .. })
+        self.is_button() || matches!(self, Self::Editor { .. } | Self::TextDocumentEditor { .. })
     }
 }
 
@@ -363,6 +372,13 @@ pub enum Patch {
     SetEnabled {
         id: NodeId,
         value: bool,
+    },
+    SetEditorDocumentVersion {
+        id: NodeId,
+        document_id: u64,
+        document_generation: u64,
+        version_id: u64,
+        version_generation: u64,
     },
     InsertChild {
         parent: NodeId,
@@ -587,6 +603,11 @@ impl Tree {
                             actual: text.len(),
                             max: limits.max_editor_text_len,
                         });
+                    }
+                }
+                NodeData::TextDocumentEditor { .. } => {
+                    if !node.children.is_empty() {
+                        return Err(ValidationError::LeafWithChildren { node: id });
                     }
                 }
                 NodeData::Countdown { .. } | NodeData::AlignedCountdown { .. } => {
@@ -896,10 +917,37 @@ impl Tree {
                     | NodeData::Text { .. }
                     | NodeData::AlignedText { .. }
                     | NodeData::Editor { .. }
+                    | NodeData::TextDocumentEditor { .. }
                     | NodeData::Countdown { .. }
                     | NodeData::AlignedCountdown { .. } => {
                         return Err(PatchError::WrongNodeKind { patch_index, id });
                     }
+                }
+            }
+            Patch::SetEditorDocumentVersion {
+                id,
+                document_id,
+                document_generation,
+                version_id,
+                version_generation,
+            } => {
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(PatchError::UnknownNode { patch_index, id })?;
+                match &mut node.data {
+                    NodeData::TextDocumentEditor {
+                        document_id: current_id,
+                        document_generation: current_generation,
+                        version_id: current_version_id,
+                        version_generation: current_version_generation,
+                    } if *current_id == document_id
+                        && *current_generation == document_generation =>
+                    {
+                        *current_version_id = version_id;
+                        *current_version_generation = version_generation;
+                    }
+                    _ => return Err(PatchError::WrongNodeKind { patch_index, id }),
                 }
             }
             Patch::InsertChild {
@@ -1174,6 +1222,25 @@ fn append_node_description(output: &mut String, node: &Node) {
             output.push_str(" \"");
             output.extend(text.escape_debug());
             output.push('"');
+            return;
+        }
+        NodeData::TextDocumentEditor {
+            document_id,
+            document_generation,
+            version_id,
+            version_generation,
+        } => {
+            output.push_str("editor");
+            output.push_str(" #");
+            output.push_str(&node.id.to_string());
+            output.push_str(" text-document=");
+            output.push_str(&document_id.to_string());
+            output.push(':');
+            output.push_str(&document_generation.to_string());
+            output.push_str(" version=");
+            output.push_str(&version_id.to_string());
+            output.push(':');
+            output.push_str(&version_generation.to_string());
             return;
         }
         NodeData::Countdown {

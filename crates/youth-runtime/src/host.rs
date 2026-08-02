@@ -51,6 +51,7 @@ pub struct TurnReceipt {
     pub patch_batch: youth_tree::PatchBatch,
     pub patch_count: usize,
     pub state_writes: u32,
+    pub external_effect_writes: u32,
     pub elapsed: std::time::Duration,
     pub committed: bool,
 }
@@ -146,6 +147,11 @@ pub(crate) struct HostState {
     staged_schedule_outputs: Vec<youth_state::SchedulerOutput>,
     editor_sessions: crate::editor_session::EditorSessionRegistry,
     staged_editor_sessions: Option<crate::editor_session::EditorSessionRegistry>,
+    text_document: Option<crate::text_document::TextDocumentSession>,
+    staged_save: Option<crate::text_document::SaveJob>,
+    committed_save: Option<crate::text_document::SaveJob>,
+    text_document_calls: u32,
+    external_effect_writes: u32,
     max_editor_bytes: usize,
 }
 
@@ -222,6 +228,23 @@ impl HostState {
 
     fn discard_staged_editor_sessions(&mut self) {
         self.staged_editor_sessions = None;
+    }
+
+    fn discard_staged_save(&mut self) {
+        self.staged_save = None;
+    }
+
+    fn commit_staged_save(&mut self) -> Result<(), crate::TextDocumentError> {
+        let Some(job) = self.staged_save.take() else {
+            return Ok(());
+        };
+        let document = self
+            .text_document
+            .as_ref()
+            .ok_or(crate::TextDocumentError::InvalidPath)?;
+        document.mark_pending(job.request)?;
+        self.committed_save = Some(job);
+        Ok(())
     }
 }
 
@@ -1594,6 +1617,456 @@ fn to_wire_schedule_error_v007(
     }
 }
 
+impl crate::bindings::v008::youth::app::ui::Host for HostState {}
+
+impl crate::bindings::v008::youth::state::store::Host for HostState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<
+        Option<crate::bindings::v008::youth::state::store::Value>,
+        crate::bindings::v008::youth::state::store::StateError,
+    > {
+        self.state
+            .get(&key)
+            .map(|value| value.map(to_wire_state_value_v008))
+            .map_err(to_wire_state_error_v008)
+    }
+
+    fn set(
+        &mut self,
+        key: String,
+        value: crate::bindings::v008::youth::state::store::Value,
+    ) -> Result<(), crate::bindings::v008::youth::state::store::StateError> {
+        self.state
+            .set(&key, from_wire_state_value_v008(value))
+            .map_err(to_wire_state_error_v008)
+    }
+
+    fn delete(
+        &mut self,
+        key: String,
+    ) -> Result<bool, crate::bindings::v008::youth::state::store::StateError> {
+        self.state.delete(&key).map_err(to_wire_state_error_v008)
+    }
+}
+
+fn to_wire_state_value_v008(
+    value: youth_state::StateValue,
+) -> crate::bindings::v008::youth::state::store::Value {
+    use crate::bindings::v008::youth::state::store::Value;
+    match value {
+        youth_state::StateValue::Boolean(value) => Value::Boolean(value),
+        youth_state::StateValue::Integer(value) => Value::Integer(value),
+        youth_state::StateValue::Text(value) => Value::Text(value),
+        youth_state::StateValue::Bytes(value) => Value::Bytes(value),
+    }
+}
+
+fn from_wire_state_value_v008(
+    value: crate::bindings::v008::youth::state::store::Value,
+) -> youth_state::StateValue {
+    use crate::bindings::v008::youth::state::store::Value;
+    match value {
+        Value::Boolean(value) => youth_state::StateValue::Boolean(value),
+        Value::Integer(value) => youth_state::StateValue::Integer(value),
+        Value::Text(value) => youth_state::StateValue::Text(value),
+        Value::Bytes(value) => youth_state::StateValue::Bytes(value),
+    }
+}
+
+fn to_wire_state_error_v008(
+    error: youth_state::StateError,
+) -> crate::bindings::v008::youth::state::store::StateError {
+    use crate::bindings::v008::youth::state::store::ErrorCode;
+    let code = match error {
+        youth_state::StateError::InvalidKey => ErrorCode::InvalidKey,
+        youth_state::StateError::InvalidValue => ErrorCode::InvalidValue,
+        youth_state::StateError::ReadOnly => ErrorCode::ReadOnly,
+        youth_state::StateError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        ref error if error.is_busy() => ErrorCode::Busy,
+        youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidScheduleDuration
+        | youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::TooManySchedules
+        | youth_state::StateError::UnknownSchedule
+        | youth_state::StateError::StaleScheduleGeneration
+        | youth_state::StateError::InvalidScheduleState
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ErrorCode::Internal,
+    };
+    crate::bindings::v008::youth::state::store::StateError {
+        code,
+        message: None,
+    }
+}
+
+impl crate::bindings::v008::youth::editor::session::Host for HostState {
+    fn snapshot(
+        &mut self,
+        editor: u64,
+    ) -> Result<
+        crate::bindings::v008::youth::editor::session::EditorSnapshot,
+        crate::bindings::v008::youth::editor::session::EditorErrorCode,
+    > {
+        let editor = editor_node_id_v008(editor)?;
+        crate::editor_session::snapshot_editor_session(self.editor_sessions_for_call_mut(), editor)
+            .map(to_wire_editor_snapshot_v008)
+            .map_err(to_wire_editor_error_v008)
+    }
+
+    fn accept(
+        &mut self,
+        editor: u64,
+        expected_document_revision: u64,
+        expected_edit_sequence: u64,
+        new_document_revision: u64,
+    ) -> Result<(), crate::bindings::v008::youth::editor::session::EditorErrorCode> {
+        let editor = editor_node_id_v008(editor)?;
+        crate::editor_session::accept_editor_session(
+            self.staged_editor_sessions_mut(),
+            editor,
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+        )
+        .map_err(to_wire_editor_error_v008)
+    }
+
+    fn replace(
+        &mut self,
+        editor: u64,
+        expected_document_revision: u64,
+        expected_edit_sequence: u64,
+        new_document_revision: u64,
+        authoritative_text: String,
+    ) -> Result<(), crate::bindings::v008::youth::editor::session::EditorErrorCode> {
+        let editor = editor_node_id_v008(editor)?;
+        let max_editor_bytes = self.max_editor_bytes;
+        crate::editor_session::replace_editor_session(
+            self.staged_editor_sessions_mut(),
+            editor,
+            expected_document_revision,
+            expected_edit_sequence,
+            new_document_revision,
+            authoritative_text,
+            max_editor_bytes,
+        )
+        .map_err(to_wire_editor_error_v008)
+    }
+}
+
+fn editor_node_id_v008(
+    value: u64,
+) -> Result<youth_tree::NodeId, crate::bindings::v008::youth::editor::session::EditorErrorCode> {
+    youth_tree::NodeId::new(value)
+        .ok_or(crate::bindings::v008::youth::editor::session::EditorErrorCode::UnknownEditor)
+}
+
+fn to_wire_editor_snapshot_v008(
+    snapshot: crate::editor_session::EditorSnapshot,
+) -> crate::bindings::v008::youth::editor::session::EditorSnapshot {
+    crate::bindings::v008::youth::editor::session::EditorSnapshot {
+        document_revision: snapshot.document_revision,
+        edit_sequence: snapshot.edit_sequence,
+        text: snapshot.text,
+    }
+}
+
+fn to_wire_editor_error_v008(
+    error: crate::editor_session::EditorSessionError,
+) -> crate::bindings::v008::youth::editor::session::EditorErrorCode {
+    use crate::bindings::v008::youth::editor::session::EditorErrorCode;
+    match error {
+        crate::editor_session::EditorSessionError::UnknownEditor => EditorErrorCode::UnknownEditor,
+        crate::editor_session::EditorSessionError::StaleDocumentRevision => {
+            EditorErrorCode::StaleDocumentRevision
+        }
+        crate::editor_session::EditorSessionError::StaleEditSequence => {
+            EditorErrorCode::StaleEditSequence
+        }
+        crate::editor_session::EditorSessionError::BufferTooLarge
+        | crate::editor_session::EditorSessionError::PreeditTooLarge => {
+            EditorErrorCode::Unavailable
+        }
+    }
+}
+
+impl crate::bindings::v008::youth::text_document::document::Host for HostState {
+    fn current(
+        &mut self,
+    ) -> Result<
+        crate::bindings::v008::youth::text_document::document::DocumentInfo,
+        crate::bindings::v008::youth::text_document::document::ErrorCode,
+    > {
+        use crate::bindings::v008::youth::text_document::document as wire;
+        self.text_document_calls = self
+            .text_document_calls
+            .checked_add(1)
+            .expect("text-document call count exhausted");
+        let document = self
+            .text_document
+            .as_ref()
+            .ok_or(wire::ErrorCode::Unavailable)?;
+        let info = document.info();
+        Ok(wire::DocumentInfo {
+            handle: wire::DocumentHandle {
+                id: info.handle.id,
+                generation: info.handle.generation,
+            },
+            version: wire::DocumentVersion {
+                id: info.version.id,
+                generation: info.version.generation,
+            },
+            relative_path: info.relative_path,
+            filename: info.filename,
+        })
+    }
+
+    fn request_save(
+        &mut self,
+        document: crate::bindings::v008::youth::text_document::document::DocumentHandle,
+        editor: u64,
+    ) -> Result<
+        crate::bindings::v008::youth::text_document::document::SaveRequest,
+        crate::bindings::v008::youth::text_document::document::ErrorCode,
+    > {
+        use crate::bindings::v008::youth::text_document::document as wire;
+        self.text_document_calls = self
+            .text_document_calls
+            .checked_add(1)
+            .expect("text-document call count exhausted");
+        if self.state.phase() != youth_state::GuestCallPhase::Handle {
+            return Err(wire::ErrorCode::WrongPhase);
+        }
+        if self.staged_save.is_some()
+            || self
+                .text_document
+                .as_ref()
+                .is_some_and(crate::text_document::TextDocumentSession::has_pending)
+        {
+            return Err(wire::ErrorCode::Busy);
+        }
+        let handle = crate::DocumentHandle {
+            id: document.id,
+            generation: document.generation,
+        };
+        let info = self
+            .text_document
+            .as_ref()
+            .ok_or(wire::ErrorCode::Unavailable)?
+            .info();
+        if info.handle != handle {
+            return Err(wire::ErrorCode::InvalidDocument);
+        }
+        let editor = youth_tree::NodeId::new(editor).ok_or(wire::ErrorCode::InvalidEditor)?;
+        let bound = self
+            .editor_sessions
+            .get(&editor)
+            .and_then(crate::editor_session::EditorSessionSlot::text_document_binding);
+        if bound != Some(handle) {
+            return Err(wire::ErrorCode::InvalidEditor);
+        }
+        let snapshot = crate::editor_session::snapshot_editor_session(
+            self.editor_sessions_for_call_mut(),
+            editor,
+        )
+        .map_err(|_| wire::ErrorCode::InvalidEditor)?;
+        let session = self
+            .text_document
+            .as_ref()
+            .ok_or(wire::ErrorCode::Unavailable)?;
+        let job = session
+            .prepare_save(
+                handle,
+                editor,
+                snapshot.edit_sequence,
+                snapshot.text,
+                self.max_editor_bytes,
+            )
+            .map_err(|error| match error {
+                crate::TextDocumentError::TooLarge => wire::ErrorCode::InvalidEditor,
+                crate::TextDocumentError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    wire::ErrorCode::Busy
+                }
+                _ => wire::ErrorCode::Internal,
+            })?;
+        self.external_effect_writes = self
+            .external_effect_writes
+            .checked_add(1)
+            .expect("external-effect write count exhausted");
+        let request = job.request;
+        self.staged_save = Some(job);
+        Ok(wire::SaveRequest {
+            id: request.id,
+            generation: request.generation,
+        })
+    }
+}
+
+impl crate::bindings::v008::youth::time::scheduler::Host for HostState {
+    fn schedule_after(
+        &mut self,
+        millis: u64,
+        options: crate::bindings::v008::youth::time::scheduler::ScheduleOptions,
+    ) -> Result<
+        crate::bindings::v008::youth::time::scheduler::Schedule,
+        crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let notification = options
+            .notification
+            .map(|notification| (notification.title, notification.body));
+        let record = self
+            .state
+            .schedule_create(now_epoch_millis, millis, notification)
+            .map_err(to_wire_schedule_error_v008)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Create {
+                app_id: self.state.app_id().clone(),
+                record: record.clone(),
+                now_epoch_millis,
+            },
+        ));
+        Ok(to_wire_schedule_v008(&record))
+    }
+
+    fn pause(
+        &mut self,
+        value: crate::bindings::v008::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v008::youth::time::scheduler::Schedule,
+        crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v008)?
+            .ok_or(
+                crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let paused = self
+            .state
+            .schedule_pause(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v008)?;
+        let wire_paused = to_wire_schedule_v008(&paused);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Pause {
+                app_id: self.state.app_id().clone(),
+                previous,
+                paused,
+            },
+        ));
+        Ok(wire_paused)
+    }
+
+    fn resume(
+        &mut self,
+        value: crate::bindings::v008::youth::time::scheduler::Schedule,
+    ) -> Result<
+        crate::bindings::v008::youth::time::scheduler::Schedule,
+        crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode,
+    > {
+        let now_epoch_millis = self.deadline_clock.now_epoch_millis();
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v008)?
+            .ok_or(
+                crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        let resumed = self
+            .state
+            .schedule_resume(now_epoch_millis, value.id, value.generation)
+            .map_err(to_wire_schedule_error_v008)?;
+        let wire_resumed = to_wire_schedule_v008(&resumed);
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Resume {
+                app_id: self.state.app_id().clone(),
+                previous,
+                resumed,
+                now_epoch_millis,
+            },
+        ));
+        Ok(wire_resumed)
+    }
+
+    fn cancel(
+        &mut self,
+        value: crate::bindings::v008::youth::time::scheduler::Schedule,
+    ) -> Result<(), crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode> {
+        let previous = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v008)?
+            .ok_or(
+                crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode::UnknownSchedule,
+            )?;
+        self.state
+            .schedule_cancel(value.id, value.generation)
+            .map_err(to_wire_schedule_error_v008)?;
+        let cancelled = self
+            .state
+            .schedule(value.id)
+            .map_err(to_wire_schedule_error_v008)?
+            .ok_or(crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode::Internal)?;
+        self.staged_schedule_outputs.extend(youth_state::transition(
+            youth_state::SchedulerInput::Cancel {
+                app_id: self.state.app_id().clone(),
+                previous,
+                cancelled,
+            },
+        ));
+        Ok(())
+    }
+}
+
+fn to_wire_schedule_v008(
+    record: &youth_state::ScheduleRecord,
+) -> crate::bindings::v008::youth::time::scheduler::Schedule {
+    crate::bindings::v008::youth::time::scheduler::Schedule {
+        id: record.id,
+        generation: record.generation,
+    }
+}
+
+fn to_wire_schedule_error_v008(
+    error: youth_state::StateError,
+) -> crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode {
+    use crate::bindings::v008::youth::time::scheduler::ScheduleErrorCode;
+    match error {
+        youth_state::StateError::InvalidScheduleDuration => ScheduleErrorCode::InvalidDuration,
+        youth_state::StateError::TooManySchedules => ScheduleErrorCode::TooManySchedules,
+        youth_state::StateError::UnknownSchedule => ScheduleErrorCode::UnknownSchedule,
+        youth_state::StateError::StaleScheduleGeneration => ScheduleErrorCode::StaleGeneration,
+        youth_state::StateError::InvalidScheduleNotification
+        | youth_state::StateError::InvalidScheduleState => ScheduleErrorCode::InvalidState,
+        youth_state::StateError::ReadOnly
+        | youth_state::StateError::Idle
+        | youth_state::StateError::NoTransaction
+        | youth_state::StateError::TransactionActive => ScheduleErrorCode::Unavailable,
+        ref error if error.is_busy() => ScheduleErrorCode::Unavailable,
+        youth_state::StateError::Database(_)
+        | youth_state::StateError::Filesystem(_)
+        | youth_state::StateError::Corrupt(_)
+        | youth_state::StateError::UsageMismatch
+        | youth_state::StateError::InvalidKey
+        | youth_state::StateError::InvalidValue
+        | youth_state::StateError::QuotaExceeded
+        | youth_state::StateError::BackupExists
+        | youth_state::StateError::InjectedCommitFailure => ScheduleErrorCode::Internal,
+    }
+}
+
 /// One synchronous, single-owner Youth component instance.
 pub struct YouthApp {
     component_id: String,
@@ -1684,6 +2157,7 @@ impl YouthApp {
                 config.app_id,
                 config.state,
                 config.limits,
+                config.workspace,
                 reconcile_on_open,
             )
         })
@@ -1779,7 +2253,9 @@ impl YouthApp {
                 None,
             )));
         }
-        let result = match edit {
+        let dirty_before =
+            crate::editor_session::editor_locally_dirty(&self.store.data().editor_sessions, editor);
+        let mut result = match edit {
             crate::EditorLocalEdit::SetViewportWidth { width } => {
                 crate::editor_session::local_set_viewport_width(
                     &mut self.store.data_mut().editor_sessions,
@@ -1897,6 +2373,15 @@ impl YouthApp {
                 outcome.interaction_changed,
                 outcome.presentation_changed,
             );
+        }
+        if let Ok(outcome) = &mut result {
+            let dirty_after = crate::editor_session::editor_locally_dirty(
+                &self.store.data().editor_sessions,
+                editor,
+            )
+            .unwrap_or(false);
+            outcome.locally_dirty = dirty_after;
+            outcome.dirty_changed = (dirty_before != Some(dirty_after)).then_some(dirty_after);
         }
         result.map_err(|error| match error {
             crate::editor_session::EditorSessionError::BufferTooLarge
@@ -2161,6 +2646,7 @@ impl YouthApp {
             },
             patch_count: 0,
             state_writes: 0,
+            external_effect_writes: 0,
             elapsed: std::time::Duration::ZERO,
             committed: false,
         });
@@ -2193,6 +2679,86 @@ impl YouthApp {
         let result = span.in_scope(|| self.handle_inner(event, None, base_revision));
         span.record("result", if result.is_ok() { "ok" } else { "error" });
         result
+    }
+
+    pub(crate) fn take_committed_save(&mut self) -> Option<crate::text_document::SaveJob> {
+        self.store.data_mut().committed_save.take()
+    }
+
+    pub(crate) fn deliver_editor_dirty_changed(
+        &mut self,
+        editor: youth_tree::NodeId,
+        dirty: bool,
+    ) -> Result<TurnReceipt, RuntimeError> {
+        let sequence = self.next_transient_event_sequence()?;
+        self.handle_inner(
+            HostEvent::EditorDirtyChanged {
+                sequence,
+                editor: editor.get(),
+                dirty,
+            },
+            None,
+            self.tree
+                .as_ref()
+                .expect("mounted applications retain a tree")
+                .revision(),
+        )
+    }
+
+    pub(crate) fn deliver_save_completion(
+        &mut self,
+        mut completion: crate::SaveCompletion,
+    ) -> Result<TurnReceipt, RuntimeError> {
+        if let crate::SaveOutcome::Saved {
+            document,
+            version,
+            saved_edit_sequence,
+            ref mut still_dirty,
+        } = completion.outcome
+        {
+            *still_dirty = crate::editor_session::accept_saved_text_document(
+                &mut self.store.data_mut().editor_sessions,
+                completion.editor,
+                document,
+                saved_edit_sequence,
+                version,
+            )
+            .map_err(|_| {
+                RuntimeError::InvalidLifecycle(
+                    self.context("saved document no longer matches its Editor session", None),
+                )
+            })?;
+        }
+        let sequence = self.next_transient_event_sequence()?;
+        self.handle_inner(
+            HostEvent::TextDocumentSaveCompleted {
+                sequence,
+                completion,
+            },
+            None,
+            self.tree
+                .as_ref()
+                .expect("mounted applications retain a tree")
+                .revision(),
+        )
+    }
+
+    fn next_transient_event_sequence(&mut self) -> Result<u64, RuntimeError> {
+        if self.lifecycle != AppLifecycle::Mounted {
+            return Err(RuntimeError::InvalidLifecycle(self.context(
+                "host event is only valid while the application is mounted",
+                None,
+            )));
+        }
+        let sequence = self
+            .last_event_sequence
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Internal(self.context("event sequence space is exhausted", None))
+            })?;
+        self.last_event_sequence = Some(sequence);
+        Ok(sequence)
     }
 
     /// Delivers the oldest durable elapsed event, if one exists.
@@ -2292,14 +2858,17 @@ impl YouthApp {
             Ok(batch) => batch,
             Err(error) => {
                 let writes = self.store.data().state.metrics().writes;
+                let effect_writes = self.store.data().external_effect_writes;
                 let recoverable = delivery.is_none()
                     && error.code == GuestErrorCode::RejectedEvent
-                    && writes == 0;
+                    && writes == 0
+                    && effect_writes == 0;
                 let error =
                     RuntimeError::GuestRejected(self.guest_error_context(error, turn_id, "handle"));
                 let _ = self.store.data_mut().state.rollback();
                 self.store.data_mut().discard_staged_schedule_outputs();
                 self.store.data_mut().discard_staged_editor_sessions();
+                self.store.data_mut().discard_staged_save();
                 self.record_state_metrics("rolled_back");
                 return if recoverable {
                     Err(error)
@@ -2382,12 +2951,17 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&staged_tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        if let Err(error) = self.validate_text_document_references(&staged_tree, turn_id) {
+            return Err(self.rollback_and_fault(error));
+        }
         let editor_sessions = crate::editor_session::reconcile_editor_sessions(
             self.store.data().editor_sessions_for_call(),
             &staged_tree,
+            self.store.data().text_document.as_ref(),
         );
 
         let state_writes = self.store.data().state.metrics().writes;
+        let external_effect_writes = self.store.data().external_effect_writes;
         if let Some(delivery) = delivery
             && let Err(source) = self
                 .store
@@ -2407,6 +2981,7 @@ impl YouthApp {
         if let Err(source) = self.store.data_mut().state.commit() {
             self.store.data_mut().discard_staged_schedule_outputs();
             self.store.data_mut().discard_staged_editor_sessions();
+            self.store.data_mut().discard_staged_save();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after patch validation", turn_id)
@@ -2415,6 +2990,9 @@ impl YouthApp {
             return Err(self.enter_fault(error));
         }
         self.store.data_mut().apply_committed_schedule_outputs();
+        if let Err(error) = self.store.data_mut().commit_staged_save() {
+            tracing::error!(%error, "committed text-document save could not be queued");
+        }
         self.store
             .data_mut()
             .install_editor_sessions(editor_sessions);
@@ -2432,6 +3010,7 @@ impl YouthApp {
             patch_batch: batch,
             patch_count,
             state_writes,
+            external_effect_writes,
             elapsed,
             committed: true,
         };
@@ -2505,6 +3084,7 @@ impl YouthApp {
                 let _ = self.store.data_mut().state.rollback();
                 self.store.data_mut().discard_staged_schedule_outputs();
                 self.store.data_mut().discard_staged_editor_sessions();
+                self.store.data_mut().discard_staged_save();
                 self.record_state_metrics("rolled_back");
                 return Err(error);
             }
@@ -2555,15 +3135,23 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        if let Err(error) = self.validate_text_document_references(&tree, turn_id) {
+            if install {
+                return Err(self.rollback_and_fault(error));
+            }
+            return Err(error);
+        }
         let editor_sessions = install.then(|| {
             crate::editor_session::reconcile_editor_sessions(
                 self.store.data().editor_sessions_for_call(),
                 &tree,
+                self.store.data().text_document.as_ref(),
             )
         });
         if let Err(source) = self.store.data_mut().state.rollback() {
             self.store.data_mut().discard_staged_schedule_outputs();
             self.store.data_mut().discard_staged_editor_sessions();
+            self.store.data_mut().discard_staged_save();
             let error = RuntimeError::StateUnavailable(
                 self.context("read-only resync transaction could not close", turn_id)
                     .with_source(source),
@@ -2579,6 +3167,7 @@ impl YouthApp {
             );
         } else {
             self.store.data_mut().discard_staged_editor_sessions();
+            self.store.data_mut().discard_staged_save();
         }
         Ok(snapshot)
     }
@@ -2719,13 +3308,18 @@ impl YouthApp {
         if let Err(error) = self.validate_countdown_references(&tree, turn_id) {
             return Err(self.rollback_and_fault(error));
         }
+        if let Err(error) = self.validate_text_document_references(&tree, turn_id) {
+            return Err(self.rollback_and_fault(error));
+        }
         let editor_sessions = crate::editor_session::reconcile_editor_sessions(
             self.store.data().editor_sessions_for_call(),
             &tree,
+            self.store.data().text_document.as_ref(),
         );
         if let Err(source) = self.store.data_mut().state.commit() {
             self.store.data_mut().discard_staged_schedule_outputs();
             self.store.data_mut().discard_staged_editor_sessions();
+            self.store.data_mut().discard_staged_save();
             self.record_state_metrics("commit_failed");
             let error = RuntimeError::StateCommitFailed(
                 self.context("state commit failed after mount validation", turn_id)
@@ -2794,6 +3388,43 @@ impl YouthApp {
         Ok(())
     }
 
+    fn validate_text_document_references(
+        &self,
+        tree: &youth_tree::Tree,
+        turn_id: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        let info = self
+            .store
+            .data()
+            .text_document
+            .as_ref()
+            .map(crate::text_document::TextDocumentSession::info);
+        for node in tree.to_snapshot().nodes {
+            let youth_tree::NodeData::TextDocumentEditor {
+                document_id,
+                document_generation,
+                version_id,
+                version_generation,
+            } = node.data
+            else {
+                continue;
+            };
+            let valid = info.as_ref().is_some_and(|info| {
+                info.handle.id == document_id
+                    && info.handle.generation == document_generation
+                    && info.version.id == version_id
+                    && info.version.generation == version_generation
+            });
+            if !valid {
+                return Err(RuntimeError::GuestRejected(self.context(
+                    "text-document Editor references a stale or forged host token",
+                    turn_id,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn guest_error_context(
         &self,
         error: GuestError,
@@ -2832,6 +3463,9 @@ impl YouthApp {
             .set_epoch_deadline(deadline_ticks(budget.deadline));
         self.store.epoch_deadline_trap();
         self.store.data_mut().limiter.limit_hit = false;
+        self.store.data_mut().text_document_calls = 0;
+        self.store.data_mut().external_effect_writes = 0;
+        self.store.data_mut().staged_save = None;
         Ok(())
     }
 
@@ -2853,6 +3487,7 @@ impl YouthApp {
         let _ = self.store.data_mut().state.rollback();
         self.store.data_mut().discard_staged_schedule_outputs();
         self.store.data_mut().discard_staged_editor_sessions();
+        self.store.data_mut().discard_staged_save();
         self.record_state_metrics("rolled_back");
         self.enter_fault(error)
     }
@@ -2933,6 +3568,7 @@ fn instantiate(
     app_id: youth_state::AppId,
     state_location: StateLocation,
     limits: RuntimeLimits,
+    workspace: Option<crate::WorkspaceGrant>,
     reconcile_on_open: bool,
 ) -> Result<YouthApp, RuntimeError> {
     let deadline_clock = Arc::clone(&limits.time.deadline_clock);
@@ -2948,6 +3584,23 @@ fn instantiate(
             None,
         ))
     })?;
+    let text_document = workspace
+        .as_ref()
+        .map(|grant| {
+            crate::text_document::TextDocumentSession::open(grant, limits.tree.max_editor_text_len)
+        })
+        .transpose()
+        .map_err(|source| {
+            RuntimeError::StateUnavailable(
+                ErrorContext::new(
+                    "the granted text document could not be opened",
+                    &component_id,
+                    AppLifecycle::Loaded,
+                    None,
+                )
+                .with_source(source),
+            )
+        })?;
     let mut state_store =
         youth_state::StateStore::open_for_app(state_location, limits.state, app_id.clone())
             .map_err(|source| {
@@ -3000,6 +3653,11 @@ fn instantiate(
         staged_schedule_outputs: Vec::new(),
         editor_sessions: crate::editor_session::EditorSessionRegistry::new(),
         staged_editor_sessions: None,
+        text_document,
+        staged_save: None,
+        committed_save: None,
+        text_document_calls: 0,
+        external_effect_writes: 0,
         max_editor_bytes: limits.tree.max_editor_text_len,
     };
     let mut store = Store::new(engine, state);
@@ -3130,6 +3788,24 @@ fn instantiate(
                 .map_err(|source| instantiation_error(&component_id, &store, source))?;
             ApplicationBindings::V007(value)
         }
+        ProtocolVersion::V008 => {
+            let mut linker = Linker::<HostState>::new(engine);
+            configure_wasi(&mut linker, &component_id)?;
+            crate::bindings::v008::Application::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|source| link_configuration_error(&component_id, source))?;
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(|source| link_error(&component_id, source))?;
+            let pre = crate::bindings::v008::ApplicationPre::new(pre)
+                .map_err(|source| unsupported_world_error(&component_id, protocol, source))?;
+            let value = pre
+                .instantiate(&mut store)
+                .map_err(|source| instantiation_error(&component_id, &store, source))?;
+            ApplicationBindings::V008(value)
+        }
     };
     Ok(YouthApp {
         component_id,
@@ -3155,6 +3831,7 @@ fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVer
     let mut v005 = false;
     let mut v006 = false;
     let mut v007 = false;
+    let mut v008 = false;
     for (name, _) in exports {
         v002 |= name == "youth:app/lifecycle@0.0.2";
         v003 |= name == "youth:app/lifecycle@0.0.3";
@@ -3162,14 +3839,16 @@ fn detect_protocol(engine: &Engine, component: &Component) -> Option<ProtocolVer
         v005 |= name == "youth:app/lifecycle@0.0.5";
         v006 |= name == "youth:app/lifecycle@0.0.6";
         v007 |= name == "youth:app/lifecycle@0.0.7";
+        v008 |= name == "youth:app/lifecycle@0.0.8";
     }
-    match (v002, v003, v004, v005, v006, v007) {
-        (false, false, false, false, false, true) => Some(ProtocolVersion::V007),
-        (false, false, false, false, true, false) => Some(ProtocolVersion::V006),
-        (false, false, false, true, false, false) => Some(ProtocolVersion::V005),
-        (false, false, true, false, false, false) => Some(ProtocolVersion::V004),
-        (false, true, false, false, false, false) => Some(ProtocolVersion::V003),
-        (true, false, false, false, false, false) => Some(ProtocolVersion::V002),
+    match (v002, v003, v004, v005, v006, v007, v008) {
+        (false, false, false, false, false, false, true) => Some(ProtocolVersion::V008),
+        (false, false, false, false, false, true, false) => Some(ProtocolVersion::V007),
+        (false, false, false, false, true, false, false) => Some(ProtocolVersion::V006),
+        (false, false, false, true, false, false, false) => Some(ProtocolVersion::V005),
+        (false, false, true, false, false, false, false) => Some(ProtocolVersion::V004),
+        (false, true, false, false, false, false, false) => Some(ProtocolVersion::V003),
+        (true, false, false, false, false, false, false) => Some(ProtocolVersion::V002),
         _ => None,
     }
 }
