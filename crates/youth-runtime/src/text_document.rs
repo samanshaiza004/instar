@@ -586,9 +586,11 @@ fn set_private_permissions(_file: &cap_std::fs::File) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(directory: &Dir) -> std::io::Result<()> {
-    use std::os::fd::AsFd;
-    let owned = directory.as_fd().try_clone_to_owned()?;
-    std::fs::File::from(owned).sync_all()
+    // cap-std may retain a Linux directory capability as an `O_PATH`
+    // descriptor, which is intentionally unsuitable for `fsync`. Opening
+    // `.` through that capability produces a real directory file handle
+    // without reconstructing an ambient path.
+    directory.open(".")?.sync_all()
 }
 
 #[cfg(not(unix))]
