@@ -1,7 +1,8 @@
 # Scratchpad Gate B — One Real Text Document
 
-Status: implemented on `codex/scratchpad-gate-b`; cross-platform release
-certification remains pending until the branch CI matrix passes.
+Status: merged to `master`; cross-platform release certification remains
+pending until the Scratchpad application repository's own CI matrix
+(canonical Ubuntu build, mounted unchanged on Windows and macOS) passes.
 
 This document is the authoritative contract for the first file-backed Youth
 application. It adds `youth:text-document@0.0.1` and `youth:app@0.0.8` while
