@@ -1,4 +1,4 @@
-//! Youth Rust Guest Profile 0.0.2 — the guest import budget.
+//! Youth Rust Guest Profile 0.0.3 — the guest import budget.
 //!
 //! Youth's WASI context is closed, so these imports are inert: the host
 //! decides what they return. They remain a real linking and compatibility

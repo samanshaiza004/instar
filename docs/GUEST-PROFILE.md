@@ -1,4 +1,4 @@
-# Youth Rust Guest Profile 0.0.2
+# Youth Rust Guest Profile 0.0.3
 
 This document records what a Youth guest component is allowed to import,
 and why the current Rust guest imports more than `youth:*`.
@@ -28,7 +28,8 @@ Required:
   youth:state/store
 
 Permitted Youth capabilities:
-  youth:time/scheduler          protocol 0.0.4 only
+  youth:time/scheduler          protocols 0.0.4, 0.0.5, 0.0.6, 0.0.7
+  youth:editor/session          protocols 0.0.6, 0.0.7
 
 Permitted inert WASIp2 imports:
   wasi:cli/environment          wasi:cli/terminal-input
@@ -46,13 +47,15 @@ Forbidden:
   wasi:filesystem/*, wasi:sockets/*, and wasi:http/* interface
 ```
 
-`youth:time/scheduler` is permitted, but not globally required: protocol 0.0.4
-guests may import it to declare bounded temporal intent, while supported 0.0.2
-and 0.0.3 guests do not have that capability in their application contract.
+`youth:time/scheduler` and `youth:editor/session` are permitted, but not
+globally required: a guest imports one only to declare bounded temporal
+intent or to own a host-backed Editor session, and only protocols that
+carry that capability in their application contract (`wit/youth-app-v0.0.N/`)
+can import it at all. Protocols 0.0.2 and 0.0.3 have neither.
 
-`crates/youth-runtime/tests/import_profile.rs` enforces this against both the
-0.0.2 counter and a 0.0.4 SDK/time component, and fails when a toolchain update
-widens the surface.
+`crates/youth-runtime/tests/import_profile.rs` enforces this against the
+0.0.2 counter, a 0.0.4 SDK/time component, and a 0.0.6 SDK/editor component,
+and fails when a toolchain update widens the surface.
 Interface versions are compared without their `@version` suffix, so a
 WASI patch bump does not read as a new capability; a genuinely new
 interface does.

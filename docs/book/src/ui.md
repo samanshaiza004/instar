@@ -33,6 +33,38 @@ Tree::root(Column::new([
 ]))
 ```
 
+`Shortcut::primary(char)` (protocol `0.0.7`) declares a `Cmd`/`Ctrl`+key
+chord distinct from the plain character, so a focused Editor's ordinary
+typing and an app-level Save command can coexist on the same key:
+
+```rust
+Button::command(command!("save"), "Save").shortcut(Shortcut::primary('s'))
+```
+
+## Editor nodes
+
+`Editor::new(node!("document"), DocumentRevision::new(1), initial_text)`
+installs a host-owned text-editing session (see
+[Mental model](mental-model.md) for the ownership split). The guest declares
+only the initial text and an opaque `DocumentRevision`; typing, selection,
+IME, undo/redo, clipboard, and scrolling are entirely host-local and never
+reach the guest. To read or replace content — typically from a Save
+command — call the `youth:editor` capability directly:
+
+```rust
+let snapshot = context.editor().snapshot(ui::DOCUMENT)?;
+context.editor().accept(
+    ui::DOCUMENT,
+    snapshot.document_revision(),
+    snapshot.edit_sequence(),
+    DocumentRevision::new(2),
+)?;
+```
+
+`accept` and `replace` both fail closed when the expected document revision
+or edit sequence no longer matches the live session, so a stale call can
+never overwrite a newer host-local edit.
+
 Handle an activation by returning the smallest supported semantic update:
 
 ```rust

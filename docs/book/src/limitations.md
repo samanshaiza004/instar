@@ -1,26 +1,41 @@
 # Limitations
 
 Developer Preview 3 proves the external workflow and three Utility Suite
-applications on the runtime. Youth is still an architecture-probing platform,
-not a general application platform.
+applications on the runtime; Milestone 2 adds a host-owned Editor capability
+and modifier-aware shortcuts. Youth is still an architecture-probing
+platform, not a general application platform.
 
-- Rendering and its framebuffer fixtures are provisional.
+- Rendering and its framebuffer fixtures are provisional outside the Editor's
+  Parley/Swash text path (`crates/youth-editor-engine`,
+  `crates/youth-text-render-cpu`); other node kinds still use the earlier
+  provisional bitmap-font renderer.
 - Layout is limited to deterministic columns, rows, and equal-track grids;
   styling, spans, and arbitrary constraints are absent.
-- Mouse and bounded logical keyboard input are supported. Native accessibility
-  projection is not yet available; no standardized completeness inventory has
-  been collected. Focus remains host-owned so it can be added without changing
-  guests.
+- Mouse, bounded logical keyboard input, and one Editor node's real text
+  entry (typing, selection, IME composition, undo/redo, clipboard, scrolling)
+  are supported. Native accessibility (AccessKit) covers the Editor's text
+  ranges, selection, cursor, and editing actions; other node kinds have no
+  accessibility projection yet, and no standardized completeness inventory
+  has been collected. Focus remains host-owned.
+- Only one modifier (`primary` — `Cmd` on macOS, `Control` on Windows/Linux)
+  is supported on declared shortcuts; no other modifier combinations, and no
+  chord sequences.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
-- The latest application protocol is `0.0.5`; the host also runs `0.0.4`,
-  `0.0.3`, and `0.0.2`. Generated Tally projects still default to `0.0.4`.
+- The latest application protocol is `0.0.7`; the host also runs `0.0.6`,
+  `0.0.5`, `0.0.4`, `0.0.3`, and `0.0.2` simultaneously. Generated projects
+  still default to `0.0.4` unless the template explicitly opts into a newer
+  profile.
 - Guests are Rust-only and target `wasm32-wasip2`.
-- `youth build` emits a bare validated component, not an installable package.
-- Packaging, publishing, registries, and SDK upgrades are absent.
+- `youth build` emits a bare validated component; `youth-cli` itself is
+  packaged for release via `dist` (see [docs/DISTRIBUTION.md](../../DISTRIBUTION.md)),
+  but application components have no installable-package or registry story.
+- Publishing, registries, and SDK upgrade tooling for applications are absent.
 
-Reactive UI, text input/IME, images, animation, multiple windows, arbitrary
-SQL, expression parsing, packaging, publishing, and SDK upgrade tooling remain
-outside the current previews. Todo additionally does not provide text entry,
+Reactive UI, images, animation, multiple windows, arbitrary SQL, expression
+parsing, and application-level packaging/publishing remain outside the
+current previews. The Editor node is one whole-buffer plain-text surface —
+rich text, multiple cursors, spell-check, find/replace, and syntax
+highlighting are absent. Todo additionally does not provide text entry,
 scrolling, list nodes, structured state, state enumeration, or automatic tree
 diffing.

@@ -37,9 +37,24 @@ The completed Utility Suite applications are independent architecture probes:
 | [Timer](https://github.com/samanshaiza004/youth-timer) | Host clocks, durable schedules, elapsed delivery, recovery | Gate C-4 recovery complete |
 | [Todo](https://github.com/samanshaiza004/youth-todo) | Dynamic collections, stable identities, structural updates, migration | `utility-todo-gate-d-release`; canonical component certified on all three hosts |
 
-Todo is the latest completed probe and remains on `youth:app@0.0.5`. Its
-findings are evidence for future platform decisions, not an authorization for
-list nodes, structured state, state enumeration, or automatic tree diffing.
+Todo remains on `youth:app@0.0.5`. Its findings are evidence for future
+platform decisions, not an authorization for list nodes, structured state,
+state enumeration, or automatic tree diffing.
+
+## Editor capability and text entry
+
+The host now owns a native text-editing surface: a stable `Editor` node
+identity owns one host-local session (live buffer, cursor, selection, IME
+composition, undo/redo, clipboard, scrolling) with zero guest turns for
+ordinary typing. The guest sees only whole-buffer `snapshot`/`accept`/
+`replace` through the `youth:editor` capability (`youth:app@0.0.6`), never
+raw byte offsets or platform key events. `youth:app@0.0.7` additively adds a
+modifier field to declared shortcuts, so a focused Editor and an app-level
+`Primary+S` Save command coexist. See
+[docs/MILESTONE-2.md](docs/MILESTONE-2.md) for the full contract, lifecycle,
+and input-precedence rules. Scratchpad, developed as a separate application
+repository the same way Calculator, Timer, and Todo were, is the first
+Editor-capable application and exercises this boundary end to end.
 
 ## Transactional Visible Counter foundation
 
@@ -67,17 +82,20 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app-v0.0.5/`, `wit/youth-app-v0.0.4/`, `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts through `0.0.5`; the unversioned tree is the generated-project default (`0.0.4`) |
+| `wit/youth-app-v0.0.7/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.7`, all frozen and simultaneously supported; the unversioned tree is the generated-project default (`0.0.4`) |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
-| `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker |
+| `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker, host-owned Editor sessions |
 | `crates/youth-sdk` | Guest-facing builders, typed state, lifecycle, and component export adapter |
 | `crates/youth-project` | Strict `Youth.toml`, `Youth.lock`, Cargo, and vendored-WIT contract |
 | `crates/youth-test` | Semantic `.youth-test` parser and real headless runner |
-| `crates/youth-desktop` | Deterministic layout/raster/input plus the provisional native window |
-| `crates/youth-cli` | Project generation, doctor/check/build/test/dev, native run, and state tools |
+| `crates/youth-interaction` | Renderer-independent focus, shortcut, and Editor-input policy (no Wasm) |
+| `crates/youth-editor-engine` | Unicode-correct text editing/layout on Parley; the only crate depending on `parley` |
+| `crates/youth-text-render-cpu` | Swash-backed CPU glyph rasterization for Editor rendering |
+| `crates/youth-desktop` | Deterministic layout/raster/input plus the native window (winit, softbuffer, AccessKit) |
+| `crates/youth-cli` | Project generation, doctor/check/build/test/dev, native run, and state tools; the packaged `youth` binary |
 | `guests/counter` | Durable counter component (Rust, `wasm32-wasip2`) |
-| `test-components/` | Malicious/invalid fixtures for containment tests |
+| `test-components/` | Malicious/invalid fixtures and SDK-backed capability fixtures for containment and integration tests |
 
 ## Building
 
