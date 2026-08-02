@@ -1,6 +1,10 @@
 [build]
-  command = "bash website/build.sh"
-  publish = "website/dist"
+  # Netlify's project is configured with `website` as its base directory.
+  # Keep the command and publish path relative to that directory so the
+  # dashboard configuration and this file agree.
+  base = "website"
+  command = "bash build.sh"
+  publish = "dist"
   # Skip the build entirely unless something under website/ or docs/ (the
   # mdbook source the build pulls in) actually changed. Netlify's documented
   # monorepo pattern: the ignore command's exit code decides whether this

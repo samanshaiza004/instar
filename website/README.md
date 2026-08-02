@@ -15,8 +15,10 @@ motivated them -- see the commit that added this file for the reasoning.
   actually gets published. `docs/book/` is the single source of truth for
   the documentation; nothing here duplicates its content.
 - `../netlify.toml` (repo root, not in this directory) -- Netlify's build
-  config: build command, publish directory, and an `ignore` hook so
-  unrelated commits elsewhere in the repo don't trigger a redeploy.
+  config. The Netlify project uses `website/` as its base directory, so the
+  build command is `bash build.sh` and the publish directory is `dist` from
+  Netlify's point of view. An `ignore` hook prevents unrelated commits
+  elsewhere in the repo from triggering a redeploy.
 
 ## Building locally
 
@@ -36,9 +38,9 @@ as production would.
 ## Connecting this to Netlify (one-time setup)
 
 1. Netlify dashboard -> **Add new site -> Import an existing project** ->
-   select this GitHub repo. Leave the base directory at its default (the
-   repo root); `netlify.toml` there already points at
-   `bash website/build.sh` / `website/dist`.
+   select this GitHub repo. Set the base directory to `website/` (the
+   committed `netlify.toml` records the same setting), then deploy. Netlify
+   runs `bash build.sh` and publishes `dist/` from that base directory.
 2. **Domain settings -> Add domain alias** -> `youth.samanshaiza.com`.
    Netlify shows the exact DNS record (a CNAME, or one click if
    samanshaiza.com's DNS is already delegated to Netlify) to add wherever
