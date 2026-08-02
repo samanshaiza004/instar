@@ -76,6 +76,14 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         // youth:editor capability.
         sdk_revision: "f9867b55988353b2d1f10854d40e23f3a58bd600",
     },
+    ContractProfile {
+        protocol: "0.0.7",
+        wit_sha256: "0fe1ec9bdca4e8d26c189a6f96b6450ca892003c6ef7a5ef7f8dca4385e66235",
+        template_version: 3,
+        // Scratchpad's published 0.0.7 profile -- resolves SCRATCHPAD-F001
+        // with a modifier-aware shortcut record (Primary+Character).
+        sdk_revision: "1ab92e317a218e59c7739776d37fdc07914f8f2b",
+    },
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -513,6 +521,7 @@ mod tests {
     const WIT_V004: &str = "package youth:app@0.0.4;\n";
     const WIT_V005: &str = "package youth:app@0.0.5;\n";
     const WIT_V006: &str = "package youth:app@0.0.6;\n";
+    const WIT_V007: &str = "package youth:app@0.0.7;\n";
 
     fn fixture(profile: ContractProfile) -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -523,6 +532,7 @@ mod tests {
             "0.0.4" => WIT_V004,
             "0.0.5" => WIT_V005,
             "0.0.6" => WIT_V006,
+            "0.0.7" => WIT_V007,
             protocol => panic!("unsupported fixture protocol {protocol}"),
         };
         let revision = profile.sdk_revision;
@@ -815,5 +825,15 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
             SUPPORTED_PROFILES[4].wit_sha256
         );
         assert_eq!(SUPPORTED_PROFILES[4].protocol, "0.0.6");
+    }
+
+    #[test]
+    fn v007_profile_hash_matches_the_canonical_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.7");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            SUPPORTED_PROFILES[5].wit_sha256
+        );
+        assert_eq!(SUPPORTED_PROFILES[5].protocol, "0.0.7");
     }
 }
