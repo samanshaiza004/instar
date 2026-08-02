@@ -84,6 +84,12 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         // with a modifier-aware shortcut record (Primary+Character).
         sdk_revision: "1ab92e317a218e59c7739776d37fdc07914f8f2b",
     },
+    ContractProfile {
+        protocol: "0.0.8",
+        wit_sha256: "9b2fb0299a132b75f3526c2cdb1ac33f1c6633f6eb3e4096eeb57c6fb70b89a7",
+        template_version: 3,
+        sdk_revision: "c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7",
+    },
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -522,6 +528,7 @@ mod tests {
     const WIT_V005: &str = "package youth:app@0.0.5;\n";
     const WIT_V006: &str = "package youth:app@0.0.6;\n";
     const WIT_V007: &str = "package youth:app@0.0.7;\n";
+    const WIT_V008: &str = "package youth:app@0.0.8;\n";
 
     fn fixture(profile: ContractProfile) -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -533,6 +540,7 @@ mod tests {
             "0.0.5" => WIT_V005,
             "0.0.6" => WIT_V006,
             "0.0.7" => WIT_V007,
+            "0.0.8" => WIT_V008,
             protocol => panic!("unsupported fixture protocol {protocol}"),
         };
         let revision = profile.sdk_revision;
@@ -835,5 +843,15 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
             SUPPORTED_PROFILES[5].wit_sha256
         );
         assert_eq!(SUPPORTED_PROFILES[5].protocol, "0.0.7");
+    }
+
+    #[test]
+    fn v008_profile_hash_matches_the_canonical_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.8");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            SUPPORTED_PROFILES[6].wit_sha256
+        );
+        assert_eq!(SUPPORTED_PROFILES[6].protocol, "0.0.8");
     }
 }
