@@ -17,8 +17,9 @@ motivated them -- see the commit that added this file for the reasoning.
 - `../netlify.toml` (repo root, not in this directory) -- Netlify's build
   config. The Netlify project uses `website/` as its base directory, so the
   build command is `bash build.sh` and the publish directory is `dist` from
-  Netlify's point of view. An `ignore` hook prevents unrelated commits
-  elsewhere in the repo from triggering a redeploy.
+  Netlify's point of view. The project intentionally builds every `master`
+  commit so deployment behavior does not depend on Netlify's working
+  directory when evaluating monorepo ignore rules.
 
 ## Building locally
 
