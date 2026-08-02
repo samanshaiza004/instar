@@ -54,6 +54,7 @@ jobs:
           -p youth-legacy-v003
           -p youth-sdk-elapsed
           -p youth-sdk-time
+          -p youth-sdk-editor
           -p youth-time-stub
           --target wasm32-wasip2 --release
       - name: Record SHA-256
@@ -218,6 +219,7 @@ jobs:
             target/wasm32-wasip2/release/youth_legacy_v003.wasm
             target/wasm32-wasip2/release/youth_sdk_elapsed.wasm
             target/wasm32-wasip2/release/youth_sdk_time.wasm
+            target/wasm32-wasip2/release/youth_sdk_editor.wasm
             target/wasm32-wasip2/release/youth_time_stub.wasm
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
