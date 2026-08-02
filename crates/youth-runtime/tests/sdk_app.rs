@@ -35,13 +35,14 @@ fn sdk_owns_protocol_bookkeeping_and_state_survives_restart() {
         .expect("SDK component loads and links");
     // youth-sdk-tally is a local-path youth-sdk fixture, so it always tracks
     // whichever protocol the SDK crate in this workspace currently targets
-    // (0.0.6, since Scratchpad Gate A), not a version frozen at this test's writing.
-    assert_eq!(first.inspect().world, "youth:app/application@0.0.6");
+    // (0.0.7, since the modifier-aware shortcut record), not a version frozen
+    // at this test's writing.
+    assert_eq!(first.inspect().world, "youth:app/application@0.0.7");
     assert_eq!(
         youth_runtime::validate_component(&component)
             .expect("SDK component validates")
             .world,
-        "youth:app/application@0.0.6"
+        "youth:app/application@0.0.7"
     );
     let mounted = first.mount().expect("SDK mount succeeds");
     assert_eq!(mounted.revision, 0);

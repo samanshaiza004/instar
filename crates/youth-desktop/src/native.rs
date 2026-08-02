@@ -1032,6 +1032,31 @@ mod tests {
         );
     }
 
+    /// SCRATCHPAD-F001 / protocol 0.0.7 regression: a `Primary+S` press
+    /// arriving mid-IME-composition must follow the existing, frozen
+    /// precedence -- composition wins over everything, unconditionally --
+    /// not a special case carved out for the new Save shortcut.
+    ///
+    /// `window_event`'s `WindowEvent::KeyboardInput` arm only calls
+    /// `InteractionState::key` for keys that `logical_key` normalizes to
+    /// `Some(_)`. Composition candidates arrive from winit as `Key::Dead`
+    /// (and, on some platforms, `Key::Unidentified`) regardless of which
+    /// modifiers are held, and `logical_key` rejects both unconditionally --
+    /// so a composition keystroke can never reach shortcut routing at all,
+    /// whether or not the primary modifier happens to be held. Adding
+    /// modifier-aware shortcuts in 0.0.7 changed nothing about this: the
+    /// composition gate is upstream of, and independent from, modifier
+    /// state.
+    #[test]
+    fn ime_composition_candidates_never_reach_key_routing_even_with_primary_held() {
+        assert_eq!(logical_key(&Key::Dead(Some('s'))), None);
+        assert_eq!(logical_key(&Key::Dead(None)), None);
+        assert_eq!(
+            logical_key(&Key::Unidentified(NativeKey::Unidentified)),
+            None
+        );
+    }
+
     #[test]
     fn named_keys_cover_focus_default_cancel_and_editing_policy() {
         assert_eq!(

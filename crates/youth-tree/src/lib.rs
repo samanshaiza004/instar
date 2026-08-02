@@ -85,6 +85,56 @@ pub enum ShortcutKey {
     Backspace,
 }
 
+/// The chord modifiers a [`Shortcut`] requires to be held.
+///
+/// Only `primary` (Cmd on macOS, Control on Windows/Linux) is supported
+/// today. This is a plain struct of named flags rather than an opaque
+/// bitfield so that `shift`/`alt` can be added later as honest new fields
+/// without another restructuring.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ShortcutModifiers {
+    pub primary: bool,
+}
+
+impl ShortcutModifiers {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { primary: false }
+    }
+
+    #[must_use]
+    pub const fn primary() -> Self {
+        Self { primary: true }
+    }
+}
+
+/// A logical key paired with the modifiers required to trigger it.
+///
+/// `Character("s")` and `Primary+Character("s")` are distinct chords and may
+/// coexist on the same tree without conflicting.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct Shortcut {
+    pub key: ShortcutKey,
+    pub modifiers: ShortcutModifiers,
+}
+
+impl Shortcut {
+    #[must_use]
+    pub const fn new(key: ShortcutKey, modifiers: ShortcutModifiers) -> Self {
+        Self { key, modifiers }
+    }
+
+    /// A shortcut with no modifiers held -- the only chord shape protocols
+    /// 0.0.2 through 0.0.6 can express.
+    #[must_use]
+    pub const fn plain(key: ShortcutKey) -> Self {
+        Self {
+            key,
+            modifiers: ShortcutModifiers::empty(),
+        }
+    }
+}
+
 /// The semantic content and behavior of a normalized node.
 ///
 /// The compact DP0 variants remain the normalized representation for their
@@ -133,7 +183,7 @@ pub enum NodeData {
     ShortcutButton {
         label: String,
         enabled: bool,
-        shortcuts: Vec<ShortcutKey>,
+        shortcuts: Vec<Shortcut>,
     },
 }
 
@@ -197,7 +247,7 @@ impl NodeData {
     }
 
     #[must_use]
-    pub fn shortcuts(&self) -> &[ShortcutKey] {
+    pub fn shortcuts(&self) -> &[Shortcut] {
         match self {
             Self::ShortcutButton { shortcuts, .. } => shortcuts,
             _ => &[],
@@ -456,7 +506,7 @@ pub enum ValidationError {
     InvalidShortcutCharacter { node: NodeId },
     #[error("logical shortcut {shortcut:?} is declared by nodes {first} and {second}")]
     DuplicateShortcut {
-        shortcut: ShortcutKey,
+        shortcut: Shortcut,
         first: NodeId,
         second: NodeId,
     },
@@ -501,7 +551,7 @@ impl Tree {
             });
         }
 
-        let mut shortcuts = BTreeMap::<ShortcutKey, NodeId>::new();
+        let mut shortcuts = BTreeMap::<Shortcut, NodeId>::new();
         let mut shortcut_count = 0_usize;
         for (&id, node) in &nodes {
             if id != snapshot.root && node.data == NodeData::Root {
@@ -576,7 +626,7 @@ impl Tree {
             }
             for shortcut in node.data.shortcuts() {
                 shortcut_count = shortcut_count.saturating_add(1);
-                if let ShortcutKey::Character(value) = shortcut
+                if let ShortcutKey::Character(value) = &shortcut.key
                     && (value.len() > limits.max_shortcut_character_bytes
                         || value.chars().count() != 1)
                 {
@@ -1281,7 +1331,7 @@ mod tests {
                     NodeData::ShortcutButton {
                         label: "=".into(),
                         enabled: true,
-                        shortcuts: vec![ShortcutKey::Enter],
+                        shortcuts: vec![Shortcut::plain(ShortcutKey::Enter)],
                     },
                     &[],
                 ),
@@ -1449,7 +1499,7 @@ mod tests {
             NodeData::ShortcutButton {
                 label: "shortcut".into(),
                 enabled: true,
-                shortcuts: vec![ShortcutKey::Enter],
+                shortcuts: vec![Shortcut::plain(ShortcutKey::Enter)],
             },
         ];
         for data in other_variants {
@@ -1489,7 +1539,7 @@ mod tests {
                     NodeData::ShortcutButton {
                         label: "First".into(),
                         enabled: true,
-                        shortcuts: vec![ShortcutKey::Character("7".into())],
+                        shortcuts: vec![Shortcut::plain(ShortcutKey::Character("7".into()))],
                     },
                     &[],
                 ),
@@ -1498,7 +1548,7 @@ mod tests {
                     NodeData::ShortcutButton {
                         label: "Second".into(),
                         enabled: false,
-                        shortcuts: vec![ShortcutKey::Character("7".into())],
+                        shortcuts: vec![Shortcut::plain(ShortcutKey::Character("7".into()))],
                     },
                     &[],
                 ),
@@ -1518,7 +1568,7 @@ mod tests {
                     NodeData::ShortcutButton {
                         label: "Bad".into(),
                         enabled: true,
-                        shortcuts: vec![ShortcutKey::Character("ab".into())],
+                        shortcuts: vec![Shortcut::plain(ShortcutKey::Character("ab".into()))],
                     },
                     &[],
                 ),
@@ -1538,13 +1588,77 @@ mod tests {
                     NodeData::ShortcutButton {
                         label: "Abacus".into(),
                         enabled: true,
-                        shortcuts: vec![ShortcutKey::Character("🧮".into())],
+                        shortcuts: vec![Shortcut::plain(ShortcutKey::Character("🧮".into()))],
                     },
                     &[],
                 ),
             ],
         ));
         assert!(four_byte_scalar.is_ok());
+    }
+
+    #[test]
+    fn plain_and_primary_shortcuts_for_the_same_key_coexist() {
+        let tree = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "Save".into(),
+                        enabled: true,
+                        shortcuts: vec![
+                            Shortcut::plain(ShortcutKey::Character("s".into())),
+                            Shortcut::new(
+                                ShortcutKey::Character("s".into()),
+                                ShortcutModifiers::primary(),
+                            ),
+                        ],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(tree.is_ok(), "{tree:?}");
+    }
+
+    #[test]
+    fn identical_primary_shortcut_chords_on_two_buttons_are_rejected() {
+        let duplicate = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(
+                    2,
+                    NodeData::ShortcutButton {
+                        label: "First".into(),
+                        enabled: true,
+                        shortcuts: vec![Shortcut::new(
+                            ShortcutKey::Character("s".into()),
+                            ShortcutModifiers::primary(),
+                        )],
+                    },
+                    &[],
+                ),
+                node(
+                    3,
+                    NodeData::ShortcutButton {
+                        label: "Second".into(),
+                        enabled: false,
+                        shortcuts: vec![Shortcut::new(
+                            ShortcutKey::Character("s".into()),
+                            ShortcutModifiers::primary(),
+                        )],
+                    },
+                    &[],
+                ),
+            ],
+        ));
+        assert!(matches!(
+            duplicate,
+            Err(ValidationError::DuplicateShortcut { .. })
+        ));
     }
 
     #[test]

@@ -33,6 +33,13 @@ pub(crate) mod v006 {
     });
 }
 
+pub(crate) mod v007 {
+    wasmtime::component::bindgen!({
+        path: "../../wit/youth-app-v0.0.7",
+        world: "application",
+    });
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolVersion {
     V002,
@@ -40,6 +47,7 @@ pub(crate) enum ProtocolVersion {
     V004,
     V005,
     V006,
+    V007,
 }
 
 impl ProtocolVersion {
@@ -50,6 +58,7 @@ impl ProtocolVersion {
             Self::V004 => "youth:app/application@0.0.4",
             Self::V005 => "youth:app/application@0.0.5",
             Self::V006 => "youth:app/application@0.0.6",
+            Self::V007 => "youth:app/application@0.0.7",
         }
     }
 }
@@ -60,6 +69,7 @@ pub(crate) enum ApplicationBindings {
     V004(v004::Application),
     V005(v005::Application),
     V006(v006::Application),
+    V007(v007::Application),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +102,7 @@ impl ApplicationBindings {
             Self::V004(_) => ProtocolVersion::V004,
             Self::V005(_) => ProtocolVersion::V005,
             Self::V006(_) => ProtocolVersion::V006,
+            Self::V007(_) => ProtocolVersion::V007,
         }
     }
 
@@ -148,6 +159,16 @@ impl ApplicationBindings {
                         result
                             .map(RawTreeSnapshot::V006)
                             .map_err(GuestError::from_v006)
+                    })
+            }
+            Self::V007(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_mount(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V007)
+                            .map_err(GuestError::from_v007)
                     })
             }
         }
@@ -319,6 +340,49 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v006)
                     })
             }
+            Self::V007(bindings) => {
+                let events = v007::youth::app::ui::EventBatch {
+                    tree_revision: revision,
+                    events: events
+                        .iter()
+                        .map(|event| v007::youth::app::ui::Event {
+                            sequence: event.sequence(),
+                            kind: match *event {
+                                HostEvent::Activate { node, .. } => {
+                                    v007::youth::app::ui::EventKind::Activate(node)
+                                }
+                                HostEvent::ScheduleElapsed {
+                                    schedule,
+                                    generation,
+                                    reason,
+                                    ..
+                                } => v007::youth::app::ui::EventKind::ScheduleElapsed(
+                                    v007::youth::app::ui::ElapsedSchedule {
+                                        id: schedule,
+                                        generation,
+                                        reason: match reason {
+                                            youth_state::ElapsedReason::Deadline => {
+                                                v007::youth::app::ui::ElapsedReason::Deadline
+                                            }
+                                            youth_state::ElapsedReason::RecoveredOverdue => {
+                                                v007::youth::app::ui::ElapsedReason::RecoveredOverdue
+                                            }
+                                        },
+                                    },
+                                ),
+                            },
+                        })
+                        .collect(),
+                };
+                bindings
+                    .youth_app_lifecycle()
+                    .call_handle(store, &events)
+                    .map(|result| {
+                        result
+                            .map(RawPatchBatch::V007)
+                            .map_err(GuestError::from_v007)
+                    })
+            }
         }
     }
 
@@ -377,6 +441,16 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v006)
                     })
             }
+            Self::V007(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_resync(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V007)
+                            .map_err(GuestError::from_v007)
+                    })
+            }
         }
     }
 }
@@ -421,6 +495,7 @@ pub(crate) enum RawTreeSnapshot {
     V004(v004::youth::app::ui::TreeSnapshot),
     V005(v005::youth::app::ui::TreeSnapshot),
     V006(v006::youth::app::ui::TreeSnapshot),
+    V007(v007::youth::app::ui::TreeSnapshot),
 }
 
 pub(crate) enum RawPatchBatch {
@@ -429,6 +504,7 @@ pub(crate) enum RawPatchBatch {
     V004(v004::youth::app::ui::PatchBatch),
     V005(v005::youth::app::ui::PatchBatch),
     V006(v006::youth::app::ui::PatchBatch),
+    V007(v007::youth::app::ui::PatchBatch),
 }
 
 impl RawPatchBatch {
@@ -439,6 +515,7 @@ impl RawPatchBatch {
             Self::V004(value) => value.processed_through,
             Self::V005(value) => value.processed_through,
             Self::V006(value) => value.processed_through,
+            Self::V007(value) => value.processed_through,
         }
     }
 }
@@ -507,6 +584,18 @@ impl GuestError {
 
     fn from_v006(value: v006::youth::app::ui::AppError) -> Self {
         use v006::youth::app::ui::AppErrorCode;
+        Self {
+            code: match value.code {
+                AppErrorCode::InvalidState => GuestErrorCode::InvalidState,
+                AppErrorCode::RejectedEvent => GuestErrorCode::RejectedEvent,
+                AppErrorCode::Internal => GuestErrorCode::Internal,
+            },
+            message: value.message,
+        }
+    }
+
+    fn from_v007(value: v007::youth::app::ui::AppError) -> Self {
+        use v007::youth::app::ui::AppErrorCode;
         Self {
             code: match value.code {
                 AppErrorCode::InvalidState => GuestErrorCode::InvalidState,

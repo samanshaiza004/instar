@@ -489,17 +489,67 @@ pub enum CountdownFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Shortcut {
+enum ShortcutKey {
     Character(char),
     Enter,
     Escape,
     Backspace,
 }
 
+/// The chord modifiers a [`Shortcut`] requires to be held.
+///
+/// Only `primary` (Cmd on macOS, Control on Windows/Linux) is supported
+/// today. A plain struct of named flags rather than an opaque bitfield, so
+/// `shift`/`alt` could be added later as honest new fields.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShortcutModifiers {
+    primary: bool,
+}
+
+/// A keyboard shortcut a [`Button`] can declare.
+///
+/// `Shortcut::character('s')` and `Shortcut::primary('s')` are distinct
+/// chords and may both be declared, on the same button or different ones,
+/// without conflicting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Shortcut {
+    key: ShortcutKey,
+    modifiers: ShortcutModifiers,
+}
+
+#[allow(non_upper_case_globals)]
 impl Shortcut {
+    pub const Enter: Self = Self {
+        key: ShortcutKey::Enter,
+        modifiers: ShortcutModifiers { primary: false },
+    };
+    pub const Escape: Self = Self {
+        key: ShortcutKey::Escape,
+        modifiers: ShortcutModifiers { primary: false },
+    };
+    pub const Backspace: Self = Self {
+        key: ShortcutKey::Backspace,
+        modifiers: ShortcutModifiers { primary: false },
+    };
+
+    /// An unmodified character shortcut, such as `Shortcut::character('7')`.
     #[must_use]
     pub const fn character(value: char) -> Self {
-        Self::Character(value)
+        Self {
+            key: ShortcutKey::Character(value),
+            modifiers: ShortcutModifiers { primary: false },
+        }
+    }
+
+    /// A character shortcut that requires the platform's primary modifier
+    /// (Cmd on macOS, Control on Windows/Linux) to be held, such as
+    /// `Shortcut::primary('s')` for Save.
+    #[must_use]
+    pub const fn primary(value: char) -> Self {
+        Self {
+            key: ShortcutKey::Character(value),
+            modifiers: ShortcutModifiers { primary: true },
+        }
     }
 }
 
@@ -2542,7 +2592,7 @@ mod tests {
             Grid::columns(
                 2,
                 [
-                    Button::command(command!("digit-7"), "7").shortcut(Shortcut::Character('7')),
+                    Button::command(command!("digit-7"), "7").shortcut(Shortcut::character('7')),
                     Button::command(command!("equals"), "=").shortcut(Shortcut::Enter),
                 ],
             ),
@@ -2612,11 +2662,11 @@ mod tests {
 
         let excess = Tree::root(
             Button::new(node!("many"), "Many")
-                .shortcut(Shortcut::Character('1'))
-                .shortcut(Shortcut::Character('2'))
-                .shortcut(Shortcut::Character('3'))
-                .shortcut(Shortcut::Character('4'))
-                .shortcut(Shortcut::Character('5')),
+                .shortcut(Shortcut::character('1'))
+                .shortcut(Shortcut::character('2'))
+                .shortcut(Shortcut::character('3'))
+                .shortcut(Shortcut::character('4'))
+                .shortcut(Shortcut::character('5')),
         );
         assert!(excess.flatten().is_err());
     }

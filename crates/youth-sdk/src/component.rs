@@ -226,13 +226,19 @@ fn wire_format(format: super::CountdownFormat) -> ui::CountdownFormat {
     }
 }
 
-fn wire_shortcut(shortcut: super::Shortcut) -> ui::ShortcutKey {
-    match shortcut {
-        super::Shortcut::Character(value) => ui::ShortcutKey::Character(value.to_string()),
-        super::Shortcut::Enter => ui::ShortcutKey::Enter,
-        super::Shortcut::Escape => ui::ShortcutKey::Escape,
-        super::Shortcut::Backspace => ui::ShortcutKey::Backspace,
-    }
+fn wire_shortcut(shortcut: super::Shortcut) -> ui::Shortcut {
+    let key = match shortcut.key {
+        super::ShortcutKey::Character(value) => ui::ShortcutKey::Character(value.to_string()),
+        super::ShortcutKey::Enter => ui::ShortcutKey::Enter,
+        super::ShortcutKey::Escape => ui::ShortcutKey::Escape,
+        super::ShortcutKey::Backspace => ui::ShortcutKey::Backspace,
+    };
+    let modifiers = if shortcut.modifiers.primary {
+        ui::ShortcutModifiers::PRIMARY
+    } else {
+        ui::ShortcutModifiers::empty()
+    };
+    ui::Shortcut { key, modifiers }
 }
 
 fn wire_patch(operation: super::AppliedPatch) -> ui::Patch {

@@ -5727,6 +5727,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-shortcut-primary-v007"
+version = "0.0.2"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "youth-state"
 version = "0.0.2"
 dependencies = [

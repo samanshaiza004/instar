@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use youth_tree::{BoxLayout, NodeId, ShortcutKey, Tree};
+use youth_tree::{BoxLayout, NodeId, Shortcut, ShortcutKey, ShortcutModifiers, Tree};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticAction {
@@ -229,11 +229,27 @@ impl InteractionState {
             }
             LogicalKey::Home | LogicalKey::End => None,
             LogicalKey::Space => self.focused,
-            LogicalKey::Enter => shortcut_target(tree, &ShortcutKey::Enter).or(self.focused),
-            LogicalKey::Escape => shortcut_target(tree, &ShortcutKey::Escape),
-            LogicalKey::Backspace => shortcut_target(tree, &ShortcutKey::Backspace),
+            LogicalKey::Enter => {
+                shortcut_target(tree, &Shortcut::plain(ShortcutKey::Enter)).or(self.focused)
+            }
+            LogicalKey::Escape => shortcut_target(tree, &Shortcut::plain(ShortcutKey::Escape)),
+            LogicalKey::Backspace => {
+                shortcut_target(tree, &Shortcut::plain(ShortcutKey::Backspace))
+            }
+            LogicalKey::Character(value) if primary_held(modifiers) && !modifiers.alt => {
+                shortcut_target(
+                    tree,
+                    &Shortcut::new(
+                        ShortcutKey::Character(value.to_string()),
+                        ShortcutModifiers::primary(),
+                    ),
+                )
+            }
             LogicalKey::Character(value) if !modifiers.control && !modifiers.super_key => {
-                shortcut_target(tree, &ShortcutKey::Character(value.to_string()))
+                shortcut_target(
+                    tree,
+                    &Shortcut::plain(ShortcutKey::Character(value.to_string())),
+                )
             }
             LogicalKey::Character(_) => None,
         };
@@ -261,8 +277,15 @@ fn focused_editor(tree: &Tree, focused: Option<NodeId>) -> Option<NodeId> {
         .then_some(focused)
 }
 
+/// Whether the platform's "primary" modifier (Cmd on macOS, Control on
+/// Windows/Linux) is held. The host maps both raw modifiers onto this single
+/// logical primary, regardless of platform.
+const fn primary_held(modifiers: Modifiers) -> bool {
+    modifiers.control || modifiers.super_key
+}
+
 fn editor_input(key: &LogicalKey, modifiers: Modifiers) -> Option<EditorInput> {
-    let primary = modifiers.control || modifiers.super_key;
+    let primary = primary_held(modifiers);
     let movement = match key {
         LogicalKey::ArrowLeft => Some(EditorMovement::Left),
         LogicalKey::ArrowRight => Some(EditorMovement::Right),
@@ -330,7 +353,7 @@ fn is_enabled_focusable(tree: &Tree, target: NodeId) -> bool {
     enabled_focusables(tree).contains(&target)
 }
 
-fn shortcut_target(tree: &Tree, shortcut: &ShortcutKey) -> Option<NodeId> {
+fn shortcut_target(tree: &Tree, shortcut: &Shortcut) -> Option<NodeId> {
     enabled_focusables(tree).into_iter().find(|id| {
         tree.node(*id)
             .is_some_and(|node| node.data.shortcuts().contains(shortcut))
@@ -458,7 +481,7 @@ fn parent_map(tree: &Tree) -> BTreeMap<NodeId, NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use youth_tree::{Node, NodeData, ShortcutKey, TreeSnapshot};
+    use youth_tree::{Node, NodeData, Shortcut, ShortcutKey, ShortcutModifiers, TreeSnapshot};
 
     fn id(value: u64) -> NodeId {
         NodeId::new(value).unwrap()
@@ -495,6 +518,20 @@ mod tests {
     }
 
     fn button(id_value: u64, label: &str, enabled: bool, shortcuts: Vec<ShortcutKey>) -> Node {
+        button_with_shortcuts(
+            id_value,
+            label,
+            enabled,
+            shortcuts.into_iter().map(Shortcut::plain).collect(),
+        )
+    }
+
+    fn button_with_shortcuts(
+        id_value: u64,
+        label: &str,
+        enabled: bool,
+        shortcuts: Vec<Shortcut>,
+    ) -> Node {
         Node {
             id: id(id_value),
             data: NodeData::ShortcutButton {
@@ -548,6 +585,129 @@ mod tests {
             control: true,
             ..Modifiers::default()
         }
+    }
+
+    /// An Editor alongside a Save button that declares a `Primary+S` chord --
+    /// the SCRATCHPAD-F001 shape: a real Save shortcut that must not fire
+    /// while the user is merely typing "s".
+    fn editor_with_save_fixture() -> Tree {
+        Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2), id(3)],
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Editor {
+                            document_revision: 7,
+                            text: "draft".into(),
+                        },
+                        children: vec![],
+                    },
+                    button_with_shortcuts(
+                        3,
+                        "Save",
+                        true,
+                        vec![Shortcut::new(
+                            ShortcutKey::Character("s".into()),
+                            ShortcutModifiers::primary(),
+                        )],
+                    ),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn focused_editor_declines_primary_s_which_falls_through_to_the_save_shortcut() {
+        let tree = editor_with_save_fixture();
+        let mut state = InteractionState::default();
+        state.focus_pointer_target(&tree, id(2));
+        assert_eq!(state.focused(), Some(id(2)));
+
+        // Plain "s" is ordinary text input: the editor claims it, no action
+        // fires, and the guest is never consulted for it.
+        let plain = state.key(
+            &tree,
+            LogicalKey::Character('s'),
+            Modifiers::default(),
+            false,
+        );
+        assert_eq!(
+            plain.editor_input,
+            Some((id(2), EditorInput::InsertText("s".into())))
+        );
+        assert_eq!(plain.action, None);
+        assert_eq!(state.focused(), Some(id(2)));
+
+        // Primary+S is declined by the editor (it has no InsertText,
+        // Undo/Redo/Copy/Cut/Paste mapping for a bare "s") and falls through
+        // to shortcut routing, which activates Save instead of inserting
+        // anything.
+        let shortcut = state.key(&tree, LogicalKey::Character('s'), primary(false), false);
+        assert_eq!(
+            shortcut.editor_input, None,
+            "a focused editor must not insert literal text for Primary+S"
+        );
+        assert_eq!(shortcut.action, Some(SemanticAction::Activate(id(3))));
+    }
+
+    #[test]
+    fn primary_s_activates_save_while_the_editor_is_unfocused() {
+        let tree = editor_with_save_fixture();
+        let mut state = InteractionState::default();
+        state.focus_pointer_target(&tree, id(3));
+        assert_eq!(state.focused(), Some(id(3)));
+
+        let shortcut = state.key(&tree, LogicalKey::Character('s'), primary(false), false);
+        assert_eq!(shortcut.editor_input, None);
+        assert_eq!(shortcut.action, Some(SemanticAction::Activate(id(3))));
+    }
+
+    #[test]
+    fn plain_s_remains_ordinary_text_input_while_the_editor_is_focused() {
+        let tree = editor_with_save_fixture();
+        let mut state = InteractionState::default();
+        state.focus_pointer_target(&tree, id(2));
+
+        let plain = state.key(
+            &tree,
+            LogicalKey::Character('s'),
+            Modifiers::default(),
+            false,
+        );
+        assert_eq!(
+            plain.editor_input,
+            Some((id(2), EditorInput::InsertText("s".into())))
+        );
+        assert_eq!(plain.action, None);
+    }
+
+    #[test]
+    fn primary_alt_s_does_not_false_positive_match_a_plain_primary_s_shortcut() {
+        let tree = editor_with_save_fixture();
+        let mut state = InteractionState::default();
+        state.focus_pointer_target(&tree, id(3));
+
+        let change = state.key(
+            &tree,
+            LogicalKey::Character('s'),
+            Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+            false,
+        );
+        assert_eq!(change.editor_input, None);
+        assert_eq!(change.action, None);
     }
 
     #[test]
