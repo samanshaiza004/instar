@@ -1296,24 +1296,32 @@ pub async fn run_file_with_options(
             }
             Command::ExpectEditorText { selector, expected } => {
                 let node = selector.node_id();
-                let observed = editor_state
-                    .get(&node)
-                    .map(|result| result.text.as_str())
-                    .or_else(|| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| {
-                                snapshot.nodes.iter().find(|entry| entry.id == node)
-                            })
-                            .and_then(|entry| entry.data.text_value())
-                    });
-                if observed != Some(expected.as_str()) {
+                // Local-edit results only carry metadata (content_changed,
+                // changed_range, cursor/selection) since edits stopped
+                // returning the whole buffer; the live text itself is
+                // fetched fresh, on demand, exactly like a real app would
+                // via `context.editor().snapshot()`.
+                let observed = if editor_state.contains_key(&node) {
+                    Some(
+                        app.editor_snapshot(node)
+                            .await
+                            .map_err(|error| runtime(path, &located, error))?
+                            .text,
+                    )
+                } else {
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.nodes.iter().find(|entry| entry.id == node))
+                        .and_then(|entry| entry.data.text_value())
+                        .map(str::to_owned)
+                };
+                if observed.as_deref() != Some(expected.as_str()) {
                     return Err(assertion_error(
                         path,
                         &located,
                         format!(
                             "expected editor text {selector} to equal {expected:?}; observed {}",
-                            observed.map_or_else(
+                            observed.as_deref().map_or_else(
                                 || "no live Editor session or semantic node".to_owned(),
                                 |value| format!("{value:?}")
                             )
@@ -1327,7 +1335,10 @@ pub async fn run_file_with_options(
                 end,
             } => {
                 let node = selector.node_id();
-                let Some(result) = editor_state.get(&node) else {
+                let Some((cursor, selection)) = editor_state
+                    .get(&node)
+                    .map(|result| (result.cursor, result.selection.clone()))
+                else {
                     return Err(assertion_error(
                         path,
                         &located,
@@ -1336,12 +1347,14 @@ pub async fn run_file_with_options(
                         ),
                     ));
                 };
-                let byte_range = result
-                    .selection
-                    .clone()
-                    .unwrap_or(result.cursor..result.cursor);
-                let observed_start = byte_to_grapheme_index(&result.text, byte_range.start);
-                let observed_end = byte_to_grapheme_index(&result.text, byte_range.end);
+                let byte_range = selection.unwrap_or(cursor..cursor);
+                let text = app
+                    .editor_snapshot(node)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?
+                    .text;
+                let observed_start = byte_to_grapheme_index(&text, byte_range.start);
+                let observed_end = byte_to_grapheme_index(&text, byte_range.end);
                 if (observed_start, observed_end) != (*start, *end) {
                     return Err(assertion_error(
                         path,
