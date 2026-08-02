@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# This crate's `[[bin]]` target is a dev/test-only smoke harness; the shipped
+# `youth` product binary (crates/youth-cli) links this crate as a library and
+# re-execs itself (std::env::current_exe()) for `youth run`/`youth dev`, so a
+# separate `youth-desktop` executable is never invoked in production. Exclude
+# it from dist so only `youth` is packaged and distributed.
+[package.metadata.dist]
+dist = false
+
 [lib]
 path = "src/lib.rs"
 

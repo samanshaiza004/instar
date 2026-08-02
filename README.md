@@ -99,6 +99,13 @@ cargo run -p youth-cli -- run \
   --app-id dev.youth.counter --ephemeral
 ```
 
+## Distribution
+
+The `youth` CLI binary is packaged for release with [`dist`](https://github.com/axodotdev/cargo-dist)
+(`dist-workspace.toml`, `.github/workflows/release.yml`). See
+[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for supported platforms, install
+paths, prerequisites, uninstall steps, and the release procedure.
+
 Offline maintenance never prints stored values. An explicit state root and app
 ID select `state/<app-id>/state.sqlite3`:
 
