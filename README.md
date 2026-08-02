@@ -5,14 +5,14 @@ application components. Applications describe semantic retained UI through a
 typed WIT contract; the host owns rendering, input, durable state, and the
 transaction boundary around every guest turn.
 
-## Developer Preview 0 — External applications
+## Create an application
 
-Youth now proves the complete workflow from a repository outside this
-workspace:
+Install the CLI, check the local toolchain, and generate a standalone Tally
+application:
 
 ```bash
 youth doctor
-youth new tally --id dev.saman.tally
+youth new tally
 cd tally
 youth check
 youth test
@@ -20,11 +20,17 @@ youth build --release
 youth dev
 ```
 
+`youth new tally` derives the durable application ID `dev.youth.tally` from
+the project name. The ID is not a display name: it namespaces the project's
+durable state and other host-owned resources so two applications cannot
+accidentally share them. Choose a different stable identity when you need
+one, for example `youth new tally --id dev.saman.tally`.
+
 The generated application uses a revision-pinned `youth-sdk`, a strict
 language-neutral project manifest and lock, an inspectable WIT snapshot, and
-semantic tests backed by the real runtime. See the
-[Developer Preview guide](docs/book/src/quickstart.md), the authoritative
-[DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
+semantic tests backed by the real runtime. New projects currently target
+`youth:app@0.0.8`. See the [Quickstart](docs/book/src/quickstart.md), the
+historical [DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
 [tooling findings](docs/DEVELOPER-PREVIEW-FINDINGS.md).
 
 ## Utility Suite status
@@ -88,7 +94,7 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app-v0.0.8/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.8`, all frozen and simultaneously supported; the unversioned tree is the generated-project default (`0.0.4`) |
+| `wit/youth-app-v0.0.8/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.8`, all frozen and simultaneously supported; new projects embed the `0.0.8` snapshot from the CLI template |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker, host-owned Editor sessions |

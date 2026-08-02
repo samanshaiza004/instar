@@ -1,4 +1,4 @@
-package youth:app@0.0.4;
+package youth:app@0.0.8;
 
 interface ui {
     type node-id = u64;
@@ -21,11 +21,44 @@ interface ui {
         end,
     }
 
+    record schedule-ref {
+        id: u64,
+        generation: u64,
+    }
+
+    enum time-precision {
+        seconds,
+    }
+
+    enum countdown-format {
+        minutes-seconds,
+    }
+
+    record countdown-data {
+        schedule: schedule-ref,
+        precision: time-precision,
+        format: countdown-format,
+    }
+
+    variant text-content {
+        literal(string),
+        countdown(countdown-data),
+    }
+
     variant shortcut-key {
         character(string),
         enter,
         escape,
         backspace,
+    }
+
+    flags shortcut-modifiers {
+        primary,
+    }
+
+    record shortcut {
+        key: shortcut-key,
+        modifiers: shortcut-modifiers,
     }
 
     record box-data {
@@ -34,20 +67,46 @@ interface ui {
     }
 
     record text-data {
-        value: string,
+        content: text-content,
         alignment: text-alignment,
+    }
+
+    record inline-editor-data {
+        document-revision: u64,
+        text: string,
+    }
+
+    record document-handle {
+        id: u64,
+        generation: u64,
+    }
+
+    record document-version {
+        id: u64,
+        generation: u64,
+    }
+
+    record text-document-editor-data {
+        document: document-handle,
+        version: document-version,
+    }
+
+    variant editor-data {
+        inline(inline-editor-data),
+        text-document(text-document-editor-data),
     }
 
     record button-data {
         label: string,
         enabled: bool,
-        shortcuts: list<shortcut-key>,
+        shortcuts: list<shortcut>,
     }
 
     variant node-data {
         root,
         box(box-data),
         text(text-data),
+        editor(editor-data),
         button(button-data),
     }
 
@@ -73,7 +132,7 @@ interface ui {
 
     record set-text {
         id: node-id,
-        value: string,
+        value: text-content,
     }
 
     record set-label {
@@ -84,6 +143,12 @@ interface ui {
     record set-enabled {
         id: node-id,
         value: bool,
+    }
+
+    record set-editor-document-version {
+        id: node-id,
+        document: document-handle,
+        version: document-version,
     }
 
     record insert-child {
@@ -111,6 +176,7 @@ interface ui {
         set-text(set-text),
         set-label(set-label),
         set-enabled(set-enabled),
+        set-editor-document-version(set-editor-document-version),
         insert-child(insert-child),
         remove-child(remove-child),
         move-child(move-child),
@@ -122,6 +188,42 @@ interface ui {
         reason: elapsed-reason,
     }
 
+    record editor-dirty-change {
+        editor: node-id,
+        dirty: bool,
+    }
+
+    record save-request {
+        id: u64,
+        generation: u64,
+    }
+
+    record saved-document {
+        document: document-handle,
+        version: document-version,
+        saved-edit-sequence: u64,
+        still-dirty: bool,
+    }
+
+    enum text-document-error-code {
+        conflict,
+        missing,
+        wrong-type,
+        permission-denied,
+        unavailable,
+        internal,
+    }
+
+    variant save-outcome {
+        saved(saved-document),
+        failed(text-document-error-code),
+    }
+
+    record save-completion {
+        request: save-request,
+        outcome: save-outcome,
+    }
+
     enum elapsed-reason {
         deadline,
         recovered-overdue,
@@ -130,6 +232,8 @@ interface ui {
     variant event-kind {
         activate(node-id),
         schedule-elapsed(elapsed-schedule),
+        editor-dirty-changed(editor-dirty-change),
+        text-document-save-completed(save-completion),
     }
 
     record event {
@@ -175,7 +279,9 @@ interface lifecycle {
 }
 
 world application {
+    import youth:editor/session@0.0.1;
     import youth:state/store@0.0.1;
+    import youth:text-document/document@0.0.1;
     import youth:time/scheduler@0.0.1;
     export lifecycle;
 }

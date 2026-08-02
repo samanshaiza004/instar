@@ -137,9 +137,13 @@
     <h2>Try it</h2>
     <pre><code>cargo install youth-cli --git https://github.com/samanshaiza004/youth
 youth doctor
-youth new tally --id dev.yourname.tally
+youth new tally
 cd tally &amp;&amp; youth dev</code></pre>
     <p class="note">
+      The project name derives the stable app ID <code>dev.youth.tally</code>;
+      add <code>--id</code> when you need a different identity. The ID selects
+      durable state and is not a display name.
+      <br>
       Requires a Rust toolchain with the <code>wasm32-wasip2</code> target;
       <code>youth doctor</code> checks and tells you what's missing. A
       packaged installer (<code>curl | sh</code>, no Rust toolchain to

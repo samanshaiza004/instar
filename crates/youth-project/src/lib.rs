@@ -16,17 +16,17 @@ use youth_state::AppId;
 pub const MANIFEST_NAME: &str = "Youth.toml";
 pub const LOCK_NAME: &str = "Youth.lock";
 /// Default protocol for newly generated projects.
-pub const SUPPORTED_PROTOCOL: &str = "0.0.4";
+pub const SUPPORTED_PROTOCOL: &str = "0.0.8";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "4a0bba175e7eb9643a0348a94a6a3efadbdae0e1";
+pub const SDK_REVISION: &str = "c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7";
 /// Default template version for newly generated projects.
 pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// WIT digest used by the default generated-project profile.
 pub const TEMPLATE_WIT_SHA256: &str =
-    "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad";
+    "9b2fb0299a132b75f3526c2cdb1ac33f1c6633f6eb3e4096eeb57c6fb70b89a7";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
@@ -52,7 +52,7 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         protocol: "0.0.4",
         wit_sha256: "d0ed637d17feb4c4cbcd6fb19794f74b2003950f250902a80b9166ed7cda52ad",
         template_version: 3,
-        sdk_revision: SDK_REVISION,
+        sdk_revision: "4a0bba175e7eb9643a0348a94a6a3efadbdae0e1",
     },
     ContractProfile {
         protocol: "0.0.5",
@@ -711,9 +711,9 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
     }
 
     #[test]
-    fn generated_project_defaults_select_the_v004_profile() {
+    fn generated_project_defaults_select_the_v008_profile() {
         let default = contract_profile(SUPPORTED_PROTOCOL).expect("default profile");
-        assert_eq!(default.protocol, "0.0.4");
+        assert_eq!(default.protocol, "0.0.8");
         assert_eq!(default.wit_sha256, TEMPLATE_WIT_SHA256);
         assert_eq!(default.template_version, TEMPLATE_VERSION);
         assert!(

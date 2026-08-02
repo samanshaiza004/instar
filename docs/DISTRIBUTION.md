@@ -106,7 +106,8 @@ from directories with no relationship to this repository checkout:
 ```
 youth --version
 youth doctor            # cargo/rustc/rustup/toolchain/target checks
-youth new <dest> --id <app-id>
+youth new <dest>                         # derives dev.youth.<package>
+youth new <dest> --id <app-id>           # optional explicit identity
 cd <dest> && youth check
 youth test
 youth build --release

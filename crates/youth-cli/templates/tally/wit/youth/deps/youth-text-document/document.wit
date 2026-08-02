@@ -1,0 +1,37 @@
+package youth:text-document@0.0.1;
+
+interface document {
+    record document-handle {
+        id: u64,
+        generation: u64,
+    }
+
+    record document-version {
+        id: u64,
+        generation: u64,
+    }
+
+    record document-info {
+        handle: document-handle,
+        version: document-version,
+        relative-path: string,
+        filename: string,
+    }
+
+    record save-request {
+        id: u64,
+        generation: u64,
+    }
+
+    enum error-code {
+        unavailable,
+        busy,
+        invalid-document,
+        invalid-editor,
+        wrong-phase,
+        internal,
+    }
+
+    current: func() -> result<document-info, error-code>;
+    request-save: func(document: document-handle, editor: u64) -> result<save-request, error-code>;
+}

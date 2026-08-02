@@ -1,7 +1,7 @@
 [app]
 id = "{{app_id}}"
 name = "{{display_name}}"
-protocol = "0.0.4"
+protocol = "0.0.8"
 
 [build]
 language = "rust"

@@ -149,7 +149,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.2",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -178,20 +178,13 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.2"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a207d6d6a2b7fc470b80443726053f18a2481b7e1eee970597051596567987a3"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "youth-template-app"
-version = "0.0.1"
-dependencies = [
- "youth-sdk",
 ]
 
 [[package]]
@@ -332,9 +325,16 @@ dependencies = [
 [[package]]
 name = "youth-sdk"
 version = "0.0.2"
-source = "git+https://github.com/samanshaiza004/youth?rev=4a0bba175e7eb9643a0348a94a6a3efadbdae0e1#4a0bba175e7eb9643a0348a94a6a3efadbdae0e1"
+source = "git+https://github.com/samanshaiza004/youth?rev=c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7#c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "youth-template-app"
+version = "0.0.1"
+dependencies = [
+ "youth-sdk",
 ]
 
 [[package]]

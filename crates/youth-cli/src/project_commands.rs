@@ -43,9 +43,17 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
         "wit/youth/deps/youth-time/scheduler.wit",
         include_str!("../templates/tally/wit/youth/deps/youth-time/scheduler.wit"),
     ),
+    (
+        "wit/youth/deps/youth-editor/session.wit",
+        include_str!("../templates/tally/wit/youth/deps/youth-editor/session.wit"),
+    ),
+    (
+        "wit/youth/deps/youth-text-document/document.wit",
+        include_str!("../templates/tally/wit/youth/deps/youth-text-document/document.wit"),
+    ),
 ];
 
-pub fn new_project(destination: &Path, app_id: &AppId) -> Result<(), CliError> {
+pub fn new_project(destination: &Path, requested_app_id: Option<&AppId>) -> Result<(), CliError> {
     if destination.exists() {
         return Err(message(format!(
             "refusing to overwrite existing destination {}",
@@ -58,6 +66,10 @@ pub fn new_project(destination: &Path, app_id: &AppId) -> Result<(), CliError> {
         .ok_or_else(|| message("destination must have a UTF-8 final path component"))?;
     let package = cargo_package_name(file_name)?;
     let display_name = display_name(file_name);
+    let (app_id, id_source) = match requested_app_id {
+        Some(app_id) => (app_id.clone(), "provided with --id"),
+        None => (default_app_id(&package)?, "derived from the project name"),
+    };
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
         return Err(message(format!(
@@ -67,14 +79,17 @@ pub fn new_project(destination: &Path, app_id: &AppId) -> Result<(), CliError> {
     }
 
     let temporary = unique_temporary_sibling(parent, file_name)?;
-    let result = write_template(&temporary, &package, &display_name, app_id)
+    let result = write_template(&temporary, &package, &display_name, &app_id)
         .and_then(|()| fs::rename(&temporary, destination).map_err(|error| io(destination, error)));
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
     }
     result?;
     println!("created: {}", destination.display());
-    println!("app ID: {app_id}");
+    println!("app ID: {app_id} ({id_source})");
+    println!(
+        "note: the app ID selects this project's durable state; use --id to choose a different identity"
+    );
     println!("next: cd {} && youth check", destination.display());
     Ok(())
 }
@@ -139,6 +154,11 @@ fn cargo_package_name(name: &str) -> Result<String, CliError> {
         package.insert_str(0, "app-");
     }
     Ok(package)
+}
+
+fn default_app_id(package: &str) -> Result<AppId, CliError> {
+    AppId::parse(format!("dev.youth.{package}"))
+        .map_err(|error| message(format!("could not derive a default app ID: {error}")))
 }
 
 fn display_name(name: &str) -> String {
@@ -732,6 +752,10 @@ mod tests {
         assert_eq!(cargo_package_name("My Tally").unwrap(), "my-tally");
         assert_eq!(cargo_package_name("123").unwrap(), "app-123");
         assert_eq!(display_name("my-tally_app"), "My Tally App");
+        assert_eq!(
+            default_app_id("my-tally").unwrap().as_str(),
+            "dev.youth.my-tally"
+        );
     }
 
     #[test]
@@ -756,6 +780,18 @@ mod tests {
             include_str!("../templates/tally/wit/youth/deps/youth-time/scheduler.wit"),
         )
         .unwrap();
+        fs::create_dir_all(root.join("deps/youth-editor")).unwrap();
+        fs::write(
+            root.join("deps/youth-editor/session.wit"),
+            include_str!("../templates/tally/wit/youth/deps/youth-editor/session.wit"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("deps/youth-text-document")).unwrap();
+        fs::write(
+            root.join("deps/youth-text-document/document.wit"),
+            include_str!("../templates/tally/wit/youth/deps/youth-text-document/document.wit"),
+        )
+        .unwrap();
         assert_eq!(
             youth_project::hash_wit_tree(root).unwrap(),
             youth_project::TEMPLATE_WIT_SHA256
@@ -766,13 +802,13 @@ mod tests {
     fn generator_writes_a_locked_external_project_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("My Tally");
-        let app_id = AppId::parse("dev.saman.generated").unwrap();
-        new_project(&destination, &app_id).unwrap();
+        new_project(&destination, None).unwrap();
 
         let project = Project::load(&destination).unwrap();
         project.verify_locked_inputs(CLI_VERSION).unwrap();
         assert_eq!(project.manifest.build.package, "my-tally");
         assert_eq!(project.manifest.app.name, "My Tally");
+        assert_eq!(project.manifest.app.id, "dev.youth.my-tally");
         let cargo = fs::read_to_string(destination.join("Cargo.toml")).unwrap();
         assert!(cargo.contains(&format!("rev = \"{}\"", youth_project::SDK_REVISION)));
         assert!(!cargo.contains("path ="));
@@ -788,13 +824,27 @@ mod tests {
     }
 
     #[test]
+    fn generator_honors_an_explicit_app_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("Tally");
+        let app_id = AppId::parse("dev.saman.tally").unwrap();
+        new_project(&destination, Some(&app_id)).unwrap();
+
+        let project = Project::load(&destination).unwrap();
+        assert_eq!(project.manifest.app.id, "dev.saman.tally");
+    }
+
+    #[test]
     fn generator_refuses_every_existing_destination() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("tally");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("owned.txt"), "keep").unwrap();
-        let error = new_project(&destination, &AppId::parse("dev.saman.generated").unwrap())
-            .expect_err("existing destination must fail");
+        let error = new_project(
+            &destination,
+            Some(&AppId::parse("dev.saman.generated").unwrap()),
+        )
+        .expect_err("existing destination must fail");
         assert!(error.to_string().contains("refusing to overwrite"));
         assert_eq!(
             fs::read_to_string(destination.join("owned.txt")).unwrap(),

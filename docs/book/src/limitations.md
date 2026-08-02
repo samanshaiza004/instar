@@ -25,8 +25,7 @@ platform, not a general application platform.
 - An application owns one native window.
 - The latest application protocol is `0.0.8`; the host also runs `0.0.7`, `0.0.6`,
   `0.0.5`, `0.0.4`, `0.0.3`, and `0.0.2` simultaneously. Generated projects
-  still default to `0.0.4` unless the template explicitly opts into a newer
-  profile.
+  default to `0.0.8`; older profiles remain available for compatibility.
 - Guests are Rust-only and target `wasm32-wasip2`.
 - `youth build` emits a bare validated component; `youth-cli` itself is
   packaged for release via `dist` (see

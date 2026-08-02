@@ -30,8 +30,9 @@ enum Command {
     /// Create the proven Rust Tally project in a new directory.
     New {
         destination: PathBuf,
-        #[arg(long)]
-        id: AppId,
+        /// Durable application identity. Defaults to `dev.youth.<project-name>`.
+        #[arg(long, value_name = "APP_ID")]
+        id: Option<AppId>,
     },
     /// Diagnose the local Youth development environment.
     Doctor {
@@ -245,7 +246,9 @@ fn init_tracing() {
 
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::New { destination, id } => project_commands::new_project(&destination, &id)?,
+        Command::New { destination, id } => {
+            project_commands::new_project(&destination, id.as_ref())?
+        }
         Command::Check => project_commands::check_project()?,
         Command::Build { release } => project_commands::build_project(release)?,
         Command::Test {
