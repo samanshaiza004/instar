@@ -64,6 +64,8 @@ enum Command {
         /// Exercise the supervisor without native presentation.
         #[arg(long, hide = true)]
         headless_supervisor: bool,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
     },
     #[command(name = "__dev-child", hide = true)]
     DevChild {
@@ -72,6 +74,8 @@ enum Command {
         app_id: AppId,
         #[arg(long)]
         state_dir: PathBuf,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
     },
     /// Check that a component loads and exports the Youth world. Does not mount.
     Validate { component: PathBuf },
@@ -80,6 +84,8 @@ enum Command {
         component: PathBuf,
         #[command(flatten)]
         state: HeadlessState,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
     },
     /// Mount, deliver one activation, and print the resulting tree.
     Activate {
@@ -117,6 +123,8 @@ enum Command {
         window_width: u32,
         #[arg(long, default_value_t = 360)]
         window_height: u32,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
         /// Accept an internal orderly-shutdown signal on stdin.
         #[arg(long, hide = true)]
         supervised: bool,
@@ -170,6 +178,24 @@ struct HeadlessState {
     state_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, clap::Args)]
+struct WorkspaceArgs {
+    /// Trusted directory containing the granted document.
+    #[arg(long, requires = "document")]
+    workspace_root: Option<PathBuf>,
+    /// UTF-8 path to one existing text document, relative to the workspace root.
+    #[arg(long, requires = "workspace_root")]
+    document: Option<PathBuf>,
+}
+
+impl WorkspaceArgs {
+    fn into_grant(self) -> Option<youth_runtime::WorkspaceGrant> {
+        self.workspace_root
+            .zip(self.document)
+            .map(|(root, document)| youth_runtime::WorkspaceGrant::text_document(root, document))
+    }
+}
+
 fn main() -> ExitCode {
     init_tracing();
     let command = Cli::parse().command;
@@ -183,15 +209,17 @@ fn main() -> ExitCode {
             window_width,
             window_height,
             supervised,
-        } => run_desktop(
+            workspace,
+        } => run_desktop(DesktopLaunch {
             component,
             app_id,
             state_dir,
             ephemeral,
-            window_width,
-            window_height,
+            width: window_width,
+            height: window_height,
             supervised,
-        ),
+            workspace,
+        }),
         command => tokio::runtime::Runtime::new()
             .map_err(|error| CliError::Message(format!("failed to start CLI runtime: {error}")))
             .and_then(|runtime| runtime.block_on(run(command))),
@@ -235,12 +263,14 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Dev {
             headless_supervisor,
-        } => project_commands::dev_project(headless_supervisor).await?,
+            workspace,
+        } => project_commands::dev_project(headless_supervisor, workspace).await?,
         Command::DevChild {
             component,
             app_id,
             state_dir,
-        } => project_commands::headless_dev_child(component, app_id, state_dir).await?,
+            workspace,
+        } => project_commands::headless_dev_child(component, app_id, state_dir, workspace).await?,
         Command::Validate { component } => {
             let app = YouthAppHandle::spawn_ephemeral(&component).map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
@@ -250,8 +280,12 @@ async fn run(command: Command) -> Result<(), CliError> {
                 inspection.world
             );
         }
-        Command::Mount { component, state } => {
-            let app = spawn_headless(&component, state)?;
+        Command::Mount {
+            component,
+            state,
+            workspace,
+        } => {
+            let app = spawn_headless(&component, state, workspace)?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             println!("component: {}", component_name(&component));
@@ -269,7 +303,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             state,
         } => {
             let node = parse_node_id(node)?;
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             match app.activate(node).await {
                 Ok(receipt) => {
@@ -299,7 +333,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             state,
         } => {
             let nodes = read_script(&events)?;
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             for node in nodes {
                 app.activate(node).await.map_err(CliError::Runtime)?;
@@ -312,7 +346,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             json,
             state,
         } => {
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             if json {
@@ -329,7 +363,7 @@ async fn run(command: Command) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_desktop(
+struct DesktopLaunch {
     component: PathBuf,
     app_id: AppId,
     state_dir: Option<PathBuf>,
@@ -337,7 +371,20 @@ fn run_desktop(
     width: u32,
     height: u32,
     supervised: bool,
-) -> Result<(), CliError> {
+    workspace: WorkspaceArgs,
+}
+
+fn run_desktop(launch: DesktopLaunch) -> Result<(), CliError> {
+    let DesktopLaunch {
+        component,
+        app_id,
+        state_dir,
+        ephemeral,
+        width,
+        height,
+        supervised,
+        workspace,
+    } = launch;
     let state = if ephemeral {
         StateLocation::Memory
     } else {
@@ -357,6 +404,7 @@ fn run_desktop(
             app_id,
             state,
             limits: youth_runtime::RuntimeLimits::default(),
+            workspace: workspace.into_grant(),
         },
         width,
         height,
@@ -369,16 +417,29 @@ fn run_desktop(
     .map_err(CliError::Desktop)
 }
 
-fn spawn_headless(component: &Path, state: HeadlessState) -> Result<YouthAppHandle, CliError> {
+fn spawn_headless(
+    component: &Path,
+    state: HeadlessState,
+    workspace: WorkspaceArgs,
+) -> Result<YouthAppHandle, CliError> {
+    let workspace = workspace.into_grant();
     match (state.app_id, state.state_dir) {
         (Some(app_id), Some(root)) => YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
             component_path: component.to_owned(),
             state: StateLocation::File(root.join(app_id.as_str()).join("state.sqlite3")),
             app_id,
             limits: youth_runtime::RuntimeLimits::default(),
+            workspace,
         })
         .map_err(CliError::Runtime),
-        (None, None) => YouthAppHandle::spawn_ephemeral(component).map_err(CliError::Runtime),
+        (None, None) => YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
+            component_path: component.to_owned(),
+            state: StateLocation::Memory,
+            app_id: AppId::parse("dev.youth.ephemeral").expect("static app ID is valid"),
+            limits: youth_runtime::RuntimeLimits::default(),
+            workspace,
+        })
+        .map_err(CliError::Runtime),
         _ => Err(CliError::Message(
             "--app-id and --state-dir must be supplied together".into(),
         )),

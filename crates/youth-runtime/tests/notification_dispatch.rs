@@ -41,6 +41,7 @@ fn config(
             },
             ..RuntimeLimits::default()
         },
+        workspace: None,
     }
 }
 

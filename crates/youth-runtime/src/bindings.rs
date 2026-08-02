@@ -40,6 +40,13 @@ pub(crate) mod v007 {
     });
 }
 
+pub(crate) mod v008 {
+    wasmtime::component::bindgen!({
+        path: "../../wit/youth-app-v0.0.8",
+        world: "application",
+    });
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolVersion {
     V002,
@@ -48,6 +55,7 @@ pub(crate) enum ProtocolVersion {
     V005,
     V006,
     V007,
+    V008,
 }
 
 impl ProtocolVersion {
@@ -59,6 +67,7 @@ impl ProtocolVersion {
             Self::V005 => "youth:app/application@0.0.5",
             Self::V006 => "youth:app/application@0.0.6",
             Self::V007 => "youth:app/application@0.0.7",
+            Self::V008 => "youth:app/application@0.0.8",
         }
     }
 }
@@ -70,6 +79,7 @@ pub(crate) enum ApplicationBindings {
     V005(v005::Application),
     V006(v006::Application),
     V007(v007::Application),
+    V008(v008::Application),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,12 +94,24 @@ pub(crate) enum HostEvent {
         generation: u64,
         reason: youth_state::ElapsedReason,
     },
+    EditorDirtyChanged {
+        sequence: u64,
+        editor: u64,
+        dirty: bool,
+    },
+    TextDocumentSaveCompleted {
+        sequence: u64,
+        completion: crate::text_document::SaveCompletion,
+    },
 }
 
 impl HostEvent {
     pub(crate) const fn sequence(self) -> u64 {
         match self {
-            Self::Activate { sequence, .. } | Self::ScheduleElapsed { sequence, .. } => sequence,
+            Self::Activate { sequence, .. }
+            | Self::ScheduleElapsed { sequence, .. }
+            | Self::EditorDirtyChanged { sequence, .. }
+            | Self::TextDocumentSaveCompleted { sequence, .. } => sequence,
         }
     }
 }
@@ -103,6 +125,7 @@ impl ApplicationBindings {
             Self::V005(_) => ProtocolVersion::V005,
             Self::V006(_) => ProtocolVersion::V006,
             Self::V007(_) => ProtocolVersion::V007,
+            Self::V008(_) => ProtocolVersion::V008,
         }
     }
 
@@ -171,6 +194,16 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v007)
                     })
             }
+            Self::V008(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_mount(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V008)
+                            .map_err(GuestError::from_v008)
+                    })
+            }
         }
     }
 
@@ -180,6 +213,19 @@ impl ApplicationBindings {
         revision: u64,
         events: &[HostEvent],
     ) -> wasmtime::Result<Result<RawPatchBatch, GuestError>> {
+        if !matches!(self, Self::V008(_))
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    HostEvent::EditorDirtyChanged { .. }
+                        | HostEvent::TextDocumentSaveCompleted { .. }
+                )
+            })
+        {
+            return Err(wasmtime::Error::msg(
+                "protocols before 0.0.8 cannot represent text-document events",
+            ));
+        }
         match self {
             Self::V002(bindings) => {
                 let events = activation_events_v002(events)?;
@@ -241,6 +287,10 @@ impl ApplicationBindings {
                                         },
                                     },
                                 ),
+                                HostEvent::EditorDirtyChanged { .. }
+                                | HostEvent::TextDocumentSaveCompleted { .. } => {
+                                    unreachable!("text-document events were rejected above")
+                                }
                             },
                         })
                         .collect(),
@@ -284,6 +334,10 @@ impl ApplicationBindings {
                                         },
                                     },
                                 ),
+                                HostEvent::EditorDirtyChanged { .. }
+                                | HostEvent::TextDocumentSaveCompleted { .. } => {
+                                    unreachable!("text-document events were rejected above")
+                                }
                             },
                         })
                         .collect(),
@@ -327,6 +381,10 @@ impl ApplicationBindings {
                                         },
                                     },
                                 ),
+                                HostEvent::EditorDirtyChanged { .. }
+                                | HostEvent::TextDocumentSaveCompleted { .. } => {
+                                    unreachable!("text-document events were rejected above")
+                                }
                             },
                         })
                         .collect(),
@@ -370,6 +428,10 @@ impl ApplicationBindings {
                                         },
                                     },
                                 ),
+                                HostEvent::EditorDirtyChanged { .. }
+                                | HostEvent::TextDocumentSaveCompleted { .. } => {
+                                    unreachable!("text-document events were rejected above")
+                                }
                             },
                         })
                         .collect(),
@@ -381,6 +443,23 @@ impl ApplicationBindings {
                         result
                             .map(RawPatchBatch::V007)
                             .map_err(GuestError::from_v007)
+                    })
+            }
+            Self::V008(bindings) => {
+                let events = v008::youth::app::ui::EventBatch {
+                    tree_revision: revision,
+                    events: events
+                        .iter()
+                        .map(event_v008)
+                        .collect::<wasmtime::Result<Vec<_>>>()?,
+                };
+                bindings
+                    .youth_app_lifecycle()
+                    .call_handle(store, &events)
+                    .map(|result| {
+                        result
+                            .map(RawPatchBatch::V008)
+                            .map_err(GuestError::from_v008)
                     })
             }
         }
@@ -451,6 +530,16 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v007)
                     })
             }
+            Self::V008(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_resync(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V008)
+                            .map_err(GuestError::from_v008)
+                    })
+            }
         }
     }
 }
@@ -465,7 +554,9 @@ fn activation_events_v002(
                 sequence,
                 kind: v002::youth::app::ui::EventKind::Activate(node),
             }),
-            HostEvent::ScheduleElapsed { .. } => Err(wasmtime::Error::msg(
+            HostEvent::ScheduleElapsed { .. }
+            | HostEvent::EditorDirtyChanged { .. }
+            | HostEvent::TextDocumentSaveCompleted { .. } => Err(wasmtime::Error::msg(
                 "protocol 0.0.2 cannot represent schedule-elapsed events",
             )),
         })
@@ -482,7 +573,9 @@ fn activation_events_v003(
                 sequence,
                 kind: v003::youth::app::ui::EventKind::Activate(node),
             }),
-            HostEvent::ScheduleElapsed { .. } => Err(wasmtime::Error::msg(
+            HostEvent::ScheduleElapsed { .. }
+            | HostEvent::EditorDirtyChanged { .. }
+            | HostEvent::TextDocumentSaveCompleted { .. } => Err(wasmtime::Error::msg(
                 "protocol 0.0.3 cannot represent schedule-elapsed events",
             )),
         })
@@ -496,6 +589,7 @@ pub(crate) enum RawTreeSnapshot {
     V005(v005::youth::app::ui::TreeSnapshot),
     V006(v006::youth::app::ui::TreeSnapshot),
     V007(v007::youth::app::ui::TreeSnapshot),
+    V008(v008::youth::app::ui::TreeSnapshot),
 }
 
 pub(crate) enum RawPatchBatch {
@@ -505,6 +599,7 @@ pub(crate) enum RawPatchBatch {
     V005(v005::youth::app::ui::PatchBatch),
     V006(v006::youth::app::ui::PatchBatch),
     V007(v007::youth::app::ui::PatchBatch),
+    V008(v008::youth::app::ui::PatchBatch),
 }
 
 impl RawPatchBatch {
@@ -516,6 +611,7 @@ impl RawPatchBatch {
             Self::V005(value) => value.processed_through,
             Self::V006(value) => value.processed_through,
             Self::V007(value) => value.processed_through,
+            Self::V008(value) => value.processed_through,
         }
     }
 }
@@ -605,4 +701,49 @@ impl GuestError {
             message: value.message,
         }
     }
+
+    fn from_v008(value: v008::youth::app::ui::AppError) -> Self {
+        use v008::youth::app::ui::AppErrorCode;
+        Self {
+            code: match value.code {
+                AppErrorCode::InvalidState => GuestErrorCode::InvalidState,
+                AppErrorCode::RejectedEvent => GuestErrorCode::RejectedEvent,
+                AppErrorCode::Internal => GuestErrorCode::Internal,
+            },
+            message: value.message,
+        }
+    }
+}
+
+fn event_v008(event: &HostEvent) -> wasmtime::Result<v008::youth::app::ui::Event> {
+    use v008::youth::app::ui;
+    let kind = match event {
+        HostEvent::Activate { node, .. } => ui::EventKind::Activate(*node),
+        HostEvent::ScheduleElapsed {
+            schedule,
+            generation,
+            reason,
+            ..
+        } => ui::EventKind::ScheduleElapsed(ui::ElapsedSchedule {
+            id: *schedule,
+            generation: *generation,
+            reason: match reason {
+                youth_state::ElapsedReason::Deadline => ui::ElapsedReason::Deadline,
+                youth_state::ElapsedReason::RecoveredOverdue => ui::ElapsedReason::RecoveredOverdue,
+            },
+        }),
+        HostEvent::EditorDirtyChanged { editor, dirty, .. } => {
+            ui::EventKind::EditorDirtyChanged(ui::EditorDirtyChange {
+                editor: *editor,
+                dirty: *dirty,
+            })
+        }
+        HostEvent::TextDocumentSaveCompleted { completion, .. } => {
+            ui::EventKind::TextDocumentSaveCompleted(completion.as_wire_v008())
+        }
+    };
+    Ok(ui::Event {
+        sequence: event.sequence(),
+        kind,
+    })
 }

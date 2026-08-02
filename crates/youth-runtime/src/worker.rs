@@ -121,7 +121,7 @@ enum WorkerMessage {
     },
     Wake(youth_state::WakeToken),
     Reconcile,
-    Shutdown,
+    SaveCompleted(crate::SaveCompletion),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +136,12 @@ pub enum TurnOrigin {
     ScheduleElapsed {
         schedule_id: ScheduleId,
         generation: Generation,
+    },
+    EditorDirtyChanged {
+        editor: youth_tree::NodeId,
+    },
+    TextDocumentSaveCompleted {
+        request_id: u64,
     },
 }
 
@@ -201,6 +207,7 @@ impl YouthAppHandle {
         let thread_component_id = component_id.clone();
         let thread_events = event_tx.clone();
         let thread_presentation = presentation.clone();
+        let thread_mailbox = mailbox_tx.clone();
         std::thread::Builder::new()
             .name(format!("youth-app-{thread_component_id}"))
             .spawn(move || {
@@ -209,6 +216,7 @@ impl YouthAppHandle {
                     mailbox_rx,
                     thread_events,
                     thread_presentation,
+                    thread_mailbox,
                     init_tx,
                 );
             })
@@ -363,10 +371,7 @@ impl YouthAppHandle {
         self.send_request(AppCommand::Stop, ReplySender::Stop(reply))
             .await?;
         response.await.map_err(|_| self.worker_stopped())??;
-        self.mailbox_tx
-            .send(WorkerMessage::Shutdown)
-            .await
-            .map_err(|_| self.worker_stopped())
+        Ok(())
     }
 
     async fn send_request(
@@ -435,6 +440,7 @@ fn worker_main(
     mut mailbox_rx: mpsc::Receiver<WorkerMessage>,
     event_tx: broadcast::Sender<RuntimeEvent>,
     presentation: PresentationReader,
+    mailbox_tx: mpsc::Sender<WorkerMessage>,
     init_tx: std::sync::mpsc::SyncSender<Result<(), RuntimeError>>,
 ) {
     if !matches!(mailbox_rx.blocking_recv(), Some(WorkerMessage::Reconcile)) {
@@ -461,12 +467,21 @@ fn worker_main(
         return;
     }
     sync_presentation(&mut app, &presentation);
+    let mut save_worker: Option<std::thread::JoinHandle<()>> = None;
 
     while let Some(message) = mailbox_rx.blocking_recv() {
         let request = matches!(&message, WorkerMessage::Request { .. });
         match message {
             WorkerMessage::Request { command, reply } => {
-                if handle_request(&mut app, command, reply, &event_tx, &presentation) {
+                if handle_request(
+                    &mut app,
+                    command,
+                    reply,
+                    &event_tx,
+                    &presentation,
+                    &mailbox_tx,
+                    &mut save_worker,
+                ) {
                     break;
                 }
             }
@@ -476,11 +491,30 @@ fn worker_main(
                     publish_fault_if_any(&app, &event_tx, &error);
                 }
             }
-            WorkerMessage::Shutdown => break,
+            WorkerMessage::SaveCompleted(completion) => {
+                if let Some(worker) = save_worker.take() {
+                    let _ = worker.join();
+                }
+                let request_id = completion.request.id;
+                match app.deliver_save_completion(completion) {
+                    Ok(receipt) => {
+                        sync_presentation(&mut app, &presentation);
+                        let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
+                            origin: TurnOrigin::TextDocumentSaveCompleted { request_id },
+                            receipt,
+                        }));
+                    }
+                    Err(error) => publish_fault_if_any(&app, &event_tx, &error),
+                }
+                dispatch_committed_save(&mut app, &mailbox_tx, &mut save_worker);
+            }
         }
         if !request {
             sync_presentation(&mut app, &presentation);
         }
+    }
+    if let Some(worker) = save_worker.take() {
+        let _ = worker.join();
     }
 }
 
@@ -510,12 +544,16 @@ fn sync_presentation(app: &mut crate::YouthApp, presentation: &PresentationReade
         .into_iter()
         .flat_map(|tree| tree.to_snapshot().nodes)
         .filter_map(|node| {
-            matches!(node.data, youth_tree::NodeData::Editor { .. })
-                .then(|| {
-                    app.editor_presentation_generation(node.id)
-                        .map(|generation| (node.id, generation))
-                })
-                .flatten()
+            matches!(
+                node.data,
+                youth_tree::NodeData::Editor { .. }
+                    | youth_tree::NodeData::TextDocumentEditor { .. }
+            )
+            .then(|| {
+                app.editor_presentation_generation(node.id)
+                    .map(|generation| (node.id, generation))
+            })
+            .flatten()
         })
         .collect();
     *presentation
@@ -632,6 +670,8 @@ fn handle_request(
     reply: ReplySender,
     event_tx: &broadcast::Sender<RuntimeEvent>,
     presentation: &PresentationReader,
+    mailbox_tx: &mpsc::Sender<WorkerMessage>,
+    save_worker: &mut Option<std::thread::JoinHandle<()>>,
 ) -> bool {
     match (command, reply) {
         (AppCommand::Mount, ReplySender::Snapshot(reply)) => {
@@ -661,6 +701,7 @@ fn handle_request(
             } else if let Err(error) = &result {
                 publish_fault_if_any(app, event_tx, error);
             }
+            dispatch_committed_save(app, mailbox_tx, save_worker);
             let _ = reply.send(result);
         }
         (AppCommand::EditorLocalEdit { editor, edit }, ReplySender::EditorLocalEdit(reply)) => {
@@ -671,9 +712,22 @@ fn handle_request(
             // reflect the mutated buffer, so this still resyncs those two
             // host-local caches.
             let result = app.edit_editor_locally(editor, edit);
-            if result.is_ok() {
+            if let Ok(outcome) = &result {
                 sync_editor_presentation(app, presentation, editor);
+                if outcome.dirty_changed == Some(true) && app.accepts_text_document_events() {
+                    match app.deliver_editor_dirty_changed(editor, true) {
+                        Ok(receipt) => {
+                            sync_presentation(app, presentation);
+                            let _ = event_tx.send(RuntimeEvent::TurnCommitted(TurnOutcome {
+                                origin: TurnOrigin::EditorDirtyChanged { editor },
+                                receipt,
+                            }));
+                        }
+                        Err(error) => publish_fault_if_any(app, event_tx, &error),
+                    }
+                }
             }
+            dispatch_committed_save(app, mailbox_tx, save_worker);
             let _ = reply.send(result);
         }
         (AppCommand::EditorSnapshot { editor }, ReplySender::EditorSnapshot(reply)) => {
@@ -706,12 +760,40 @@ fn handle_request(
             let _ = reply.send(Ok(()));
         }
         (AppCommand::Stop, ReplySender::Stop(reply)) => {
+            if let Some(worker) = save_worker.take() {
+                let _ = worker.join();
+            }
             let result = app.stop();
             let _ = reply.send(result);
+            return true;
         }
         _ => unreachable!("request command and reply types are constructed together"),
     }
     false
+}
+
+fn dispatch_committed_save(
+    app: &mut crate::YouthApp,
+    mailbox_tx: &mpsc::Sender<WorkerMessage>,
+    save_worker: &mut Option<std::thread::JoinHandle<()>>,
+) {
+    let Some(job) = app.take_committed_save() else {
+        return;
+    };
+    debug_assert!(save_worker.is_none());
+    let mailbox = mailbox_tx.clone();
+    let fallback = job.clone();
+    match std::thread::Builder::new()
+        .name("youth-text-document-save".to_owned())
+        .spawn(move || {
+            let completion = job.execute();
+            let _ = mailbox.blocking_send(WorkerMessage::SaveCompleted(completion));
+        }) {
+        Ok(worker) => *save_worker = Some(worker),
+        Err(_) => {
+            let _ = mailbox_tx.try_send(WorkerMessage::SaveCompleted(fallback.enqueue_failed()));
+        }
+    }
 }
 
 fn handle_wake(

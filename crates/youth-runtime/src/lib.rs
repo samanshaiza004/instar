@@ -15,6 +15,7 @@ mod host;
 mod limits;
 mod presentation;
 mod profile;
+mod text_document;
 mod wire;
 mod worker;
 
@@ -22,7 +23,7 @@ pub use config::{
     AppId, ClipboardError, ClipboardService, GuestMonotonicClock, NotificationDispatcher,
     RecordingClipboardService, RecordingNotificationDispatcher, RuntimeTimeSeams, StateLocation,
     SystemClipboardService, SystemGuestMonotonicClock, SystemNotificationDispatcher,
-    VirtualGuestMonotonicClock, YouthAppConfig,
+    VirtualGuestMonotonicClock, WorkspaceGrant, YouthAppConfig,
 };
 pub use editor_session::{
     EditorAccessibility, EditorLocalEdit, EditorLocalEditResult, EditorSnapshot,
@@ -39,6 +40,10 @@ pub use profile::{
     APPLICATION_PROTOCOL, APPLICATION_WORLD, ComponentValidation, ComponentValidationError,
     PERMITTED_GUEST_IMPORTS, REQUIRED_GUEST_IMPORTS, SUPPORTED_APPLICATION_PROTOCOLS,
     validate_component,
+};
+pub use text_document::{
+    DocumentHandle, DocumentVersion, SaveCompletion, SaveFailure, SaveOutcome, SaveRequest,
+    TextDocumentError, TextEncoding,
 };
 pub use worker::{
     Generation, PresentationReader, RequestId, RuntimeEvent, ScheduleId, TurnOrigin, TurnOutcome,

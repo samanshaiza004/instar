@@ -76,6 +76,13 @@ impl fmt::Display for Selector {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
+    FixtureFile {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    GrantDocument {
+        path: String,
+    },
     State {
         key: String,
         value: StateValue,
@@ -228,6 +235,18 @@ pub enum Command {
         start: usize,
         end: usize,
     },
+    ExternalWrite {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    ExpectFile {
+        path: String,
+        expected: Vec<u8>,
+    },
+    ExpectEditorDirty {
+        selector: Selector,
+        expected: bool,
+    },
     /// Records the current lifetime guest-call count
     /// (`AppInspection::guest_call_count`) under `label`, for a later
     /// `measure expect` to diff against. Namespaced under harness
@@ -269,6 +288,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
     let mut commands = Vec::new();
     let mut mounted = false;
     let mut mount_seen = false;
+    let mut grant_seen = false;
     let mut version = None;
     let mut first_content_line = true;
     for (offset, raw) in source.lines().enumerate() {
@@ -286,7 +306,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
         }
         let command = parse_command(path, line, source_line)?;
         match command {
-            Command::State { .. } => {
+            Command::State { .. } | Command::FixtureFile { .. } | Command::GrantDocument { .. } => {
                 if mounted {
                     return Err(diagnostic(
                         path,
@@ -294,6 +314,17 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
                         source_line,
                         "state may only be seeded before the initial mount",
                     ));
+                }
+                if matches!(command, Command::GrantDocument { .. }) {
+                    if grant_seen {
+                        return Err(diagnostic(
+                            path,
+                            line,
+                            source_line,
+                            "a test may grant exactly one text document",
+                        ));
+                    }
+                    grant_seen = true;
                 }
             }
             Command::Mount => {
@@ -331,6 +362,9 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             | Command::ComposeCancel { .. }
             | Command::ExpectEditorText { .. }
             | Command::ExpectEditorSelection { .. }
+            | Command::ExternalWrite { .. }
+            | Command::ExpectFile { .. }
+            | Command::ExpectEditorDirty { .. }
             | Command::MeasureBegin { .. }
             | Command::MeasureExpectGuestTurns { .. }
             | Command::Restart => {
@@ -415,6 +449,61 @@ fn parse_format_version(
 }
 
 fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, TestError> {
+    for (prefix, encoding) in [
+        ("fixture file ", FileEncoding::Text),
+        ("fixture file-hex ", FileEncoding::Hex),
+        ("fixture file-base64 ", FileEncoding::Base64),
+    ] {
+        if let Some(arguments) = source.strip_prefix(prefix) {
+            let (file, bytes) = parse_file_arguments(path, line, source, arguments, encoding)?;
+            return Ok(Command::FixtureFile { path: file, bytes });
+        }
+    }
+    if let Some(arguments) = source.strip_prefix("grant document ") {
+        let (file, remainder) = parse_json_string_prefix(path, line, source, arguments)?;
+        require_empty(path, line, source, remainder)?;
+        validate_fixture_path(path, line, source, &file)?;
+        return Ok(Command::GrantDocument { path: file });
+    }
+    for (prefix, encoding) in [
+        ("external write ", FileEncoding::Text),
+        ("external write-hex ", FileEncoding::Hex),
+        ("external write-base64 ", FileEncoding::Base64),
+    ] {
+        if let Some(arguments) = source.strip_prefix(prefix) {
+            let (file, bytes) = parse_file_arguments(path, line, source, arguments, encoding)?;
+            return Ok(Command::ExternalWrite { path: file, bytes });
+        }
+    }
+    for (prefix, encoding) in [
+        ("expect file ", FileEncoding::Text),
+        ("expect file-hex ", FileEncoding::Hex),
+        ("expect file-base64 ", FileEncoding::Base64),
+    ] {
+        if let Some(arguments) = source.strip_prefix(prefix) {
+            let (file, expected) = parse_file_arguments(path, line, source, arguments, encoding)?;
+            return Ok(Command::ExpectFile {
+                path: file,
+                expected,
+            });
+        }
+    }
+    if let Some(arguments) = source.strip_prefix("expect editor dirty ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, arguments)?;
+        let expected = match remainder {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(diagnostic(
+                    path,
+                    line,
+                    source,
+                    "expected: expect editor dirty <selector> true|false",
+                ));
+            }
+        };
+        return Ok(Command::ExpectEditorDirty { selector, expected });
+    }
     if source == "mount" {
         return Ok(Command::Mount);
     }
@@ -667,6 +756,83 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         source,
         "unknown command; expected state, mount, invoke, activate, click, sleep, advance, key, type, replace-selection, paste, compose, measure, restart, or an expect assertion",
     ))
+}
+
+#[derive(Clone, Copy)]
+enum FileEncoding {
+    Text,
+    Hex,
+    Base64,
+}
+
+fn parse_file_arguments(
+    path: &Path,
+    line: usize,
+    source: &str,
+    arguments: &str,
+    encoding: FileEncoding,
+) -> Result<(String, Vec<u8>), TestError> {
+    let (file, remainder) = parse_json_string_prefix(path, line, source, arguments)?;
+    validate_fixture_path(path, line, source, &file)?;
+    let (encoded, remainder) = parse_json_string_prefix(path, line, source, remainder)?;
+    require_empty(path, line, source, remainder)?;
+    let bytes = match encoding {
+        FileEncoding::Text => encoded.into_bytes(),
+        FileEncoding::Hex => {
+            decode_hex(&encoded).map_err(|message| diagnostic(path, line, source, &message))?
+        }
+        FileEncoding::Base64 => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|error| {
+                    diagnostic(
+                        path,
+                        line,
+                        source,
+                        &format!("invalid base64 bytes: {error}"),
+                    )
+                })?;
+            if base64::engine::general_purpose::STANDARD.encode(&decoded) != encoded {
+                return Err(diagnostic(
+                    path,
+                    line,
+                    source,
+                    "base64 bytes must use canonical padded RFC 4648 encoding",
+                ));
+            }
+            decoded
+        }
+    };
+    Ok((file, bytes))
+}
+
+fn validate_fixture_path(
+    test_path: &Path,
+    line: usize,
+    source: &str,
+    value: &str,
+) -> Result<(), TestError> {
+    let candidate = Path::new(value);
+    if value.is_empty()
+        || candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(diagnostic(
+            test_path,
+            line,
+            source,
+            "file paths must be nonempty relative paths without `.` or `..` components",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_selector_prefix<'a>(
@@ -1004,49 +1170,64 @@ fn parse_key(
     source: &str,
     value: &str,
 ) -> Result<(LogicalKey, Modifiers), TestError> {
-    let named = match value {
-        "enter" => Some((LogicalKey::Enter, Modifiers::default())),
-        "escape" => Some((LogicalKey::Escape, Modifiers::default())),
-        "backspace" => Some((LogicalKey::Backspace, Modifiers::default())),
-        "space" => Some((LogicalKey::Space, Modifiers::default())),
-        "tab" => Some((LogicalKey::Tab, Modifiers::default())),
-        "shift-tab" => Some((
-            LogicalKey::Tab,
-            Modifiers {
-                shift: true,
-                ..Modifiers::default()
-            },
-        )),
-        "left" => Some((LogicalKey::ArrowLeft, Modifiers::default())),
-        "right" => Some((LogicalKey::ArrowRight, Modifiers::default())),
-        "up" => Some((LogicalKey::ArrowUp, Modifiers::default())),
-        "down" => Some((LogicalKey::ArrowDown, Modifiers::default())),
-        _ => None,
+    let shift_tab = value.starts_with("shift-tab");
+    let (key, modifier_source) = if value.starts_with('"') {
+        let (character, remainder) = parse_json_string_prefix(path, line, source, value)?;
+        let mut characters = character.chars();
+        let character = characters
+            .next()
+            .filter(|_| characters.next().is_none())
+            .ok_or_else(|| {
+                diagnostic(
+                    path,
+                    line,
+                    source,
+                    "character key must contain exactly one Unicode scalar",
+                )
+            })?;
+        (LogicalKey::Character(character), remainder)
+    } else if let Some((key, modifiers)) = value.split_once(' ') {
+        (named_key(path, line, source, key)?, modifiers)
+    } else {
+        (named_key(path, line, source, value)?, "")
     };
-    if let Some(named) = named {
-        return Ok(named);
-    }
-    let character: String = serde_json::from_str(value).map_err(|error| {
-        diagnostic(
-            path,
-            line,
-            source,
-            &format!("key must be a named key or JSON string: {error}"),
-        )
-    })?;
-    let mut characters = character.chars();
-    let character = characters
-        .next()
-        .filter(|_| characters.next().is_none())
-        .ok_or_else(|| {
-            diagnostic(
+    let mut modifiers = Modifiers {
+        shift: shift_tab,
+        ..Modifiers::default()
+    };
+    match modifier_source {
+        "" => {}
+        "+primary" => modifiers.control = true,
+        _ => {
+            return Err(diagnostic(
                 path,
                 line,
                 source,
-                "character key must contain exactly one Unicode scalar",
-            )
-        })?;
-    Ok((LogicalKey::Character(character), Modifiers::default()))
+                "key modifiers must be exactly `+primary`",
+            ));
+        }
+    }
+    Ok((key, modifiers))
+}
+
+fn named_key(path: &Path, line: usize, source: &str, value: &str) -> Result<LogicalKey, TestError> {
+    match value {
+        "enter" => Ok(LogicalKey::Enter),
+        "escape" => Ok(LogicalKey::Escape),
+        "backspace" => Ok(LogicalKey::Backspace),
+        "space" => Ok(LogicalKey::Space),
+        "tab" | "shift-tab" => Ok(LogicalKey::Tab),
+        "left" => Ok(LogicalKey::ArrowLeft),
+        "right" => Ok(LogicalKey::ArrowRight),
+        "up" => Ok(LogicalKey::ArrowUp),
+        "down" => Ok(LogicalKey::ArrowDown),
+        _ => Err(diagnostic(
+            path,
+            line,
+            source,
+            "key must be a supported named key or JSON string",
+        )),
+    }
 }
 
 fn validate_name(path: &Path, line: usize, source: &str, name: &str) -> Result<(), TestError> {
@@ -1151,6 +1332,18 @@ pub async fn run_file_with_options(
     })?;
     let state_file = state.path().join("state.sqlite3");
     seed_state(path, &script.commands, app_id, &state_file)?;
+    let workspace = tempfile::tempdir().map_err(|source| TestError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    seed_workspace(path, &script.commands, workspace.path())?;
+    let granted_document = script
+        .commands
+        .iter()
+        .find_map(|located| match &located.command {
+            Command::GrantDocument { path } => Some(path.clone()),
+            _ => None,
+        });
     let uses_virtual_time = script
         .commands
         .iter()
@@ -1166,6 +1359,8 @@ pub async fn run_file_with_options(
         &state_file,
         virtual_time.as_ref(),
         &clipboard,
+        workspace.path(),
+        granted_document.as_deref(),
     )?;
     let mut events = app.subscribe();
     let mut snapshot = None;
@@ -1184,7 +1379,8 @@ pub async fn run_file_with_options(
 
     for located in script.commands {
         match &located.command {
-            Command::State { .. } => {}
+            Command::State { .. } | Command::FixtureFile { .. } | Command::GrantDocument { .. } => {
+            }
             Command::Mount => {
                 snapshot = Some(
                     app.mount()
@@ -1198,9 +1394,13 @@ pub async fn run_file_with_options(
             }
             Command::Activate { selector } => {
                 let node = selector.node_id();
-                app.activate(node)
+                let receipt = app
+                    .activate(node)
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
+                if receipt.external_effect_writes > 0 {
+                    await_save_completion(path, &located, &mut events).await?;
+                }
                 snapshot = Some(
                     app.snapshot()
                         .await
@@ -1213,9 +1413,13 @@ pub async fn run_file_with_options(
                 let node = selector.node_id();
                 check_click_policy(path, &located, &tree, selector, node)?;
                 interaction.focus_pointer_target(&tree, node);
-                app.activate(node)
+                let receipt = app
+                    .activate(node)
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
+                if receipt.external_effect_writes > 0 {
+                    await_save_completion(path, &located, &mut events).await?;
+                }
                 snapshot = Some(
                     app.snapshot()
                         .await
@@ -1230,6 +1434,11 @@ pub async fn run_file_with_options(
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
                 editor_state.insert(node, result);
+                snapshot = Some(
+                    app.snapshot()
+                        .await
+                        .map_err(|error| runtime(path, &located, error))?,
+                );
             }
             Command::ReplaceSelection { selector, text } => {
                 let node = selector.node_id();
@@ -1301,20 +1510,12 @@ pub async fn run_file_with_options(
                 // returning the whole buffer; the live text itself is
                 // fetched fresh, on demand, exactly like a real app would
                 // via `context.editor().snapshot()`.
-                let observed = if editor_state.contains_key(&node) {
-                    Some(
-                        app.editor_snapshot(node)
-                            .await
-                            .map_err(|error| runtime(path, &located, error))?
-                            .text,
-                    )
-                } else {
-                    snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.nodes.iter().find(|entry| entry.id == node))
-                        .and_then(|entry| entry.data.text_value())
-                        .map(str::to_owned)
-                };
+                let observed = Some(
+                    app.editor_snapshot(node)
+                        .await
+                        .map_err(|error| runtime(path, &located, error))?
+                        .text,
+                );
                 if observed.as_deref() != Some(expected.as_str()) {
                     return Err(assertion_error(
                         path,
@@ -1361,6 +1562,50 @@ pub async fn run_file_with_options(
                         &located,
                         format!(
                             "expected editor selection {selector} to be graphemes {start}..{end}; observed graphemes {observed_start}..{observed_end}"
+                        ),
+                    ));
+                }
+            }
+            Command::ExternalWrite { path: file, bytes } => {
+                let destination = workspace.path().join(file);
+                fs::write(&destination, bytes).map_err(|source| TestError::Io {
+                    path: destination,
+                    source,
+                })?;
+            }
+            Command::ExpectFile {
+                path: file,
+                expected,
+            } => {
+                let destination = workspace.path().join(file);
+                let observed = fs::read(&destination).map_err(|source| TestError::Io {
+                    path: destination.clone(),
+                    source,
+                })?;
+                if &observed != expected {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected file {file:?} to contain {} bytes; observed {} bytes",
+                            expected.len(),
+                            observed.len()
+                        ),
+                    ));
+                }
+            }
+            Command::ExpectEditorDirty { selector, expected } => {
+                let observed = app
+                    .editor_snapshot(selector.node_id())
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?
+                    .locally_dirty;
+                if observed != *expected {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor dirty {selector} to be {expected}; observed {observed}"
                         ),
                     ));
                 }
@@ -1465,6 +1710,8 @@ pub async fn run_file_with_options(
                     &state_file,
                     virtual_time.as_ref(),
                     &clipboard,
+                    workspace.path(),
+                    granted_document.as_deref(),
                 )?;
                 events = app.subscribe();
                 snapshot = Some(
@@ -1490,9 +1737,13 @@ pub async fn run_file_with_options(
                 let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
                 let change = interaction.key(&tree, key.clone(), *modifiers, false);
                 if let Some(SemanticAction::Activate(node)) = change.action {
-                    app.activate(node)
+                    let receipt = app
+                        .activate(node)
                         .await
                         .map_err(|error| runtime(path, &located, error))?;
+                    if receipt.external_effect_writes > 0 {
+                        await_save_completion(path, &located, &mut events).await?;
+                    }
                     snapshot = Some(
                         app.snapshot()
                             .await
@@ -1644,7 +1895,8 @@ fn seed_state(
 ) -> Result<(), TestError> {
     let seeds = commands
         .iter()
-        .take_while(|located| matches!(located.command, Command::State { .. }))
+        .take_while(|located| !matches!(located.command, Command::Mount))
+        .filter(|located| matches!(located.command, Command::State { .. }))
         .collect::<Vec<_>>();
     let Some(first) = seeds.first() else {
         return Ok(());
@@ -1676,6 +1928,36 @@ fn seed_state(
         .commit()
         .map_err(|error| state_error(path, last, "could not commit seeded state", error))?;
     drop(store);
+    Ok(())
+}
+
+fn seed_workspace(
+    test_path: &Path,
+    commands: &[LocatedCommand],
+    workspace: &Path,
+) -> Result<(), TestError> {
+    for located in commands.iter().take_while(|located| {
+        matches!(
+            located.command,
+            Command::State { .. } | Command::FixtureFile { .. } | Command::GrantDocument { .. }
+        )
+    }) {
+        let Command::FixtureFile { path, bytes } = &located.command else {
+            continue;
+        };
+        let destination = workspace.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source| TestError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&destination, bytes).map_err(|source| TestError::Io {
+            path: destination,
+            source,
+        })?;
+    }
+    let _ = test_path;
     Ok(())
 }
 
@@ -1778,6 +2060,44 @@ async fn verify_view_convergence(
     compare_guest_semantics(&verification.retained, &verification.reconstructed).map_err(
         |message| assertion_error(path, located, format!("view convergence failed: {message}")),
     )
+}
+
+async fn await_save_completion(
+    path: &Path,
+    located: &LocatedCommand,
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+) -> Result<(), TestError> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match events.recv().await {
+                Ok(RuntimeEvent::TurnCommitted(turn))
+                    if matches!(
+                        turn.origin,
+                        youth_runtime::TurnOrigin::TextDocumentSaveCompleted { .. }
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    return Err(assertion_error(
+                        path,
+                        located,
+                        format!("runtime observer lagged by {count} events while awaiting save"),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(assertion_error(
+                        path,
+                        located,
+                        "runtime stopped before save completion".into(),
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| assertion_error(path, located, "timed out awaiting save completion".into()))?
 }
 
 fn compare_guest_semantics(
@@ -1887,6 +2207,8 @@ fn spawn(
     state_file: &Path,
     virtual_time: Option<&VirtualTime>,
     clipboard: &RecordingClipboardService,
+    workspace_root: &Path,
+    granted_document: Option<&str>,
 ) -> Result<YouthAppHandle, TestError> {
     let mut limits = RuntimeLimits::default();
     if let Some(virtual_time) = virtual_time {
@@ -1899,6 +2221,8 @@ fn spawn(
         app_id: app_id.clone(),
         state: StateLocation::File(state_file.to_path_buf()),
         limits,
+        workspace: granted_document
+            .map(|document| youth_runtime::WorkspaceGrant::text_document(workspace_root, document)),
     })
     .map_err(|error| TestError::Diagnostic {
         path: component.to_path_buf(),
@@ -2019,6 +2343,14 @@ fn describe(observed: Option<&NodeData>) -> String {
         }) => {
             format!("editor(document_revision={document_revision}, text={text:?})")
         }
+        Some(NodeData::TextDocumentEditor {
+            document_id,
+            document_generation,
+            version_id,
+            version_generation,
+        }) => format!(
+            "text-document editor(document={document_id}:{document_generation}, version={version_id}:{version_generation})"
+        ),
         Some(NodeData::Countdown { .. }) | Some(NodeData::AlignedCountdown { .. }) => {
             "a countdown node".into()
         }

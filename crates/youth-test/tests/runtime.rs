@@ -34,6 +34,47 @@ async fn sleep_command_blocks_real_runtime_progress() {
 }
 
 #[tokio::test]
+async fn text_document_fixtures_primary_shortcut_save_and_restart_are_real() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-wasip2/release/youth_sdk_text_document.wasm");
+    assert!(
+        component.is_file(),
+        "build the fixture first: cargo build -p youth-sdk-text-document --target wasm32-wasip2 --release"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let test = directory.path().join("text-document.youth-test");
+    fs::write(
+        &test,
+        r#"fixture file-hex "note.md" "efbbbf48656c6c6f0d0a"
+grant document "note.md"
+mount
+expect editor dirty document false
+type document " world"
+expect editor dirty document true
+expect text status "Unsaved changes"
+key "s" +primary
+expect file-hex "note.md" "efbbbf48656c6c6f0d0a20776f726c64"
+expect editor dirty document false
+restart
+expect editor text document "Hello\r\n world"
+expect editor dirty document false
+"#,
+    )
+    .unwrap();
+
+    youth_test::run_file_with_options(
+        &test,
+        &component,
+        &AppId::parse("dev.youth.dsl-text-document").unwrap(),
+        RunOptions {
+            verify_view_convergence: true,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn semantic_dsl_activates_and_persists_through_implicit_restart_mount() {
     let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-wasip2/release/youth_sdk_tally.wasm");
@@ -389,7 +430,7 @@ async fn editor_selection_is_reported_in_grapheme_clusters_not_bytes() {
 }
 
 #[tokio::test]
-async fn measure_proves_host_local_typing_makes_zero_guest_turns_and_save_makes_one() {
+async fn measure_proves_dirty_notification_is_coalesced_and_save_makes_one_turn() {
     let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-wasip2/release/youth_sdk_editor.wasm");
     assert!(
@@ -404,11 +445,14 @@ async fn measure_proves_host_local_typing_makes_zero_guest_turns_and_save_makes_
 
 mount
 
-measure begin "typing"
+measure begin "first dirty transition"
 type document "clean architecture"
+measure expect "first dirty transition" guest-turns 1
+
+measure begin "further dirty typing"
 replace-selection document " over clever tricks"
 paste document "!"
-measure expect "typing" guest-turns 0
+measure expect "further dirty typing" guest-turns 0
 
 measure begin "save"
 invoke save

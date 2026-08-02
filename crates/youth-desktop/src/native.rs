@@ -275,7 +275,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                             }
                             let is_editor = matches!(
                                 mirror.tree().node(armed).map(|n| &n.data),
-                                Some(NodeData::Editor { .. })
+                                Some(NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. })
                             );
                             if is_editor
                                 && let Some(cursor) = self.pointer.cursor
@@ -322,7 +322,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 };
                 if !matches!(
                     mirror.tree().node(node).map(|n| &n.data),
-                    Some(NodeData::Editor { .. })
+                    Some(NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. })
                 ) {
                     return;
                 }
@@ -556,7 +556,12 @@ impl NativeApp {
                     .mirror
                     .as_ref()
                     .and_then(|mirror| mirror.tree().node(node))
-                    .is_some_and(|node| matches!(node.data, NodeData::Editor { .. }));
+                    .is_some_and(|node| {
+                        matches!(
+                            node.data,
+                            NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. }
+                        )
+                    });
                 is_editor.then_some((node, layout_node.bounds.width as f32))
             })
             .filter(|(node, width)| {
@@ -717,7 +722,7 @@ impl NativeApp {
         let Some(mirror) = &self.mirror else { return };
         let is_editor = matches!(
             mirror.tree().node(target).map(|node| &node.data),
-            Some(NodeData::Editor { .. })
+            Some(NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. })
         );
         match request.action {
             accesskit::Action::Focus => {

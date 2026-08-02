@@ -324,9 +324,9 @@ pub async fn test_project(override_convergence: Option<bool>) -> Result<(), CliE
     Ok(())
 }
 
-pub async fn dev_project(headless: bool) -> Result<(), CliError> {
+pub async fn dev_project(headless: bool, workspace: crate::WorkspaceArgs) -> Result<(), CliError> {
     let (mut project, _) = build_and_validate(false)?;
-    let mut child = Some(spawn_dev_child(&project, headless)?);
+    let mut child = Some(spawn_dev_child(&project, headless, &workspace)?);
     let mut observed = watch_fingerprint(project.root())?;
     let mut changed_at = None;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -377,7 +377,7 @@ pub async fn dev_project(headless: bool) -> Result<(), CliError> {
                         if let Some(mut running) = child.take() {
                             stop_child(&mut running).await?;
                         }
-                        child = Some(spawn_dev_child(&rebuilt, headless)?);
+                        child = Some(spawn_dev_child(&rebuilt, headless, &workspace)?);
                         project = rebuilt;
                         changed_at = None;
                         println!("dev: restarted");
@@ -392,7 +392,11 @@ pub async fn dev_project(headless: bool) -> Result<(), CliError> {
     }
 }
 
-fn spawn_dev_child(project: &Project, headless: bool) -> Result<Child, CliError> {
+fn spawn_dev_child(
+    project: &Project,
+    headless: bool,
+    workspace: &crate::WorkspaceArgs,
+) -> Result<Child, CliError> {
     let executable = std::env::current_exe().map_err(|error| {
         message(format!(
             "could not locate the current Youth executable: {error}"
@@ -413,6 +417,13 @@ fn spawn_dev_child(project: &Project, headless: bool) -> Result<Child, CliError>
     if !headless {
         command.arg("--supervised");
     }
+    if let (Some(root), Some(document)) = (&workspace.workspace_root, &workspace.document) {
+        command
+            .arg("--workspace-root")
+            .arg(root)
+            .arg("--document")
+            .arg(document);
+    }
     command
         .spawn()
         .map_err(|error| message(format!("could not start Youth application: {error}")))
@@ -422,6 +433,7 @@ pub async fn headless_dev_child(
     component: PathBuf,
     app_id: AppId,
     state_root: PathBuf,
+    workspace: crate::WorkspaceArgs,
 ) -> Result<(), CliError> {
     let app = youth_runtime::YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
         component_path: component,
@@ -430,6 +442,7 @@ pub async fn headless_dev_child(
         ),
         app_id,
         limits: youth_runtime::RuntimeLimits::default(),
+        workspace: workspace.into_grant(),
     })
     .map_err(CliError::Runtime)?;
     app.mount().await.map_err(CliError::Runtime)?;

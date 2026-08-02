@@ -273,7 +273,13 @@ impl InteractionState {
 fn focused_editor(tree: &Tree, focused: Option<NodeId>) -> Option<NodeId> {
     let focused = focused?;
     tree.node(focused)
-        .is_some_and(|node| matches!(node.data, youth_tree::NodeData::Editor { .. }))
+        .is_some_and(|node| {
+            matches!(
+                node.data,
+                youth_tree::NodeData::Editor { .. }
+                    | youth_tree::NodeData::TextDocumentEditor { .. }
+            )
+        })
         .then_some(focused)
 }
 

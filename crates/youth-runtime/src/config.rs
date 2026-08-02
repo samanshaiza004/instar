@@ -284,6 +284,23 @@ pub struct YouthAppConfig {
     pub app_id: AppId,
     pub state: StateLocation,
     pub limits: RuntimeLimits,
+    pub workspace: Option<WorkspaceGrant>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceGrant {
+    pub root: PathBuf,
+    pub document: PathBuf,
+}
+
+impl WorkspaceGrant {
+    #[must_use]
+    pub fn text_document(root: impl AsRef<Path>, document: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_owned(),
+            document: document.as_ref().to_owned(),
+        }
+    }
 }
 
 impl YouthAppConfig {
@@ -294,6 +311,7 @@ impl YouthAppConfig {
                 .expect("the built-in ephemeral application ID is valid"),
             state: StateLocation::Memory,
             limits: RuntimeLimits::default(),
+            workspace: None,
         }
     }
 

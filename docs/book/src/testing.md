@@ -239,7 +239,7 @@ into silently. `youth test --verify-view-convergence` and
 fault-injection tests, guest-call-counting tests). The runner prints when
 convergence checking is disabled.
 
-**Known gap with Editor nodes**: `context.editor().accept()`/`replace()`
+**Inline Editor caveat**: `context.editor().accept()`/`replace()`
 (the `youth:editor` capability) advance the live host-owned Editor session's
 `document_revision` directly; there is no `Patch::SetEditorRevision`-shaped
 patch, so the retained tree's `Editor` node keeps whatever `document_revision`
@@ -248,8 +248,29 @@ restart, or resync. A resync-based reconstruction, in contrast, always
 reflects the current state -- so convergence checking reports a "changed
 node" for any Editor node `accept()`/`replace()` touched since the tree was
 last fully installed, even though nothing is actually wrong. An app that
-relies on `accept()`/`replace()` (Scratchpad is the first) needs
-`verify_view_convergence = false` with a comment explaining why until this
-is resolved -- either by adding a real patch for the Editor node's
-declared revision, or by teaching the convergence checker to treat Editor
-document-revision drift since the last full install as expected.
+relies directly on inline `accept()`/`replace()` may need
+`verify_view_convergence = false` with a comment explaining why. Scratchpad no
+longer uses that path: protocol `0.0.8` provides an opaque host-issued document
+version patch, and convergence includes the document/editor/version binding.
+
+File-backed tests can declare an isolated grant before mount and then exercise
+the real post-commit save worker:
+
+```text
+fixture file "note.md" "Hello"
+fixture file-hex "bom.md" "efbbbf48656c6c6f0d0a"
+fixture file-base64 "invalid.txt" "/w=="
+grant document "note.md"
+mount
+type document " world"
+key "s" +primary
+expect file "note.md" "Hello world"
+expect editor dirty document false
+```
+
+`external write`, `external write-hex`, and `external write-base64` model a
+non-cooperating writer; matching `expect file*` commands assert exact bytes.
+Hex must be even-length and base64 canonical padded RFC 4648. Fixtures and the
+single grant are pre-mount declarations. Restart retains the isolated root and
+grant but reloads the canonical file. Each action drains committed runtime and
+save-completion work before the following assertion.

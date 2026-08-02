@@ -8,15 +8,25 @@ use thiserror::Error;
 
 use crate::{RuntimeError, YouthApp, component_imports};
 
-pub const APPLICATION_PROTOCOL: &str = "0.0.4";
-pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.4";
-pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &["0.0.2", "0.0.3", APPLICATION_PROTOCOL];
+pub const APPLICATION_PROTOCOL: &str = "0.0.8";
+pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.8";
+pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &[
+    "0.0.2",
+    "0.0.3",
+    "0.0.4",
+    "0.0.5",
+    "0.0.6",
+    "0.0.7",
+    APPLICATION_PROTOCOL,
+];
 
-pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui", "youth:state/store"];
+pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui"];
 
 pub const PERMITTED_GUEST_IMPORTS: &[&str] = &[
     "youth:time/scheduler",
     "youth:editor/session",
+    "youth:text-document/document",
+    "youth:state/store",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stderr",
@@ -136,7 +146,7 @@ mod tests {
 
         let missing = imports
             .into_iter()
-            .filter(|value| value != "youth:state/store")
+            .filter(|value| value != "youth:app/ui")
             .collect::<Vec<_>>();
         assert!(matches!(
             validate_imports(&missing),

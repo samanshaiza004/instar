@@ -1,0 +1,13 @@
+[package]
+name = "youth-sdk-text-document"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SDK-backed fixture for the 0.0.8 single text-document capability."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { path = "../../crates/youth-sdk" }

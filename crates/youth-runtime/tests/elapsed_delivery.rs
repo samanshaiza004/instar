@@ -16,6 +16,7 @@ fn config(component: &str, database: &std::path::Path) -> YouthAppConfig {
         app_id: AppId::parse("dev.youth.elapsed").unwrap(),
         state: StateLocation::File(database.to_owned()),
         limits: RuntimeLimits::default(),
+        workspace: None,
     }
 }
 

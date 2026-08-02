@@ -1,0 +1,36 @@
+package youth:editor@0.0.1;
+
+interface session {
+    type node-id = u64;
+    type document-revision = u64;
+    type edit-sequence = u64;
+
+    record editor-snapshot {
+        document-revision: document-revision,
+        edit-sequence: edit-sequence,
+        text: string,
+    }
+
+    enum editor-error-code {
+        unknown-editor,
+        stale-document-revision,
+        stale-edit-sequence,
+        unavailable,
+        internal,
+    }
+
+    snapshot: func(editor: node-id) -> result<editor-snapshot, editor-error-code>;
+    accept: func(
+        editor: node-id,
+        expected-document-revision: document-revision,
+        expected-edit-sequence: edit-sequence,
+        new-document-revision: document-revision,
+    ) -> result<_, editor-error-code>;
+    replace: func(
+        editor: node-id,
+        expected-document-revision: document-revision,
+        expected-edit-sequence: edit-sequence,
+        new-document-revision: document-revision,
+        authoritative-text: string,
+    ) -> result<_, editor-error-code>;
+}

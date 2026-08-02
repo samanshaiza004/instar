@@ -74,7 +74,10 @@ fn visit(context: &BuildContext<'_>, id: NodeId, nodes: &mut Vec<(AccessNodeId, 
     };
     let bounds = physical_bounds(context, id);
 
-    if matches!(semantic.data, NodeData::Editor { .. }) {
+    if matches!(
+        semantic.data,
+        NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. }
+    ) {
         build_editor_node(context, id, bounds, nodes);
         for &child in &semantic.children {
             visit(context, child, nodes);
@@ -123,7 +126,9 @@ fn visit(context: &BuildContext<'_>, id: NodeId, nodes: &mut Vec<(AccessNodeId, 
             }
             node
         }
-        NodeData::Editor { .. } => unreachable!("Editor nodes are handled above"),
+        NodeData::Editor { .. } | NodeData::TextDocumentEditor { .. } => {
+            unreachable!("Editor nodes are handled above")
+        }
     };
     if let Some(bounds) = bounds {
         node.set_bounds(bounds);
