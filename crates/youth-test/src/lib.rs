@@ -1191,8 +1191,10 @@ fn parse_key(
     } else {
         (named_key(path, line, source, value)?, "")
     };
-    let mut modifiers = Modifiers::default();
-    modifiers.shift = shift_tab;
+    let mut modifiers = Modifiers {
+        shift: shift_tab,
+        ..Modifiers::default()
+    };
     match modifier_source {
         "" => {}
         "+primary" => modifiers.control = true,

@@ -739,7 +739,7 @@ fn event_v008(event: &HostEvent) -> wasmtime::Result<v008::youth::app::ui::Event
             })
         }
         HostEvent::TextDocumentSaveCompleted { completion, .. } => {
-            ui::EventKind::TextDocumentSaveCompleted(completion.to_wire_v008())
+            ui::EventKind::TextDocumentSaveCompleted(completion.as_wire_v008())
         }
     };
     Ok(ui::Event {

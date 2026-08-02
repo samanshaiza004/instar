@@ -20,12 +20,13 @@ pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &[
     APPLICATION_PROTOCOL,
 ];
 
-pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui", "youth:state/store"];
+pub const REQUIRED_GUEST_IMPORTS: &[&str] = &["youth:app/ui"];
 
 pub const PERMITTED_GUEST_IMPORTS: &[&str] = &[
     "youth:time/scheduler",
     "youth:editor/session",
     "youth:text-document/document",
+    "youth:state/store",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stderr",
@@ -145,7 +146,7 @@ mod tests {
 
         let missing = imports
             .into_iter()
-            .filter(|value| value != "youth:state/store")
+            .filter(|value| value != "youth:app/ui")
             .collect::<Vec<_>>();
         assert!(matches!(
             validate_imports(&missing),

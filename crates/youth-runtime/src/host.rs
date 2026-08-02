@@ -2149,18 +2149,8 @@ impl YouthApp {
         })?;
 
         let instantiate_span = info_span!("component.instantiate", component_id = %component_id);
-        instantiate_span.in_scope(|| {
-            instantiate(
-                engine,
-                component,
-                component_id,
-                config.app_id,
-                config.state,
-                config.limits,
-                config.workspace,
-                reconcile_on_open,
-            )
-        })
+        instantiate_span
+            .in_scope(|| instantiate(engine, component, component_id, config, reconcile_on_open))
     }
 
     #[must_use]
@@ -2705,6 +2695,10 @@ impl YouthApp {
         )
     }
 
+    pub(crate) fn accepts_text_document_events(&self) -> bool {
+        matches!(self.bindings.version(), ProtocolVersion::V008)
+    }
+
     pub(crate) fn deliver_save_completion(
         &mut self,
         mut completion: crate::SaveCompletion,
@@ -2785,6 +2779,7 @@ impl YouthApp {
                     | ProtocolVersion::V005
                     | ProtocolVersion::V006
                     | ProtocolVersion::V007
+                    | ProtocolVersion::V008
             )
         {
             let error = RuntimeError::UnsupportedWorld(self.context(
@@ -3565,12 +3560,16 @@ fn instantiate(
     engine: &Engine,
     component: Component,
     component_id: String,
-    app_id: youth_state::AppId,
-    state_location: StateLocation,
-    limits: RuntimeLimits,
-    workspace: Option<crate::WorkspaceGrant>,
+    config: YouthAppConfig,
     reconcile_on_open: bool,
 ) -> Result<YouthApp, RuntimeError> {
+    let YouthAppConfig {
+        app_id,
+        state: state_location,
+        limits,
+        workspace,
+        ..
+    } = config;
     let deadline_clock = Arc::clone(&limits.time.deadline_clock);
     let wake_driver = Arc::clone(&limits.time.wake_driver);
     let guest_monotonic_clock = Arc::clone(&limits.time.guest_monotonic_clock);

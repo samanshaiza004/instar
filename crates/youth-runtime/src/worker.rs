@@ -122,7 +122,6 @@ enum WorkerMessage {
     Wake(youth_state::WakeToken),
     Reconcile,
     SaveCompleted(crate::SaveCompletion),
-    Shutdown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -372,10 +371,7 @@ impl YouthAppHandle {
         self.send_request(AppCommand::Stop, ReplySender::Stop(reply))
             .await?;
         response.await.map_err(|_| self.worker_stopped())??;
-        self.mailbox_tx
-            .send(WorkerMessage::Shutdown)
-            .await
-            .map_err(|_| self.worker_stopped())
+        Ok(())
     }
 
     async fn send_request(
@@ -512,7 +508,6 @@ fn worker_main(
                 }
                 dispatch_committed_save(&mut app, &mailbox_tx, &mut save_worker);
             }
-            WorkerMessage::Shutdown => break,
         }
         if !request {
             sync_presentation(&mut app, &presentation);
@@ -719,7 +714,7 @@ fn handle_request(
             let result = app.edit_editor_locally(editor, edit);
             if let Ok(outcome) = &result {
                 sync_editor_presentation(app, presentation, editor);
-                if outcome.dirty_changed == Some(true) {
+                if outcome.dirty_changed == Some(true) && app.accepts_text_document_events() {
                     match app.deliver_editor_dirty_changed(editor, true) {
                         Ok(receipt) => {
                             sync_presentation(app, presentation);

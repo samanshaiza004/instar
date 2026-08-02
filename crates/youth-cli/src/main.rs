@@ -84,6 +84,8 @@ enum Command {
         component: PathBuf,
         #[command(flatten)]
         state: HeadlessState,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
     },
     /// Mount, deliver one activation, and print the resulting tree.
     Activate {
@@ -208,16 +210,16 @@ fn main() -> ExitCode {
             window_height,
             supervised,
             workspace,
-        } => run_desktop(
+        } => run_desktop(DesktopLaunch {
             component,
             app_id,
             state_dir,
             ephemeral,
-            window_width,
-            window_height,
+            width: window_width,
+            height: window_height,
             supervised,
             workspace,
-        ),
+        }),
         command => tokio::runtime::Runtime::new()
             .map_err(|error| CliError::Message(format!("failed to start CLI runtime: {error}")))
             .and_then(|runtime| runtime.block_on(run(command))),
@@ -278,8 +280,12 @@ async fn run(command: Command) -> Result<(), CliError> {
                 inspection.world
             );
         }
-        Command::Mount { component, state } => {
-            let app = spawn_headless(&component, state)?;
+        Command::Mount {
+            component,
+            state,
+            workspace,
+        } => {
+            let app = spawn_headless(&component, state, workspace)?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             println!("component: {}", component_name(&component));
@@ -297,7 +303,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             state,
         } => {
             let node = parse_node_id(node)?;
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             match app.activate(node).await {
                 Ok(receipt) => {
@@ -327,7 +333,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             state,
         } => {
             let nodes = read_script(&events)?;
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             for node in nodes {
                 app.activate(node).await.map_err(CliError::Runtime)?;
@@ -340,7 +346,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             json,
             state,
         } => {
-            let app = spawn_headless(&component, state)?;
+            let app = spawn_headless(&component, state, WorkspaceArgs::default())?;
             app.mount().await.map_err(CliError::Runtime)?;
             let inspection = app.inspect().await.map_err(CliError::Runtime)?;
             if json {
@@ -357,7 +363,7 @@ async fn run(command: Command) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_desktop(
+struct DesktopLaunch {
     component: PathBuf,
     app_id: AppId,
     state_dir: Option<PathBuf>,
@@ -366,7 +372,19 @@ fn run_desktop(
     height: u32,
     supervised: bool,
     workspace: WorkspaceArgs,
-) -> Result<(), CliError> {
+}
+
+fn run_desktop(launch: DesktopLaunch) -> Result<(), CliError> {
+    let DesktopLaunch {
+        component,
+        app_id,
+        state_dir,
+        ephemeral,
+        width,
+        height,
+        supervised,
+        workspace,
+    } = launch;
     let state = if ephemeral {
         StateLocation::Memory
     } else {
@@ -399,17 +417,29 @@ fn run_desktop(
     .map_err(CliError::Desktop)
 }
 
-fn spawn_headless(component: &Path, state: HeadlessState) -> Result<YouthAppHandle, CliError> {
+fn spawn_headless(
+    component: &Path,
+    state: HeadlessState,
+    workspace: WorkspaceArgs,
+) -> Result<YouthAppHandle, CliError> {
+    let workspace = workspace.into_grant();
     match (state.app_id, state.state_dir) {
         (Some(app_id), Some(root)) => YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
             component_path: component.to_owned(),
             state: StateLocation::File(root.join(app_id.as_str()).join("state.sqlite3")),
             app_id,
             limits: youth_runtime::RuntimeLimits::default(),
-            workspace: None,
+            workspace,
         })
         .map_err(CliError::Runtime),
-        (None, None) => YouthAppHandle::spawn_ephemeral(component).map_err(CliError::Runtime),
+        (None, None) => YouthAppHandle::spawn(youth_runtime::YouthAppConfig {
+            component_path: component.to_owned(),
+            state: StateLocation::Memory,
+            app_id: AppId::parse("dev.youth.ephemeral").expect("static app ID is valid"),
+            limits: youth_runtime::RuntimeLimits::default(),
+            workspace,
+        })
+        .map_err(CliError::Runtime),
         _ => Err(CliError::Message(
             "--app-id and --state-dir must be supplied together".into(),
         )),

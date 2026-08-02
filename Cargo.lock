@@ -5739,7 +5739,6 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
- "windows-sys 0.61.2",
  "youth-editor-engine",
  "youth-interaction",
  "youth-sdk",

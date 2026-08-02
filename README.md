@@ -36,6 +36,7 @@ The completed Utility Suite applications are independent architecture probes:
 | [Calculator](https://github.com/samanshaiza004/youth-calculator) | Rows, grid layout, keyboard focus, commands, formatting | Canonical component certified on Ubuntu, Windows, and macOS |
 | [Timer](https://github.com/samanshaiza004/youth-timer) | Host clocks, durable schedules, elapsed delivery, recovery | Gate C-4 recovery complete |
 | [Todo](https://github.com/samanshaiza004/youth-todo) | Dynamic collections, stable identities, structural updates, migration | `utility-todo-gate-d-release`; canonical component certified on all three hosts |
+| Scratchpad | Host-owned text editing, one capability-granted file, transactional Save effects | Gate B implemented on `codex/scratchpad-gate-b`; cross-platform certification pending |
 
 Todo remains on `youth:app@0.0.5`. Its findings are evidence for future
 platform decisions, not an authorization for list nodes, structured state,
@@ -50,9 +51,14 @@ ordinary typing. The guest sees only whole-buffer `snapshot`/`accept`/
 `replace` through the `youth:editor` capability (`youth:app@0.0.6`), never
 raw byte offsets or platform key events. `youth:app@0.0.7` additively adds a
 modifier field to declared shortcuts, so a focused Editor and an app-level
-`Primary+S` Save command coexist. See
+`Primary+S` Save command coexist. `youth:app@0.0.8` adds one narrowly granted
+host-owned text document, exact-byte conflict detection, post-commit atomic
+Save, coalesced dirty notification, and opaque host-issued document versions.
+File contents remain out of guest memory and Youth state. See
 [docs/MILESTONE-2.md](docs/MILESTONE-2.md) for the full contract, lifecycle,
-and input-precedence rules. Scratchpad, developed as a separate application
+and input-precedence rules and
+[docs/SCRATCHPAD-GATE-B.md](docs/SCRATCHPAD-GATE-B.md) for the file effect.
+Scratchpad, developed as a separate application
 repository the same way Calculator, Timer, and Todo were, is the first
 Editor-capable application and exercises this boundary end to end.
 
@@ -82,7 +88,7 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app-v0.0.7/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.7`, all frozen and simultaneously supported; the unversioned tree is the generated-project default (`0.0.4`) |
+| `wit/youth-app-v0.0.8/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.8`, all frozen and simultaneously supported; the unversioned tree is the generated-project default (`0.0.4`) |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker, host-owned Editor sessions |

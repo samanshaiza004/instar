@@ -2,7 +2,8 @@
 
 Developer Preview 3 proves the external workflow and three Utility Suite
 applications on the runtime; Milestone 2 adds a host-owned Editor capability
-and modifier-aware shortcuts. Youth is still an architecture-probing
+and modifier-aware shortcuts. Scratchpad Gate B adds one explicitly granted
+existing UTF-8 text document and a post-commit Save effect. Youth is still an architecture-probing
 platform, not a general application platform.
 
 - Rendering and its framebuffer fixtures are provisional outside the Editor's
@@ -22,7 +23,7 @@ platform, not a general application platform.
   chord sequences.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
-- The latest application protocol is `0.0.7`; the host also runs `0.0.6`,
+- The latest application protocol is `0.0.8`; the host also runs `0.0.7`, `0.0.6`,
   `0.0.5`, `0.0.4`, `0.0.3`, and `0.0.2` simultaneously. Generated projects
   still default to `0.0.4` unless the template explicitly opts into a newer
   profile.
@@ -31,6 +32,14 @@ platform, not a general application platform.
   packaged for release via `dist` (see [docs/DISTRIBUTION.md](../../DISTRIBUTION.md)),
   but application components have no installable-package or registry story.
 - Publishing, registries, and SDK upgrade tooling for applications are absent.
+
+Scratchpad's text-document grant is deliberately narrow: one existing regular
+file, no picker, listing, creation, rename, delete, watching, reload/merge,
+overwrite confirmation, Save Copy, or multiple documents. The file must be
+valid UTF-8 and at most 1 MiB after its optional BOM. Replacement preserves
+ordinary permissions where supported but does not promise universal ACL,
+xattr, ownership, resource-fork, or power-loss durability. A durable external-
+effect journal is deferred.
 
 Reactive UI, images, animation, multiple windows, arbitrary SQL, expression
 parsing, and application-level packaging/publishing remain outside the

@@ -25,11 +25,12 @@ is budgeted rather than left implicit.
 ```text
 Required:
   youth:app/ui
-  youth:state/store
 
 Permitted Youth capabilities:
-  youth:time/scheduler          protocols 0.0.4, 0.0.5, 0.0.6, 0.0.7
-  youth:editor/session          protocols 0.0.6, 0.0.7
+  youth:state/store             protocols 0.0.2 through 0.0.8
+  youth:time/scheduler          protocols 0.0.4 through 0.0.8
+  youth:editor/session          protocols 0.0.6 through 0.0.8
+  youth:text-document/document protocol 0.0.8
 
 Permitted inert WASIp2 imports:
   wasi:cli/environment          wasi:cli/terminal-input
@@ -47,14 +48,16 @@ Forbidden:
   wasi:filesystem/*, wasi:sockets/*, and wasi:http/* interface
 ```
 
-`youth:time/scheduler` and `youth:editor/session` are permitted, but not
-globally required: a guest imports one only to declare bounded temporal
-intent or to own a host-backed Editor session, and only protocols that
+Youth capabilities are permitted, but not globally required: a guest imports
+one only when its linked application uses that surface, and only protocols that
 carry that capability in their application contract (`wit/youth-app-v0.0.N/`)
-can import it at all. Protocols 0.0.2 and 0.0.3 have neither.
+can import it at all. Link-time elimination may remove even state imports from
+an application that does not use them. Protocols 0.0.2 and 0.0.3 have neither
+time, Editor, nor text-document capability.
 
 `crates/youth-runtime/tests/import_profile.rs` enforces this against the
-0.0.2 counter, a 0.0.4 SDK/time component, and a 0.0.6 SDK/editor component,
+0.0.2 counter, a 0.0.4 SDK/time component, a 0.0.6 SDK/editor component, and
+a 0.0.8 SDK/text-document component,
 and fails when a toolchain update widens the surface.
 Interface versions are compared without their `@version` suffix, so a
 WASI patch bump does not read as a new capability; a genuinely new

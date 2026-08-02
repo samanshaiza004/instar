@@ -430,7 +430,7 @@ async fn editor_selection_is_reported_in_grapheme_clusters_not_bytes() {
 }
 
 #[tokio::test]
-async fn measure_proves_host_local_typing_makes_zero_guest_turns_and_save_makes_one() {
+async fn measure_proves_dirty_notification_is_coalesced_and_save_makes_one_turn() {
     let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-wasip2/release/youth_sdk_editor.wasm");
     assert!(
@@ -445,11 +445,14 @@ async fn measure_proves_host_local_typing_makes_zero_guest_turns_and_save_makes_
 
 mount
 
-measure begin "typing"
+measure begin "first dirty transition"
 type document "clean architecture"
+measure expect "first dirty transition" guest-turns 1
+
+measure begin "further dirty typing"
 replace-selection document " over clever tricks"
 paste document "!"
-measure expect "typing" guest-turns 0
+measure expect "further dirty typing" guest-turns 0
 
 measure begin "save"
 invoke save

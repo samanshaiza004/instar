@@ -149,3 +149,78 @@ async fn external_content_change_returns_conflict_without_overwriting() {
     );
     app.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn one_mebibyte_document_opens_edits_saves_and_restarts() {
+    let scenario_started = std::time::Instant::now();
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let document = root.join("large.txt");
+    let initial = vec![b'a'; 1024 * 1024 - 1];
+    std::fs::write(&document, &initial).unwrap();
+    let config = YouthAppConfig {
+        component_path: test_component("youth-sdk-text-document"),
+        app_id: AppId::parse("dev.youth.text-document-large").unwrap(),
+        state: StateLocation::Memory,
+        limits: youth_runtime::RuntimeLimits::default(),
+        workspace: Some(WorkspaceGrant::text_document(&root, "large.txt")),
+    };
+    let open_started = std::time::Instant::now();
+    let app = YouthAppHandle::spawn(config.clone()).unwrap();
+    let mut events = app.subscribe();
+    app.mount().await.unwrap();
+    let open_elapsed = open_started.elapsed();
+    assert_eq!(
+        app.editor_snapshot(node("document"))
+            .await
+            .unwrap()
+            .text
+            .len(),
+        initial.len()
+    );
+    let edit_started = std::time::Instant::now();
+    app.edit_editor_locally(node("document"), EditorLocalEdit::InsertText("!".into()))
+        .await
+        .unwrap();
+    let edit_elapsed = edit_started.elapsed();
+    let save_started = std::time::Instant::now();
+    app.activate(node("save")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                RuntimeEvent::TurnCommitted(ref turn)
+                    if matches!(turn.origin, TurnOrigin::TextDocumentSaveCompleted { .. })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("one-mebibyte save completes");
+    let save_elapsed = save_started.elapsed();
+    app.stop().await.unwrap();
+
+    let saved = std::fs::read(&document).unwrap();
+    assert_eq!(saved.len(), 1024 * 1024);
+    assert_eq!(saved.last(), Some(&b'!'));
+    let restart_started = std::time::Instant::now();
+    let restarted = YouthAppHandle::spawn(config).unwrap();
+    restarted.mount().await.unwrap();
+    let restart_elapsed = restart_started.elapsed();
+    assert_eq!(
+        restarted
+            .editor_snapshot(node("document"))
+            .await
+            .unwrap()
+            .text
+            .len(),
+        1024 * 1024
+    );
+    restarted.stop().await.unwrap();
+    eprintln!(
+        "1 MiB text-document evidence: open={open_elapsed:?} edit={edit_elapsed:?} save={save_elapsed:?} restart={restart_elapsed:?} total={:?}",
+        scenario_started.elapsed()
+    );
+}

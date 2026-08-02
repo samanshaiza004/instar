@@ -66,7 +66,7 @@ pub struct SaveCompletion {
 }
 
 impl SaveCompletion {
-    pub(crate) fn to_wire_v008(&self) -> crate::bindings::v008::youth::app::ui::SaveCompletion {
+    pub(crate) fn as_wire_v008(&self) -> crate::bindings::v008::youth::app::ui::SaveCompletion {
         use crate::bindings::v008::youth::app::ui;
         let outcome = match self.outcome {
             SaveOutcome::Saved {
@@ -144,6 +144,30 @@ struct DocumentState {
     editor_text: Arc<str>,
     next_request: u64,
     pending: Option<SaveRequest>,
+}
+
+trait AtomicFileReplacer {
+    fn replace(
+        &self,
+        candidate: cap_tempfile::TempFile<'_>,
+        destination: &Path,
+    ) -> std::io::Result<()>;
+}
+
+struct CapabilityRelativeReplacer;
+
+impl AtomicFileReplacer for CapabilityRelativeReplacer {
+    fn replace(
+        &self,
+        candidate: cap_tempfile::TempFile<'_>,
+        destination: &Path,
+    ) -> std::io::Result<()> {
+        // `TempFile` is created in the retained destination directory and its
+        // replacement operation remains relative to that directory
+        // capability. This gives every supported host one containment model
+        // and never reconstructs an ambient destination path.
+        candidate.replace(destination)
+    }
 }
 
 #[derive(Clone)]
@@ -432,8 +456,8 @@ fn execute_save(job: &SaveJob) -> Result<(), SaveFailure> {
     if current.as_slice() != job.expected.as_ref() {
         return Err(SaveFailure::Conflict);
     }
-    candidate
-        .replace(&job.session.filename)
+    CapabilityRelativeReplacer
+        .replace(candidate, Path::new(&job.session.filename))
         .map_err(classify_save_io)?;
     sync_directory(&directory).map_err(classify_save_io)?;
     Ok(())
