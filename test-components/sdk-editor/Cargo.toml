@@ -1,0 +1,13 @@
+[package]
+name = "youth-sdk-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SDK-backed fixture with a single host-owned Editor node, for .youth-test's editor interaction family."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+youth-sdk = { path = "../../crates/youth-sdk" }

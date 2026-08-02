@@ -2,13 +2,18 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use thiserror::Error;
-use youth_runtime::{RuntimeLimits, YouthAppConfig, YouthAppHandle};
+use unicode_segmentation::UnicodeSegmentation;
+use youth_runtime::{
+    ClipboardService, EditorLocalEdit, EditorLocalEditResult, RecordingClipboardService,
+    RuntimeLimits, YouthAppConfig, YouthAppHandle,
+};
 use youth_state::{AppId, GuestCallPhase, StateLimits, StateLocation, StateStore, StateValue};
 use youth_tree::{NodeData, NodeId, Tree, TreeSnapshot};
 
@@ -19,6 +24,17 @@ use youth_runtime::RuntimeEvent;
 pub struct RunOptions {
     pub verify_view_convergence: bool,
 }
+
+/// Oldest `.youth-test` format version this runner still accepts.
+pub const MIN_FORMAT_VERSION: u32 = 1;
+/// Newest `.youth-test` format version this runner understands. A file
+/// with no `youth-test <n>` header is treated as version 1 (legacy).
+///
+/// Versions the *test language* grammar, independently of the Youth
+/// application protocol (`youth:app@0.0.6` etc.) that the driven
+/// component implements -- one test-language version can drive many
+/// supported component profiles.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Selector {
@@ -65,10 +81,47 @@ pub enum Command {
         value: StateValue,
     },
     Mount,
+    /// Direct guest activation: sends the activation command straight to
+    /// the guest by `NodeId`, bypassing host interaction policy entirely
+    /// (no present/enabled/focus/role check). Useful for testing guest
+    /// command guards, and for targeting a control the host would refuse
+    /// to let a real user reach (e.g. a disabled button). Written `invoke`
+    /// in the DSL; `activate` parses to the same command as a
+    /// backward-compatible alias.
     Activate {
         selector: Selector,
     },
+    /// Semantic click: requires the target to be present, enabled, and an
+    /// activatable role (a button), exactly as `youth_interaction`'s host
+    /// policy would require of a real pointer click -- then activates it.
+    /// Real headless hit-testing/geometry is not implemented yet, so this
+    /// enforces only that semantic subset of click policy.
+    Click {
+        selector: Selector,
+    },
+    /// Real wall-clock sleep in the test process. Kept for backward
+    /// compatibility: a file with no `advance time` command runs entirely
+    /// against the production system clock/wake-driver, exactly as before,
+    /// so `sleep` still means a genuine wait. A file that also uses
+    /// `advance time` must spell a real wait as `sleep real`/`wall-sleep`
+    /// instead -- see [`Command::SleepReal`].
     Sleep {
+        millis: u64,
+    },
+    /// Advances the file's injected virtual `DeadlineClock` and
+    /// `WakeDriver`, fires every schedule that becomes due, drains the
+    /// resulting host work (including any newly rearmed schedule), and
+    /// stops once quiescent. Present anywhere in a file switches that
+    /// file's entire run to a virtual clock/wake-driver instead of the
+    /// production ones (see [`Command::Sleep`]'s note).
+    AdvanceTime {
+        millis: u64,
+    },
+    /// Real wall-clock sleep, explicit and independent of the virtual
+    /// clock -- for production-clock smoke evidence in a file that also
+    /// uses `advance time`. Written `sleep real` or `wall-sleep` in the
+    /// DSL.
+    SleepReal {
         millis: u64,
     },
     Restart,
@@ -105,6 +158,96 @@ pub enum Command {
         key: String,
         expected: Option<StateValue>,
     },
+    /// Committed text input against a host-owned Editor session --
+    /// `youth_runtime::EditorLocalEdit::InsertText`, the whole string in
+    /// one host-local edit (not iterated key-by-key, which would test
+    /// keyboard shortcut handling rather than the editor contract).
+    TypeText {
+        selector: Selector,
+        text: String,
+    },
+    /// Replaces the current selection with `text`. No separate host
+    /// primitive exists for this -- it is exactly `InsertText`, which
+    /// already replaces an active selection -- kept as its own DSL command
+    /// only to document a test's intent.
+    ReplaceSelection {
+        selector: Selector,
+        text: String,
+    },
+    /// Writes `text` to the injected host clipboard test double, then
+    /// applies `EditorLocalEdit::Paste`.
+    Paste {
+        selector: Selector,
+        text: String,
+    },
+    /// Sets or replaces the IME preedit text
+    /// (`EditorLocalEdit::ImeSetCompose`). `start` and `update` parse to
+    /// the same host call -- the session itself distinguishes a fresh
+    /// composition from a continued one by whether a composition is
+    /// already pending, not by a different call -- kept as two DSL verbs
+    /// only to document a test's intent.
+    ComposeStart {
+        selector: Selector,
+        text: String,
+    },
+    ComposeUpdate {
+        selector: Selector,
+        text: String,
+    },
+    /// Sets the preedit to `text`, then commits it as ordinary buffer
+    /// content in the same step (`ImeSetCompose` followed by
+    /// `ImeFinishCompose`) -- so a test can commit a composition without a
+    /// separate preceding `update`.
+    ComposeCommit {
+        selector: Selector,
+        text: String,
+    },
+    /// Cancels IME composition, discarding the preedit text
+    /// (`EditorLocalEdit::ImeClearCompose`).
+    ComposeCancel {
+        selector: Selector,
+    },
+    /// Asserts the Editor's current live buffer text. Distinct from
+    /// `expect text`, which reads the retained tree's `Editor.text` field
+    /// -- accurate right after mount/resync/restart, but not kept in sync
+    /// with host-local edits (`type`, `paste`, `compose`, `undo`/`redo`
+    /// aren't tree patches). This reads the live session instead, via the
+    /// same result every host-local edit already returns.
+    ExpectEditorText {
+        selector: Selector,
+        expected: String,
+    },
+    /// Asserts the Editor's current selection as a grapheme-cluster
+    /// range (not bytes, UTF-16 units, or Unicode scalar values) --
+    /// `youth_editor_engine`'s `EditorLocalEditResult::{cursor,selection}`
+    /// are byte offsets; converted here at the assertion layer, mirroring
+    /// the byte-to-char-index conversion AccessKit support already does. A
+    /// collapsed cursor at grapheme position `n` is `n..n`.
+    ExpectEditorSelection {
+        selector: Selector,
+        start: usize,
+        end: usize,
+    },
+    /// Records the current lifetime guest-call count
+    /// (`AppInspection::guest_call_count`) under `label`, for a later
+    /// `measure expect` to diff against. Namespaced under harness
+    /// observation, not the ordinary semantic-tree `expect` vocabulary --
+    /// these are facts about the host's own behavior, not app semantics.
+    /// Does not span a `restart`: the counter is per process instance.
+    MeasureBegin {
+        label: String,
+    },
+    /// Asserts that the lifetime guest-call count has advanced by exactly
+    /// `expected` since the matching `measure begin label`. This is the
+    /// only counter implemented today -- state-calls, state-writes,
+    /// commits, rollbacks, host-repaints, observer-outcomes, and
+    /// pending-deliveries are deferred; none of them are a cumulative
+    /// counter already exposed via `YouthAppHandle::inspect`, unlike
+    /// guest-turns.
+    MeasureExpectGuestTurns {
+        label: String,
+        expected: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +259,9 @@ pub struct LocatedCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Script {
+    /// The declared `youth-test <n>` format version, or 1 if the file has
+    /// no version header (legacy).
+    pub version: u32,
     pub commands: Vec<LocatedCommand>,
 }
 
@@ -123,11 +269,20 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
     let mut commands = Vec::new();
     let mut mounted = false;
     let mut mount_seen = false;
+    let mut version = None;
+    let mut first_content_line = true;
     for (offset, raw) in source.lines().enumerate() {
         let line = offset + 1;
         let source_line = strip_comment(raw).trim();
         if source_line.is_empty() {
             continue;
+        }
+        if first_content_line {
+            first_content_line = false;
+            if let Some(declared) = source_line.strip_prefix("youth-test ") {
+                version = Some(parse_format_version(path, line, source_line, declared)?);
+                continue;
+            }
         }
         let command = parse_command(path, line, source_line)?;
         match command {
@@ -154,7 +309,10 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
                 mounted = true;
             }
             Command::Activate { .. }
+            | Command::Click { .. }
             | Command::Sleep { .. }
+            | Command::AdvanceTime { .. }
+            | Command::SleepReal { .. }
             | Command::Key { .. }
             | Command::ExpectText { .. }
             | Command::ExpectCountdown { .. }
@@ -164,6 +322,17 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             | Command::ExpectChildCount { .. }
             | Command::ExpectChild { .. }
             | Command::ExpectState { .. }
+            | Command::TypeText { .. }
+            | Command::ReplaceSelection { .. }
+            | Command::Paste { .. }
+            | Command::ComposeStart { .. }
+            | Command::ComposeUpdate { .. }
+            | Command::ComposeCommit { .. }
+            | Command::ComposeCancel { .. }
+            | Command::ExpectEditorText { .. }
+            | Command::ExpectEditorSelection { .. }
+            | Command::MeasureBegin { .. }
+            | Command::MeasureExpectGuestTurns { .. }
             | Command::Restart => {
                 if !mounted {
                     return Err(diagnostic(
@@ -189,7 +358,60 @@ pub fn parse(path: &Path, source: &str) -> Result<Script, TestError> {
             "every test must contain exactly one explicit initial mount",
         ));
     }
-    Ok(Script { commands })
+    let uses_virtual_time = commands
+        .iter()
+        .any(|located| matches!(located.command, Command::AdvanceTime { .. }));
+    if uses_virtual_time
+        && let Some(bare_sleep) = commands
+            .iter()
+            .find(|located| matches!(located.command, Command::Sleep { .. }))
+    {
+        return Err(diagnostic(
+            path,
+            bare_sleep.line,
+            &bare_sleep.source,
+            "this file also uses `advance time`, which runs against a virtual clock; `sleep` would only block the test process without advancing it, so use `sleep real`/`wall-sleep` for a genuine wall-clock wait instead",
+        ));
+    }
+    Ok(Script {
+        version: version.unwrap_or(1),
+        commands,
+    })
+}
+
+fn parse_format_version(
+    path: &Path,
+    line: usize,
+    source: &str,
+    declared: &str,
+) -> Result<u32, TestError> {
+    if declared.is_empty() || !declared.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "expected: youth-test <format version, a decimal integer>",
+        ));
+    }
+    let version: u32 = declared.parse().map_err(|error| {
+        diagnostic(
+            path,
+            line,
+            source,
+            &format!("invalid format version: {error}"),
+        )
+    })?;
+    if !(MIN_FORMAT_VERSION..=CURRENT_FORMAT_VERSION).contains(&version) {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            &format!(
+                "unsupported .youth-test format version {version}; this runner supports {MIN_FORMAT_VERSION}..={CURRENT_FORMAT_VERSION}"
+            ),
+        ));
+    }
+    Ok(version)
 }
 
 fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, TestError> {
@@ -199,10 +421,68 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
     if source == "restart" {
         return Ok(Command::Restart);
     }
-    if let Some(name) = source.strip_prefix("activate ") {
+    if let Some(name) = source
+        .strip_prefix("invoke ")
+        .or_else(|| source.strip_prefix("activate "))
+    {
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
         return Ok(Command::Activate { selector });
+    }
+    if let Some(name) = source.strip_prefix("click ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::Click { selector });
+    }
+    if let Some(rest) = source.strip_prefix("type ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::TypeText { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("replace-selection ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::ReplaceSelection { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("paste ") {
+        let (selector, text) = parse_selector_then_text(path, line, source, rest)?;
+        return Ok(Command::Paste { selector, text });
+    }
+    if let Some(rest) = source.strip_prefix("compose ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, rest)?;
+        if let Some(text_input) = remainder.strip_prefix("start ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeStart { selector, text });
+        }
+        if let Some(text_input) = remainder.strip_prefix("update ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeUpdate { selector, text });
+        }
+        if let Some(text_input) = remainder.strip_prefix("commit ") {
+            let (text, remainder) = parse_json_string_prefix(path, line, source, text_input)?;
+            require_empty(path, line, source, remainder)?;
+            return Ok(Command::ComposeCommit { selector, text });
+        }
+        if remainder == "cancel" {
+            return Ok(Command::ComposeCancel { selector });
+        }
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "expected: compose <selector> start|update|commit <JSON-string>, or compose <selector> cancel",
+        ));
+    }
+    if let Some(rest) = source.strip_prefix("advance time ") {
+        let millis = parse_millis_with_unit_suffix(path, line, source, rest)?;
+        return Ok(Command::AdvanceTime { millis });
+    }
+    if let Some(rest) = source
+        .strip_prefix("sleep real ")
+        .or_else(|| source.strip_prefix("wall-sleep "))
+    {
+        let millis = parse_millis_with_unit_suffix(path, line, source, rest)?;
+        return Ok(Command::SleepReal { millis });
     }
     if let Some(digits) = source.strip_prefix("sleep ") {
         let millis = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -234,7 +514,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
                 path,
                 line,
                 source,
-                "expected: state <boolean|integer|text|bytes> <JSON-string-key> <value>",
+                "expected: state <boolean|integer|text|bytes|utf8-bytes|bytes-hex|bytes-base64> <JSON-string-key> <value>",
             )
         })?;
         let (key, encoded) = parse_json_string_prefix(path, line, source, arguments)?;
@@ -289,6 +569,57 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         })?;
         return Ok(Command::ExpectText { selector, expected });
     }
+    if let Some(arguments) = source.strip_prefix("expect editor text ") {
+        let (selector, encoded) = parse_selector_prefix(path, line, source, arguments)?;
+        if encoded.is_empty() {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "expected: expect editor text <selector> <JSON-string>",
+            ));
+        }
+        let expected: String = serde_json::from_str(encoded).map_err(|error| {
+            diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+        })?;
+        return Ok(Command::ExpectEditorText { selector, expected });
+    }
+    if let Some(arguments) = source.strip_prefix("expect editor selection ") {
+        let (selector, remainder) = parse_selector_prefix(path, line, source, arguments)?;
+        let (start, end, remainder) = parse_grapheme_range(path, line, source, remainder)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::ExpectEditorSelection {
+            selector,
+            start,
+            end,
+        });
+    }
+    if let Some(rest) = source.strip_prefix("measure begin ") {
+        let (label, remainder) = parse_json_string_prefix(path, line, source, rest)?;
+        require_empty(path, line, source, remainder)?;
+        return Ok(Command::MeasureBegin { label });
+    }
+    if let Some(rest) = source.strip_prefix("measure expect ") {
+        let (label, remainder) = parse_json_string_prefix(path, line, source, rest)?;
+        let counter_error = || {
+            diagnostic(
+                path,
+                line,
+                source,
+                "expected: measure expect <JSON-string-label> guest-turns <count> (the only measure counter implemented today)",
+            )
+        };
+        let remainder = remainder
+            .strip_prefix("guest-turns ")
+            .ok_or_else(counter_error)?;
+        if remainder.is_empty() || !remainder.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(counter_error());
+        }
+        let expected: u64 = remainder
+            .parse()
+            .map_err(|error| diagnostic(path, line, source, &format!("invalid count: {error}")))?;
+        return Ok(Command::MeasureExpectGuestTurns { label, expected });
+    }
     if let Some(name) = source.strip_prefix("expect countdown ") {
         let (selector, remainder) = parse_selector_prefix(path, line, source, name)?;
         require_empty(path, line, source, remainder)?;
@@ -334,7 +665,7 @@ fn parse_command(path: &Path, line: usize, source: &str) -> Result<Command, Test
         path,
         line,
         source,
-        "unknown command; expected state, mount, activate, sleep, key, restart, or an expect assertion",
+        "unknown command; expected state, mount, invoke, activate, click, sleep, advance, key, type, replace-selection, paste, compose, measure, restart, or an expect assertion",
     ))
 }
 
@@ -373,10 +704,76 @@ fn parse_selector_prefix<'a>(
             remainder,
         ));
     }
+    // The canonical form: a quoted exact name, which can hold whitespace,
+    // `#`, and any other UTF-8 the bare-identifier shorthand below cannot
+    // safely delimit -- Youth's own node-name identity model is not
+    // restricted to single tokens, so the DSL must not accidentally narrow
+    // what it can select.
+    if input.starts_with('"') {
+        let (name, remainder) = parse_json_string_prefix(path, line, source, input)?;
+        if name.is_empty() {
+            return Err(diagnostic(
+                path,
+                line,
+                source,
+                "node name must not be empty",
+            ));
+        }
+        return Ok((Selector::Static(name), remainder));
+    }
+    // The bare-identifier shorthand: convenient for the common case of an
+    // ASCII-identifier-shaped name with no whitespace.
     let end = input.find(char::is_whitespace).unwrap_or(input.len());
     let name = &input[..end];
     validate_name(path, line, source, name)?;
     Ok((Selector::Static(name.to_owned()), input[end..].trim_start()))
+}
+
+/// The shared `<selector> <JSON-string>` shape behind `type`,
+/// `replace-selection`, and `paste`.
+fn parse_selector_then_text(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &str,
+) -> Result<(Selector, String), TestError> {
+    let (selector, remainder) = parse_selector_prefix(path, line, source, input)?;
+    let (text, remainder) = parse_json_string_prefix(path, line, source, remainder)?;
+    require_empty(path, line, source, remainder)?;
+    Ok((selector, text))
+}
+
+/// Parses `graphemes <start>..<end>`, the explicit position unit
+/// `expect editor selection` requires.
+fn parse_grapheme_range<'a>(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &'a str,
+) -> Result<(usize, usize, &'a str), TestError> {
+    let invalid = || {
+        diagnostic(
+            path,
+            line,
+            source,
+            "expected: graphemes <start>..<end> (unsigned decimal grapheme-cluster indices)",
+        )
+    };
+    let input = input.strip_prefix("graphemes ").ok_or_else(invalid)?;
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let range_text = &input[..end];
+    let (start_text, end_text) = range_text.split_once("..").ok_or_else(invalid)?;
+    let start: usize = start_text.parse().map_err(|_| invalid())?;
+    let end_value: usize = end_text.parse().map_err(|_| invalid())?;
+    if end_value < start {
+        return Err(diagnostic(
+            path,
+            line,
+            source,
+            "grapheme range end must not be before its start",
+        ));
+    }
+    Ok((start, end_value, input[end..].trim_start()))
 }
 
 fn parse_u64_prefix<'a>(
@@ -425,6 +822,32 @@ fn parse_usize(
     let (value, remainder) = parse_usize_prefix(path, line, source, input, label)?;
     require_empty(path, line, source, remainder)?;
     Ok(value)
+}
+
+/// Parses a duration written as a decimal integer immediately followed by
+/// `ms` (e.g. `100ms`), with no separating whitespace and no other unit --
+/// the exact spelling `advance time` and `sleep real` use.
+fn parse_millis_with_unit_suffix(
+    path: &Path,
+    line: usize,
+    source: &str,
+    input: &str,
+) -> Result<u64, TestError> {
+    let invalid = || {
+        diagnostic(
+            path,
+            line,
+            source,
+            "duration must be a non-negative decimal integer immediately followed by ms, e.g. 100ms",
+        )
+    };
+    let digits = input.strip_suffix("ms").ok_or_else(invalid)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    digits
+        .parse()
+        .map_err(|error| diagnostic(path, line, source, &format!("invalid duration: {error}")))
 }
 
 fn require_empty(path: &Path, line: usize, source: &str, remainder: &str) -> Result<(), TestError> {
@@ -494,23 +917,85 @@ fn parse_state_value(
                     &format!("invalid 64-bit integer: {error}"),
                 )
             }),
-        "text" | "bytes" => {
+        "text" => {
             let value: String = serde_json::from_str(encoded).map_err(|error| {
                 diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
             })?;
-            if kind == "text" {
-                Ok(StateValue::Text(value))
-            } else {
-                Ok(StateValue::Bytes(value.into_bytes()))
-            }
+            Ok(StateValue::Text(value))
+        }
+        // `bytes` is kept as a compatibility alias of `utf8-bytes`: despite
+        // the name, it can only represent well-formed UTF-8 text encoded as
+        // bytes, not arbitrary binary or invalid UTF-8. `bytes-hex` and
+        // `bytes-base64` below can represent every value the typed state
+        // API's `StateValue::Bytes(Vec<u8>)` actually supports.
+        "bytes" | "utf8-bytes" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            Ok(StateValue::Bytes(value.into_bytes()))
+        }
+        "bytes-hex" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            let bytes = decode_hex(&value).map_err(|error| {
+                diagnostic(
+                    path,
+                    line,
+                    source,
+                    &format!("invalid hex-encoded bytes: {error}"),
+                )
+            })?;
+            Ok(StateValue::Bytes(bytes))
+        }
+        "bytes-base64" => {
+            let value: String = serde_json::from_str(encoded).map_err(|error| {
+                diagnostic(path, line, source, &format!("invalid JSON string: {error}"))
+            })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value.as_bytes())
+                .map_err(|error| {
+                    diagnostic(
+                        path,
+                        line,
+                        source,
+                        &format!("invalid base64-encoded bytes: {error}"),
+                    )
+                })?;
+            Ok(StateValue::Bytes(bytes))
         }
         _ => Err(diagnostic(
             path,
             line,
             source,
-            "state kind must be boolean, integer, text, or bytes",
+            "state kind must be boolean, integer, text, bytes (legacy alias of utf8-bytes), utf8-bytes, bytes-hex, or bytes-base64",
         )),
     }
+}
+
+/// Decodes ASCII hex digits into bytes, able to represent every byte
+/// sequence including invalid UTF-8 -- unlike `bytes`/`utf8-bytes`, which
+/// can only represent well-formed UTF-8 text.
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.is_ascii() {
+        return Err("hex-encoded bytes must be ASCII".into());
+    }
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err("hex-encoded bytes must have an even number of digits".into());
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid hex digit {:?}", pair[0] as char))?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid hex digit {:?}", pair[1] as char))?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
 }
 
 fn parse_key(
@@ -666,9 +1151,35 @@ pub async fn run_file_with_options(
     })?;
     let state_file = state.path().join("state.sqlite3");
     seed_state(path, &script.commands, app_id, &state_file)?;
-    let mut app = spawn(component, app_id, &state_file)?;
+    let uses_virtual_time = script
+        .commands
+        .iter()
+        .any(|located| matches!(located.command, Command::AdvanceTime { .. }));
+    let virtual_time = uses_virtual_time.then(VirtualTime::new);
+    // Every run gets an isolated, deterministic clipboard test double --
+    // headless tests must never read or write the real developer's OS
+    // clipboard -- and it's what `paste` writes through.
+    let clipboard = RecordingClipboardService::default();
+    let mut app = spawn(
+        component,
+        app_id,
+        &state_file,
+        virtual_time.as_ref(),
+        &clipboard,
+    )?;
     let mut events = app.subscribe();
     let mut snapshot = None;
+    // The live Editor session state as of the most recent host-local edit
+    // against each node, for `expect editor text`/`expect editor
+    // selection` -- host-local edits touch only the live Editor registry,
+    // never the retained tree, so this is the only place that state is
+    // observable from the runner.
+    let mut editor_state: HashMap<NodeId, EditorLocalEditResult> = HashMap::new();
+    // The lifetime `guest_call_count` observed at each active `measure
+    // begin <label>`, for `measure expect <label> guest-turns <n>` to diff
+    // against. Does not survive a `restart` -- the counter is per process
+    // instance -- so it is cleared there, same as `editor_state`.
+    let mut measure_baselines: HashMap<String, u64> = HashMap::new();
     let mut interaction = InteractionState::default();
 
     for located in script.commands {
@@ -697,14 +1208,251 @@ pub async fn run_file_with_options(
                 );
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
             }
-            Command::Sleep { millis } => {
+            Command::Click { selector } => {
+                let tree = normalized_tree(snapshot.as_ref().expect("parser requires mount"));
+                let node = selector.node_id();
+                check_click_policy(path, &located, &tree, selector, node)?;
+                interaction.focus_pointer_target(&tree, node);
+                app.activate(node)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                snapshot = Some(
+                    app.snapshot()
+                        .await
+                        .map_err(|error| runtime(path, &located, error))?,
+                );
+                reconcile(&mut interaction, snapshot.as_ref().unwrap());
+            }
+            Command::TypeText { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::InsertText(text.clone()))
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ReplaceSelection { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::InsertText(text.clone()))
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::Paste { selector, text } => {
+                let node = selector.node_id();
+                clipboard.write_text(text).map_err(|error| {
+                    assertion_error(
+                        path,
+                        &located,
+                        format!("could not write the test clipboard: {error}"),
+                    )
+                })?;
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::Paste)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeStart { selector, text }
+            | Command::ComposeUpdate { selector, text } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(
+                        node,
+                        EditorLocalEdit::ImeSetCompose {
+                            text: text.clone(),
+                            cursor: None,
+                        },
+                    )
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeCommit { selector, text } => {
+                let node = selector.node_id();
+                app.edit_editor_locally(
+                    node,
+                    EditorLocalEdit::ImeSetCompose {
+                        text: text.clone(),
+                        cursor: None,
+                    },
+                )
+                .await
+                .map_err(|error| runtime(path, &located, error))?;
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::ImeFinishCompose)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ComposeCancel { selector } => {
+                let node = selector.node_id();
+                let result = app
+                    .edit_editor_locally(node, EditorLocalEdit::ImeClearCompose)
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                editor_state.insert(node, result);
+            }
+            Command::ExpectEditorText { selector, expected } => {
+                let node = selector.node_id();
+                let observed = editor_state
+                    .get(&node)
+                    .map(|result| result.text.as_str())
+                    .or_else(|| {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                snapshot.nodes.iter().find(|entry| entry.id == node)
+                            })
+                            .and_then(|entry| entry.data.text_value())
+                    });
+                if observed != Some(expected.as_str()) {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor text {selector} to equal {expected:?}; observed {}",
+                            observed.map_or_else(
+                                || "no live Editor session or semantic node".to_owned(),
+                                |value| format!("{value:?}")
+                            )
+                        ),
+                    ));
+                }
+            }
+            Command::ExpectEditorSelection {
+                selector,
+                start,
+                end,
+            } => {
+                let node = selector.node_id();
+                let Some(result) = editor_state.get(&node) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor selection for {selector}; observed no live Editor session (no host-local edit against it yet)"
+                        ),
+                    ));
+                };
+                let byte_range = result
+                    .selection
+                    .clone()
+                    .unwrap_or(result.cursor..result.cursor);
+                let observed_start = byte_to_grapheme_index(&result.text, byte_range.start);
+                let observed_end = byte_to_grapheme_index(&result.text, byte_range.end);
+                if (observed_start, observed_end) != (*start, *end) {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected editor selection {selector} to be graphemes {start}..{end}; observed graphemes {observed_start}..{observed_end}"
+                        ),
+                    ));
+                }
+            }
+            Command::MeasureBegin { label } => {
+                let inspection = app
+                    .inspect()
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                measure_baselines.insert(label.clone(), inspection.guest_call_count);
+            }
+            Command::MeasureExpectGuestTurns { label, expected } => {
+                let Some(baseline) = measure_baselines.get(label) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected a measurement named {label:?}; observed no matching `measure begin` (or it was cleared by an intervening `restart`)"
+                        ),
+                    ));
+                };
+                let inspection = app
+                    .inspect()
+                    .await
+                    .map_err(|error| runtime(path, &located, error))?;
+                let Some(observed) = inspection.guest_call_count.checked_sub(*baseline) else {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "measurement {label:?}'s guest-call count went backwards since `measure begin`; a `measure` span cannot cross a `restart`"
+                        ),
+                    ));
+                };
+                if observed != *expected {
+                    return Err(assertion_error(
+                        path,
+                        &located,
+                        format!(
+                            "expected measurement {label:?} to record {expected} guest turns; observed {observed}"
+                        ),
+                    ));
+                }
+            }
+            Command::Sleep { millis } | Command::SleepReal { millis } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
+            }
+            Command::AdvanceTime { millis } => {
+                let virtual_time = virtual_time
+                    .as_ref()
+                    .expect("parser requires advance time to run in a virtual-time file");
+                let duration = std::time::Duration::from_millis(*millis);
+                virtual_time.clock.advance(duration);
+                virtual_time.wake.advance(duration);
+                let mut iterations = 0_u32;
+                loop {
+                    let due = virtual_time.wake.due();
+                    if due.is_empty() {
+                        break;
+                    }
+                    for token in due {
+                        // `due()` just reported this token as armed and
+                        // overdue, and only this loop mutates the driver,
+                        // so `fire` returning `false` here would mean the
+                        // seams disagree with themselves.
+                        assert!(
+                            virtual_time.wake.fire(&token),
+                            "a token `due()` just reported was not fired"
+                        );
+                    }
+                    // Barrier: the mailbox is a strict FIFO processed by one
+                    // dedicated worker thread, so this round-trip guarantees
+                    // every wake fired above -- and any host work it
+                    // triggered, including a newly rearmed schedule -- is
+                    // fully applied before the next `due()` check.
+                    snapshot = Some(
+                        app.snapshot()
+                            .await
+                            .map_err(|error| runtime(path, &located, error))?,
+                    );
+                    iterations += 1;
+                    if iterations > 10_000 {
+                        return Err(assertion_error(
+                            path,
+                            &located,
+                            "advance time did not settle: a schedule kept rearming after 10,000 drain iterations".into(),
+                        ));
+                    }
+                }
+                reconcile(
+                    &mut interaction,
+                    snapshot.as_ref().expect("parser requires mount"),
+                );
             }
             Command::Restart => {
                 app.stop()
                     .await
                     .map_err(|error| runtime(path, &located, error))?;
-                app = spawn(component, app_id, &state_file)?;
+                app = spawn(
+                    component,
+                    app_id,
+                    &state_file,
+                    virtual_time.as_ref(),
+                    &clipboard,
+                )?;
                 events = app.subscribe();
                 snapshot = Some(
                     app.mount()
@@ -712,6 +1460,14 @@ pub async fn run_file_with_options(
                         .map_err(|error| runtime(path, &located, error))?,
                 );
                 interaction = InteractionState::default();
+                // A restart drops the whole runtime, including every live
+                // Editor session; any cached local-edit result now
+                // describes a session that no longer exists.
+                editor_state.clear();
+                // The new process instance's guest_call_count starts back
+                // at zero; a baseline from before the restart is no longer
+                // meaningful.
+                measure_baselines.clear();
                 reconcile(&mut interaction, snapshot.as_ref().unwrap());
                 if options.verify_view_convergence {
                     verify_view_convergence(path, &located, &app).await?;
@@ -1067,12 +1823,69 @@ fn reconcile(interaction: &mut InteractionState, snapshot: &TreeSnapshot) {
     interaction.reconcile(&normalized_tree(snapshot));
 }
 
-fn spawn(component: &Path, app_id: &AppId, state_file: &Path) -> Result<YouthAppHandle, TestError> {
+/// The injected virtual `DeadlineClock` and `WakeDriver` for a file that
+/// uses `advance time`. Held for the file's entire run, including across
+/// `restart`, since state (and thus how much virtual time has already
+/// elapsed) is meant to persist across a restart exactly like it would
+/// against the production clock.
+struct VirtualTime {
+    clock: std::sync::Arc<youth_state::VirtualDeadlineClock>,
+    wake: std::sync::Arc<youth_state::VirtualWakeDriver>,
+}
+
+impl VirtualTime {
+    /// Seeds the virtual deadline clock with the real current time, purely
+    /// so absolute epoch-millisecond values stay realistic (useful for
+    /// debugging output); nothing depends on this exact starting value.
+    fn new() -> Self {
+        Self {
+            clock: std::sync::Arc::new(youth_state::VirtualDeadlineClock::new(real_epoch_millis())),
+            wake: std::sync::Arc::new(youth_state::VirtualWakeDriver::default()),
+        }
+    }
+}
+
+fn real_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Converts a byte offset into `text` to a grapheme-cluster index -- the
+/// count of extended grapheme cluster boundaries (UAX #29) strictly before
+/// it. `.youth-test`'s editor assertions are written in grapheme clusters,
+/// not bytes, UTF-16 units, or Unicode scalar values, so this is the
+/// conversion at the assertion layer that
+/// `EditorLocalEditResult::{cursor,selection}` (byte offsets) need before
+/// they can be compared against a DSL-level grapheme position. `byte_offset`
+/// is assumed to already land on a grapheme boundary, true of every offset
+/// the editor engine itself produces.
+fn byte_to_grapheme_index(text: &str, byte_offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .take_while(|(index, _)| *index < byte_offset)
+        .count()
+}
+
+fn spawn(
+    component: &Path,
+    app_id: &AppId,
+    state_file: &Path,
+    virtual_time: Option<&VirtualTime>,
+    clipboard: &RecordingClipboardService,
+) -> Result<YouthAppHandle, TestError> {
+    let mut limits = RuntimeLimits::default();
+    if let Some(virtual_time) = virtual_time {
+        limits.time.deadline_clock = virtual_time.clock.clone();
+        limits.time.wake_driver = virtual_time.wake.clone();
+    }
+    limits.time.clipboard_service = std::sync::Arc::new(clipboard.clone());
     YouthAppHandle::spawn(YouthAppConfig {
         component_path: component.to_path_buf(),
         app_id: app_id.clone(),
         state: StateLocation::File(state_file.to_path_buf()),
-        limits: RuntimeLimits::default(),
+        limits,
     })
     .map_err(|error| TestError::Diagnostic {
         path: component.to_path_buf(),
@@ -1085,6 +1898,49 @@ fn spawn(component: &Path, app_id: &AppId, state_file: &Path) -> Result<YouthApp
 #[cfg(test)]
 fn named_id(name: &str) -> NodeId {
     Selector::Static(name.to_owned()).node_id()
+}
+
+/// The semantic subset of real click policy: present, an activatable role
+/// (a button), and enabled (accounting for ancestor `enabled` state, same
+/// as `youth_interaction::InteractionState`'s focus/shortcut discovery).
+/// Real headless hit-testing/geometry is not implemented yet.
+fn check_click_policy(
+    path: &Path,
+    located: &LocatedCommand,
+    tree: &Tree,
+    selector: &Selector,
+    node: NodeId,
+) -> Result<(), TestError> {
+    let Some(entry) = tree.node(node) else {
+        return Err(assertion_error(
+            path,
+            located,
+            format!("click target {selector} is not present in the semantic tree"),
+        ));
+    };
+    if !entry.data.is_button() {
+        return Err(assertion_error(
+            path,
+            located,
+            format!(
+                "click target {selector} has no activatable role; observed {}",
+                describe(Some(&entry.data))
+            ),
+        ));
+    }
+    let probe = InteractionState::default();
+    if !probe
+        .snapshot(tree)
+        .enabled_actions
+        .contains(&SemanticAction::Activate(node))
+    {
+        return Err(assertion_error(
+            path,
+            located,
+            format!("click target {selector} is present but disabled"),
+        ));
+    }
+    Ok(())
 }
 
 fn expect_text(
@@ -1207,6 +2063,59 @@ pub enum TestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_header_defaults_to_format_version_one() {
+        let script = parse(Path::new("legacy.youth-test"), "mount\n").unwrap();
+        assert_eq!(script.version, 1);
+    }
+
+    #[test]
+    fn explicit_header_is_parsed_and_excluded_from_commands() {
+        let script = parse(Path::new("versioned.youth-test"), "youth-test 1\nmount\n").unwrap();
+        assert_eq!(script.version, 1);
+        assert_eq!(script.commands.len(), 1);
+        assert_eq!(script.commands[0].command, Command::Mount);
+    }
+
+    #[test]
+    fn header_may_follow_leading_comments_and_blank_lines() {
+        let script = parse(
+            Path::new("versioned.youth-test"),
+            "# leading comment\n\nyouth-test 1\nmount\n",
+        )
+        .unwrap();
+        assert_eq!(script.version, 1);
+        assert_eq!(script.commands.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_format_version_newer_than_this_runner_supports() {
+        let error = parse(Path::new("future.youth-test"), "youth-test 2\nmount\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported .youth-test format version 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_format_version() {
+        for source in ["youth-test\nmount\n", "youth-test abc\nmount\n"] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
+    }
+
+    #[test]
+    fn header_is_only_recognized_as_the_first_content_line() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nyouth-test 1\nrestart\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown command"), "{error}");
+    }
 
     #[test]
     fn parses_comments_json_strings_and_restart() {
@@ -1346,6 +2255,212 @@ expect focus derived "todo" 1 "toggle"
     }
 
     #[test]
+    fn invoke_and_activate_parse_to_the_same_command() {
+        let script = parse(Path::new("invoke.youth-test"), "mount\ninvoke increment\n").unwrap();
+        let alias = parse(
+            Path::new("activate.youth-test"),
+            "mount\nactivate increment\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::Activate {
+                selector: Selector::Static("increment".into())
+            }
+        );
+        assert_eq!(script.commands[1].command, alias.commands[1].command);
+    }
+
+    #[test]
+    fn click_parses_to_its_own_command() {
+        let script = parse(Path::new("click.youth-test"), "mount\nclick increment\n").unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::Click {
+                selector: Selector::Static("increment".into())
+            }
+        );
+    }
+
+    #[test]
+    fn click_policy_rejects_absent_disabled_and_non_button_targets() {
+        let id = |value| NodeId::new(value).unwrap();
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    youth_tree::Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2), id(3), id(4)],
+                    },
+                    youth_tree::Node {
+                        id: id(2),
+                        data: NodeData::Button {
+                            label: "Go".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                    },
+                    youth_tree::Node {
+                        id: id(3),
+                        data: NodeData::Button {
+                            label: "Disabled".into(),
+                            enabled: false,
+                        },
+                        children: vec![],
+                    },
+                    youth_tree::Node {
+                        id: id(4),
+                        data: NodeData::Text {
+                            value: "not a button".into(),
+                        },
+                        children: vec![],
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let located = LocatedCommand {
+            line: 1,
+            source: "click go".into(),
+            command: Command::Click {
+                selector: Selector::Static("go".into()),
+            },
+        };
+        let path = Path::new("click.youth-test");
+
+        check_click_policy(path, &located, &tree, &Selector::Static("go".into()), id(2))
+            .expect("enabled button target is clickable");
+
+        let disabled = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("disabled".into()),
+            id(3),
+        )
+        .unwrap_err();
+        assert!(
+            disabled.to_string().contains("present but disabled"),
+            "{disabled}"
+        );
+
+        let non_button = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("label".into()),
+            id(4),
+        )
+        .unwrap_err();
+        assert!(
+            non_button.to_string().contains("no activatable role"),
+            "{non_button}"
+        );
+
+        let absent = check_click_policy(
+            path,
+            &located,
+            &tree,
+            &Selector::Static("missing".into()),
+            id(99),
+        )
+        .unwrap_err();
+        assert!(absent.to_string().contains("is not present"), "{absent}");
+    }
+
+    #[test]
+    fn quoted_selectors_accept_whitespace_hashes_and_non_ascii() {
+        let script = parse(
+            Path::new("quoted.youth-test"),
+            "mount\nexpect present \"sidebar/current note\"\nexpect present \"\u{6587}\u{66f8}/\u{73fe}\u{5728} # not a comment\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectPresent {
+                selector: Selector::Static("sidebar/current note".into())
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectPresent {
+                selector: Selector::Static(
+                    "\u{6587}\u{66f8}/\u{73fe}\u{5728} # not a comment".into()
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn quoted_selector_named_none_is_not_the_no_focus_sentinel() {
+        let script = parse(
+            Path::new("quoted-focus.youth-test"),
+            "mount\nexpect focus \"none\"\nexpect focus none\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectFocus {
+                selector: Some(Selector::Static("none".into()))
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectFocus { selector: None }
+        );
+    }
+
+    #[test]
+    fn parses_extended_bytes_seed_encodings() {
+        let script = parse(
+            Path::new("bytes.youth-test"),
+            r#"
+state utf8-bytes "text" "héllo"
+state bytes-hex "binary" "00ff7f80"
+state bytes-base64 "based" "AP9/gA=="
+mount
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[0].command,
+            Command::State {
+                key: "text".into(),
+                value: StateValue::Bytes("héllo".as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            script.commands[1].command,
+            Command::State {
+                key: "binary".into(),
+                value: StateValue::Bytes(vec![0x00, 0xff, 0x7f, 0x80]),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::State {
+                key: "based".into(),
+                value: StateValue::Bytes(vec![0x00, 0xff, 0x7f, 0x80]),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_hex_and_base64_seeds() {
+        for source in [
+            "state bytes-hex \"k\" \"0ff\"\nmount\n",
+            "state bytes-hex \"k\" \"zz\"\nmount\n",
+            "state bytes-base64 \"k\" \"not base64!!\"\nmount\n",
+        ] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
+    }
+
+    #[test]
     fn parses_sleep_and_rejects_invalid_durations() {
         let script = parse(Path::new("sleep.youth-test"), "mount\nsleep 150\n").unwrap();
         assert_eq!(script.commands[1].command, Command::Sleep { millis: 150 });
@@ -1359,6 +2474,240 @@ expect focus derived "todo" 1 "toggle"
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn parses_type_replace_selection_and_paste() {
+        let script = parse(
+            Path::new("editor.youth-test"),
+            "mount\ntype document \"Hello, 世界\"\nreplace-selection document \"Hi\"\npaste document \"clipped\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::TypeText {
+                selector: Selector::Static("document".into()),
+                text: "Hello, 世界".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ReplaceSelection {
+                selector: Selector::Static("document".into()),
+                text: "Hi".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::Paste {
+                selector: Selector::Static("document".into()),
+                text: "clipped".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_the_compose_family() {
+        let script = parse(
+            Path::new("compose.youth-test"),
+            "mount\ncompose document start \"n\"\ncompose document update \"\u{f1}\"\ncompose document commit \"\u{f1}\"\ncompose document cancel\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ComposeStart {
+                selector: Selector::Static("document".into()),
+                text: "n".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ComposeUpdate {
+                selector: Selector::Static("document".into()),
+                text: "\u{f1}".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::ComposeCommit {
+                selector: Selector::Static("document".into()),
+                text: "\u{f1}".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[4].command,
+            Command::ComposeCancel {
+                selector: Selector::Static("document".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_compose_verb() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\ncompose document nonsense\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected: compose <selector> start|update|commit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_expect_editor_text_and_selection() {
+        let script = parse(
+            Path::new("editor-expect.youth-test"),
+            "mount\nexpect editor text document \"Hi, 世界\"\nexpect editor selection document graphemes 2..2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::ExpectEditorText {
+                selector: Selector::Static("document".into()),
+                expected: "Hi, 世界".into(),
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::ExpectEditorSelection {
+                selector: Selector::Static("document".into()),
+                start: 2,
+                end: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_grapheme_range() {
+        for source in [
+            "mount\nexpect editor selection document 2..2\n",
+            "mount\nexpect editor selection document graphemes 2\n",
+            "mount\nexpect editor selection document graphemes two..three\n",
+            "mount\nexpect editor selection document graphemes 5..2\n",
+        ] {
+            assert!(parse(Path::new("bad.youth-test"), source).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_measure_begin_and_expect_guest_turns() {
+        let script = parse(
+            Path::new("measure.youth-test"),
+            "mount\nmeasure begin \"typing\"\nmeasure expect \"typing\" guest-turns 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::MeasureBegin {
+                label: "typing".into()
+            }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::MeasureExpectGuestTurns {
+                label: "typing".into(),
+                expected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_measure_expect_naming_an_unsupported_counter() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nmeasure expect \"typing\" state-writes 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the only measure counter implemented today"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn byte_to_grapheme_index_counts_extended_grapheme_clusters_not_bytes_or_scalars() {
+        // "Hi, 世界" -- "世" and "界" are each one grapheme cluster but
+        // three UTF-8 bytes; a naive byte-offset comparison would be wrong.
+        let text = "Hi, 世界";
+        assert_eq!(byte_to_grapheme_index(text, 0), 0);
+        assert_eq!(byte_to_grapheme_index(text, 4), 4); // just after "Hi, "
+        assert_eq!(byte_to_grapheme_index(text, 7), 5); // just after "世" (3 bytes)
+        assert_eq!(byte_to_grapheme_index(text, 10), 6); // end of string
+    }
+
+    #[test]
+    fn parses_advance_time_and_sleep_real_and_wall_sleep() {
+        let script = parse(
+            Path::new("advance.youth-test"),
+            "mount\nadvance time 100ms\nsleep real 150ms\nwall-sleep 25ms\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.commands[1].command,
+            Command::AdvanceTime { millis: 100 }
+        );
+        assert_eq!(
+            script.commands[2].command,
+            Command::SleepReal { millis: 150 }
+        );
+        assert_eq!(
+            script.commands[3].command,
+            Command::SleepReal { millis: 25 }
+        );
+    }
+
+    #[test]
+    fn rejects_advance_time_and_sleep_durations_missing_the_ms_suffix() {
+        for source in [
+            "mount\nadvance time 100\n",
+            "mount\nsleep real 100\n",
+            "mount\nadvance time 100s\n",
+            "mount\nadvance time ms\n",
+        ] {
+            let error = parse(Path::new("bad.youth-test"), source).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("immediately followed by ms, e.g. 100ms"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bare_sleep_mixed_with_advance_time_in_the_same_file() {
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nadvance time 100ms\nsleep 50\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("also uses `advance time`"),
+            "{error}"
+        );
+        // Order does not matter -- the bare `sleep` still runs against the
+        // production clock either way.
+        let error = parse(
+            Path::new("bad.youth-test"),
+            "mount\nsleep 50\nadvance time 100ms\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("also uses `advance time`"),
+            "{error}"
+        );
+        // `sleep real`/`wall-sleep` remain fine alongside `advance time`.
+        parse(
+            Path::new("ok.youth-test"),
+            "mount\nadvance time 100ms\nsleep real 50ms\nwall-sleep 50ms\n",
+        )
+        .unwrap();
     }
 
     #[test]

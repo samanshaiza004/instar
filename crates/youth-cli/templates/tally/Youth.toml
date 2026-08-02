@@ -10,3 +10,6 @@ target = "wasm32-wasip2"
 
 [development]
 state = ".youth/state"
+
+[test]
+verify_view_convergence = true
