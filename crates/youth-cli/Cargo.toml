@@ -18,6 +18,7 @@ sha2 = "0.10.9"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "time"] }
 toml = "0.9.12"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+youth-capsule = { path = "../youth-capsule" }
 youth-runtime = { path = "../youth-runtime" }
 youth-project = { path = "../youth-project" }
 youth-state = { path = "../youth-state" }

@@ -3,10 +3,14 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use youth_capsule::{
+    CAPSULE_FORMAT_VERSION, CapsuleManifest, CapsuleProvenance, ComponentRecord, MANIFEST_NAME,
+    PROVENANCE_NAME, RequiredProfile,
+};
 use youth_project::{CLI_VERSION, Project, SUPPORTED_PROTOCOL, TEMPLATE_VERSION};
 use youth_state::AppId;
 
@@ -319,6 +323,204 @@ pub fn build_project(release: bool) -> Result<(), CliError> {
     println!("size: {} bytes", validation.size);
     println!("sha256: {}", validation.sha256);
     Ok(())
+}
+
+pub fn capsule_project(
+    release: bool,
+    out_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<(), CliError> {
+    let (project, validation) = build_and_validate(release)?;
+    let output =
+        out_dir.unwrap_or_else(|| project.root().join("capsule").join(project.app_id.as_str()));
+    if output.exists() && !force {
+        return Err(message(format!(
+            "refusing to overwrite existing capsule directory {}; use --force to replace it",
+            output.display()
+        )));
+    }
+    let profile = project
+        .resolved_contract_profile()
+        .map_err(|error| message(error.to_string()))?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+    let staging = unique_capsule_staging_directory(&output)?;
+    let result = (|| {
+        let source = project.cargo_component(release);
+        let component = staging.join("component.wasm");
+        publish_component(&source, &component)?;
+
+        let written = fs::read(&component).map_err(|error| io(&component, error))?;
+        let written_size = u64::try_from(written.len()).unwrap_or(u64::MAX);
+        let written_sha256 = format!("{:x}", Sha256::digest(&written));
+        if written_size != validation.size || written_sha256 != validation.sha256 {
+            return Err(message(format!(
+                "copied capsule component failed verification: expected {} bytes with SHA-256 {}, found {} bytes with SHA-256 {}",
+                validation.size, validation.sha256, written_size, written_sha256
+            )));
+        }
+
+        let manifest = CapsuleManifest::new(
+            CAPSULE_FORMAT_VERSION,
+            project.app_id.clone(),
+            project.manifest.app.name.clone(),
+            RequiredProfile {
+                protocol: profile.protocol.to_owned(),
+                wit_sha256: profile
+                    .wit_sha256
+                    .parse()
+                    .map_err(|error| message(format!("invalid profile WIT digest: {error}")))?,
+            },
+            ComponentRecord {
+                path: "component.wasm"
+                    .parse()
+                    .map_err(|error| message(format!("invalid capsule component path: {error}")))?,
+                sha256: validation.sha256.parse().map_err(|error| {
+                    message(format!("invalid validated component digest: {error}"))
+                })?,
+                size_bytes: validation.size,
+            },
+        )
+        .map_err(|error| message(format!("invalid capsule manifest: {error}")))?;
+        let provenance = CapsuleProvenance {
+            app_commit: git_commit(project.root()),
+            youth_commit: git_commit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")),
+            sdk_revision: profile.sdk_revision.to_owned(),
+            template_version: profile.template_version,
+            cli_version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_profile: if release { "release" } else { "dev" }.to_owned(),
+            rustc_version: tool_version("rustc")?,
+            cargo_version: tool_version("cargo")?,
+            built_at: rfc3339_now()?,
+        };
+        let provenance_path = staging.join(PROVENANCE_NAME);
+        let provenance_toml = toml::to_string(&provenance).map_err(|error| {
+            message(format!(
+                "could not serialize {}: {error}",
+                provenance_path.display()
+            ))
+        })?;
+        write_synced(&provenance_path, &provenance_toml)?;
+        let manifest_path = staging.join(MANIFEST_NAME);
+        let manifest_toml = toml::to_string(&manifest).map_err(|error| {
+            message(format!(
+                "could not serialize {}: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        write_synced(&manifest_path, &manifest_toml)?;
+        youth_capsule::verify::verify_capsule(&staging)
+            .map_err(|error| message(format!("staged capsule verification failed: {error}")))?;
+
+        if output.exists() {
+            fs::remove_dir_all(&output).map_err(|error| io(&output, error))?;
+        }
+        fs::rename(&staging, &output).map_err(|error| io(&output, error))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+
+    println!("capsule: {}", output.display());
+    println!("component: {}", output.join("component.wasm").display());
+    println!("sha256: {}", validation.sha256);
+    println!("protocol: {}", profile.protocol);
+    println!("app: {}", project.app_id);
+    Ok(())
+}
+
+fn unique_capsule_staging_directory(output: &Path) -> Result<PathBuf, CliError> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| message("capsule output must have a UTF-8 final path component"))?;
+    for attempt in 0..100_u32 {
+        let staging = parent.join(format!(".{name}.staging-{}-{attempt}", std::process::id()));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io(&staging, error)),
+        }
+    }
+    Err(message("could not allocate a capsule staging directory"))
+}
+
+fn write_synced(path: &Path, contents: &str) -> Result<(), CliError> {
+    fs::write(path, contents).map_err(|error| io(path, error))?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| io(path, error))?;
+    file.sync_all().map_err(|error| io(path, error))
+}
+
+fn git_commit(directory: &Path) -> Option<String> {
+    command_stdout("git", &["rev-parse", "HEAD"], Some(directory))
+}
+
+fn tool_version(tool: &str) -> Result<String, CliError> {
+    command_stdout(tool, &["--version"], None)
+        .ok_or_else(|| message(format!("failed to read {tool} version")))
+}
+
+fn command_stdout(command: &str, arguments: &[&str], directory: Option<&Path>) -> Option<String> {
+    let mut process = Command::new(command);
+    process.args(arguments).stdin(Stdio::null());
+    if let Some(directory) = directory {
+        process.current_dir(directory);
+    }
+    let output = process.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn rfc3339_now() -> Result<String, CliError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| message(format!("system clock is before the Unix epoch: {error}")))?;
+    let total_seconds = elapsed.as_secs();
+    let days = i64::try_from(total_seconds / 86_400)
+        .map_err(|_| message("current time is outside the supported RFC 3339 range"))?;
+    let seconds = total_seconds % 86_400;
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
+fn civil_date_from_days(days: i64) -> (i64, i64, i64) {
+    let zero_based_march_days = days + 719_468;
+    let era = if zero_based_march_days >= 0 {
+        zero_based_march_days
+    } else {
+        zero_based_march_days - 146_096
+    } / 146_097;
+    let day_of_era = zero_based_march_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = march_month + if march_month < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 pub async fn test_project(override_convergence: Option<bool>) -> Result<(), CliError> {

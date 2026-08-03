@@ -5,6 +5,7 @@ members = [
     "crates/youth-state",
     "crates/youth-sdk",
     "crates/youth-project",
+    "crates/youth-capsule",
     "crates/youth-test",
     "crates/youth-runtime",
     "crates/youth-interaction",

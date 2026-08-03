@@ -1,0 +1,16 @@
+[package]
+name = "youth-capsule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable capsule schema and payload integrity verification for Youth."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2"
+toml = "0.9.12"
+youth-state = { path = "../youth-state" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -232,6 +232,10 @@ impl Project {
             .join(format!("{}.wasm", self.app_id.as_str()))
     }
 
+    pub fn resolved_contract_profile(&self) -> Result<&'static ContractProfile, ProjectError> {
+        contract_profile_for_lock(&self.manifest, &self.lock)
+    }
+
     /// Verifies the inspectable WIT snapshot and both Cargo dependency records.
     pub fn verify_locked_inputs(&self, running_cli_version: &str) -> Result<(), ProjectError> {
         compare(

@@ -5536,6 +5536,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "youth-capsule"
+version = "0.0.2"
+dependencies = [
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
+ "youth-state",
+]
+
+[[package]]
 name = "youth-cli"
 version = "0.0.2"
 dependencies = [
@@ -5547,6 +5559,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing-subscriber",
+ "youth-capsule",
  "youth-desktop",
  "youth-project",
  "youth-runtime",

@@ -47,6 +47,15 @@ enum Command {
         #[arg(long)]
         release: bool,
     },
+    /// Build a portable capsule (manifest + provenance + component) for distribution.
+    Capsule {
+        #[arg(long)]
+        release: bool,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Run all semantic `tests/*.youth-test` files headlessly.
     Test {
         /// Force reconstruct-and-compare view convergence checking on,
@@ -120,6 +129,13 @@ enum Command {
         state_dir: Option<PathBuf>,
         #[arg(long, conflicts_with = "state_dir")]
         ephemeral: bool,
+        /// Use the same state root a packaged capsule launch would use,
+        /// instead of the default development root.
+        #[arg(
+            long,
+            conflicts_with_all = ["state_dir", "ephemeral"]
+        )]
+        use_production_state: bool,
         #[arg(long, default_value_t = 640)]
         window_width: u32,
         #[arg(long, default_value_t = 360)]
@@ -207,6 +223,7 @@ fn main() -> ExitCode {
             app_id,
             state_dir,
             ephemeral,
+            use_production_state,
             window_width,
             window_height,
             supervised,
@@ -216,6 +233,7 @@ fn main() -> ExitCode {
             app_id,
             state_dir,
             ephemeral,
+            use_production_state,
             width: window_width,
             height: window_height,
             supervised,
@@ -251,6 +269,11 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Check => project_commands::check_project()?,
         Command::Build { release } => project_commands::build_project(release)?,
+        Command::Capsule {
+            release,
+            out_dir,
+            force,
+        } => project_commands::capsule_project(release, out_dir, force)?,
         Command::Test {
             verify_view_convergence,
             no_verify_view_convergence,
@@ -371,6 +394,7 @@ struct DesktopLaunch {
     app_id: AppId,
     state_dir: Option<PathBuf>,
     ephemeral: bool,
+    use_production_state: bool,
     width: u32,
     height: u32,
     supervised: bool,
@@ -383,6 +407,7 @@ fn run_desktop(launch: DesktopLaunch) -> Result<(), CliError> {
         app_id,
         state_dir,
         ephemeral,
+        use_production_state,
         width,
         height,
         supervised,
@@ -393,11 +418,23 @@ fn run_desktop(launch: DesktopLaunch) -> Result<(), CliError> {
     } else {
         let root = match state_dir {
             Some(root) => root,
-            None => directories::BaseDirs::new()
-                .ok_or_else(|| CliError::Message("platform data directory is unavailable".into()))?
-                .data_local_dir()
-                .join("youth")
-                .join("state"),
+            None => {
+                // A developer's `youth run` and a packaged capsule launch of
+                // the same app_id must not silently share one state root:
+                // that would let an in-progress SDK build touch a real
+                // packaged app's data. `apps/` is the production root a
+                // capsule launcher uses by default; `dev/` is this CLI's
+                // default. --use-production-state opts into testing against
+                // the production root intentionally (e.g. upgrade checks).
+                let segment = if use_production_state { "apps" } else { "dev" };
+                directories::BaseDirs::new()
+                    .ok_or_else(|| {
+                        CliError::Message("platform data directory is unavailable".into())
+                    })?
+                    .data_local_dir()
+                    .join("youth")
+                    .join(segment)
+            }
         };
         StateLocation::File(root.join(app_id.as_str()).join("state.sqlite3"))
     };
