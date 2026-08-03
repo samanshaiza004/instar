@@ -23,7 +23,9 @@ state and other app-owned resources; it is not a UI label or a filesystem
 path. Use `--id`, for example `youth new tally --id dev.saman.tally`, when you
 need a different identity. Keep it stable after sharing or shipping an app.
 
-New projects use the current `youth:app@0.0.8` contract. `Youth.toml` is the
+New projects use the current `youth:app@0.0.9` contract. This protocol adds a
+wire-node `grow` field for forthcoming responsive layout; current host layout
+behavior is unchanged. `Youth.toml` is the
 developer-owned project description; `Youth.lock` records the exact SDK Git
 revision, protocol, vendored WIT hash, CLI version, and template version.
 Commit both files. Rust bindings come from the pinned SDK; the vendored WIT

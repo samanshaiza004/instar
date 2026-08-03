@@ -674,11 +674,13 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data: NodeData::Box { enabled: true },
                         children: vec![id(3), id(4)],
+                        grow: 0,
                     },
                     Node {
                         id: id(3),
@@ -686,6 +688,7 @@ mod tests {
                             value: "Count: 0".into(),
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(4),
@@ -694,6 +697,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },
@@ -712,11 +716,13 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data,
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },

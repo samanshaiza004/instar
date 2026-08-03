@@ -110,11 +110,13 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data: NodeData::Box { enabled },
                         children: vec![id(4)],
+                        grow: 0,
                     },
                     Node {
                         id: id(4),
@@ -123,6 +125,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },

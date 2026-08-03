@@ -1,5 +1,10 @@
 # Youth — Master Reference
 
+The latest frozen application protocol is `youth:app@0.0.9`. It adds a `grow`
+field to the wire node record for a forthcoming responsive-layout capability;
+host layout behavior remains outside this protocol-only step. Protocols
+`0.0.2` through `0.0.9` remain simultaneously supported.
+
 Authoritative documents, in order of precedence:
 
 1. [SCRATCHPAD-GATE-B.md](SCRATCHPAD-GATE-B.md) — implemented single real

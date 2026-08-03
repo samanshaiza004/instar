@@ -60,11 +60,11 @@ fn v002_through_v006_components_mount_without_cross_version_drift() {
         ),
         // youth-sdk-tally is a local-path youth-sdk fixture, so it always
         // tracks whichever protocol the SDK crate in this workspace
-        // currently targets (0.0.8, since the text-document capability), not
+        // currently targets (0.0.9, since the grow field), not
         // a version frozen at this file's original name.
         (
             test_component("youth-sdk-tally"),
-            "youth:app/application@0.0.8",
+            "youth:app/application@0.0.9",
             "current SDK tally",
         ),
         (

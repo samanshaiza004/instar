@@ -1,4 +1,4 @@
-package youth:app@0.0.8;
+package youth:app@0.0.9;
 
 interface ui {
     type node-id = u64;
@@ -113,6 +113,7 @@ interface ui {
     record node {
         id: node-id,
         data: node-data,
+        grow: u16,
         children: list<node-id>,
     }
 

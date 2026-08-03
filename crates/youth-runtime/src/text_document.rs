@@ -103,6 +103,44 @@ impl SaveCompletion {
             outcome,
         }
     }
+
+    pub(crate) fn as_wire_v009(&self) -> crate::bindings::v009::youth::app::ui::SaveCompletion {
+        use crate::bindings::v009::youth::app::ui;
+        let outcome = match self.outcome {
+            SaveOutcome::Saved {
+                document,
+                version,
+                saved_edit_sequence,
+                still_dirty,
+            } => ui::SaveOutcome::Saved(ui::SavedDocument {
+                document: ui::DocumentHandle {
+                    id: document.id,
+                    generation: document.generation,
+                },
+                version: ui::DocumentVersion {
+                    id: version.id,
+                    generation: version.generation,
+                },
+                saved_edit_sequence,
+                still_dirty,
+            }),
+            SaveOutcome::Failed(failure) => ui::SaveOutcome::Failed(match failure {
+                SaveFailure::Conflict => ui::TextDocumentErrorCode::Conflict,
+                SaveFailure::Missing => ui::TextDocumentErrorCode::Missing,
+                SaveFailure::WrongType => ui::TextDocumentErrorCode::WrongType,
+                SaveFailure::PermissionDenied => ui::TextDocumentErrorCode::PermissionDenied,
+                SaveFailure::Unavailable => ui::TextDocumentErrorCode::Unavailable,
+                SaveFailure::Internal => ui::TextDocumentErrorCode::Internal,
+            }),
+        };
+        ui::SaveCompletion {
+            request: ui::SaveRequest {
+                id: self.request.id,
+                generation: self.request.generation,
+            },
+            outcome,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

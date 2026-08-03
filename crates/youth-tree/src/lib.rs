@@ -296,6 +296,7 @@ impl NodeData {
 pub struct Node {
     pub id: NodeId,
     pub data: NodeData,
+    pub grow: u16,
     pub children: Vec<NodeId>,
 }
 
@@ -482,6 +483,8 @@ pub enum ValidationError {
     Orphan { node: NodeId },
     #[error("leaf node {node} has children")]
     LeafWithChildren { node: NodeId },
+    #[error("node {node} has a positive grow weight outside row or column parent {parent}")]
+    GrowOutsideRowOrColumn { node: NodeId, parent: NodeId },
     #[error("snapshot has {actual} nodes, exceeding the limit of {max}")]
     TooManyNodes { actual: usize, max: usize },
     #[error("node {node} is at depth {depth}, exceeding the limit of {max}")]
@@ -678,6 +681,14 @@ impl Tree {
                 }
                 if !nodes.contains_key(&child) {
                     return Err(ValidationError::UnknownChild { parent, child });
+                }
+                if nodes[&child].grow > 0
+                    && !matches!(node.data, NodeData::Box { .. } | NodeData::Row { .. })
+                {
+                    return Err(ValidationError::GrowOutsideRowOrColumn {
+                        node: child,
+                        parent,
+                    });
                 }
                 if child == snapshot.root {
                     return Err(ValidationError::RootHasParent {
@@ -1312,6 +1323,16 @@ mod tests {
         Node {
             id: id(value),
             data,
+            grow: 0,
+            children: children.iter().copied().map(id).collect(),
+        }
+    }
+
+    fn growing_node(value: u64, data: NodeData, grow: u16, children: &[u64]) -> Node {
+        Node {
+            id: id(value),
+            data,
+            grow,
             children: children.iter().copied().map(id).collect(),
         }
     }
@@ -1355,6 +1376,150 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(tree.depth(), 2);
+    }
+
+    #[test]
+    fn zero_grow_is_valid_under_any_parent() {
+        validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(
+                    2,
+                    NodeData::Grid {
+                        enabled: true,
+                        columns: 1,
+                    },
+                    &[4],
+                ),
+                node(
+                    3,
+                    NodeData::Text {
+                        value: "root child".into(),
+                    },
+                    &[],
+                ),
+                node(
+                    4,
+                    NodeData::Text {
+                        value: "grid child".into(),
+                    },
+                    &[],
+                ),
+            ],
+        ))
+        .expect("zero grow must preserve compatibility under every parent");
+    }
+
+    #[test]
+    fn positive_grow_is_valid_under_row_and_column() {
+        validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2, 3]),
+                node(2, NodeData::Row { enabled: true }, &[4]),
+                node(3, NodeData::Box { enabled: true }, &[5]),
+                growing_node(
+                    4,
+                    NodeData::Text {
+                        value: "row".into(),
+                    },
+                    1,
+                    &[],
+                ),
+                growing_node(
+                    5,
+                    NodeData::Text {
+                        value: "column".into(),
+                    },
+                    2,
+                    &[],
+                ),
+            ],
+        ))
+        .expect("row and column children may grow");
+    }
+
+    #[test]
+    fn positive_grow_is_rejected_under_root() {
+        let result = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                growing_node(
+                    2,
+                    NodeData::Text {
+                        value: "child".into(),
+                    },
+                    1,
+                    &[],
+                ),
+            ],
+        ));
+        assert_eq!(
+            result,
+            Err(ValidationError::GrowOutsideRowOrColumn {
+                node: id(2),
+                parent: id(1),
+            })
+        );
+    }
+
+    #[test]
+    fn positive_grow_is_rejected_under_grid() {
+        let result = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(
+                    2,
+                    NodeData::Grid {
+                        enabled: true,
+                        columns: 1,
+                    },
+                    &[3],
+                ),
+                growing_node(
+                    3,
+                    NodeData::Text {
+                        value: "child".into(),
+                    },
+                    1,
+                    &[],
+                ),
+            ],
+        ));
+        assert_eq!(
+            result,
+            Err(ValidationError::GrowOutsideRowOrColumn {
+                node: id(3),
+                parent: id(2),
+            })
+        );
+    }
+
+    #[test]
+    fn grow_round_trips_through_snapshot() {
+        let tree = validate(snapshot(
+            1,
+            vec![
+                node(1, NodeData::Root, &[2]),
+                node(2, NodeData::Box { enabled: true }, &[3]),
+                growing_node(
+                    3,
+                    NodeData::Text {
+                        value: "child".into(),
+                    },
+                    7,
+                    &[],
+                ),
+            ],
+        ))
+        .unwrap();
+        let canonical_snapshot = tree.to_snapshot();
+        let round_trip = validate(canonical_snapshot.clone()).unwrap();
+        assert_eq!(round_trip.to_snapshot(), canonical_snapshot);
+        assert_eq!(round_trip.node(id(3)).unwrap().grow, 7);
     }
 
     #[test]
@@ -2248,6 +2413,40 @@ mod tests {
     }
 
     #[test]
+    fn patch_rejects_positive_grow_outside_row_or_column() {
+        let mut tree = patch_tree(vec![node(1, NodeData::Root, &[])]);
+        let result = tree.apply(
+            batch(vec![
+                Patch::Create {
+                    node: growing_node(
+                        2,
+                        NodeData::Text {
+                            value: "hello".into(),
+                        },
+                        1,
+                        &[],
+                    ),
+                },
+                Patch::InsertChild {
+                    parent: id(1),
+                    index: 0,
+                    child: id(2),
+                },
+            ]),
+            &Limits::default(),
+        );
+        assert_eq!(
+            result,
+            Err(PatchError::Validation(
+                ValidationError::GrowOutsideRowOrColumn {
+                    node: id(2),
+                    parent: id(1),
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn valid_detach_delete_batch() {
         let mut tree = patch_tree(vec![
             node(1, NodeData::Root, &[2]),
@@ -2880,6 +3079,7 @@ mod tests {
                             enabled,
                         },
                     },
+                    grow: 0,
                     children: children.into_iter().map(id).collect(),
                 })
         }
@@ -2904,6 +3104,7 @@ mod tests {
                     let mut nodes = vec![Node {
                         id: id(1),
                         data: NodeData::Root,
+                        grow: 0,
                         children,
                     }];
                     nodes.extend(entries.into_iter().enumerate().map(
@@ -2917,6 +3118,7 @@ mod tests {
                                     enabled,
                                 },
                             },
+                            grow: 0,
                             children: vec![],
                         },
                     ));

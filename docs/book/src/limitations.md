@@ -23,9 +23,11 @@ platform, not a general application platform.
   chord sequences.
 - Development uses validated rebuild-and-restart, not hot reload.
 - An application owns one native window.
-- The latest application protocol is `0.0.8`; the host also runs `0.0.7`, `0.0.6`,
-  `0.0.5`, `0.0.4`, `0.0.3`, and `0.0.2` simultaneously. Generated projects
-  default to `0.0.8`; older profiles remain available for compatibility.
+- The latest application protocol is `0.0.9`; the host also runs `0.0.8`, `0.0.7`,
+  `0.0.6`, `0.0.5`, `0.0.4`, `0.0.3`, and `0.0.2` simultaneously. Generated
+  projects default to `0.0.9`; older profiles remain available for compatibility.
+  Protocol `0.0.9` adds a wire-node `grow` field for forthcoming responsive
+  layout, but the current host layout engine does not use it yet.
 - Guests are Rust-only and target `wasm32-wasip2`.
 - `youth build` emits a bare validated component; `youth-cli` itself is
   packaged for release via `dist` (see

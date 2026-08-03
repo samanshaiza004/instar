@@ -2638,6 +2638,7 @@ expect focus derived "todo" 1 "toggle"
                     youth_tree::Node {
                         id: id(1),
                         data: NodeData::Root,
+                        grow: 0,
                         children: vec![id(2), id(3), id(4)],
                     },
                     youth_tree::Node {
@@ -2646,6 +2647,7 @@ expect focus derived "todo" 1 "toggle"
                             label: "Go".into(),
                             enabled: true,
                         },
+                        grow: 0,
                         children: vec![],
                     },
                     youth_tree::Node {
@@ -2654,6 +2656,7 @@ expect focus derived "todo" 1 "toggle"
                             label: "Disabled".into(),
                             enabled: false,
                         },
+                        grow: 0,
                         children: vec![],
                     },
                     youth_tree::Node {
@@ -2661,6 +2664,7 @@ expect focus derived "todo" 1 "toggle"
                         data: NodeData::Text {
                             value: "not a button".into(),
                         },
+                        grow: 0,
                         children: vec![],
                     },
                 ],
@@ -3226,6 +3230,7 @@ mount
                 youth_tree::Node {
                     id: id(1),
                     data: NodeData::Root,
+                    grow: 0,
                     children: vec![id(2)],
                 },
                 youth_tree::Node {
@@ -3233,6 +3238,7 @@ mount
                     data: NodeData::Text {
                         value: "old".into(),
                     },
+                    grow: 0,
                     children: vec![],
                 },
                 youth_tree::Node {
@@ -3240,6 +3246,7 @@ mount
                     data: NodeData::Text {
                         value: "missing".into(),
                     },
+                    grow: 0,
                     children: vec![],
                 },
             ],
@@ -3251,6 +3258,7 @@ mount
                 youth_tree::Node {
                     id: id(1),
                     data: NodeData::Root,
+                    grow: 0,
                     children: vec![id(2)],
                 },
                 youth_tree::Node {
@@ -3258,6 +3266,7 @@ mount
                     data: NodeData::Text {
                         value: "new".into(),
                     },
+                    grow: 0,
                     children: vec![],
                 },
                 youth_tree::Node {
@@ -3265,6 +3274,7 @@ mount
                     data: NodeData::Text {
                         value: "extra".into(),
                     },
+                    grow: 0,
                     children: vec![],
                 },
             ],

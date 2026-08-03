@@ -8,8 +8,8 @@ use thiserror::Error;
 
 use crate::{RuntimeError, YouthApp, component_imports};
 
-pub const APPLICATION_PROTOCOL: &str = "0.0.8";
-pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.8";
+pub const APPLICATION_PROTOCOL: &str = "0.0.9";
+pub const APPLICATION_WORLD: &str = "youth:app/application@0.0.9";
 pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &[
     "0.0.2",
     "0.0.3",
@@ -17,6 +17,7 @@ pub const SUPPORTED_APPLICATION_PROTOCOLS: &[&str] = &[
     "0.0.5",
     "0.0.6",
     "0.0.7",
+    "0.0.8",
     APPLICATION_PROTOCOL,
 ];
 

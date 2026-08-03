@@ -1,0 +1,18 @@
+[package]
+name = "youth-capsule-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-user capsule startup verification for Youth applications."
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+directories = "6.0.0"
+thiserror = "2"
+youth-capsule = { path = "../youth-capsule" }
+youth-desktop = { path = "../youth-desktop" }
+youth-runtime = { path = "../youth-runtime" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

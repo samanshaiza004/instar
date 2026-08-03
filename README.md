@@ -29,7 +29,7 @@ one, for example `youth new tally --id dev.saman.tally`.
 The generated application uses a revision-pinned `youth-sdk`, a strict
 language-neutral project manifest and lock, an inspectable WIT snapshot, and
 semantic tests backed by the real runtime. New projects currently target
-`youth:app@0.0.8`. See the [Quickstart](docs/book/src/quickstart.md), the
+`youth:app@0.0.9`. See the [Quickstart](docs/book/src/quickstart.md), the
 historical [DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
 [tooling findings](docs/DEVELOPER-PREVIEW-FINDINGS.md).
 
@@ -60,6 +60,8 @@ modifier field to declared shortcuts, so a focused Editor and an app-level
 `Primary+S` Save command coexist. `youth:app@0.0.8` adds one narrowly granted
 host-owned text document, exact-byte conflict detection, post-commit atomic
 Save, coalesced dirty notification, and opaque host-issued document versions.
+`youth:app@0.0.9` adds a `grow` field to the wire node record for a forthcoming
+responsive-layout capability; the host layout engine does not use it yet.
 File contents remain out of guest memory and Youth state. See
 [docs/MILESTONE-2.md](docs/MILESTONE-2.md) for the full contract, lifecycle,
 and input-precedence rules and
@@ -94,7 +96,7 @@ snapshot for renderer recovery without calling the guest. See
 
 | Path | Purpose |
 | --- | --- |
-| `wit/youth-app-v0.0.8/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.8`, all frozen and simultaneously supported; new projects embed the `0.0.8` snapshot from the CLI template |
+| `wit/youth-app-v0.0.9/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.9`, all frozen and simultaneously supported; new projects embed the `0.0.9` snapshot from the CLI template |
 | `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
 | `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
 | `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker, host-owned Editor sessions |

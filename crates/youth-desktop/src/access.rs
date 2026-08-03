@@ -245,11 +245,13 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data: NodeData::Box { enabled: true },
                         children: vec![id(3), id(4), id(5), id(6)],
+                        grow: 0,
                     },
                     Node {
                         id: id(3),
@@ -257,6 +259,7 @@ mod tests {
                             value: "Count: 0".into(),
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(4),
@@ -265,6 +268,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(5),
@@ -273,6 +277,7 @@ mod tests {
                             enabled: false,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(6),
@@ -281,6 +286,7 @@ mod tests {
                             text: "draft".into(),
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },
@@ -399,6 +405,72 @@ mod tests {
             let bounds = root.bounds().expect("the root has layout bounds");
             assert_eq!(bounds.x1, 320.0 * scale);
             assert_eq!(bounds.y1, 180.0 * scale);
+        }
+    }
+
+    #[test]
+    fn grown_editors_accessibility_bounds_scale_with_the_window_scale_factor() {
+        // P1.5-C's flow-through claim, exercised through the accessibility
+        // path specifically: a grow-aware Editor's real (grown) height, not
+        // its tiny GLYPH_HEIGHT intrinsic size, must be what a screen reader
+        // is told, at every scale factor.
+        let tree = SemanticTree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                        grow: 0,
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Box { enabled: true },
+                        children: vec![id(3)],
+                        grow: 0,
+                    },
+                    Node {
+                        id: id(3),
+                        data: NodeData::Editor {
+                            document_revision: 1,
+                            text: "draft".into(),
+                        },
+                        children: vec![],
+                        grow: 1,
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let logical = layout(&tree, LogicalSize::new(320.0, 180.0).unwrap()).unwrap();
+            let logical_height = logical.nodes[&id(3)].bounds.height;
+            assert!(
+                logical_height > crate::geometry::GLYPH_HEIGHT * 2.0,
+                "the editor did not grow past its intrinsic height"
+            );
+            let update = build_tree_update(
+                &tree,
+                &logical,
+                &InteractionState::default(),
+                None,
+                scale,
+                &HashMap::new(),
+            );
+            let editor = update
+                .nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == AccessNodeId(3))
+                .map(|(_, node)| node)
+                .unwrap();
+            let bounds = editor.bounds().expect("the grown editor has layout bounds");
+            assert!(
+                (bounds.y1 - bounds.y0 - logical_height * scale).abs() < 1e-6,
+                "accessibility bounds did not reflect the grown height at scale {scale}"
+            );
         }
     }
 

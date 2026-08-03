@@ -272,6 +272,7 @@ fn wire_node(node: &super::FlatNode) -> ui::Node {
                 shortcuts: shortcuts.iter().copied().map(wire_shortcut).collect(),
             }),
         },
+        grow: node.grow,
         children: node.children.clone(),
     }
 }

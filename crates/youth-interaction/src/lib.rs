@@ -502,6 +502,7 @@ mod tests {
                     Node {
                         id: id(1),
                         data: NodeData::Root,
+                        grow: 0,
                         children: vec![id(2)],
                     },
                     Node {
@@ -510,6 +511,7 @@ mod tests {
                             enabled: true,
                             columns: 2,
                         },
+                        grow: 0,
                         children: vec![id(3), id(4), id(5), id(6)],
                     },
                     button(3, "1", true, vec![ShortcutKey::Character("1".into())]),
@@ -545,6 +547,7 @@ mod tests {
                 enabled,
                 shortcuts,
             },
+            grow: 0,
             children: vec![],
         }
     }
@@ -558,6 +561,7 @@ mod tests {
                     Node {
                         id: id(1),
                         data: NodeData::Root,
+                        grow: 0,
                         children: vec![id(2)],
                     },
                     Node {
@@ -566,6 +570,7 @@ mod tests {
                             enabled: true,
                             columns: 3,
                         },
+                        grow: 0,
                         children: vec![id(3), id(4), id(5)],
                     },
                     button(3, "Before", true, vec![]),
@@ -575,6 +580,7 @@ mod tests {
                             document_revision: 7,
                             text: "draft".into(),
                         },
+                        grow: 0,
                         children: vec![],
                     },
                     button(5, "Cancel", true, vec![ShortcutKey::Escape]),
@@ -605,6 +611,7 @@ mod tests {
                     Node {
                         id: id(1),
                         data: NodeData::Root,
+                        grow: 0,
                         children: vec![id(2), id(3)],
                     },
                     Node {
@@ -613,6 +620,7 @@ mod tests {
                             document_revision: 7,
                             text: "draft".into(),
                         },
+                        grow: 0,
                         children: vec![],
                     },
                     button_with_shortcuts(

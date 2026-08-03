@@ -666,6 +666,7 @@ impl Text {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(key: impl Into<NodeIdentity>, value: impl Into<String>) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Text(TextElement {
                 key: key.into(),
                 value: value.into(),
@@ -692,6 +693,7 @@ impl Countdown {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(key: impl Into<NodeIdentity>, schedule: Schedule) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Countdown(CountdownElement {
                 key: key.into(),
                 schedule,
@@ -733,6 +735,7 @@ impl Editor {
         initial_text: impl Into<String>,
     ) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Editor(EditorElement {
                 key: key.into(),
                 source: EditorSource::Inline {
@@ -746,6 +749,7 @@ impl Editor {
     #[must_use]
     pub fn document(key: impl Into<NodeIdentity>, document: &Document) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Editor(EditorElement {
                 key: key.into(),
                 source: EditorSource::TextDocument {
@@ -774,6 +778,7 @@ impl Button {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(key: impl Into<NodeIdentity>, label: impl Into<String>) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Button(ButtonElement {
                 key: key.into(),
                 label: label.into(),
@@ -788,6 +793,7 @@ impl Button {
     pub fn command(key: impl Into<CommandIdentity>, label: impl Into<String>) -> Element {
         let command = key.into();
         Element {
+            grow: 0,
             kind: ElementKind::Button(ButtonElement {
                 key: command.node_identity(),
                 label: label.into(),
@@ -814,6 +820,7 @@ impl BoxNode {
     #[must_use]
     pub fn column(children: impl IntoIterator<Item = Element>) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: None,
                 children: children.into_iter().collect(),
@@ -840,6 +847,7 @@ impl Column {
         children: impl IntoIterator<Item = Element>,
     ) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: Some(key.into()),
                 children: children.into_iter().collect(),
@@ -858,6 +866,7 @@ impl Row {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(children: impl IntoIterator<Item = Element>) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: None,
                 children: children.into_iter().collect(),
@@ -873,6 +882,7 @@ impl Row {
         children: impl IntoIterator<Item = Element>,
     ) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: Some(key.into()),
                 children: children.into_iter().collect(),
@@ -890,6 +900,7 @@ impl Grid {
     #[must_use]
     pub fn columns(columns: u8, children: impl IntoIterator<Item = Element>) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: None,
                 children: children.into_iter().collect(),
@@ -906,6 +917,7 @@ impl Grid {
         children: impl IntoIterator<Item = Element>,
     ) -> Element {
         Element {
+            grow: 0,
             kind: ElementKind::Box(BoxElement {
                 key: Some(key.into()),
                 children: children.into_iter().collect(),
@@ -918,6 +930,7 @@ impl Grid {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Element {
+    grow: u16,
     kind: ElementKind,
 }
 
@@ -931,6 +944,12 @@ enum ElementKind {
 }
 
 impl Element {
+    #[must_use]
+    pub fn grow(mut self, weight: u16) -> Self {
+        self.grow = weight;
+        self
+    }
+
     #[must_use]
     pub fn enabled(mut self, enabled: bool) -> Self {
         match &mut self.kind {
@@ -978,6 +997,7 @@ impl Tree {
             nodes: vec![FlatNode {
                 id: 1,
                 data: FlatNodeData::Root,
+                grow: 0,
                 children: Vec::new(),
             }],
             names: BTreeMap::new(),
@@ -1707,6 +1727,7 @@ enum FlatNodeData {
 struct FlatNode {
     id: u64,
     data: FlatNodeData,
+    grow: u16,
     children: Vec<u64>,
 }
 
@@ -2069,6 +2090,7 @@ impl FlatTreeBuilder {
                         enabled: value.enabled,
                         layout: value.layout,
                     },
+                    grow: element.grow,
                     children: Vec::new(),
                 });
                 for child in &value.children {
@@ -2085,6 +2107,7 @@ impl FlatTreeBuilder {
                         value: value.value.clone(),
                         alignment: value.alignment,
                     },
+                    grow: element.grow,
                     children: Vec::new(),
                 });
                 Ok(id)
@@ -2099,6 +2122,7 @@ impl FlatTreeBuilder {
                         format: value.format,
                         alignment: value.alignment,
                     },
+                    grow: element.grow,
                     children: Vec::new(),
                 });
                 Ok(id)
@@ -2123,6 +2147,7 @@ impl FlatTreeBuilder {
                 self.nodes.push(FlatNode {
                     id,
                     data,
+                    grow: element.grow,
                     children: Vec::new(),
                 });
                 Ok(id)
@@ -2155,6 +2180,7 @@ impl FlatTreeBuilder {
                         command: value.command.clone(),
                         shortcuts: value.shortcuts.clone(),
                     },
+                    grow: element.grow,
                     children: Vec::new(),
                 });
                 Ok(id)
@@ -2620,6 +2646,15 @@ mod tests {
                 text,
             } if document_revision.get() == 7 && text == "Draft"
         ));
+    }
+
+    #[test]
+    fn grow_builder_threads_weight_to_flat_node() {
+        let tree = Tree::root(Text::new(node!("status"), "Ready").grow(7))
+            .flatten()
+            .unwrap();
+        assert_eq!(tree.nodes[0].grow, 0);
+        assert_eq!(tree.nodes[1].grow, 7);
     }
 
     #[test]

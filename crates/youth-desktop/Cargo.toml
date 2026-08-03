@@ -32,6 +32,15 @@ youth-interaction = { path = "../youth-interaction" }
 youth-tree = { path = "../youth-tree" }
 youth-text-render-cpu = { path = "../youth-text-render-cpu" }
 
+# The portal backend avoids a GTK build-time dependency and is suitable for
+# later Flatpak/AppImage packaging. rfd may fall back to Zenity if the portal
+# is unavailable at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false }
+
 [dev-dependencies]
 # Test-only: constructs a real TextPresentation to exercise draw_editor_presentation
 # end-to-end. Not a production dependency -- the youth-desktop binary itself never

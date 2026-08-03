@@ -16,17 +16,17 @@ use youth_state::AppId;
 pub const MANIFEST_NAME: &str = "Youth.toml";
 pub const LOCK_NAME: &str = "Youth.lock";
 /// Default protocol for newly generated projects.
-pub const SUPPORTED_PROTOCOL: &str = "0.0.8";
+pub const SUPPORTED_PROTOCOL: &str = "0.0.9";
 pub const SUPPORTED_LANGUAGE: &str = "rust";
 pub const SUPPORTED_TARGET: &str = "wasm32-wasip2";
 pub const SDK_SOURCE: &str = "https://github.com/samanshaiza004/youth";
-pub const SDK_REVISION: &str = "c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7";
+pub const SDK_REVISION: &str = "df479a081cb82be5d134486fd03bab27f6db1bdb";
 /// Default template version for newly generated projects.
 pub const TEMPLATE_VERSION: u32 = 3;
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// WIT digest used by the default generated-project profile.
 pub const TEMPLATE_WIT_SHA256: &str =
-    "9b2fb0299a132b75f3526c2cdb1ac33f1c6633f6eb3e4096eeb57c6fb70b89a7";
+    "ff85dd0534b70fff23949dfb7bfae69af364c6c23595651e411fb6f501e7ddc2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
@@ -89,6 +89,12 @@ pub const SUPPORTED_PROFILES: &[ContractProfile] = &[
         wit_sha256: "9b2fb0299a132b75f3526c2cdb1ac33f1c6633f6eb3e4096eeb57c6fb70b89a7",
         template_version: 3,
         sdk_revision: "c786e5bb6693f98b4fd8e6d8f6a37e73e63fdbc7",
+    },
+    ContractProfile {
+        protocol: "0.0.9",
+        wit_sha256: "ff85dd0534b70fff23949dfb7bfae69af364c6c23595651e411fb6f501e7ddc2",
+        template_version: 3,
+        sdk_revision: "df479a081cb82be5d134486fd03bab27f6db1bdb",
     },
 ];
 
@@ -533,6 +539,7 @@ mod tests {
     const WIT_V006: &str = "package youth:app@0.0.6;\n";
     const WIT_V007: &str = "package youth:app@0.0.7;\n";
     const WIT_V008: &str = "package youth:app@0.0.8;\n";
+    const WIT_V009: &str = "package youth:app@0.0.9;\n";
 
     fn fixture(profile: ContractProfile) -> TempDir {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -545,6 +552,7 @@ mod tests {
             "0.0.6" => WIT_V006,
             "0.0.7" => WIT_V007,
             "0.0.8" => WIT_V008,
+            "0.0.9" => WIT_V009,
             protocol => panic!("unsupported fixture protocol {protocol}"),
         };
         let revision = profile.sdk_revision;
@@ -715,9 +723,9 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
     }
 
     #[test]
-    fn generated_project_defaults_select_the_v008_profile() {
+    fn generated_project_defaults_select_the_v009_profile() {
         let default = contract_profile(SUPPORTED_PROTOCOL).expect("default profile");
-        assert_eq!(default.protocol, "0.0.8");
+        assert_eq!(default.protocol, "0.0.9");
         assert_eq!(default.wit_sha256, TEMPLATE_WIT_SHA256);
         assert_eq!(default.template_version, TEMPLATE_VERSION);
         assert!(
@@ -857,5 +865,15 @@ source = "git+{SDK_SOURCE}?rev={revision}#{revision}"
             SUPPORTED_PROFILES[6].wit_sha256
         );
         assert_eq!(SUPPORTED_PROFILES[6].protocol, "0.0.8");
+    }
+
+    #[test]
+    fn v009_profile_hash_matches_the_canonical_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/youth-app-v0.0.9");
+        assert_eq!(
+            hash_wit_tree(root).expect("canonical WIT hash"),
+            SUPPORTED_PROFILES[7].wit_sha256
+        );
+        assert_eq!(SUPPORTED_PROFILES[7].protocol, "0.0.9");
     }
 }

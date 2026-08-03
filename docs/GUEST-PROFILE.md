@@ -27,10 +27,10 @@ Required:
   youth:app/ui
 
 Permitted Youth capabilities:
-  youth:state/store             protocols 0.0.2 through 0.0.8
-  youth:time/scheduler          protocols 0.0.4 through 0.0.8
-  youth:editor/session          protocols 0.0.6 through 0.0.8
-  youth:text-document/document protocol 0.0.8
+  youth:state/store             protocols 0.0.2 through 0.0.9
+  youth:time/scheduler          protocols 0.0.4 through 0.0.9
+  youth:editor/session          protocols 0.0.6 through 0.0.9
+  youth:text-document/document protocols 0.0.8 through 0.0.9
 
 Permitted inert WASIp2 imports:
   wasi:cli/environment          wasi:cli/terminal-input
@@ -62,6 +62,10 @@ and fails when a toolchain update widens the surface.
 Interface versions are compared without their `@version` suffix, so a
 WASI patch bump does not read as a new capability; a genuinely new
 interface does.
+
+Protocol `0.0.9` adds a `grow` field to the `youth:app/ui` wire node for a
+forthcoming responsive-layout capability. It does not widen the import budget
+or make the current host layout engine consume that field.
 
 Widening the allowlist is a deliberate decision. Add the interface to
 that test and to this document in the same change, with a note on why the

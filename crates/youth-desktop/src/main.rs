@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use youth_desktop::{DesktopOptions, run, window_smoke};
+use youth_desktop::{DesktopOptions, document_picker_smoke, run, window_smoke};
 use youth_runtime::{AppId, RuntimeLimits, StateLocation, YouthAppConfig};
 
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let result = if arguments.len() == 1 && arguments[0] == "--window-smoke" {
         window_smoke()
+    } else if arguments.len() == 1 && arguments[0] == "--document-picker-smoke" {
+        document_picker_smoke()
     } else {
         parse_options(&arguments).and_then(run)
     };
@@ -24,7 +26,9 @@ fn parse_options(
     arguments: &[std::ffi::OsString],
 ) -> Result<DesktopOptions, youth_desktop::DesktopError> {
     let component = arguments.first().map(PathBuf::from).ok_or_else(|| {
-        youth_desktop::DesktopError::Arguments("expected a component path or --window-smoke".into())
+        youth_desktop::DesktopError::Arguments(
+            "expected a component path, --window-smoke, or --document-picker-smoke".into(),
+        )
     })?;
     let mut app_id = None;
     let mut state = StateLocation::Memory;

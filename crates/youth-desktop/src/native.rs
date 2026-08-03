@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,20 +15,31 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::{
-    Controller, ControllerCommand, DesktopEvent, InteractionState, LogicalKey, LogicalPoint,
-    LogicalSize, Modifiers, Palette, PointerState, RenderState, RendererMirror, SemanticAction,
-    access, layout, render,
+    Controller, ControllerCommand, DesktopEvent, DialogError, DocumentPicker, DocumentPickerFuture,
+    DocumentPickerResult, InteractionState, LogicalKey, LogicalPoint, LogicalSize, Modifiers,
+    Palette, PointerState, RenderState, RendererMirror, RfdDocumentPicker, SemanticAction, access,
+    layout, render,
 };
 use youth_interaction::EditorInput;
 use youth_runtime::{
-    PresentationReader, RuntimeErrorCategory, YouthAppConfig, YouthAppHandle,
-    next_display_boundary_epoch_millis,
+    AppId, PresentationReader, RuntimeErrorCategory, RuntimeLimits, StateLocation, WorkspaceGrant,
+    YouthAppConfig, YouthAppHandle, next_display_boundary_epoch_millis,
 };
 use youth_tree::{Node, NodeData, NodeId, TreeSnapshot};
 
 #[derive(Clone, Debug)]
 pub struct DesktopOptions {
     pub config: YouthAppConfig,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub struct CapsuleLaunchOptions {
+    pub picker: Box<dyn DocumentPicker + Send + Sync>,
+    pub component_path: PathBuf,
+    pub app_id: AppId,
+    pub app_name: String,
+    pub state: StateLocation,
     pub width: u32,
     pub height: u32,
 }
@@ -45,6 +57,9 @@ enum NativeEvent {
     Runtime(DesktopEvent),
     StartupFault(RuntimeErrorCategory),
     Access(accesskit_winit::Event),
+    DocumentSelected(PathBuf),
+    DocumentSelectionCancelled,
+    DocumentSelectionFailed(DialogError),
     Shutdown,
 }
 
@@ -56,7 +71,17 @@ impl From<accesskit_winit::Event> for NativeEvent {
 
 enum Mode {
     Application(Option<Box<YouthAppConfig>>),
+    PickDocument(Option<Box<dyn DocumentPicker + Send + Sync>>),
+    CapsuleLaunch(CapsuleLaunchPending),
     Smoke,
+}
+
+struct CapsuleLaunchPending {
+    picker: Option<Box<dyn DocumentPicker + Send + Sync>>,
+    component_path: PathBuf,
+    app_id: AppId,
+    app_name: String,
+    state: StateLocation,
 }
 
 struct NativeApp {
@@ -90,6 +115,12 @@ struct NativeApp {
     /// from, whatever assistive technology is listening.
     access_adapter: Option<AccessAdapter>,
     fault: Option<String>,
+    document_selection: Option<DocumentPickerResult>,
+    /// Set right before a picked document is handed to `bootstrap()`, since
+    /// `CapsuleLaunchPending` (which carries `app_name`) is discarded at that
+    /// same mode transition -- the `Mounted` handler reads this instead of
+    /// the generic "Youth" title.
+    window_title: Option<String>,
     smoke_presented: bool,
 }
 
@@ -112,8 +143,41 @@ pub fn run_with_shutdown(options: DesktopOptions) -> Result<(), DesktopError> {
     )
 }
 
+pub fn run_capsule_launch(options: CapsuleLaunchOptions) -> Result<(), DesktopError> {
+    let CapsuleLaunchOptions {
+        picker,
+        component_path,
+        app_id,
+        app_name,
+        state,
+        width,
+        height,
+    } = options;
+    run_mode(
+        Mode::CapsuleLaunch(CapsuleLaunchPending {
+            picker: Some(picker),
+            component_path,
+            app_id,
+            app_name,
+            state,
+        }),
+        width,
+        height,
+        false,
+    )
+}
+
 pub fn window_smoke() -> Result<(), DesktopError> {
     run_mode(Mode::Smoke, 320, 180, false)
+}
+
+pub fn document_picker_smoke() -> Result<(), DesktopError> {
+    run_mode(
+        Mode::PickDocument(Some(Box::new(RfdDocumentPicker::new()))),
+        320,
+        180,
+        false,
+    )
 }
 
 fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result<(), DesktopError> {
@@ -143,6 +207,8 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         text_drag_anchor: None,
         access_adapter: None,
         fault: None,
+        document_selection: None,
+        window_title: None,
         smoke_presented: false,
     };
     event_loop.run_app(&mut app)?;
@@ -159,6 +225,21 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if matches!(&self.mode, Mode::PickDocument(_) | Mode::CapsuleLaunch(_)) {
+            if self.window.is_none() {
+                let title = match &self.mode {
+                    Mode::CapsuleLaunch(pending) => pending.app_name.clone(),
+                    _ => "Youth document picker".to_owned(),
+                };
+                self.create_window(event_loop, &title);
+            }
+            if self.window.is_some()
+                && let Some(future) = begin_document_pick(&mut self.mode)
+            {
+                spawn_document_pick(future, self.proxy.clone());
+            }
+            return;
+        }
         match &mut self.mode {
             Mode::Application(config) => {
                 if let Some(config) = config.take() {
@@ -170,6 +251,8 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 self.create_window(event_loop, "Youth window smoke");
             }
             Mode::Smoke => {}
+            Mode::PickDocument(_) => unreachable!("document picker mode returns above"),
+            Mode::CapsuleLaunch(_) => unreachable!("capsule launch mode returns above"),
         }
     }
 
@@ -182,14 +265,26 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                 self.controller = Some(Controller::spawn(handle, move |event| {
                     let _ = proxy.send_event(NativeEvent::Runtime(event));
                 }));
-                self.create_window(event_loop, "Youth");
+                let title = self
+                    .window_title
+                    .clone()
+                    .unwrap_or_else(|| "Youth".to_owned());
+                self.create_window(event_loop, &title);
             }
             NativeEvent::StartupFault(category) => {
-                self.fault = Some(category_name(category).to_owned());
-                self.create_window(event_loop, "Youth fault");
+                self.present_startup_fault(category_name(category).to_owned(), event_loop);
             }
             NativeEvent::Runtime(event) => self.runtime_event(event, event_loop),
             NativeEvent::Access(event) => self.handle_access_event(event),
+            NativeEvent::DocumentSelected(path) => {
+                self.handle_document_selected(path, event_loop);
+            }
+            NativeEvent::DocumentSelectionCancelled => {
+                self.complete_document_selection(DocumentPickerResult::Cancelled, event_loop);
+            }
+            NativeEvent::DocumentSelectionFailed(error) => {
+                self.handle_document_selection_failed(error, event_loop);
+            }
             NativeEvent::Shutdown => {
                 if let Some(controller) = &self.controller {
                     let _ = controller.send(ControllerCommand::Stop);
@@ -425,6 +520,73 @@ fn watch_shutdown(proxy: EventLoopProxy<NativeEvent>) {
 }
 
 impl NativeApp {
+    fn handle_document_selected(&mut self, path: PathBuf, event_loop: &ActiveEventLoop) {
+        let config = match &self.mode {
+            Mode::CapsuleLaunch(pending) => Some((
+                capsule_launch_config(pending, &path),
+                pending.app_name.clone(),
+            )),
+            Mode::Application(_) | Mode::PickDocument(_) | Mode::Smoke => None,
+        };
+        let Some((config, app_name)) = config else {
+            self.complete_document_selection(DocumentPickerResult::Picked(path), event_loop);
+            return;
+        };
+        match config {
+            Ok(config) => {
+                self.document_selection = Some(DocumentPickerResult::Picked(path.clone()));
+                self.window_title = Some(document_window_title(&path, &app_name));
+                // The application must answer accessibility activation with
+                // its own genesis tree, not through the picker adapter that
+                // may already be waiting for an initial tree update.
+                self.surface = None;
+                self.context = None;
+                self.access_adapter = None;
+                self.window = None;
+                self.mode = Mode::Application(None);
+                bootstrap(config, self.proxy.clone());
+            }
+            Err(error) => self.handle_document_selection_failed(error, event_loop),
+        }
+    }
+
+    fn handle_document_selection_failed(
+        &mut self,
+        error: DialogError,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if matches!(&self.mode, Mode::CapsuleLaunch(_)) {
+            self.document_selection = Some(DocumentPickerResult::Failed(error.clone()));
+            self.present_startup_fault(error.to_string(), event_loop);
+        } else {
+            self.complete_document_selection(DocumentPickerResult::Failed(error), event_loop);
+        }
+    }
+
+    fn present_startup_fault(&mut self, fault: String, event_loop: &ActiveEventLoop) {
+        self.fault = Some(fault);
+        if let Some(window) = &self.window {
+            window.set_title("Youth fault");
+            window.request_redraw();
+        }
+        self.create_window(event_loop, "Youth fault");
+    }
+
+    fn complete_document_selection(
+        &mut self,
+        result: DocumentPickerResult,
+        event_loop: &ActiveEventLoop,
+    ) {
+        self.fault = document_selection_fault(&result);
+        match &result {
+            DocumentPickerResult::Picked(path) => println!("picked: {}", path.display()),
+            DocumentPickerResult::Cancelled => println!("cancelled"),
+            DocumentPickerResult::Failed(error) => println!("failed: {error}"),
+        }
+        self.document_selection = Some(result);
+        event_loop.exit();
+    }
+
     fn create_window(&mut self, event_loop: &ActiveEventLoop, title: &str) {
         if self.window.is_some() {
             return;
@@ -949,6 +1111,106 @@ fn bootstrap(config: YouthAppConfig, proxy: EventLoopProxy<NativeEvent>) {
         });
 }
 
+fn begin_document_pick(mode: &mut Mode) -> Option<DocumentPickerFuture> {
+    match mode {
+        Mode::PickDocument(picker) => picker
+            .take()
+            .map(|picker| picker.begin_pick_text_document()),
+        Mode::CapsuleLaunch(pending) => pending
+            .picker
+            .take()
+            .map(|picker| picker.begin_pick_text_document()),
+        Mode::Application(_) | Mode::Smoke => None,
+    }
+}
+
+fn capsule_launch_config(
+    pending: &CapsuleLaunchPending,
+    document_path: &Path,
+) -> Result<YouthAppConfig, DialogError> {
+    let parent = document_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(DialogError::InvalidSelection)?;
+    let file_name = document_path
+        .file_name()
+        .ok_or(DialogError::InvalidSelection)?;
+    Ok(YouthAppConfig {
+        component_path: pending.component_path.clone(),
+        app_id: pending.app_id.clone(),
+        state: pending.state.clone(),
+        limits: RuntimeLimits::default(),
+        workspace: Some(WorkspaceGrant::text_document(parent, Path::new(file_name))),
+    })
+}
+
+const WINDOW_TITLE_MAX_CHARS: usize = 200;
+
+/// A packaged application must not settle on the generic "Youth" title once
+/// a real document is open. `file_name` comes from the OS file dialog and is
+/// otherwise untrusted display text -- sanitize it the same way
+/// `youth-capsule-launcher` already sanitizes `app_name` (strip control
+/// characters, collapse to one line) before it ever reaches a window title,
+/// and bound the length so a pathological filename can't produce an
+/// unbounded or multi-line title. This never touches the actual path used
+/// for file I/O, only the display string.
+fn document_window_title(document_path: &Path, app_name: &str) -> String {
+    let file_name = document_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let sanitized: String = file_name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(WINDOW_TITLE_MAX_CHARS)
+        .collect();
+    format!("{sanitized} — {app_name}")
+}
+
+fn document_picker_event(result: DocumentPickerResult) -> NativeEvent {
+    match result {
+        DocumentPickerResult::Picked(path) => NativeEvent::DocumentSelected(path),
+        DocumentPickerResult::Cancelled => NativeEvent::DocumentSelectionCancelled,
+        DocumentPickerResult::Failed(error) => NativeEvent::DocumentSelectionFailed(error),
+    }
+}
+
+fn document_selection_fault(result: &DocumentPickerResult) -> Option<String> {
+    match result {
+        DocumentPickerResult::Failed(error) => Some(error.to_string()),
+        DocumentPickerResult::Picked(_) | DocumentPickerResult::Cancelled => None,
+    }
+}
+
+fn spawn_document_pick(future: DocumentPickerFuture, proxy: EventLoopProxy<NativeEvent>) {
+    let failure_proxy = proxy.clone();
+    let spawn = std::thread::Builder::new()
+        .name("youth-desktop-document-picker".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_or(
+                        DocumentPickerResult::Failed(DialogError::Unavailable),
+                        |runtime| runtime.block_on(future),
+                    )
+            }))
+            .unwrap_or(DocumentPickerResult::Failed(DialogError::Unavailable));
+            let _ = proxy.send_event(document_picker_event(result));
+        });
+    if spawn.is_err() {
+        let _ = failure_proxy.send_event(NativeEvent::DocumentSelectionFailed(
+            DialogError::Unavailable,
+        ));
+    }
+}
+
 fn smoke_snapshot() -> TreeSnapshot {
     let id = |value| NodeId::new(value).expect("smoke IDs are non-zero");
     TreeSnapshot {
@@ -959,11 +1221,13 @@ fn smoke_snapshot() -> TreeSnapshot {
                 id: id(1),
                 data: NodeData::Root,
                 children: vec![id(2)],
+                grow: 0,
             },
             Node {
                 id: id(2),
                 data: NodeData::Box { enabled: true },
                 children: vec![id(3), id(4)],
+                grow: 0,
             },
             Node {
                 id: id(3),
@@ -971,6 +1235,7 @@ fn smoke_snapshot() -> TreeSnapshot {
                     value: "Count: 0".to_owned(),
                 },
                 children: vec![],
+                grow: 0,
             },
             Node {
                 id: id(4),
@@ -979,6 +1244,7 @@ fn smoke_snapshot() -> TreeSnapshot {
                     enabled: true,
                 },
                 children: vec![],
+                grow: 0,
             },
         ],
     }
@@ -1013,7 +1279,157 @@ fn category_name(category: RuntimeErrorCategory) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FixedDocumentPicker, RecordingDocumentPicker};
     use winit::keyboard::NativeKey;
+
+    fn drive_document_picker(result: DocumentPickerResult) -> (NativeEvent, usize) {
+        let picker = RecordingDocumentPicker::new(result);
+        let recording = picker.clone();
+        let mut mode = Mode::PickDocument(Some(Box::new(picker)));
+        let future = begin_document_pick(&mut mode).expect("picker starts once");
+        assert!(begin_document_pick(&mut mode).is_none());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let event = document_picker_event(runtime.block_on(future));
+        (event, recording.call_count())
+    }
+
+    fn capsule_launch_pending(
+        picker: Box<dyn DocumentPicker + Send + Sync>,
+    ) -> CapsuleLaunchPending {
+        CapsuleLaunchPending {
+            picker: Some(picker),
+            component_path: PathBuf::from("/capsule/component.wasm"),
+            app_id: AppId::parse("dev.youth.scratchpad").expect("valid test app ID"),
+            app_name: "Scratchpad".to_owned(),
+            state: StateLocation::File(PathBuf::from("/state/state.sqlite3")),
+        }
+    }
+
+    #[test]
+    fn document_window_title_combines_filename_and_app_name() {
+        assert_eq!(
+            document_window_title(&PathBuf::from("/documents/notes.md"), "Scratchpad"),
+            "notes.md — Scratchpad"
+        );
+    }
+
+    #[test]
+    fn document_window_title_sanitizes_control_characters_in_the_filename() {
+        assert_eq!(
+            document_window_title(&PathBuf::from("evil\nname.txt"), "Scratchpad"),
+            "evil name.txt — Scratchpad"
+        );
+    }
+
+    #[test]
+    fn document_window_title_bounds_an_unreasonably_long_filename() {
+        let long_name = format!("{}.txt", "a".repeat(500));
+        let title = document_window_title(&PathBuf::from(long_name), "Scratchpad");
+        assert!(title.chars().count() <= WINDOW_TITLE_MAX_CHARS + " — Scratchpad".chars().count());
+    }
+
+    #[test]
+    fn capsule_launch_mode_picks_once_and_builds_the_document_workspace() {
+        let path = PathBuf::from("/documents/notes.md");
+        let picker = RecordingDocumentPicker::new(DocumentPickerResult::Picked(path.clone()));
+        let recording = picker.clone();
+        let mut mode = Mode::CapsuleLaunch(capsule_launch_pending(Box::new(picker)));
+
+        let future = begin_document_pick(&mut mode).expect("capsule picker starts once");
+        assert!(begin_document_pick(&mut mode).is_none());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let NativeEvent::DocumentSelected(selected) =
+            document_picker_event(runtime.block_on(future))
+        else {
+            panic!("picked path was not forwarded");
+        };
+        let Mode::CapsuleLaunch(pending) = mode else {
+            panic!("capsule launch inputs were not retained");
+        };
+        let config = capsule_launch_config(&pending, &selected).expect("selected path is usable");
+
+        assert_eq!(recording.call_count(), 1);
+        assert_eq!(
+            config.component_path,
+            PathBuf::from("/capsule/component.wasm")
+        );
+        assert_eq!(config.app_id, pending.app_id);
+        assert_eq!(config.state, pending.state);
+        assert_eq!(
+            config.workspace,
+            Some(WorkspaceGrant::text_document("/documents", "notes.md"))
+        );
+    }
+
+    #[test]
+    fn capsule_launch_rejects_a_path_without_a_parent() {
+        let mut mode = Mode::CapsuleLaunch(capsule_launch_pending(Box::new(
+            FixedDocumentPicker::new(DocumentPickerResult::Picked(PathBuf::from("notes.md"))),
+        )));
+        let future = begin_document_pick(&mut mode).expect("capsule picker starts");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let NativeEvent::DocumentSelected(selected) =
+            document_picker_event(runtime.block_on(future))
+        else {
+            panic!("picked path was not forwarded");
+        };
+        let Mode::CapsuleLaunch(pending) = mode else {
+            panic!("capsule launch inputs were not retained");
+        };
+
+        assert_eq!(
+            capsule_launch_config(&pending, &selected),
+            Err(DialogError::InvalidSelection)
+        );
+    }
+
+    #[test]
+    fn document_picker_mode_forwards_a_picked_path_without_a_fault() {
+        let expected = PathBuf::from("notes.md");
+        let (event, calls) = drive_document_picker(DocumentPickerResult::Picked(expected.clone()));
+
+        let NativeEvent::DocumentSelected(path) = event else {
+            panic!("picked path was not forwarded");
+        };
+        let result = DocumentPickerResult::Picked(path.clone());
+        assert_eq!(path, expected);
+        assert_eq!(document_selection_fault(&result), None);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn document_picker_mode_treats_cancellation_as_a_clean_completion() {
+        let (event, calls) = drive_document_picker(DocumentPickerResult::Cancelled);
+
+        assert!(matches!(event, NativeEvent::DocumentSelectionCancelled));
+        assert_eq!(
+            document_selection_fault(&DocumentPickerResult::Cancelled),
+            None
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn document_picker_mode_forwards_a_dialog_failure_into_fault_state() {
+        let error = DialogError::Unavailable;
+        let (event, calls) = drive_document_picker(DocumentPickerResult::Failed(error.clone()));
+
+        let NativeEvent::DocumentSelectionFailed(forwarded) = event else {
+            panic!("dialog failure was not forwarded");
+        };
+        assert_eq!(forwarded, error);
+        assert_eq!(
+            document_selection_fault(&DocumentPickerResult::Failed(forwarded)),
+            Some("The document picker could not be opened.".to_owned())
+        );
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn logical_key_normalization_is_exact_and_rejects_compositions() {

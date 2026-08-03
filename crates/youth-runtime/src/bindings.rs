@@ -47,6 +47,13 @@ pub(crate) mod v008 {
     });
 }
 
+pub(crate) mod v009 {
+    wasmtime::component::bindgen!({
+        path: "../../wit/youth-app-v0.0.9",
+        world: "application",
+    });
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolVersion {
     V002,
@@ -56,6 +63,7 @@ pub(crate) enum ProtocolVersion {
     V006,
     V007,
     V008,
+    V009,
 }
 
 impl ProtocolVersion {
@@ -68,6 +76,7 @@ impl ProtocolVersion {
             Self::V006 => "youth:app/application@0.0.6",
             Self::V007 => "youth:app/application@0.0.7",
             Self::V008 => "youth:app/application@0.0.8",
+            Self::V009 => "youth:app/application@0.0.9",
         }
     }
 }
@@ -80,6 +89,7 @@ pub(crate) enum ApplicationBindings {
     V006(v006::Application),
     V007(v007::Application),
     V008(v008::Application),
+    V009(v009::Application),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +136,7 @@ impl ApplicationBindings {
             Self::V006(_) => ProtocolVersion::V006,
             Self::V007(_) => ProtocolVersion::V007,
             Self::V008(_) => ProtocolVersion::V008,
+            Self::V009(_) => ProtocolVersion::V009,
         }
     }
 
@@ -204,6 +215,16 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v008)
                     })
             }
+            Self::V009(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_mount(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V009)
+                            .map_err(GuestError::from_v009)
+                    })
+            }
         }
     }
 
@@ -213,7 +234,7 @@ impl ApplicationBindings {
         revision: u64,
         events: &[HostEvent],
     ) -> wasmtime::Result<Result<RawPatchBatch, GuestError>> {
-        if !matches!(self, Self::V008(_))
+        if !matches!(self, Self::V008(_) | Self::V009(_))
             && events.iter().any(|event| {
                 matches!(
                     event,
@@ -462,6 +483,23 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v008)
                     })
             }
+            Self::V009(bindings) => {
+                let events = v009::youth::app::ui::EventBatch {
+                    tree_revision: revision,
+                    events: events
+                        .iter()
+                        .map(event_v009)
+                        .collect::<wasmtime::Result<Vec<_>>>()?,
+                };
+                bindings
+                    .youth_app_lifecycle()
+                    .call_handle(store, &events)
+                    .map(|result| {
+                        result
+                            .map(RawPatchBatch::V009)
+                            .map_err(GuestError::from_v009)
+                    })
+            }
         }
     }
 
@@ -540,6 +578,16 @@ impl ApplicationBindings {
                             .map_err(GuestError::from_v008)
                     })
             }
+            Self::V009(bindings) => {
+                bindings
+                    .youth_app_lifecycle()
+                    .call_resync(store)
+                    .map(|result| {
+                        result
+                            .map(RawTreeSnapshot::V009)
+                            .map_err(GuestError::from_v009)
+                    })
+            }
         }
     }
 }
@@ -590,6 +638,7 @@ pub(crate) enum RawTreeSnapshot {
     V006(v006::youth::app::ui::TreeSnapshot),
     V007(v007::youth::app::ui::TreeSnapshot),
     V008(v008::youth::app::ui::TreeSnapshot),
+    V009(v009::youth::app::ui::TreeSnapshot),
 }
 
 pub(crate) enum RawPatchBatch {
@@ -600,6 +649,7 @@ pub(crate) enum RawPatchBatch {
     V006(v006::youth::app::ui::PatchBatch),
     V007(v007::youth::app::ui::PatchBatch),
     V008(v008::youth::app::ui::PatchBatch),
+    V009(v009::youth::app::ui::PatchBatch),
 }
 
 impl RawPatchBatch {
@@ -612,6 +662,7 @@ impl RawPatchBatch {
             Self::V006(value) => value.processed_through,
             Self::V007(value) => value.processed_through,
             Self::V008(value) => value.processed_through,
+            Self::V009(value) => value.processed_through,
         }
     }
 }
@@ -713,6 +764,18 @@ impl GuestError {
             message: value.message,
         }
     }
+
+    fn from_v009(value: v009::youth::app::ui::AppError) -> Self {
+        use v009::youth::app::ui::AppErrorCode;
+        Self {
+            code: match value.code {
+                AppErrorCode::InvalidState => GuestErrorCode::InvalidState,
+                AppErrorCode::RejectedEvent => GuestErrorCode::RejectedEvent,
+                AppErrorCode::Internal => GuestErrorCode::Internal,
+            },
+            message: value.message,
+        }
+    }
 }
 
 fn event_v008(event: &HostEvent) -> wasmtime::Result<v008::youth::app::ui::Event> {
@@ -740,6 +803,39 @@ fn event_v008(event: &HostEvent) -> wasmtime::Result<v008::youth::app::ui::Event
         }
         HostEvent::TextDocumentSaveCompleted { completion, .. } => {
             ui::EventKind::TextDocumentSaveCompleted(completion.as_wire_v008())
+        }
+    };
+    Ok(ui::Event {
+        sequence: event.sequence(),
+        kind,
+    })
+}
+
+fn event_v009(event: &HostEvent) -> wasmtime::Result<v009::youth::app::ui::Event> {
+    use v009::youth::app::ui;
+    let kind = match event {
+        HostEvent::Activate { node, .. } => ui::EventKind::Activate(*node),
+        HostEvent::ScheduleElapsed {
+            schedule,
+            generation,
+            reason,
+            ..
+        } => ui::EventKind::ScheduleElapsed(ui::ElapsedSchedule {
+            id: *schedule,
+            generation: *generation,
+            reason: match reason {
+                youth_state::ElapsedReason::Deadline => ui::ElapsedReason::Deadline,
+                youth_state::ElapsedReason::RecoveredOverdue => ui::ElapsedReason::RecoveredOverdue,
+            },
+        }),
+        HostEvent::EditorDirtyChanged { editor, dirty, .. } => {
+            ui::EventKind::EditorDirtyChanged(ui::EditorDirtyChange {
+                editor: *editor,
+                dirty: *dirty,
+            })
+        }
+        HostEvent::TextDocumentSaveCompleted { completion, .. } => {
+            ui::EventKind::TextDocumentSaveCompleted(completion.as_wire_v009())
         }
     };
     Ok(ui::Event {

@@ -141,16 +141,30 @@ pub fn layout(tree: &Tree, viewport: LogicalSize) -> Result<LayoutSnapshot, Geom
     );
     snapshot.hit_order.push(root);
     let root_node = tree.node(root).ok_or(GeometryError::MissingNode)?;
+    // Single-margin convention, matching width: child.x/child.y already start
+    // at OUTER_MARGIN, so available space is measured to the far viewport
+    // edge with no separate trailing margin (not centered/symmetric).
+    let content_bottom = viewport.height;
+    let available_width = (viewport.width - OUTER_MARGIN).max(0.0);
     let mut y = OUTER_MARGIN;
     for child in &root_node.children {
-        let size = measure(tree, *child)?;
-        place(
+        // A root child's available main size is whatever vertical space remains
+        // at this point in root's own sequential stacking, not the full
+        // viewport unconditionally -- root's children are not guaranteed to be
+        // singular (youth-tree's own validation permits and tests a multi-child
+        // root), so an earlier grow-aware sibling can legitimately leave a
+        // later one with little or no remaining height.
+        let available_height = (content_bottom - y).max(0.0);
+        let size = place(
             tree,
             *child,
             LogicalPoint { x: OUTER_MARGIN, y },
-            size.width.min((viewport.width - OUTER_MARGIN).max(0.0)),
+            LogicalSize {
+                width: available_width,
+                height: available_height,
+            },
             true,
-            false,
+            ForcedSize::default(),
             &mut snapshot,
         )?;
         y += size.height + CHILD_GAP;
@@ -249,22 +263,75 @@ fn measure_container(
     })
 }
 
+/// Cumulative allocation, not N independent `free * weight / total` products:
+/// summing independent float products can leave a gap or overshoot the
+/// container's inner boundary when weights don't divide evenly. Tracking a
+/// running weight sum and taking each share as `target - already_allocated`
+/// guarantees the shares sum to exactly `free`.
+fn allocate_grow_shares(
+    free: f64,
+    total_weight: u64,
+    grow_children: &[(usize, u16)],
+) -> Vec<(usize, f64)> {
+    let mut cumulative_weight: u64 = 0;
+    let mut cumulative_allocated = 0.0;
+    grow_children
+        .iter()
+        .map(|&(index, weight)| {
+            cumulative_weight += u64::from(weight);
+            let target = free * cumulative_weight as f64 / total_weight as f64;
+            let share = target - cumulative_allocated;
+            cumulative_allocated = target;
+            (index, share)
+        })
+        .collect()
+}
+
+/// A caller-computed exact override for a specific child's size on one or
+/// both axes -- used by `Grid` (always forces width to `track_width`) and by
+/// a grow-aware `Row`/`Column`'s own children loop (forces a grow child's
+/// main axis to its weighted share, and its cross axis to the container's
+/// full inner size). `None` on either axis falls through to today's
+/// shrink-to-intrinsic behavior, unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+struct ForcedSize {
+    width: Option<f64>,
+    height: Option<f64>,
+}
+
 fn place(
     tree: &Tree,
     id: NodeId,
     origin: LogicalPoint,
-    available_width: f64,
+    available: LogicalSize,
     ancestor_enabled: bool,
-    stretch_width: bool,
+    forced: ForcedSize,
     snapshot: &mut LayoutSnapshot,
 ) -> Result<LogicalSize, GeometryError> {
     let LogicalPoint { x, y } = origin;
     let node = tree.node(id).ok_or(GeometryError::MissingNode)?;
     let measured = measure(tree, id)?;
-    let width = if stretch_width {
-        available_width.max(0.0)
-    } else {
-        measured.width.min(available_width.max(0.0))
+    let box_layout = node.data.box_layout();
+    // Grow layout is entirely gated on a direct child's grow field: with no
+    // grow > 0 child present (every 0.0.2-0.0.8 tree, by construction, since
+    // only a 0.0.9 component can ever set grow above zero), width and height
+    // fall through to exactly today's shrink-to-intrinsic behavior below --
+    // this is what makes the whole feature backward compatible by
+    // construction, not merely by test coverage.
+    let has_grow_child = box_layout.is_some()
+        && node.children.iter().any(|child| {
+            tree.node(*child)
+                .is_some_and(|candidate| candidate.grow > 0)
+        });
+    let width = match forced.width {
+        Some(forced) => forced.max(0.0),
+        None if has_grow_child => available.width.max(measured.width),
+        None => measured.width.min(available.width.max(0.0)),
+    };
+    let height = match forced.height {
+        Some(forced) => forced.max(0.0),
+        None if has_grow_child => available.height.max(measured.height),
+        None => measured.height,
     };
     let own_enabled = match &node.data {
         NodeData::Box { enabled }
@@ -288,7 +355,7 @@ fn place(
                 x,
                 y,
                 width,
-                height: measured.height,
+                height,
             },
             effective_enabled,
             interaction: if node.data.is_focusable() {
@@ -299,13 +366,52 @@ fn place(
         },
     );
     snapshot.hit_order.push(id);
-    if let Some(box_layout) = node.data.box_layout() {
+    if let Some(box_layout) = box_layout {
         let child_x = x + BOX_PADDING;
         let child_width = (width - BOX_PADDING * 2.0).max(0.0);
+        let inner_height = (height - BOX_PADDING * 2.0).max(0.0);
         match box_layout {
             BoxLayout::Column => {
+                let intrinsic = node
+                    .children
+                    .iter()
+                    .map(|child| measure(tree, *child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let grow_weights = node
+                    .children
+                    .iter()
+                    .map(|child| {
+                        tree.node(*child)
+                            .map(|candidate| candidate.grow)
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>();
+                let total_weight: u64 = grow_weights.iter().map(|&weight| u64::from(weight)).sum();
+                let base = intrinsic.iter().map(|size| size.height).sum::<f64>()
+                    + CHILD_GAP * node.children.len().saturating_sub(1) as f64;
+                let free = (inner_height - base).max(0.0);
+                let grow_indices = grow_weights
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &weight)| weight > 0)
+                    .map(|(index, &weight)| (index, weight))
+                    .collect::<Vec<_>>();
+                let shares = if total_weight > 0 {
+                    allocate_grow_shares(free, total_weight, &grow_indices)
+                } else {
+                    Vec::new()
+                };
+                let mut shares = shares.into_iter().peekable();
                 let mut child_y = y + BOX_PADDING;
-                for child in &node.children {
+                for (index, child) in node.children.iter().enumerate() {
+                    let forced_height = match shares.peek() {
+                        Some(&(share_index, share)) if share_index == index => {
+                            shares.next();
+                            Some(intrinsic[index].height + share)
+                        }
+                        _ => None,
+                    };
+                    let forced_width = (grow_weights[index] > 0).then_some(child_width);
                     let child_size = place(
                         tree,
                         *child,
@@ -313,17 +419,61 @@ fn place(
                             x: child_x,
                             y: child_y,
                         },
-                        child_width,
+                        LogicalSize {
+                            width: child_width,
+                            height: inner_height,
+                        },
                         effective_enabled,
-                        false,
+                        ForcedSize {
+                            width: forced_width,
+                            height: forced_height,
+                        },
                         snapshot,
                     )?;
                     child_y += child_size.height + CHILD_GAP;
                 }
             }
             BoxLayout::Row => {
+                let intrinsic = node
+                    .children
+                    .iter()
+                    .map(|child| measure(tree, *child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let grow_weights = node
+                    .children
+                    .iter()
+                    .map(|child| {
+                        tree.node(*child)
+                            .map(|candidate| candidate.grow)
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>();
+                let total_weight: u64 = grow_weights.iter().map(|&weight| u64::from(weight)).sum();
+                let base = intrinsic.iter().map(|size| size.width).sum::<f64>()
+                    + CHILD_GAP * node.children.len().saturating_sub(1) as f64;
+                let free = (child_width - base).max(0.0);
+                let grow_indices = grow_weights
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &weight)| weight > 0)
+                    .map(|(index, &weight)| (index, weight))
+                    .collect::<Vec<_>>();
+                let shares = if total_weight > 0 {
+                    allocate_grow_shares(free, total_weight, &grow_indices)
+                } else {
+                    Vec::new()
+                };
+                let mut shares = shares.into_iter().peekable();
                 let mut next_x = child_x;
-                for child in &node.children {
+                for (index, child) in node.children.iter().enumerate() {
+                    let forced_width = match shares.peek() {
+                        Some(&(share_index, share)) if share_index == index => {
+                            shares.next();
+                            Some(intrinsic[index].width + share)
+                        }
+                        _ => None,
+                    };
+                    let forced_height = (grow_weights[index] > 0).then_some(inner_height);
                     let child_size = place(
                         tree,
                         *child,
@@ -331,9 +481,15 @@ fn place(
                             x: next_x,
                             y: y + BOX_PADDING,
                         },
-                        (child_x + child_width - next_x).max(0.0),
+                        LogicalSize {
+                            width: (child_x + child_width - next_x).max(0.0),
+                            height: inner_height,
+                        },
                         effective_enabled,
-                        false,
+                        ForcedSize {
+                            width: forced_width,
+                            height: forced_height,
+                        },
                         snapshot,
                     )?;
                     next_x += child_size.width + CHILD_GAP;
@@ -365,9 +521,15 @@ fn place(
                                 x: child_x + column as f64 * (track_width + CHILD_GAP),
                                 y: row_y,
                             },
-                            track_width,
+                            LogicalSize {
+                                width: track_width,
+                                height: row_height,
+                            },
                             effective_enabled,
-                            true,
+                            ForcedSize {
+                                width: Some(track_width),
+                                height: None,
+                            },
                             snapshot,
                         )?;
                     }
@@ -376,10 +538,7 @@ fn place(
             }
         }
     }
-    Ok(LogicalSize {
-        width,
-        height: measured.height,
-    })
+    Ok(LogicalSize { width, height })
 }
 
 #[cfg(test)]
@@ -401,11 +560,13 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data: NodeData::Box { enabled },
                         children: vec![id(3), id(4)],
+                        grow: 0,
                     },
                     Node {
                         id: id(3),
@@ -413,6 +574,7 @@ mod tests {
                             value: "Count: 0".into(),
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(4),
@@ -421,6 +583,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },
@@ -439,16 +602,19 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
                         data: NodeData::Box { enabled: true },
                         children: vec![id(3), id(6)],
+                        grow: 0,
                     },
                     Node {
                         id: id(3),
                         data: NodeData::Row { enabled: true },
                         children: vec![id(4), id(5)],
+                        grow: 0,
                     },
                     Node {
                         id: id(4),
@@ -457,6 +623,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(5),
@@ -465,6 +632,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(6),
@@ -473,6 +641,7 @@ mod tests {
                             columns: 2,
                         },
                         children: vec![id(7), id(8), id(9)],
+                        grow: 0,
                     },
                     Node {
                         id: id(7),
@@ -481,6 +650,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(8),
@@ -489,6 +659,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                     Node {
                         id: id(9),
@@ -497,6 +668,7 @@ mod tests {
                             enabled: true,
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },
@@ -557,6 +729,7 @@ mod tests {
                         id: id(1),
                         data: NodeData::Root,
                         children: vec![id(2)],
+                        grow: 0,
                     },
                     Node {
                         id: id(2),
@@ -565,6 +738,7 @@ mod tests {
                             text: "draft".into(),
                         },
                         children: vec![],
+                        grow: 0,
                     },
                 ],
             },
@@ -611,5 +785,295 @@ mod tests {
         assert_eq!(second.y, first.y);
         assert_eq!(third.x, first.x);
         assert_eq!(third.y, first.y + BUTTON_MIN_HEIGHT + CHILD_GAP);
+    }
+
+    fn growing_node(value: u64, data: NodeData, grow: u16, children: &[u64]) -> Node {
+        Node {
+            id: id(value),
+            data,
+            grow,
+            children: children.iter().copied().map(id).collect(),
+        }
+    }
+
+    fn plain_node(value: u64, data: NodeData, children: &[u64]) -> Node {
+        growing_node(value, data, 0, children)
+    }
+
+    fn text(value: &str) -> NodeData {
+        NodeData::Text {
+            value: value.to_owned(),
+        }
+    }
+
+    /// A column mirroring the "narrow P1.5 responsive-layout slice" acceptance
+    /// shape: an intrinsic header, one grow=1 editor, and an intrinsic footer.
+    fn scratchpad_shaped_tree() -> Tree {
+        Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2]),
+                    plain_node(2, NodeData::Box { enabled: true }, &[3, 4, 5]),
+                    plain_node(3, text("all.txt"), &[]),
+                    growing_node(
+                        4,
+                        NodeData::Editor {
+                            document_revision: 0,
+                            text: String::new(),
+                        },
+                        1,
+                        &[],
+                    ),
+                    plain_node(
+                        5,
+                        NodeData::Button {
+                            label: "Save".into(),
+                            enabled: true,
+                        },
+                        &[],
+                    ),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn grow_absent_tree_matches_todays_exact_reference_geometry() {
+        // The full-snapshot compatibility proof, not just the pre-existing
+        // assertions still holding: capture every node's bounds for a
+        // realistic multi-kind tree with grow absent everywhere (as every
+        // 0.0.2-0.0.8 tree necessarily is) and pin them all.
+        let snapshot = layout(&rich_layout(), LogicalSize::new(640.0, 480.0).unwrap()).unwrap();
+        let root = snapshot.nodes[&id(1)].bounds;
+        let outer = snapshot.nodes[&id(2)].bounds;
+        let row = snapshot.nodes[&id(3)].bounds;
+        let grid = snapshot.nodes[&id(6)].bounds;
+        assert_eq!(
+            root,
+            LogicalRect {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: 480.0
+            }
+        );
+        assert_eq!(outer.x, OUTER_MARGIN);
+        assert_eq!(outer.y, OUTER_MARGIN);
+        assert_eq!(row.x, OUTER_MARGIN + BOX_PADDING);
+        assert_eq!(row.y, OUTER_MARGIN + BOX_PADDING);
+        assert_eq!(grid.x, OUTER_MARGIN + BOX_PADDING);
+        assert_eq!(grid.y, row.y + row.height + CHILD_GAP);
+        // Root's own width, and the outer Box's width, are unaffected by
+        // this phase (no grow field anywhere in this tree): the outer Box
+        // stays intrinsic-width, exactly as it did before grow existed.
+        assert!(outer.width < 640.0 - OUTER_MARGIN);
+    }
+
+    #[test]
+    fn editor_consumes_remaining_height_at_three_viewports() {
+        for (width, height) in [(640.0, 480.0), (1024.0, 720.0), (1600.0, 900.0)] {
+            let tree = scratchpad_shaped_tree();
+            let snapshot = layout(&tree, LogicalSize::new(width, height).unwrap()).unwrap();
+            let viewport_rect = snapshot.nodes[&id(1)].bounds;
+            assert_eq!(
+                viewport_rect,
+                LogicalRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height
+                }
+            );
+            let content_rect = snapshot.nodes[&id(2)].bounds;
+            assert_eq!(content_rect.x, OUTER_MARGIN);
+            assert_eq!(content_rect.y, OUTER_MARGIN);
+            assert_eq!(content_rect.width, width - OUTER_MARGIN);
+            assert_eq!(content_rect.height, height - OUTER_MARGIN);
+
+            let filename = snapshot.nodes[&id(3)].bounds;
+            let editor = snapshot.nodes[&id(4)].bounds;
+            let save = snapshot.nodes[&id(5)].bounds;
+            assert_eq!(filename.height, GLYPH_HEIGHT);
+            assert_eq!(save.height, BUTTON_MIN_HEIGHT);
+            assert_eq!(editor.y, filename.y + filename.height + CHILD_GAP);
+            assert_eq!(save.y, editor.y + editor.height + CHILD_GAP);
+
+            let inner_height = content_rect.height - BOX_PADDING * 2.0;
+            let expected_editor_height =
+                inner_height - filename.height - save.height - CHILD_GAP * 2.0;
+            assert!(
+                (editor.height - expected_editor_height).abs() < 1e-9,
+                "editor height {} did not consume remaining space {} at {width}x{height}",
+                editor.height,
+                expected_editor_height
+            );
+            // The editor is forced to the column's full inner width, not
+            // merely clamped to it -- this is the fix for a shrink-clamped
+            // child staying narrow inside a widened container.
+            assert_eq!(editor.width, content_rect.width - BOX_PADDING * 2.0);
+        }
+    }
+
+    #[test]
+    fn unequal_weights_distribute_positive_free_space_on_top_of_intrinsic_size() {
+        // available inner main size: 500 (matches the plan's own worked
+        // example). A: intrinsic 8*8=64 wide text "AAAAAAAA", grow 1.
+        // B: intrinsic 8*16=128 wide text (16 chars), grow 1.
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2]),
+                    plain_node(2, NodeData::Row { enabled: true }, &[3, 4]),
+                    growing_node(3, text("AAAAAAAA"), 1, &[]),
+                    growing_node(4, text("BBBBBBBBBBBBBBBB"), 1, &[]),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        // width - OUTER_MARGIN - 2*BOX_PADDING = inner row width.
+        let width = 500.0 + OUTER_MARGIN + BOX_PADDING * 2.0;
+        let snapshot = layout(&tree, LogicalSize::new(width, 200.0).unwrap()).unwrap();
+        let a = snapshot.nodes[&id(3)].bounds;
+        let b = snapshot.nodes[&id(4)].bounds;
+        let base = 64.0 + 128.0 + CHILD_GAP;
+        let free = 500.0 - base;
+        assert!((a.width - (64.0 + free / 2.0)).abs() < 1e-9);
+        assert!((b.width - (128.0 + free / 2.0)).abs() < 1e-9);
+        assert!((b.x + b.width - (a.x + a.width + CHILD_GAP + b.width)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn free_space_not_evenly_divisible_lands_exactly_on_the_container_boundary() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2]),
+                    plain_node(2, NodeData::Row { enabled: true }, &[3, 4, 5]),
+                    growing_node(3, text(""), 1, &[]),
+                    growing_node(4, text(""), 2, &[]),
+                    growing_node(5, text(""), 3, &[]),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let snapshot = layout(&tree, LogicalSize::new(311.0, 100.0).unwrap()).unwrap();
+        let row = snapshot.nodes[&id(2)].bounds;
+        let last = snapshot.nodes[&id(5)].bounds;
+        let inner_right = row.x + (row.width - BOX_PADDING * 2.0) + BOX_PADDING;
+        assert!(
+            (last.x + last.width - inner_right).abs() < 1e-9,
+            "last grow child did not land exactly on the container's inner boundary"
+        );
+    }
+
+    #[test]
+    fn nested_row_inside_a_grow_aware_column_receives_its_own_forced_width() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2]),
+                    plain_node(2, NodeData::Box { enabled: true }, &[3, 4]),
+                    plain_node(3, text("header"), &[]),
+                    growing_node(4, NodeData::Row { enabled: true }, 1, &[5]),
+                    plain_node(5, text("nested"), &[]),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let snapshot = layout(&tree, LogicalSize::new(400.0, 400.0).unwrap()).unwrap();
+        let column = snapshot.nodes[&id(2)].bounds;
+        let nested_row = snapshot.nodes[&id(4)].bounds;
+        assert_eq!(nested_row.width, column.width - BOX_PADDING * 2.0);
+    }
+
+    #[test]
+    fn nested_column_inside_a_grow_aware_row_receives_its_own_forced_height() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2]),
+                    plain_node(2, NodeData::Row { enabled: true }, &[3, 4]),
+                    plain_node(3, text("sidebar"), &[]),
+                    growing_node(4, NodeData::Box { enabled: true }, 1, &[5]),
+                    plain_node(5, text("nested"), &[]),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let snapshot = layout(&tree, LogicalSize::new(400.0, 300.0).unwrap()).unwrap();
+        let row = snapshot.nodes[&id(2)].bounds;
+        let nested_column = snapshot.nodes[&id(4)].bounds;
+        assert_eq!(nested_column.height, row.height - BOX_PADDING * 2.0);
+    }
+
+    #[test]
+    fn a_grown_editors_pointer_hit_area_extends_past_its_old_intrinsic_bounds() {
+        // Proves P1.5-C's flow-through concretely, not just by code
+        // inspection: hit_test (and by the same LayoutSnapshot.bounds path,
+        // paint clipping, scroll-viewport clamping, and accessibility
+        // bounds) must see the editor's *grown* height, not the tiny
+        // GLYPH_HEIGHT intrinsic size it would have without a grow weight.
+        let tree = scratchpad_shaped_tree();
+        let snapshot = layout(&tree, LogicalSize::new(400.0, 400.0).unwrap()).unwrap();
+        let editor = snapshot.nodes[&id(4)].bounds;
+        assert!(
+            editor.height > GLYPH_HEIGHT * 2.0,
+            "editor did not grow past its intrinsic height"
+        );
+        let point_below_intrinsic_height = LogicalPoint {
+            x: editor.x + 1.0,
+            y: editor.y + GLYPH_HEIGHT + 1.0,
+        };
+        assert_eq!(
+            hit_test(&snapshot, point_below_intrinsic_height),
+            Some(id(4)),
+            "hit-testing did not see the editor's grown bounds"
+        );
+    }
+
+    #[test]
+    fn multi_child_root_leaves_a_later_sibling_the_actual_remaining_height() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 1,
+                root: id(1),
+                nodes: vec![
+                    plain_node(1, NodeData::Root, &[2, 4]),
+                    growing_node(2, NodeData::Box { enabled: true }, 0, &[3]),
+                    growing_node(3, text(""), 1, &[]),
+                    plain_node(4, text("second"), &[]),
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        // First root child (id 2) is a grow-aware column with an internal
+        // grow child (id 3), so it consumes the offered remaining height
+        // rather than its own tiny intrinsic size.
+        let snapshot = layout(&tree, LogicalSize::new(300.0, 300.0).unwrap()).unwrap();
+        let first = snapshot.nodes[&id(2)].bounds;
+        let second = snapshot.nodes[&id(4)].bounds;
+        assert_eq!(second.y, first.y + first.height + CHILD_GAP);
+        // The first child alone is offered the full remaining vertical
+        // space (viewport.height itself, single-margin convention -- only
+        // the leading OUTER_MARGIN is subtracted, matching width), and
+        // consumes all of it since it is grow-aware.
+        assert!((first.y + first.height - 300.0).abs() < 1e-9);
     }
 }
