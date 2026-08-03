@@ -1,8 +1,13 @@
 # Scratchpad Gate B — One Real Text Document
 
-Status: merged to `master`; cross-platform release certification remains
-pending until the Scratchpad application repository's own CI matrix
-(canonical Ubuntu build, mounted unchanged on Windows and macOS) passes.
+Status: complete. Merged to `master`. Cross-platform release certified at
+[samanshaiza004/scratchpad](https://github.com/samanshaiza004/scratchpad)
+commit `b58a6b0` (tag `scratchpad-gate-b-one-real-file`): the canonical
+Ubuntu component (SHA-256
+`e58968335db8b51cf551e64ae728d9bc04563bd2efd8adf2197023811b1b8b56`,
+160,435 bytes) mounted unchanged and passed on Ubuntu, Windows, and macOS,
+each also building and semantically testing the locked source
+independently.
 
 This document is the authoritative contract for the first file-backed Youth
 application. It adds `youth:text-document@0.0.1` and `youth:app@0.0.8` while
