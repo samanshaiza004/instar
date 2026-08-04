@@ -31,6 +31,13 @@ pub enum DesktopEvent {
     AppRejected(AppErrorSummary),
     EditorInputRejected(RuntimeErrorSummary),
     AppFaulted(RuntimeErrorSummary),
+    /// A host-local Editor mutation (an `EditorInput`/`EditorLocalEdit`
+    /// command) finished applying on the controller thread. `native.rs`
+    /// already requests a redraw optimistically the moment the command is
+    /// sent, but that redraw can race the async apply and paint a stale
+    /// frame; this event is the guaranteed signal to repaint once the
+    /// mutation has actually landed.
+    EditorLocalEditApplied,
     Stopped,
 }
 
@@ -151,27 +158,24 @@ impl Controller {
                                     EditorInput::MoveToPoint { x, y } => {
                                         vec![youth_runtime::EditorLocalEdit::MoveToPoint { x, y }]
                                     }
-                                    EditorInput::ExtendSelectionToPoint {
-                                        anchor_x,
-                                        anchor_y,
-                                        x,
-                                        y,
-                                    } => vec![
-                                        youth_runtime::EditorLocalEdit::ExtendSelectionToPoint {
-                                            anchor_x,
-                                            anchor_y,
-                                            x,
-                                            y,
-                                        },
-                                    ],
+                                    EditorInput::ExtendSelectionToPoint { x, y } => {
+                                        vec![
+                                            youth_runtime::EditorLocalEdit::ExtendSelectionToPoint {
+                                                x,
+                                                y,
+                                            },
+                                        ]
+                                    }
                                     // No selection-consuming clipboard semantics yet
                                     // -- deferred alongside real Cut/Copy behavior.
                                     EditorInput::Cut | EditorInput::Copy => Vec::new(),
                                 };
+                                let mut all_applied = true;
                                 for edit in edits {
                                     if let Err(error) =
                                         handle.edit_editor_locally(editor, edit).await
                                     {
+                                        all_applied = false;
                                         if error.category()
                                             == RuntimeErrorCategory::EditorInputRejected
                                         {
@@ -190,17 +194,24 @@ impl Controller {
                                         break;
                                     }
                                 }
+                                if all_applied {
+                                    sink.send(DesktopEvent::EditorLocalEditApplied);
+                                }
                             }
                             ControllerCommand::EditorLocalEdit { editor, edit } => {
-                                if let Err(error) = handle.edit_editor_locally(editor, edit).await {
-                                    let summary = RuntimeErrorSummary {
-                                        category: error.category(),
-                                    };
-                                    if error.category() == RuntimeErrorCategory::EditorInputRejected
-                                    {
-                                        sink.send(DesktopEvent::EditorInputRejected(summary));
-                                    } else {
-                                        sink.send(DesktopEvent::AppFaulted(summary));
+                                match handle.edit_editor_locally(editor, edit).await {
+                                    Ok(_) => sink.send(DesktopEvent::EditorLocalEditApplied),
+                                    Err(error) => {
+                                        let summary = RuntimeErrorSummary {
+                                            category: error.category(),
+                                        };
+                                        if error.category()
+                                            == RuntimeErrorCategory::EditorInputRejected
+                                        {
+                                            sink.send(DesktopEvent::EditorInputRejected(summary));
+                                        } else {
+                                            sink.send(DesktopEvent::AppFaulted(summary));
+                                        }
                                     }
                                 }
                             }

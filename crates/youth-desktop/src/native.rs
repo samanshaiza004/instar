@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use accesskit_winit::Adapter as AccessAdapter;
 use softbuffer::{Context, Surface};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition as WinitLogicalPosition, LogicalSize as WinitLogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -17,13 +18,13 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::{
     Controller, ControllerCommand, DesktopEvent, DialogError, DocumentPicker, DocumentPickerFuture,
     DocumentPickerResult, InteractionState, LogicalKey, LogicalPoint, LogicalSize, Modifiers,
-    Palette, PointerState, RenderState, RendererMirror, RfdDocumentPicker, SemanticAction, access,
-    layout, render,
+    Palette, PointerState, RenderState, RendererMirror, RfdDocumentPicker, RuntimeErrorSummary,
+    SemanticAction, access, layout, render,
 };
 use youth_interaction::EditorInput;
 use youth_runtime::{
-    AppId, PresentationReader, RuntimeErrorCategory, RuntimeLimits, StateLocation, WorkspaceGrant,
-    YouthAppConfig, YouthAppHandle, next_display_boundary_epoch_millis,
+    AppId, PresentationReader, RuntimeErrorCategory, RuntimeEvent, RuntimeLimits, StateLocation,
+    TurnOrigin, WorkspaceGrant, YouthAppConfig, YouthAppHandle, next_display_boundary_epoch_millis,
 };
 use youth_tree::{Node, NodeData, NodeId, TreeSnapshot};
 
@@ -103,13 +104,24 @@ struct NativeApp {
     /// Purely a paint-time transform -- never sent to the guest, never
     /// part of any revision.
     editor_scroll_offsets: HashMap<NodeId, f32>,
+    /// The cursor position `sync_editor_scroll` last auto-followed, per
+    /// Editor. Auto-follow only re-centers the viewport when this changes
+    /// (an edit, arrow-key move, or click) -- `present()` runs on every
+    /// redraw, and re-following unconditionally would fight a deliberate
+    /// scroll-wheel action on every subsequent repaint, snapping straight
+    /// back to the cursor and making it look like scrolling away from the
+    /// cursor is impossible.
+    editor_followed_cursor: HashMap<NodeId, (f32, f32)>,
     /// Last logical wrapping width sent to each live Editor session.
     editor_viewport_widths: HashMap<NodeId, f32>,
-    /// The fixed end of an in-progress pointer text-selection drag: which
-    /// Editor, and its click-down position in that Editor's own content
-    /// coordinate space (see [`Self::editor_content_point`]). `None` when
-    /// no primary-button drag is in progress over an Editor.
-    text_drag_anchor: Option<(NodeId, f32, f32)>,
+    /// Which Editor an in-progress pointer text-selection drag is over.
+    /// The anchor's own content-space position is not tracked here -- it is
+    /// resolved once, host-runtime-side, to a stable byte offset when the
+    /// drag begins (see `local_move_to_point`'s drag-anchor recording), so
+    /// it can't drift out of sync with the drag's current point the way a
+    /// re-hit-tested screen coordinate could. `None` when no primary-button
+    /// drag is in progress over an Editor.
+    text_drag_anchor: Option<NodeId>,
     /// `None` until the window exists (it needs a live `Window` to
     /// construct). Feeds tree updates to, and receives action requests
     /// from, whatever assistive technology is listening.
@@ -203,6 +215,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         presentation: None,
         editor_rasterizer: std::cell::RefCell::new(youth_text_render_cpu::GlyphRasterizer::new()),
         editor_scroll_offsets: HashMap::new(),
+        editor_followed_cursor: HashMap::new(),
         editor_viewport_widths: HashMap::new(),
         text_drag_anchor: None,
         access_adapter: None,
@@ -261,6 +274,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
             NativeEvent::Mounted(handle, snapshot) => {
                 self.install_snapshot(snapshot);
                 self.presentation = Some(handle.presentation());
+                spawn_runtime_event_bridge(handle.subscribe(), self.proxy.clone());
                 let proxy = self.proxy.clone();
                 self.controller = Some(Controller::spawn(handle, move |event| {
                     let _ = proxy.send_event(NativeEvent::Runtime(event));
@@ -334,18 +348,12 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                         window.request_redraw();
                     }
                 }
-                if let (Some((editor, anchor_x, anchor_y)), Some(controller)) =
-                    (self.text_drag_anchor, &self.controller)
+                if let (Some(editor), Some(controller)) = (self.text_drag_anchor, &self.controller)
                     && let Some((x, y)) = self.editor_content_point(editor, &window, logical_point)
                 {
                     let _ = controller.send(ControllerCommand::EditorInput {
                         editor,
-                        input: EditorInput::ExtendSelectionToPoint {
-                            anchor_x,
-                            anchor_y,
-                            x,
-                            y,
-                        },
+                        input: EditorInput::ExtendSelectionToPoint { x, y },
                     });
                     window.request_redraw();
                 }
@@ -378,7 +386,7 @@ impl ApplicationHandler<NativeEvent> for NativeApp {
                                     self.editor_content_point(armed, &window, cursor)
                                 && let Some(controller) = &self.controller
                             {
-                                self.text_drag_anchor = Some((armed, x, y));
+                                self.text_drag_anchor = Some(armed);
                                 let _ = controller.send(ControllerCommand::EditorInput {
                                     editor: armed,
                                     input: EditorInput::MoveToPoint { x, y },
@@ -678,6 +686,9 @@ impl NativeApp {
             DesktopEvent::AppFaulted(error) => {
                 self.fault = Some(category_name(error.category).to_owned());
             }
+            DesktopEvent::EditorLocalEditApplied => {
+                self.relayout();
+            }
             DesktopEvent::Stopped => event_loop.exit(),
         }
         if let Some(window) = &self.window {
@@ -806,20 +817,24 @@ impl NativeApp {
         };
 
         let viewport_height = rect.height as f32;
-        let mut offset = self
+        let offset = self
             .editor_scroll_offsets
             .get(&editor)
             .copied()
             .unwrap_or(0.0);
-        if let Some(cursor) = presentation.cursor {
-            offset = follow_cursor_scroll_offset(
-                offset,
-                viewport_height,
-                cursor.y0 as f32,
-                cursor.y1 as f32,
-            );
+        let cursor = presentation.cursor.map(|c| (c.y0 as f32, c.y1 as f32));
+        let last_followed = self.editor_followed_cursor.get(&editor).copied();
+        let (offset, followed) =
+            resolve_editor_scroll_offset(offset, viewport_height, cursor, last_followed);
+        match followed {
+            Some(position) => {
+                self.editor_followed_cursor.insert(editor, position);
+            }
+            None => {
+                self.editor_followed_cursor.remove(&editor);
+            }
         }
-        offset = clamp_scroll_offset(offset, viewport_height, presentation.content_height);
+        let offset = clamp_scroll_offset(offset, viewport_height, presentation.content_height);
         self.editor_scroll_offsets.insert(editor, offset);
     }
 
@@ -1024,6 +1039,32 @@ fn clamp_scroll_offset(offset: f32, viewport_height: f32, content_height: f32) -
     offset.clamp(0.0, max_offset)
 }
 
+/// Decides whether `sync_editor_scroll` should re-follow the caret this
+/// frame. `sync_editor_scroll` runs on every `present()`, but re-following
+/// unconditionally would fight a deliberate scroll-wheel action on every
+/// subsequent repaint, snapping straight back to the cursor. Re-following
+/// only happens when `cursor` differs from `last_followed` (an edit,
+/// arrow-key move, or click) -- otherwise `offset` passes through
+/// untouched, leaving room for an independent scroll to take effect.
+/// Returns the resulting offset and the cursor position now considered
+/// followed (`None` once the editor has no cursor).
+fn resolve_editor_scroll_offset(
+    offset: f32,
+    viewport_height: f32,
+    cursor: Option<(f32, f32)>,
+    last_followed: Option<(f32, f32)>,
+) -> (f32, Option<(f32, f32)>) {
+    match cursor {
+        Some(position) if Some(position) != last_followed => {
+            let offset =
+                follow_cursor_scroll_offset(offset, viewport_height, position.0, position.1);
+            (offset, Some(position))
+        }
+        Some(_) => (offset, last_followed),
+        None => (offset, None),
+    }
+}
+
 /// Adjusts `offset` by the minimum amount needed to bring
 /// `[cursor_top, cursor_bottom)` fully inside `[offset, offset +
 /// viewport_height)`, preferring to leave `offset` untouched when the
@@ -1108,6 +1149,62 @@ fn bootstrap(config: YouthAppConfig, proxy: EventLoopProxy<NativeEvent>) {
                     let _ = proxy.send_event(NativeEvent::StartupFault(error.category()));
                 }
             }
+        });
+}
+
+/// Forwards autonomous guest turns -- ones with no waiting requester, such
+/// as a text-document save completing on a background thread or an
+/// Editor's dirty flag flipping as a side effect of a local edit -- into
+/// the same `NativeEvent::Runtime` path used for user-requested turns.
+/// Without this, those turns only reach the client the next time some
+/// unrelated request happens to fail its revision check and fall back to a
+/// resync, which reads as one action of visible latency (e.g. a save
+/// finishing but the status label staying on "Saving..." until another
+/// button press). `TurnOrigin::Requested` turns are skipped here since the
+/// `Controller` already delivers those through its own direct reply.
+fn spawn_runtime_event_bridge(
+    mut events: broadcast::Receiver<RuntimeEvent>,
+    proxy: EventLoopProxy<NativeEvent>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("youth-desktop-runtime-events".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
+                return;
+            };
+            runtime.block_on(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(RuntimeEvent::TurnCommitted(outcome)) => {
+                            if matches!(outcome.origin, TurnOrigin::Requested(_)) {
+                                continue;
+                            }
+                            let event = DesktopEvent::TurnCommitted(outcome.receipt);
+                            if proxy.send_event(NativeEvent::Runtime(event)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(RuntimeEvent::Faulted(fault)) => {
+                            let event = DesktopEvent::AppFaulted(RuntimeErrorSummary {
+                                category: fault.category,
+                            });
+                            if proxy.send_event(NativeEvent::Runtime(event)).is_err() {
+                                return;
+                            }
+                        }
+                        // Both producers of `SnapshotReplaced` (mount and an
+                        // explicit resync) already deliver through their own
+                        // direct reply; nothing autonomous emits it.
+                        Ok(RuntimeEvent::SnapshotReplaced(_)) => {}
+                        // A lagged receiver missed some turns, but the next
+                        // `TurnCommitted` this loop does forward will fail its
+                        // revision check against the client's now-stale
+                        // mirror and fall back to a resync on its own.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            });
         });
 }
 
@@ -1539,5 +1636,38 @@ mod tests {
         assert_eq!(follow_cursor_scroll_offset(0.0, 100.0, 120.0, 136.0), 36.0);
         // Never scrolls negative even for a caret near the very top.
         assert_eq!(follow_cursor_scroll_offset(5.0, 100.0, 0.0, 16.0), 0.0);
+    }
+
+    #[test]
+    fn resolve_editor_scroll_offset_follows_the_caret_once_then_leaves_a_manual_scroll_alone() {
+        // Caret starts below the viewport: the first frame follows it.
+        let (offset, followed) =
+            resolve_editor_scroll_offset(0.0, 100.0, Some((120.0, 136.0)), None);
+        assert_eq!(offset, 36.0);
+        assert_eq!(followed, Some((120.0, 136.0)));
+
+        // A manual scroll (e.g. the wheel) moves the offset elsewhere in
+        // between frames, and the caret has not moved. The next frame must
+        // not snap the offset back toward the caret.
+        let scrolled_offset = 0.0;
+        let (offset, followed) =
+            resolve_editor_scroll_offset(scrolled_offset, 100.0, Some((120.0, 136.0)), followed);
+        assert_eq!(
+            offset, scrolled_offset,
+            "an unchanged cursor position must not re-trigger auto-follow"
+        );
+        assert_eq!(followed, Some((120.0, 136.0)));
+
+        // The caret then genuinely moves: auto-follow kicks back in.
+        let (offset, followed) =
+            resolve_editor_scroll_offset(offset, 100.0, Some((220.0, 236.0)), followed);
+        assert_eq!(offset, 136.0);
+        assert_eq!(followed, Some((220.0, 236.0)));
+
+        // The editor loses its cursor (e.g. focus moved elsewhere): the
+        // tracked position is cleared so a later refocus follows again.
+        let (offset, followed) = resolve_editor_scroll_offset(offset, 100.0, None, followed);
+        assert_eq!(offset, 136.0);
+        assert_eq!(followed, None);
     }
 }

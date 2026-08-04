@@ -157,11 +157,10 @@ pub enum EditorLocalEdit {
         x: f32,
         y: f32,
     },
-    /// Selects from `(anchor_x, anchor_y)` to `(x, y)`, both in the
-    /// engine's own content coordinate space (a pointer drag).
+    /// Selects from the drag anchor recorded by the most recent
+    /// `MoveToPoint` to `(x, y)` in the engine's own content coordinate
+    /// space (a pointer drag).
     ExtendSelectionToPoint {
-        anchor_x: f32,
-        anchor_y: f32,
         x: f32,
         y: f32,
     },
@@ -236,6 +235,16 @@ struct EditorSession {
     /// this is pushed onto `undo_stack` only on `ImeFinishCompose` (a
     /// cancelled composition via `ImeClearCompose` has nothing to undo).
     pending_compose_snapshot: Option<UndoSnapshot>,
+    /// The byte offset a pointer text-selection drag started from, resolved
+    /// once by `local_move_to_point` at the initial click. `native.rs` only
+    /// knows the anchor as a content-space point, but re-hit-testing that
+    /// point on every subsequent extend call is fragile: anything that
+    /// changes the coordinate basis between the click and a later
+    /// same-gesture move (the host's scroll offset auto-following the
+    /// cursor, a width-driven rewrap) desyncs the anchor from the current
+    /// point and produces a wrong, oversized selection. A byte offset has
+    /// no coordinate basis to drift.
+    drag_anchor: Option<usize>,
 }
 
 impl Clone for EditorSession {
@@ -255,6 +264,7 @@ impl Clone for EditorSession {
             redo_stack: self.redo_stack.clone(),
             insert_group_open: self.insert_group_open,
             pending_compose_snapshot: self.pending_compose_snapshot.clone(),
+            drag_anchor: self.drag_anchor,
         }
     }
 }
@@ -409,6 +419,7 @@ fn new_session(
         redo_stack: VecDeque::new(),
         insert_group_open: false,
         pending_compose_snapshot: None,
+        drag_anchor: None,
     }
 }
 
@@ -877,7 +888,11 @@ pub(super) fn local_extend_selection(
 
 /// Collapses the cursor to the text position nearest a pointer click. Same
 /// group-boundary and non-content-mutating behavior as
-/// [`local_move_cursor`].
+/// [`local_move_cursor`]. Also records the resolved byte offset as the
+/// pending drag anchor for a possible following
+/// [`local_extend_selection_to_point`], since a plain click is
+/// indistinguishable from the start of a click-and-drag selection until a
+/// later pointer move (or lack of one) settles it.
 pub(super) fn local_move_to_point(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
@@ -889,6 +904,7 @@ pub(super) fn local_move_to_point(
     session.insert_group_open = false;
     let offset = session.engine.hit_test(x, y);
     session.engine.move_to_byte(offset);
+    session.drag_anchor = Some(offset);
     let (cursor, selection) = session.engine.selection_state();
     Ok(local_edit_result_from_parts(
         session,
@@ -901,23 +917,28 @@ pub(super) fn local_move_to_point(
     ))
 }
 
-/// Selects from `(anchor_x, anchor_y)` to `(x, y)`, the host-local effect
-/// of a click-and-drag text selection. The anchor is re-hit-tested on every
-/// call rather than cached as a byte offset, since the caller (native
-/// pointer input) only knows the anchor as a content-space point, not a
-/// byte position.
+/// Selects from the pending drag anchor (set by the most recent
+/// [`local_move_to_point`]) to `(x, y)`, the host-local effect of a
+/// click-and-drag text selection. The anchor is a byte offset resolved once
+/// at the initial click, not re-hit-tested from a content-space point on
+/// every call: the caller (native pointer input) derives that point from
+/// the current scroll offset, and anything that changes the scroll offset
+/// between the click and a later same-gesture move -- most notably the
+/// click's own cursor movement triggering auto-follow-scroll -- would
+/// desync a re-hit-tested anchor from the current point and produce a
+/// wrong, oversized selection. A byte offset has no coordinate basis to
+/// drift. Falls back to the current cursor position if no click preceded
+/// this call.
 pub(super) fn local_extend_selection_to_point(
     registry: &mut EditorSessionRegistry,
     editor: NodeId,
-    anchor_x: f32,
-    anchor_y: f32,
     x: f32,
     y: f32,
 ) -> Result<EditorLocalEditResult, EditorSessionError> {
     let session = live_session_mut(registry, editor)?;
     let (before_cursor, before_selection) = session.engine.selection_state();
     session.insert_group_open = false;
-    let anchor = session.engine.hit_test(anchor_x, anchor_y);
+    let anchor = session.drag_anchor.unwrap_or(before_cursor);
     let focus = session.engine.hit_test(x, y);
     session.engine.select_byte_range(anchor, focus);
     let (cursor, selection) = session.engine.selection_state();

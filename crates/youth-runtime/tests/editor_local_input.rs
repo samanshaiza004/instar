@@ -694,15 +694,13 @@ async fn extend_selection_to_point_selects_from_the_anchor_to_the_current_point(
     app.mount().await.expect("Editor fixture mounts");
     let baseline = app.inspect().await.expect("baseline inspection succeeds");
 
+    app.edit_editor_locally(id(2), EditorLocalEdit::MoveToPoint { x: 0.0, y: 0.0 })
+        .await
+        .expect("the click that begins the drag succeeds");
     let dragged = app
         .edit_editor_locally(
             id(2),
-            EditorLocalEdit::ExtendSelectionToPoint {
-                anchor_x: 0.0,
-                anchor_y: 0.0,
-                x: 1_000.0,
-                y: 0.0,
-            },
+            EditorLocalEdit::ExtendSelectionToPoint { x: 1_000.0, y: 0.0 },
         )
         .await
         .expect("drag from the start to far right succeeds");

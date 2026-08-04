@@ -2784,19 +2784,14 @@ impl YouthApp {
                     y,
                 )
             }
-            crate::EditorLocalEdit::ExtendSelectionToPoint {
-                anchor_x,
-                anchor_y,
-                x,
-                y,
-            } => crate::editor_session::local_extend_selection_to_point(
-                &mut self.store.data_mut().editor_sessions,
-                editor,
-                anchor_x,
-                anchor_y,
-                x,
-                y,
-            ),
+            crate::EditorLocalEdit::ExtendSelectionToPoint { x, y } => {
+                crate::editor_session::local_extend_selection_to_point(
+                    &mut self.store.data_mut().editor_sessions,
+                    editor,
+                    x,
+                    y,
+                )
+            }
             crate::EditorLocalEdit::SetSelectionFromAccessKit(selection) => {
                 crate::editor_session::local_set_selection_from_accesskit(
                     &mut self.store.data_mut().editor_sessions,

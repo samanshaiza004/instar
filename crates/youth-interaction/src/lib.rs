@@ -89,12 +89,10 @@ pub enum EditorInput {
         x: f32,
         y: f32,
     },
-    /// Selects from `(anchor_x, anchor_y)` to `(x, y)`, both in the Editor's
-    /// content coordinate space -- the host-local effect of a
-    /// click-and-drag text selection.
+    /// Extends the selection from the anchor set by the most recent
+    /// `MoveToPoint` to `(x, y)`, in the Editor's content coordinate space
+    /// -- the host-local effect of a click-and-drag text selection.
     ExtendSelectionToPoint {
-        anchor_x: f32,
-        anchor_y: f32,
         x: f32,
         y: f32,
     },

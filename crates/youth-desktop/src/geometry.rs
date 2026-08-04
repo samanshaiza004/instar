@@ -141,11 +141,12 @@ pub fn layout(tree: &Tree, viewport: LogicalSize) -> Result<LayoutSnapshot, Geom
     );
     snapshot.hit_order.push(root);
     let root_node = tree.node(root).ok_or(GeometryError::MissingNode)?;
-    // Single-margin convention, matching width: child.x/child.y already start
-    // at OUTER_MARGIN, so available space is measured to the far viewport
-    // edge with no separate trailing margin (not centered/symmetric).
-    let content_bottom = viewport.height;
-    let available_width = (viewport.width - OUTER_MARGIN).max(0.0);
+    // Symmetric margin: content is inset by OUTER_MARGIN on every edge, not
+    // just the leading (top/left) one -- a grow-aware root child that fills
+    // the offered space therefore stops OUTER_MARGIN short of the trailing
+    // (bottom/right) viewport edge too, instead of touching it flush.
+    let content_bottom = (viewport.height - OUTER_MARGIN).max(0.0);
+    let available_width = (viewport.width - OUTER_MARGIN * 2.0).max(0.0);
     let mut y = OUTER_MARGIN;
     for child in &root_node.children {
         // A root child's available main size is whatever vertical space remains
@@ -870,7 +871,7 @@ mod tests {
         // Root's own width, and the outer Box's width, are unaffected by
         // this phase (no grow field anywhere in this tree): the outer Box
         // stays intrinsic-width, exactly as it did before grow existed.
-        assert!(outer.width < 640.0 - OUTER_MARGIN);
+        assert!(outer.width < 640.0 - OUTER_MARGIN * 2.0);
     }
 
     #[test]
@@ -891,8 +892,8 @@ mod tests {
             let content_rect = snapshot.nodes[&id(2)].bounds;
             assert_eq!(content_rect.x, OUTER_MARGIN);
             assert_eq!(content_rect.y, OUTER_MARGIN);
-            assert_eq!(content_rect.width, width - OUTER_MARGIN);
-            assert_eq!(content_rect.height, height - OUTER_MARGIN);
+            assert_eq!(content_rect.width, width - OUTER_MARGIN * 2.0);
+            assert_eq!(content_rect.height, height - OUTER_MARGIN * 2.0);
 
             let filename = snapshot.nodes[&id(3)].bounds;
             let editor = snapshot.nodes[&id(4)].bounds;
@@ -937,8 +938,8 @@ mod tests {
             &youth_tree::Limits::default(),
         )
         .unwrap();
-        // width - OUTER_MARGIN - 2*BOX_PADDING = inner row width.
-        let width = 500.0 + OUTER_MARGIN + BOX_PADDING * 2.0;
+        // width - 2*OUTER_MARGIN - 2*BOX_PADDING = inner row width.
+        let width = 500.0 + OUTER_MARGIN * 2.0 + BOX_PADDING * 2.0;
         let snapshot = layout(&tree, LogicalSize::new(width, 200.0).unwrap()).unwrap();
         let a = snapshot.nodes[&id(3)].bounds;
         let b = snapshot.nodes[&id(4)].bounds;
@@ -1071,9 +1072,8 @@ mod tests {
         let second = snapshot.nodes[&id(4)].bounds;
         assert_eq!(second.y, first.y + first.height + CHILD_GAP);
         // The first child alone is offered the full remaining vertical
-        // space (viewport.height itself, single-margin convention -- only
-        // the leading OUTER_MARGIN is subtracted, matching width), and
-        // consumes all of it since it is grow-aware.
-        assert!((first.y + first.height - 300.0).abs() < 1e-9);
+        // space up to the trailing margin (symmetric convention, matching
+        // width), and consumes all of it since it is grow-aware.
+        assert!((first.y + first.height - (300.0 - OUTER_MARGIN)).abs() < 1e-9);
     }
 }
