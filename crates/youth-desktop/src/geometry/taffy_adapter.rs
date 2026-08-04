@@ -122,7 +122,15 @@ fn build_root(
     };
     // Root's own padding is OUTER_MARGIN, not BOX_PADDING -- distinct from
     // every other container, which is why this doesn't just reuse
-    // `container_style()` unmodified.
+    // `container_style()` unmodified. Root also needs `BorderBox` (Taffy's
+    // own default, overriding `container_style()`'s `ContentBox`): Root is
+    // the one node with an *explicit* declared size (the viewport itself),
+    // and under `ContentBox` an explicit size is interpreted as the
+    // content area with padding added on top -- expanding the border box
+    // past the viewport and handing children the full declared size as
+    // available space instead of `viewport - 2*OUTER_MARGIN`. Every other
+    // container is auto-sized (no declared `size`), where content-vs-border
+    // box makes no difference, so this override is Root-specific.
     let padding = uniform_padding(OUTER_MARGIN);
     if let [single_child] = root_node.children.as_slice() {
         let child_taffy_id = build_node(tree, taffy, *single_child, forward)?;
@@ -138,6 +146,7 @@ fn build_root(
         let style = Style {
             size,
             padding,
+            box_sizing: BoxSizing::BorderBox,
             ..container_style(FlexDirection::Column)
         };
         taffy
@@ -152,6 +161,7 @@ fn build_root(
         let style = Style {
             size,
             padding,
+            box_sizing: BoxSizing::BorderBox,
             ..container_style(FlexDirection::Column)
         };
         taffy
