@@ -12,6 +12,7 @@ members = [
     "crates/youth-interaction",
     "crates/youth-editor-engine",
     "crates/youth-text-render-cpu",
+    "crates/youth-paint",
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",

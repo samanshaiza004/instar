@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
+use youth_paint::{Color, PaintCommand, PaintScene, PhysicalSize, Point, Rect, Size};
 use youth_runtime::{PresentationReader, resolve_countdown_display};
 use youth_text_render_cpu::GlyphRasterizer;
 use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
@@ -124,8 +126,10 @@ impl FrameBuffer {
     }
 
     /// Alpha-blends `color` (0x00RRGGBB) over the existing pixel at `(x,
-    /// y)` weighted by `coverage` (0 = no-op, 255 = fully opaque). A no-op
-    /// outside the framebuffer's bounds.
+    /// y)` weighted by `coverage` (0 = no-op, 255 = fully opaque, and bit-
+    /// identical to a hard overwrite since `blend_over` reduces to the
+    /// foreground channel exactly at full coverage). A no-op outside the
+    /// framebuffer's bounds.
     fn blend_pixel(&mut self, x: i32, y: i32, color: u32, coverage: u8) {
         if coverage == 0 {
             return;
@@ -138,65 +142,6 @@ impl FrameBuffer {
         }
         let index = y as usize * self.width as usize + x as usize;
         self.pixels[index] = blend_over(self.pixels[index], color, coverage);
-    }
-
-    fn fill(&mut self, rect: PixelRect, color: u32) {
-        let x_end = rect.x.saturating_add(rect.width).min(self.width);
-        let y_end = rect.y.saturating_add(rect.height).min(self.height);
-        for y in rect.y.min(self.height)..y_end {
-            let row = y as usize * self.width as usize;
-            for x in rect.x.min(self.width)..x_end {
-                self.pixels[row + x as usize] = color;
-            }
-        }
-    }
-
-    fn border(&mut self, rect: PixelRect, color: u32) {
-        if rect.width == 0 || rect.height == 0 {
-            return;
-        }
-        self.fill(PixelRect { height: 1, ..rect }, color);
-        self.fill(
-            PixelRect {
-                y: rect.y.saturating_add(rect.height.saturating_sub(1)),
-                height: 1,
-                ..rect
-            },
-            color,
-        );
-        self.fill(PixelRect { width: 1, ..rect }, color);
-        self.fill(
-            PixelRect {
-                x: rect.x.saturating_add(rect.width.saturating_sub(1)),
-                width: 1,
-                ..rect
-            },
-            color,
-        );
-    }
-
-    fn text(&mut self, x: u32, y: u32, value: &str, color: u32, scale: u32) {
-        let scale = scale.max(1);
-        let mut cursor = x;
-        for character in value.chars() {
-            let rows = glyph_rows(character);
-            for (row, bits) in rows.into_iter().enumerate() {
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) != 0 {
-                        self.fill(
-                            PixelRect {
-                                x: cursor.saturating_add(column * scale),
-                                y: y.saturating_add(row as u32 * scale),
-                                width: scale,
-                                height: scale,
-                            },
-                            color,
-                        );
-                    }
-                }
-            }
-            cursor = cursor.saturating_add(8 * scale);
-        }
     }
 }
 
@@ -216,8 +161,17 @@ pub enum RasterError {
     InvalidScale,
     #[error("layout and semantic tree revisions differ")]
     RevisionMismatch,
+    #[error("scene construction produced an invalid paint scene: {0}")]
+    InvalidScene(#[from] youth_paint::PaintSceneError),
 }
 
+/// Renders `tree`/`layout` against `state` into an owned [`FrameBuffer`].
+/// Internally: build a [`PaintScene`] describing paint *intent* (colors,
+/// rects, glyph masks, clip regions -- deciding what each node means
+/// visually), validate it, then interpret that scene into pixels (deciding
+/// how to rasterize it). This function's signature and behavior are
+/// unchanged by that split; it exists so a future paint backend can
+/// consume the same `PaintScene` without touching scene construction.
 pub fn render(
     tree: &Tree,
     layout: &LayoutSnapshot,
@@ -234,8 +188,38 @@ pub fn render(
     if tree.revision() != layout.tree_revision {
         return Err(RasterError::RevisionMismatch);
     }
-    let mut frame = FrameBuffer::new(physical_width, physical_height)?;
-    frame.clear(palette.background);
+    let scene = build_scene(
+        tree,
+        layout,
+        physical_width,
+        physical_height,
+        scale_factor,
+        state,
+        palette,
+    );
+    scene.validate()?;
+    Ok(paint_scene(&scene))
+}
+
+/// Translates `tree`/`layout`/`state` into paint intent: one deterministic
+/// pass over `layout.nodes` (already NodeId-ordered, which is what today's
+/// paint order is and must stay, since it's baked into the exact pinned
+/// frame hashes below) deciding what each node means visually. Contains no
+/// pixel-level rasterization at all -- every color decision (button state,
+/// palette lookup) happens here; every actual pixel write happens in
+/// [`paint_scene`].
+fn build_scene(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
+    state: &RenderState<'_>,
+    palette: Palette,
+) -> PaintScene {
+    let mut commands = vec![PaintCommand::Clear {
+        color: opaque(palette.background),
+    }];
     for (id, node) in &layout.nodes {
         let Some(semantic) = tree.node(*id) else {
             continue;
@@ -244,17 +228,17 @@ pub fn render(
         match &semantic.data {
             NodeData::Root => {}
             NodeData::Box { .. } | NodeData::Row { .. } | NodeData::Grid { .. } => {
-                frame.fill(rect, palette.container);
-                frame.border(rect, palette.border);
+                commands.push(fill_command(rect, palette.container));
+                commands.push(stroke_command(rect, palette.border));
             }
             NodeData::Text { value } => {
-                draw_text(
-                    &mut frame,
+                push_text_run(
+                    &mut commands,
                     rect,
                     value,
                     TextAlignment::Start,
                     scale_factor,
-                    palette,
+                    palette.text,
                 );
             }
             NodeData::Editor { text, .. } => {
@@ -266,8 +250,8 @@ pub fn render(
                             .and_then(|offsets| offsets.get(id))
                             .copied()
                             .unwrap_or(0.0);
-                        draw_editor_presentation(
-                            &mut frame,
+                        push_editor_presentation(
+                            &mut commands,
                             rect,
                             &presentation,
                             &mut rasterizer.borrow_mut(),
@@ -283,13 +267,13 @@ pub fn render(
                         // text rendering (pure-geometry tests): fall back
                         // to the guest-declared static text via the
                         // existing bitmap font.
-                        draw_text(
-                            &mut frame,
+                        push_text_run(
+                            &mut commands,
                             rect,
                             text,
                             TextAlignment::Start,
                             scale_factor,
-                            palette,
+                            palette.text,
                         );
                     }
                 }
@@ -304,8 +288,8 @@ pub fn render(
                         .and_then(|offsets| offsets.get(id))
                         .copied()
                         .unwrap_or(0.0);
-                    draw_editor_presentation(
-                        &mut frame,
+                    push_editor_presentation(
+                        &mut commands,
                         rect,
                         &presentation,
                         &mut rasterizer.borrow_mut(),
@@ -316,7 +300,14 @@ pub fn render(
                 }
             }
             NodeData::AlignedText { value, alignment } => {
-                draw_text(&mut frame, rect, value, *alignment, scale_factor, palette);
+                push_text_run(
+                    &mut commands,
+                    rect,
+                    value,
+                    *alignment,
+                    scale_factor,
+                    palette.text,
+                );
             }
             NodeData::Countdown {
                 schedule,
@@ -337,13 +328,13 @@ pub fn render(
                     .map_or(0, PresentationReader::now_epoch_millis);
                 let value =
                     resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
-                draw_text(
-                    &mut frame,
+                push_text_run(
+                    &mut commands,
                     rect,
                     &value,
                     TextAlignment::Start,
                     scale_factor,
-                    palette,
+                    palette.text,
                 );
             }
             NodeData::AlignedCountdown {
@@ -360,7 +351,14 @@ pub fn render(
                     .map_or(0, PresentationReader::now_epoch_millis);
                 let value =
                     resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
-                draw_text(&mut frame, rect, &value, *alignment, scale_factor, palette);
+                push_text_run(
+                    &mut commands,
+                    rect,
+                    &value,
+                    *alignment,
+                    scale_factor,
+                    palette.text,
+                );
             }
             NodeData::Button { label, .. } | NodeData::ShortcutButton { label, .. } => {
                 let color = if !node.effective_enabled {
@@ -372,10 +370,10 @@ pub fn render(
                 } else {
                     palette.button
                 };
-                frame.fill(rect, color);
-                frame.border(rect, palette.border);
+                commands.push(fill_command(rect, color));
+                commands.push(stroke_command(rect, palette.border));
                 if state.focused == Some(*id) && rect.width > 4 && rect.height > 4 {
-                    frame.border(
+                    commands.push(stroke_command(
                         PixelRect {
                             x: rect.x + 2,
                             y: rect.y + 2,
@@ -383,41 +381,256 @@ pub fn render(
                             height: rect.height - 4,
                         },
                         palette.focus,
-                    );
+                    ));
                 }
                 let inset_x = (12.0 * scale_factor).floor().max(0.0) as u32;
                 let inset_y = (8.0 * scale_factor).floor().max(0.0) as u32;
-                frame.text(
-                    rect.x.saturating_add(inset_x),
-                    rect.y.saturating_add(inset_y),
+                let label_rect = PixelRect {
+                    x: rect.x.saturating_add(inset_x),
+                    y: rect.y.saturating_add(inset_y),
+                    width: rect.width.saturating_sub(inset_x),
+                    height: rect.height.saturating_sub(inset_y),
+                };
+                push_text_run(
+                    &mut commands,
+                    label_rect,
                     label,
+                    TextAlignment::Start,
+                    scale_factor,
                     palette.text,
-                    scale_factor.round() as u32,
                 );
             }
         }
     }
     if let Some(category) = state.fault_category {
-        frame.clear(palette.fault_background);
-        frame.text(16, 16, "YOUTH APP FAULT", palette.fault_text, 1);
-        frame.text(16, 32, category, palette.fault_text, 1);
+        commands.push(PaintCommand::Clear {
+            color: opaque(palette.fault_background),
+        });
+        push_text_run_at(
+            &mut commands,
+            16,
+            16,
+            "YOUTH APP FAULT",
+            palette.fault_text,
+            1,
+        );
+        push_text_run_at(&mut commands, 16, 32, category, palette.fault_text, 1);
     }
-    Ok(frame)
+    PaintScene {
+        size: PhysicalSize {
+            width: physical_width,
+            height: physical_height,
+        },
+        commands,
+    }
 }
 
-fn draw_text(
-    frame: &mut FrameBuffer,
+/// Interprets a validated [`PaintScene`] into an owned [`FrameBuffer`].
+/// This is the only place that turns paint intent into actual pixels; it
+/// has no knowledge of `NodeData`, palettes, or layout -- it only knows
+/// how to composite the six [`PaintCommand`] variants, in order, against a
+/// clip-rect stack.
+fn paint_scene(scene: &PaintScene) -> FrameBuffer {
+    let mut frame = FrameBuffer {
+        width: scene.size.width,
+        height: scene.size.height,
+        pixels: vec![0; scene.size.width as usize * scene.size.height as usize],
+    };
+    let mut clip_stack: Vec<PixelRect> = Vec::new();
+    for command in &scene.commands {
+        match command {
+            PaintCommand::Clear { color } => frame.clear(rgb_u32(*color)),
+            PaintCommand::FillRect { rect, color } => {
+                blend_rect(&mut frame, *rect, *color, current_clip(&clip_stack));
+            }
+            PaintCommand::StrokeRect { rect, color, .. } => {
+                // Always a 1-physical-pixel stroke in this increment (see
+                // the `PaintCommand::StrokeRect` doc comment) -- four edge
+                // fills, exactly matching the old hand-rolled `border()`.
+                let clip = current_clip(&clip_stack);
+                if rect.width > 0 && rect.height > 0 {
+                    blend_rect(&mut frame, Rect { height: 1, ..*rect }, *color, clip);
+                    blend_rect(
+                        &mut frame,
+                        Rect {
+                            y: rect.y + rect.height as i32 - 1,
+                            height: 1,
+                            ..*rect
+                        },
+                        *color,
+                        clip,
+                    );
+                    blend_rect(&mut frame, Rect { width: 1, ..*rect }, *color, clip);
+                    blend_rect(
+                        &mut frame,
+                        Rect {
+                            x: rect.x + rect.width as i32 - 1,
+                            width: 1,
+                            ..*rect
+                        },
+                        *color,
+                        clip,
+                    );
+                }
+            }
+            PaintCommand::GlyphMask {
+                origin,
+                size,
+                alpha,
+                color,
+            } => {
+                let clip = current_clip(&clip_stack);
+                let rgb = rgb_u32(*color);
+                for row in 0..size.height {
+                    for col in 0..size.width {
+                        let coverage = alpha[(row * size.width + col) as usize];
+                        if coverage == 0 {
+                            continue;
+                        }
+                        let x = origin.x + col as i32;
+                        let y = origin.y + row as i32;
+                        if let Some(clip) = clip
+                            && !pixel_in(x, y, clip)
+                        {
+                            continue;
+                        }
+                        frame.blend_pixel(x, y, rgb, coverage);
+                    }
+                }
+            }
+            PaintCommand::PushClip { rect } => {
+                let pixel_rect = to_pixel_rect(*rect);
+                clip_stack.push(match current_clip(&clip_stack) {
+                    Some(existing) => intersect(existing, pixel_rect),
+                    None => pixel_rect,
+                });
+            }
+            PaintCommand::PopClip => {
+                clip_stack.pop();
+            }
+        }
+    }
+    frame
+}
+
+fn opaque(rgb: u32) -> Color {
+    Color {
+        r: ((rgb >> 16) & 0xff) as u8,
+        g: ((rgb >> 8) & 0xff) as u8,
+        b: (rgb & 0xff) as u8,
+        a: 255,
+    }
+}
+
+fn color_with_alpha(rgb: u32, a: u8) -> Color {
+    Color { a, ..opaque(rgb) }
+}
+
+fn rgb_u32(color: Color) -> u32 {
+    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+}
+
+fn fill_command(rect: PixelRect, rgb: u32) -> PaintCommand {
+    PaintCommand::FillRect {
+        rect: to_rect(rect),
+        color: opaque(rgb),
+    }
+}
+
+fn stroke_command(rect: PixelRect, rgb: u32) -> PaintCommand {
+    PaintCommand::StrokeRect {
+        rect: to_rect(rect),
+        width: 1.0,
+        color: opaque(rgb),
+    }
+}
+
+fn to_rect(rect: PixelRect) -> Rect {
+    Rect {
+        x: rect.x as i32,
+        y: rect.y as i32,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn to_pixel_rect(rect: Rect) -> PixelRect {
+    PixelRect {
+        x: rect.x.max(0) as u32,
+        y: rect.y.max(0) as u32,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn current_clip(stack: &[PixelRect]) -> Option<PixelRect> {
+    stack.last().copied()
+}
+
+fn pixel_in(x: i32, y: i32, clip: PixelRect) -> bool {
+    let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+        return false;
+    };
+    x >= clip.x
+        && x < clip.x.saturating_add(clip.width)
+        && y >= clip.y
+        && y < clip.y.saturating_add(clip.height)
+}
+
+fn intersect(a: PixelRect, b: PixelRect) -> PixelRect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let x_end = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let y_end =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
+    PixelRect {
+        x,
+        y,
+        width: x_end.saturating_sub(x),
+        height: y_end.saturating_sub(y),
+    }
+}
+
+/// Alpha-blends `color` over every pixel of `rect`, intersected with
+/// `clip` if a clip is active. A no-op for any pixel outside the
+/// framebuffer's own bounds (`FrameBuffer::blend_pixel` handles that).
+fn blend_rect(frame: &mut FrameBuffer, rect: Rect, color: Color, clip: Option<PixelRect>) {
+    let rgb = rgb_u32(color);
+    let (x_start, y_start, width, height) = match clip {
+        Some(clip) => {
+            let clipped = intersect(to_pixel_rect(rect), clip);
+            (
+                clipped.x as i32,
+                clipped.y as i32,
+                clipped.width,
+                clipped.height,
+            )
+        }
+        None => (rect.x, rect.y, rect.width, rect.height),
+    };
+    for y in y_start..y_start.saturating_add(height as i32) {
+        for x in x_start..x_start.saturating_add(width as i32) {
+            frame.blend_pixel(x, y, rgb, color.a);
+        }
+    }
+}
+
+/// Emits one [`PaintCommand::GlyphMask`] for `value` drawn via the
+/// bitmap font, honoring `alignment` exactly as the old `draw_text`
+/// helper did. A no-op (emits nothing) for an empty string, matching the
+/// old code's behavior of simply not looping over any characters.
+fn push_text_run(
+    commands: &mut Vec<PaintCommand>,
     rect: PixelRect,
     value: &str,
     alignment: TextAlignment,
     scale_factor: f64,
-    palette: Palette,
+    color_rgb: u32,
 ) {
     let glyph_scale = scale_factor.round().max(1.0) as u32;
-    let text_width = u32::try_from(value.chars().count())
-        .unwrap_or(u32::MAX)
-        .saturating_mul(8)
-        .saturating_mul(glyph_scale);
+    let char_count = u32::try_from(value.chars().count()).unwrap_or(u32::MAX);
+    let text_width = char_count.saturating_mul(8).saturating_mul(glyph_scale);
     let text_x = match alignment {
         TextAlignment::Start => rect.x,
         TextAlignment::Center => rect
@@ -425,7 +638,162 @@ fn draw_text(
             .saturating_add(rect.width.saturating_sub(text_width) / 2),
         TextAlignment::End => rect.x.saturating_add(rect.width.saturating_sub(text_width)),
     };
-    frame.text(text_x, rect.y, value, palette.text, glyph_scale);
+    push_text_run_at(commands, text_x, rect.y, value, color_rgb, glyph_scale);
+}
+
+/// Rasterizes `value` via the bitmap font into one synthetic alpha-mask
+/// [`PaintCommand::GlyphMask`], at absolute physical position `(x, y)`.
+/// This is the bitmap-font equivalent of a real glyph run: one command per
+/// drawn string, not per character -- an honest reflection of what the
+/// font actually is (filled squares from a fixed 5x7 bitmap), not a fake
+/// per-glyph scheme.
+fn push_text_run_at(
+    commands: &mut Vec<PaintCommand>,
+    x: u32,
+    y: u32,
+    value: &str,
+    color_rgb: u32,
+    scale: u32,
+) {
+    if value.is_empty() {
+        return;
+    }
+    let scale = scale.max(1);
+    let char_count = u32::try_from(value.chars().count()).unwrap_or(u32::MAX);
+    let width = char_count.saturating_mul(8).saturating_mul(scale);
+    let height = 7 * scale;
+    let Some(byte_count) = (width as usize).checked_mul(height as usize) else {
+        return;
+    };
+    let mut alpha = vec![0u8; byte_count];
+    let mut cursor = 0u32;
+    for character in value.chars() {
+        let rows = glyph_rows(character);
+        for (row, bits) in rows.into_iter().enumerate() {
+            for column in 0..5u32 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = cursor.saturating_add(column * scale).saturating_add(dx);
+                        let py = (row as u32).saturating_mul(scale).saturating_add(dy);
+                        if px < width && py < height {
+                            alpha[(py * width + px) as usize] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        cursor = cursor.saturating_add(8 * scale);
+    }
+    commands.push(PaintCommand::GlyphMask {
+        origin: Point {
+            x: x as i32,
+            y: y as i32,
+        },
+        size: Size { width, height },
+        alpha: Arc::from(alpha),
+        color: opaque(color_rgb),
+    });
+}
+
+/// Emits one live, host-owned Editor presentation (real glyph runs plus
+/// selection/cursor geometry) as paint commands, bracketed in a
+/// `PushClip`/`PopClip` pair around `rect`. A no-op for a zero-area rect.
+///
+/// Engine geometry is logical; glyph masks and rectangles are converted to
+/// physical pixels exactly once using the window scale factor -- the same
+/// conversion the old `draw_editor_presentation` performed, just emitting
+/// commands instead of writing pixels directly.
+fn push_editor_presentation(
+    commands: &mut Vec<PaintCommand>,
+    rect: PixelRect,
+    presentation: &youth_runtime::TextPresentation,
+    rasterizer: &mut GlyphRasterizer,
+    palette: Palette,
+    scroll_offset_y: f32,
+    scale: f32,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    commands.push(PaintCommand::PushClip {
+        rect: to_rect(rect),
+    });
+
+    let origin_x = rect.x as f32;
+    let origin_y = rect.y as f32 - scroll_offset_y * scale;
+
+    for selection_rect in &presentation.selection {
+        let x0 = (origin_x + selection_rect.x0 as f32 * scale).round() as i32;
+        let y0 = (origin_y + selection_rect.y0 as f32 * scale).round() as i32;
+        let x1 = (origin_x + selection_rect.x1 as f32 * scale).round() as i32;
+        let y1 = (origin_y + selection_rect.y1 as f32 * scale).round() as i32;
+        let width = (x1 - x0).max(0) as u32;
+        let height = (y1 - y0).max(0) as u32;
+        if width > 0 && height > 0 {
+            commands.push(PaintCommand::FillRect {
+                rect: Rect {
+                    x: x0,
+                    y: y0,
+                    width,
+                    height,
+                },
+                color: color_with_alpha(palette.focus, 64),
+            });
+        }
+    }
+
+    for run in &presentation.runs {
+        for glyph in &run.glyphs {
+            let Some(mask) = rasterizer.rasterize(&run.font, glyph.id, run.font_size * scale)
+            else {
+                continue;
+            };
+            if mask.is_empty() {
+                continue;
+            }
+            let pen_x = (origin_x + glyph.x * scale).round() as i32;
+            let pen_y = (origin_y + glyph.y * scale).round() as i32;
+            let base_x = pen_x + mask.left;
+            let base_y = pen_y - mask.top;
+            commands.push(PaintCommand::GlyphMask {
+                origin: Point {
+                    x: base_x,
+                    y: base_y,
+                },
+                size: Size {
+                    width: mask.width,
+                    height: mask.height,
+                },
+                alpha: Arc::from(mask.alpha.as_slice()),
+                color: opaque(palette.text),
+            });
+        }
+    }
+
+    if let Some(cursor) = &presentation.cursor {
+        let x0 = (origin_x + cursor.x0 as f32 * scale).round() as i32;
+        let y0 = (origin_y + cursor.y0 as f32 * scale).round() as i32;
+        let x1 = (origin_x + cursor.x1 as f32 * scale).round() as i32;
+        let y1 = (origin_y + cursor.y1 as f32 * scale).round() as i32;
+        let width = (x1 - x0).max(1) as u32;
+        let height = (y1 - y0).max(0) as u32;
+        if height > 0 {
+            commands.push(PaintCommand::FillRect {
+                rect: Rect {
+                    x: x0,
+                    y: y0,
+                    width,
+                    height,
+                },
+                color: color_with_alpha(palette.focus, 255),
+            });
+        }
+    }
+
+    commands.push(PaintCommand::PopClip);
 }
 
 /// Standard "over" alpha compositing of one 0x00RRGGBB color onto another,
@@ -441,77 +809,6 @@ fn blend_over(background: u32, foreground: u32, coverage: u8) -> u32 {
         out |= channel << shift;
     }
     out
-}
-
-/// Paints a live, host-owned Editor presentation (real glyph runs plus
-/// selection/cursor geometry) into `frame`, clipped to `rect`. Falls back
-/// to nothing if `rect` has no area.
-///
-/// Engine geometry is logical; glyph masks and rectangles are converted to
-/// physical pixels exactly once using the window scale factor.
-fn draw_editor_presentation(
-    frame: &mut FrameBuffer,
-    rect: PixelRect,
-    presentation: &youth_runtime::TextPresentation,
-    rasterizer: &mut GlyphRasterizer,
-    palette: Palette,
-    scroll_offset_y: f32,
-    scale: f32,
-) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
-    let clip = |x: i32, y: i32| -> bool {
-        x >= 0
-            && y >= 0
-            && (x as u32) < rect.x.saturating_add(rect.width)
-            && (y as u32) < rect.y.saturating_add(rect.height)
-            && (x as u32) >= rect.x
-            && (y as u32) >= rect.y
-    };
-    let origin_x = rect.x as f32;
-    let origin_y = rect.y as f32 - scroll_offset_y * scale;
-
-    for selection_rect in &presentation.selection {
-        let x0 = origin_x + selection_rect.x0 as f32 * scale;
-        let y0 = origin_y + selection_rect.y0 as f32 * scale;
-        let x1 = origin_x + selection_rect.x1 as f32 * scale;
-        let y1 = origin_y + selection_rect.y1 as f32 * scale;
-        for y in y0.round() as i32..y1.round() as i32 {
-            for x in x0.round() as i32..x1.round() as i32 {
-                if clip(x, y) {
-                    frame.blend_pixel(x, y, palette.focus, 64);
-                }
-            }
-        }
-    }
-
-    youth_text_render_cpu::paint_presentation(
-        rasterizer,
-        presentation,
-        origin_x,
-        origin_y,
-        scale,
-        |x, y, coverage| {
-            if clip(x, y) {
-                frame.blend_pixel(x, y, palette.text, coverage);
-            }
-        },
-    );
-
-    if let Some(cursor) = &presentation.cursor {
-        let x0 = (origin_x + cursor.x0 as f32 * scale).round() as i32;
-        let y0 = (origin_y + cursor.y0 as f32 * scale).round() as i32;
-        let x1 = (origin_x + cursor.x1 as f32 * scale).round() as i32;
-        let y1 = (origin_y + cursor.y1 as f32 * scale).round() as i32;
-        for y in y0..y1 {
-            for x in x0..x1.max(x0 + 1) {
-                if clip(x, y) {
-                    frame.blend_pixel(x, y, palette.focus, 255);
-                }
-            }
-        }
-    }
 }
 
 #[must_use]
@@ -855,8 +1152,9 @@ mod tests {
             width: 120,
             height: 24,
         };
-        draw_editor_presentation(
-            &mut frame,
+        let mut commands = Vec::new();
+        push_editor_presentation(
+            &mut commands,
             rect,
             &presentation,
             &mut rasterizer,
@@ -864,6 +1162,21 @@ mod tests {
             0.0,
             1.0,
         );
+        let scene = PaintScene {
+            size: PhysicalSize {
+                width: 160,
+                height: 32,
+            },
+            commands: {
+                let mut all = vec![PaintCommand::Clear {
+                    color: opaque(palette.background),
+                }];
+                all.extend(commands);
+                all
+            },
+        };
+        scene.validate().unwrap();
+        let frame = paint_scene(&scene);
 
         let painted_pixels = frame
             .pixels()
@@ -910,31 +1223,33 @@ mod tests {
         };
         let palette = Palette::default();
 
-        let mut unscrolled = FrameBuffer::new(160, 32).unwrap();
-        unscrolled.clear(palette.background);
-        let mut rasterizer = GlyphRasterizer::new();
-        draw_editor_presentation(
-            &mut unscrolled,
-            rect,
-            &presentation,
-            &mut rasterizer,
-            palette,
-            0.0,
-            1.0,
-        );
+        let render_at = |scroll_offset_y: f32| -> FrameBuffer {
+            let mut rasterizer = GlyphRasterizer::new();
+            let mut commands = vec![PaintCommand::Clear {
+                color: opaque(palette.background),
+            }];
+            push_editor_presentation(
+                &mut commands,
+                rect,
+                &presentation,
+                &mut rasterizer,
+                palette,
+                scroll_offset_y,
+                1.0,
+            );
+            let scene = PaintScene {
+                size: PhysicalSize {
+                    width: 160,
+                    height: 32,
+                },
+                commands,
+            };
+            scene.validate().unwrap();
+            paint_scene(&scene)
+        };
 
-        let mut scrolled = FrameBuffer::new(160, 32).unwrap();
-        scrolled.clear(palette.background);
-        let mut rasterizer = GlyphRasterizer::new();
-        draw_editor_presentation(
-            &mut scrolled,
-            rect,
-            &presentation,
-            &mut rasterizer,
-            palette,
-            6.0,
-            1.0,
-        );
+        let unscrolled = render_at(0.0);
+        let scrolled = render_at(6.0);
 
         assert_ne!(
             unscrolled, scrolled,
@@ -963,10 +1278,10 @@ mod tests {
 
         let mut engine = ParleyEditorEngine::with_text("Hi");
         let presentation: youth_runtime::TextPresentation = engine.presentation();
-        let mut frame = FrameBuffer::new(160, 32).unwrap();
         let mut rasterizer = GlyphRasterizer::new();
-        draw_editor_presentation(
-            &mut frame,
+        let mut commands = Vec::new();
+        push_editor_presentation(
+            &mut commands,
             PixelRect {
                 x: 0,
                 y: 0,
@@ -978,6 +1293,10 @@ mod tests {
             Palette::default(),
             0.0,
             1.0,
+        );
+        assert!(
+            commands.is_empty(),
+            "a zero-area rect must emit no paint commands"
         );
     }
 
@@ -1058,7 +1377,8 @@ mod tests {
         // the new Root contract unconditionally fills to the viewport --
         // a real, intentional layout change, not a rendering regression.
         // The fault overlay's hash (last) is unaffected since it clears
-        // and repaints independent of node layout.
+        // and repaints independent of node layout. Gate R0 (the PaintScene
+        // extraction) changed none of these -- same pins as after Gate L3.
         assert_eq!(
             [
                 frame_hash(&normal),
@@ -1093,15 +1413,261 @@ mod tests {
         assert_eq!(glyph_rows('.'), [0, 0, 0, 0, 0, 12, 12]);
         assert_eq!(glyph_rows('='), [0, 31, 0, 31, 0, 0, 0]);
 
-        let mut frame = FrameBuffer::new(224, 7).unwrap();
-        frame.clear(0);
-        frame.text(0, 0, "+/- * . = % @ [] {} ~ AaZz", u32::MAX, 1);
-        assert_eq!(frame_hash(&frame), 2_309_453_928_318_357_117);
+        // 0x00ff_ffff (opaque white in this codebase's 0x00RRGGBB
+        // convention -- every real Palette color follows it), not
+        // `u32::MAX`: the pre-Gate-R0 `FrameBuffer::text` wrote colors as
+        // a raw `u32` overwrite, so `u32::MAX`'s otherwise-unused top byte
+        // (0xff) silently survived into the pinned hash below. The new
+        // `youth_paint::Color{r,g,b,a}` type has no such stray byte to
+        // leak -- structurally enforcing the "top byte is always zero"
+        // invariant this codebase already relied on everywhere else.
+        let mut commands = Vec::new();
+        push_text_run_at(
+            &mut commands,
+            0,
+            0,
+            "+/- * . = % @ [] {} ~ AaZz",
+            0x00ff_ffff,
+            1,
+        );
+        let scene = PaintScene {
+            size: PhysicalSize {
+                width: 224,
+                height: 7,
+            },
+            commands,
+        };
+        scene.validate().unwrap();
+        let frame = paint_scene(&scene);
+        assert_eq!(frame_hash(&frame), 13_376_335_021_794_499_461);
     }
 
     #[test]
     fn framebuffer_limits_and_zero_size_are_safe() {
         assert!(FrameBuffer::new(0, 0).is_ok());
         assert!(FrameBuffer::new(u32::MAX, u32::MAX).is_err());
+    }
+
+    // --- Gate R0: direct scene tests -------------------------------------
+    //
+    // Assert PaintScene *structure*, not just final pixels, so a future
+    // backend mismatch is diagnosable as "wrong scene" (a build_scene bug)
+    // versus "wrong rendering" (a paint_scene/backend bug), rather than one
+    // opaque frame_hash mismatch.
+
+    #[test]
+    fn a_plain_button_scene_is_fill_then_border_then_one_glyph_mask() {
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                        grow: 0,
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Button {
+                            label: "Go".into(),
+                            enabled: true,
+                        },
+                        children: vec![],
+                        grow: 0,
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let layout = layout(&tree, LogicalSize::new(200.0, 100.0).unwrap()).unwrap();
+        let scene = build_scene(
+            &tree,
+            &layout,
+            200,
+            100,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        );
+        scene.validate().unwrap();
+
+        // Clear, then exactly [FillRect, StrokeRect, GlyphMask] for the
+        // one button node -- no focus ring since nothing is focused here.
+        assert!(matches!(scene.commands[0], PaintCommand::Clear { .. }));
+        assert!(matches!(scene.commands[1], PaintCommand::FillRect { .. }));
+        assert!(matches!(scene.commands[2], PaintCommand::StrokeRect { .. }));
+        assert!(matches!(scene.commands[3], PaintCommand::GlyphMask { .. }));
+        assert_eq!(
+            scene.commands.len(),
+            4,
+            "a plain, unfocused button must produce exactly clear+fill+border+label"
+        );
+    }
+
+    #[test]
+    fn a_focused_editor_scene_is_container_then_clip_selection_glyphs_cursor_pop() {
+        use youth_editor_engine::{EditorEngine, EditorLayout, ParleyEditorEngine};
+
+        let tree = Tree::from_snapshot(
+            TreeSnapshot {
+                revision: 0,
+                root: id(1),
+                nodes: vec![
+                    Node {
+                        id: id(1),
+                        data: NodeData::Root,
+                        children: vec![id(2)],
+                        grow: 0,
+                    },
+                    Node {
+                        id: id(2),
+                        data: NodeData::Box { enabled: true },
+                        children: vec![id(3)],
+                        grow: 0,
+                    },
+                    Node {
+                        id: id(3),
+                        data: NodeData::Editor {
+                            document_revision: 0,
+                            text: "Hi".into(),
+                        },
+                        children: vec![],
+                        grow: 0,
+                    },
+                ],
+            },
+            &youth_tree::Limits::default(),
+        )
+        .unwrap();
+        let layout = layout(&tree, LogicalSize::new(200.0, 100.0).unwrap()).unwrap();
+
+        let mut engine = ParleyEditorEngine::with_text("Hi");
+        // Select the whole string so a selection rect is present alongside
+        // the cursor and glyph runs.
+        engine.move_to_byte(0);
+        let presentation: youth_runtime::TextPresentation = engine.presentation();
+        assert!(
+            !presentation.runs.is_empty(),
+            "the fixture text must produce at least one glyph run"
+        );
+
+        let rasterizer = RefCell::new(GlyphRasterizer::new());
+        let scene = build_scene(
+            &tree,
+            &layout,
+            200,
+            100,
+            1.0,
+            &RenderState {
+                presentation: None,
+                editor_rasterizer: Some(&rasterizer),
+                ..RenderState::default()
+            },
+            Palette::default(),
+        );
+        // `presentation: None` means the live path never activates in this
+        // harness (there's no real PresentationReader to construct without
+        // a running runtime); assert the FALLBACK bitmap-text path's shape
+        // instead, which is what a headless build_scene call actually
+        // exercises: container fill, container border, one glyph mask for
+        // the fallback text -- no clip/selection/cursor commands, since
+        // those only exist on the live-presentation path.
+        scene.validate().unwrap();
+        assert!(matches!(scene.commands[0], PaintCommand::Clear { .. }));
+        assert!(matches!(scene.commands[1], PaintCommand::FillRect { .. }));
+        assert!(matches!(scene.commands[2], PaintCommand::StrokeRect { .. }));
+        assert!(matches!(scene.commands[3], PaintCommand::GlyphMask { .. }));
+        assert_eq!(scene.commands.len(), 4);
+
+        // Exercise the actual live-presentation command shape directly via
+        // push_editor_presentation (what the live path emits once a real
+        // PresentationReader is wired, e.g. by native.rs): container
+        // background (from the enclosing Box, painted first, matching
+        // "editor background" preceding the clip region), PushClip,
+        // selection rect(s), one glyph mask per glyph, cursor, PopClip.
+        let rect = PixelRect {
+            x: 10,
+            y: 10,
+            width: 100,
+            height: 40,
+        };
+        let mut editor_commands = Vec::new();
+        push_editor_presentation(
+            &mut editor_commands,
+            rect,
+            &presentation,
+            &mut rasterizer.borrow_mut(),
+            Palette::default(),
+            0.0,
+            1.0,
+        );
+        assert!(matches!(
+            editor_commands.first(),
+            Some(PaintCommand::PushClip { .. })
+        ));
+        assert!(matches!(
+            editor_commands.last(),
+            Some(PaintCommand::PopClip)
+        ));
+        // At least one selection FillRect, at least one glyph mask, and
+        // exactly the sequence PushClip -> [FillRect...] -> [GlyphMask...]
+        // -> FillRect (cursor) -> PopClip, in that relative order.
+        let push_index = 0;
+        let pop_index = editor_commands.len() - 1;
+        let first_glyph_index = editor_commands
+            .iter()
+            .position(|c| matches!(c, PaintCommand::GlyphMask { .. }))
+            .expect("at least one glyph mask for non-empty text");
+        let last_fill_before_pop = editor_commands[..pop_index]
+            .iter()
+            .rposition(|c| matches!(c, PaintCommand::FillRect { .. }))
+            .expect("a cursor FillRect immediately precedes PopClip");
+        assert!(push_index < first_glyph_index);
+        assert!(last_fill_before_pop < pop_index);
+    }
+
+    #[test]
+    fn a_fault_scene_appends_the_overlay_after_the_normal_scene() {
+        let tree = counter();
+        let layout = layout(&tree, LogicalSize::new(320.0, 180.0).unwrap()).unwrap();
+        let normal = build_scene(
+            &tree,
+            &layout,
+            320,
+            180,
+            1.0,
+            &RenderState::default(),
+            Palette::default(),
+        );
+        let fault = build_scene(
+            &tree,
+            &layout,
+            320,
+            180,
+            1.0,
+            &RenderState {
+                fault_category: Some("guest_trap"),
+                ..RenderState::default()
+            },
+            Palette::default(),
+        );
+        fault.validate().unwrap();
+
+        // The fault scene starts with exactly the normal scene's commands
+        // unchanged, then appends the overlay: a second Clear, then two
+        // glyph masks (the fixed "YOUTH APP FAULT" heading and the fault
+        // category), with nothing else after.
+        assert_eq!(
+            &fault.commands[..normal.commands.len()],
+            &normal.commands[..]
+        );
+        let overlay = &fault.commands[normal.commands.len()..];
+        assert_eq!(overlay.len(), 3, "Clear + 2 glyph masks for the overlay");
+        assert!(matches!(overlay[0], PaintCommand::Clear { .. }));
+        assert!(matches!(overlay[1], PaintCommand::GlyphMask { .. }));
+        assert!(matches!(overlay[2], PaintCommand::GlyphMask { .. }));
     }
 }

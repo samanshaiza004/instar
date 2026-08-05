@@ -1,0 +1,9 @@
+[package]
+name = "youth-paint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Renderer-neutral paint-intent contract for Youth's desktop presentation: PaintScene/PaintCommand, produced by a scene builder and consumed by a paint backend."
+
+[dependencies]
+thiserror = "2"

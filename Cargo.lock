@@ -5670,6 +5670,7 @@ dependencies = [
  "winit",
  "youth-editor-engine",
  "youth-interaction",
+ "youth-paint",
  "youth-runtime",
  "youth-text-render-cpu",
  "youth-tree",
@@ -5793,6 +5794,13 @@ name = "youth-oversized-snapshot"
 version = "0.0.2"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "youth-paint"
+version = "0.0.2"
+dependencies = [
+ "thiserror 2.0.19",
 ]
 
 [[package]]

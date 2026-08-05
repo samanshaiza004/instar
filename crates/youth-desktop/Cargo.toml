@@ -32,6 +32,7 @@ youth-runtime = { path = "../youth-runtime" }
 youth-interaction = { path = "../youth-interaction" }
 youth-tree = { path = "../youth-tree" }
 youth-text-render-cpu = { path = "../youth-text-render-cpu" }
+youth-paint = { path = "../youth-paint" }
 
 # The portal backend avoids a GTK build-time dependency and is suitable for
 # later Flatpak/AppImage packaging. rfd may fall back to Zenity if the portal
