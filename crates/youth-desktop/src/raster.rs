@@ -1053,6 +1053,12 @@ mod tests {
             palette,
         )
         .unwrap();
+        // The first four hashes were repinned by Gate L3 (the Taffy layout
+        // cutover): `counter()`'s outer Box is Root's single child, which
+        // the new Root contract unconditionally fills to the viewport --
+        // a real, intentional layout change, not a rendering regression.
+        // The fault overlay's hash (last) is unaffected since it clears
+        // and repaints independent of node layout.
         assert_eq!(
             [
                 frame_hash(&normal),
@@ -1062,10 +1068,10 @@ mod tests {
                 frame_hash(&fault)
             ],
             [
-                2_337_801_063_811_903_698,
-                16_375_953_899_127_657_034,
-                3_619_998_415_868_681_374,
-                4_262_902_459_279_915_530,
+                10_691_040_568_706_047_298,
+                6_907_917_246_561_339_834,
+                10_876_101_366_824_324_814,
+                1_586_224_771_165_965_434,
                 10_375_799_425_807_607_732,
             ]
         );
