@@ -19,9 +19,11 @@ use crate::{
     Controller, ControllerCommand, DesktopEvent, DialogError, DocumentPicker, DocumentPickerFuture,
     DocumentPickerResult, InteractionState, LogicalKey, LogicalPoint, LogicalSize, Modifiers,
     Palette, PointerState, RenderState, RendererMirror, RfdDocumentPicker, RuntimeErrorSummary,
-    SemanticAction, access, layout, render,
+    SemanticAction, access, layout, raster, render, softbuffer_bridge,
 };
 use youth_interaction::EditorInput;
+use youth_paint::PaintBackend;
+use youth_render_vello_cpu::VelloCpuBackend;
 use youth_runtime::{
     AppId, PresentationReader, RuntimeErrorCategory, RuntimeEvent, RuntimeLimits, StateLocation,
     TurnOrigin, WorkspaceGrant, YouthAppConfig, YouthAppHandle, next_display_boundary_epoch_millis,
@@ -51,6 +53,59 @@ pub enum DesktopError {
     Arguments(String),
     #[error("native event loop could not be created: {0}")]
     EventLoop(#[from] winit::error::EventLoopError),
+}
+
+/// The paint backend the native presentation uses to rasterize a frame.
+///
+/// This is *not* a default flip to Vello: `Legacy` (the hand-rolled
+/// `FrameBuffer` interpreter) remains the default comparison path, and the
+/// Vello CPU backend is opt-in via `YOUTH_RENDER_BACKEND=vello_cpu` (Gate
+/// R3 selectable work, not Gate R5 adoption). See [`parse_render_backend`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderBackend {
+    /// The existing `FrameBuffer` interpreter (the default). Keeps the exact
+    /// R0 pixel output and its `copy_from_slice` presentation copy.
+    Legacy,
+    /// The opt-in Vello CPU backend: rasters the same `PaintScene` into a
+    /// reusable premultiplied RGBA8 target and converts it directly into the
+    /// acquired softbuffer buffer -- no intermediate `Vec<u32>`, no
+    /// `copy_from_slice`.
+    VelloCpu,
+}
+
+/// Environment variable that selects the render backend.
+pub const RENDER_BACKEND_ENV: &str = "YOUTH_RENDER_BACKEND";
+
+/// Parses a `YOUTH_RENDER_BACKEND` selector value into the backend it names.
+///
+/// `None` (the variable is unset) and `"legacy"` select the default
+/// [`RenderBackend::Legacy`] comparison path; `"vello_cpu"` selects the
+/// opt-in [`RenderBackend::VelloCpu`] path. Any other value falls back to
+/// `Legacy` and returns the offending value as a tuple so the caller can log
+/// and diagnose the typo. The parse itself is pure -- it never touches the
+/// process environment -- so tests can exercise every branch without
+/// mutating `std::env` in parallel.
+pub fn parse_render_backend(value: Option<&str>) -> (RenderBackend, Option<&str>) {
+    match value {
+        None | Some("legacy") => (RenderBackend::Legacy, None),
+        Some("vello_cpu") => (RenderBackend::VelloCpu, None),
+        Some(other) => (RenderBackend::Legacy, Some(other)),
+    }
+}
+
+/// Reads `YOUTH_RENDER_BACKEND` once and resolves it to a [`RenderBackend`],
+/// logging a diagnosable warning for an unrecognized value (which falls back
+/// to the legacy path). Called exactly once at app construction.
+fn select_render_backend() -> RenderBackend {
+    let selector = std::env::var(RENDER_BACKEND_ENV).ok();
+    let (backend, invalid) = parse_render_backend(selector.as_deref());
+    if let Some(value) = invalid {
+        tracing::warn!(
+            backend_selector = %value,
+            "unrecognized YOUTH_RENDER_BACKEND value; falling back to the legacy comparison backend",
+        );
+    }
+    backend
 }
 
 enum NativeEvent {
@@ -134,6 +189,17 @@ struct NativeApp {
     /// the generic "Youth" title.
     window_title: Option<String>,
     smoke_presented: bool,
+    /// The paint backend selected for this run (default `Legacy`; Vello CPU
+    /// only via `YOUTH_RENDER_BACKEND=vello_cpu`). Fixed at app construction.
+    render_backend: RenderBackend,
+    /// Persistent Vello CPU backend for the opt-in path. Created lazily on
+    /// the first Vello frame and reused -- it recreates its render context
+    /// internally whenever the physical size changes, so no fresh context is
+    /// allocated per frame.
+    vello: Option<VelloCpuBackend>,
+    /// Reusable premultiplied RGBA8 [`RenderTarget`] for the opt-in path,
+    /// resized in place by the backend when the physical size changes.
+    vello_target: Option<youth_paint::RenderTarget>,
 }
 
 pub fn run(options: DesktopOptions) -> Result<(), DesktopError> {
@@ -223,6 +289,9 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         document_selection: None,
         window_title: None,
         smoke_presented: false,
+        render_backend: select_render_backend(),
+        vello: None,
+        vello_target: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -945,8 +1014,33 @@ impl NativeApp {
         let _span = tracing::info_span!("desktop.present").entered();
         self.sync_editor_scroll();
         self.sync_access();
-        let (Some(window), Some(surface), Some(mirror), Some(layout)) =
-            (&self.window, &mut self.surface, &self.mirror, &self.layout)
+        match self.render_backend {
+            RenderBackend::Legacy => self.present_legacy(event_loop),
+            RenderBackend::VelloCpu => self.present_vello(event_loop),
+        }
+    }
+
+    /// The current frame's paint state, shared by the legacy and Vello
+    /// presentation paths so both consume the same tree/layout/state
+    /// producer.
+    fn render_state(&self) -> RenderState<'_> {
+        RenderState {
+            hovered: self.pointer.hovered,
+            pressed: self.pointer.pressed.then_some(self.pointer.armed).flatten(),
+            focused: self.interaction.focused(),
+            fault_category: self.fault.as_deref(),
+            presentation: self.presentation.as_ref(),
+            editor_rasterizer: Some(&self.editor_rasterizer),
+            editor_scroll_offsets: Some(&self.editor_scroll_offsets),
+        }
+    }
+
+    /// Presents a frame through the legacy `FrameBuffer` comparison path.
+    /// Behavior and timing are unchanged from before Gate R3: build the
+    /// frame, resize the surface, acquire the buffer, `copy_from_slice` the
+    /// frame's packed pixels, present.
+    fn present_legacy(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(mirror), Some(layout)) = (&self.window, &self.mirror, &self.layout)
         else {
             return;
         };
@@ -956,15 +1050,7 @@ impl NativeApp {
         else {
             return;
         };
-        let state = RenderState {
-            hovered: self.pointer.hovered,
-            pressed: self.pointer.pressed.then_some(self.pointer.armed).flatten(),
-            focused: self.interaction.focused(),
-            fault_category: self.fault.as_deref(),
-            presentation: self.presentation.as_ref(),
-            editor_rasterizer: Some(&self.editor_rasterizer),
-            editor_scroll_offsets: Some(&self.editor_scroll_offsets),
-        };
+        let state = self.render_state();
         let Ok(frame) = render(
             mirror.tree(),
             layout,
@@ -977,19 +1063,159 @@ impl NativeApp {
             self.fault = Some("renderer_failure".to_owned());
             return;
         };
-        if surface.resize(width, height).is_err() {
-            self.fault = Some("surface_failure".to_owned());
-            return;
+        {
+            let Some(surface) = &mut self.surface else {
+                return;
+            };
+            if surface.resize(width, height).is_err() {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            }
+            let Ok(mut buffer) = surface.buffer_mut() else {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            };
+            // The legacy comparison path keeps its existing FrameBuffer copy
+            // while it remains the default; only the Vello path removes the
+            // extra copy (see present_vello).
+            buffer.copy_from_slice(frame.pixels());
+            if buffer.present().is_err() {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            }
         }
-        let Ok(mut buffer) = surface.buffer_mut() else {
-            self.fault = Some("surface_failure".to_owned());
+        self.finish_present(event_loop);
+    }
+
+    /// Presents a frame through the opt-in Vello CPU path: build the same
+    /// [`PaintScene`] the legacy path uses, rasterize it with the persistent
+    /// [`VelloCpuBackend`] into the reusable premultiplied RGBA8
+    /// [`RenderTarget`], then convert directly into the acquired softbuffer
+    /// buffer -- no intermediate `Vec<u32>`, no `copy_from_slice`.
+    ///
+    /// The surface is resized before the buffer is acquired, so the acquired
+    /// buffer is always exactly `width * height` words. On any render,
+    /// validation, or conversion failure the frame is **not** presented: the
+    /// previously displayed frame stays on screen and a renderer-contract
+    /// fault is recorded through the same native fault handling as legacy
+    /// render failures. Stage timings are emitted as debug-level structured
+    /// fields so idle normal operation does not print them.
+    fn present_vello(&mut self, event_loop: &ActiveEventLoop) {
+        let started = Instant::now();
+        let (Some(window), Some(mirror), Some(layout)) = (&self.window, &self.mirror, &self.layout)
+        else {
             return;
         };
-        buffer.copy_from_slice(frame.pixels());
-        if buffer.present().is_err() {
-            self.fault = Some("surface_failure".to_owned());
+        let size = window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
+        let scale = window.scale_factor();
+        if !scale.is_finite() || scale <= 0.0 {
+            self.fault = Some("renderer_failure".to_owned());
             return;
         }
+        if mirror.tree().revision() != layout.tree_revision {
+            self.fault = Some("renderer_failure".to_owned());
+            return;
+        }
+        let state = self.render_state();
+        let scene = raster::build_scene(
+            mirror.tree(),
+            layout,
+            size.width,
+            size.height,
+            scale,
+            &state,
+            Palette::default(),
+        );
+        if let Err(error) = softbuffer_bridge::validate_scene_opacity(&scene) {
+            tracing::error!(
+                ?error,
+                "vello scene violates the opaque-window contract; not presenting"
+            );
+            self.fault = Some("renderer_failure".to_owned());
+            return;
+        }
+        let scene_us = started.elapsed();
+
+        // Render into the reusable premultiplied RGBA8 target. The target is
+        // created lazily and resized in place by the backend when the
+        // physical size changes; the backend's render context is recreated
+        // there too, so nothing is freshly allocated per frame.
+        let render_started = Instant::now();
+        if self.vello_target.is_none() {
+            match youth_paint::RenderTarget::new(scene.size) {
+                Ok(target) => self.vello_target = Some(target),
+                Err(_) => {
+                    self.fault = Some("renderer_failure".to_owned());
+                    return;
+                }
+            }
+        }
+        let target = self.vello_target.as_mut().expect("initialized above");
+        let backend = self.vello.get_or_insert_with(VelloCpuBackend::new);
+        if let Err(error) = backend.render_into(scene.size, &scene, target) {
+            tracing::error!(?error, "vello render failed; not presenting");
+            self.fault = Some("renderer_failure".to_owned());
+            return;
+        }
+        let render_us = render_started.elapsed();
+
+        // Acquire the softbuffer buffer and convert the premultiplied RGBA8
+        // target directly into it. The surface was just resized, so the
+        // acquired buffer is exactly `width * height` words; a bridge error
+        // (including a late NonOpaquePixel, after which the destination may
+        // be partially modified) means we never present.
+        let convert_started = Instant::now();
+        {
+            let Some(surface) = &mut self.surface else {
+                return;
+            };
+            if surface.resize(width, height).is_err() {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            }
+            let Ok(mut buffer) = surface.buffer_mut() else {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            };
+            if let Err(error) =
+                softbuffer_bridge::convert_rgba8_to_rgbx32(target.pixels(), &mut buffer, scene.size)
+            {
+                tracing::error!(
+                    ?error,
+                    "softbuffer conversion rejected the frame; not presenting"
+                );
+                self.fault = Some("renderer_failure".to_owned());
+                return;
+            }
+            let convert_us = convert_started.elapsed();
+            let present_started = Instant::now();
+            if buffer.present().is_err() {
+                self.fault = Some("surface_failure".to_owned());
+                return;
+            }
+            let present_us = present_started.elapsed();
+            let total_us = started.elapsed();
+            tracing::debug!(
+                target: "youth_desktop::render",
+                scene_us = scene_us.as_micros() as u64,
+                render_us = render_us.as_micros() as u64,
+                convert_us = convert_us.as_micros() as u64,
+                present_us = present_us.as_micros() as u64,
+                total_us = total_us.as_micros() as u64,
+                "vello present stage timings",
+            );
+        }
+        self.finish_present(event_loop);
+    }
+
+    /// Shared post-present bookkeeping for both backends: arm the countdown
+    /// repaint and let the smoke harness exit once it has presented a frame.
+    fn finish_present(&mut self, event_loop: &ActiveEventLoop) {
         self.arm_countdown_repaint(event_loop);
         if matches!(self.mode, Mode::Smoke) && !self.smoke_presented {
             self.smoke_presented = true;
@@ -1410,6 +1636,36 @@ mod tests {
             document_window_title(&PathBuf::from("/documents/notes.md"), "Scratchpad"),
             "notes.md — Scratchpad"
         );
+    }
+
+    #[test]
+    fn render_backend_selector_defaults_to_legacy_and_accepts_vello_cpu() {
+        // Unset and the explicit legacy spelling both select the default
+        // comparison path.
+        assert_eq!(parse_render_backend(None), (RenderBackend::Legacy, None));
+        assert_eq!(
+            parse_render_backend(Some("legacy")),
+            (RenderBackend::Legacy, None)
+        );
+        // The opt-in selector enables the Vello CPU path.
+        assert_eq!(
+            parse_render_backend(Some("vello_cpu")),
+            (RenderBackend::VelloCpu, None)
+        );
+    }
+
+    #[test]
+    fn render_backend_selector_falls_back_to_legacy_and_reports_invalid_values() {
+        // An unrecognized value must safely fall back to the legacy path and
+        // be diagnosable -- never a hard failure and never a silent Vello
+        // flip.
+        for value in ["", "vello", "VelloCpu", "velo_cpu", "gpu", "1"] {
+            assert_eq!(
+                parse_render_backend(Some(value)),
+                (RenderBackend::Legacy, Some(value)),
+                "selector {value:?} must fall back to legacy and report the invalid value"
+            );
+        }
     }
 
     #[test]

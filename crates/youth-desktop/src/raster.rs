@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use thiserror::Error;
-use youth_paint::{Color, PaintCommand, PaintScene, PhysicalSize, Point, Rect, Size};
+use youth_paint::{AlphaMask, Color, MaskId, PaintCommand, PaintScene, PhysicalSize, Point, Rect};
 use youth_runtime::{PresentationReader, resolve_countdown_display};
 use youth_text_render_cpu::GlyphRasterizer;
 use youth_tree::{NodeData, NodeId, TextAlignment, Tree};
@@ -165,6 +165,51 @@ pub enum RasterError {
     InvalidScene(#[from] youth_paint::PaintSceneError),
 }
 
+/// Accumulates a [`PaintScene`] while it is under construction: paint
+/// commands plus the [`AlphaMask`]s those commands reference. Masks are
+/// registered here (getting a stable, producer-ordered [`MaskId`]) instead
+/// of being inlined into commands, so backends can bridge or cache each
+/// rasterized coverage bitmap once.
+struct SceneBuilder {
+    commands: Vec<PaintCommand>,
+    masks: Vec<AlphaMask>,
+}
+
+impl SceneBuilder {
+    fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+            masks: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, command: PaintCommand) {
+        self.commands.push(command);
+    }
+
+    /// Registers a rasterized coverage bitmap and emits an
+    /// [`PaintCommand::AlphaMask`] referencing it at absolute physical
+    /// `origin`.
+    fn push_mask(&mut self, mask: AlphaMask, origin: Point, color: Color) {
+        let id = MaskId(u32::try_from(self.masks.len()).expect("too many masks in one scene"));
+        self.masks.push(mask);
+        self.commands.push(PaintCommand::AlphaMask {
+            mask: id,
+            origin,
+            color,
+        });
+    }
+
+    fn into_scene(self, size: PhysicalSize) -> PaintScene {
+        PaintScene {
+            size,
+            commands: self.commands,
+            masks: self.masks,
+            images: vec![],
+        }
+    }
+}
+
 /// Renders `tree`/`layout` against `state` into an owned [`FrameBuffer`].
 /// Internally: build a [`PaintScene`] describing paint *intent* (colors,
 /// rects, glyph masks, clip regions -- deciding what each node means
@@ -208,7 +253,11 @@ pub fn render(
 /// pixel-level rasterization at all -- every color decision (button state,
 /// palette lookup) happens here; every actual pixel write happens in
 /// [`paint_scene`].
-fn build_scene(
+///
+/// `pub(crate)` so the opt-in Vello CPU presentation path in `native.rs`
+/// can build the same scene from the same tree/layout/state producer that
+/// the legacy `render()` uses.
+pub(crate) fn build_scene(
     tree: &Tree,
     layout: &LayoutSnapshot,
     physical_width: u32,
@@ -217,9 +266,10 @@ fn build_scene(
     state: &RenderState<'_>,
     palette: Palette,
 ) -> PaintScene {
-    let mut commands = vec![PaintCommand::Clear {
+    let mut builder = SceneBuilder::new();
+    builder.push(PaintCommand::Clear {
         color: opaque(palette.background),
-    }];
+    });
     for (id, node) in &layout.nodes {
         let Some(semantic) = tree.node(*id) else {
             continue;
@@ -228,12 +278,12 @@ fn build_scene(
         match &semantic.data {
             NodeData::Root => {}
             NodeData::Box { .. } | NodeData::Row { .. } | NodeData::Grid { .. } => {
-                commands.push(fill_command(rect, palette.container));
-                commands.push(stroke_command(rect, palette.border));
+                builder.push(fill_command(rect, palette.container));
+                builder.push(stroke_command(rect, palette.border));
             }
             NodeData::Text { value } => {
                 push_text_run(
-                    &mut commands,
+                    &mut builder,
                     rect,
                     value,
                     TextAlignment::Start,
@@ -251,7 +301,7 @@ fn build_scene(
                             .copied()
                             .unwrap_or(0.0);
                         push_editor_presentation(
-                            &mut commands,
+                            &mut builder,
                             rect,
                             &presentation,
                             &mut rasterizer.borrow_mut(),
@@ -268,7 +318,7 @@ fn build_scene(
                         // to the guest-declared static text via the
                         // existing bitmap font.
                         push_text_run(
-                            &mut commands,
+                            &mut builder,
                             rect,
                             text,
                             TextAlignment::Start,
@@ -289,7 +339,7 @@ fn build_scene(
                         .copied()
                         .unwrap_or(0.0);
                     push_editor_presentation(
-                        &mut commands,
+                        &mut builder,
                         rect,
                         &presentation,
                         &mut rasterizer.borrow_mut(),
@@ -301,7 +351,7 @@ fn build_scene(
             }
             NodeData::AlignedText { value, alignment } => {
                 push_text_run(
-                    &mut commands,
+                    &mut builder,
                     rect,
                     value,
                     *alignment,
@@ -329,7 +379,7 @@ fn build_scene(
                 let value =
                     resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
                 push_text_run(
-                    &mut commands,
+                    &mut builder,
                     rect,
                     &value,
                     TextAlignment::Start,
@@ -352,7 +402,7 @@ fn build_scene(
                 let value =
                     resolve_countdown_display(*schedule, *precision, *format, record.as_ref(), now);
                 push_text_run(
-                    &mut commands,
+                    &mut builder,
                     rect,
                     &value,
                     *alignment,
@@ -370,10 +420,10 @@ fn build_scene(
                 } else {
                     palette.button
                 };
-                commands.push(fill_command(rect, color));
-                commands.push(stroke_command(rect, palette.border));
+                builder.push(fill_command(rect, color));
+                builder.push(stroke_command(rect, palette.border));
                 if state.focused == Some(*id) && rect.width > 4 && rect.height > 4 {
-                    commands.push(stroke_command(
+                    builder.push(stroke_command(
                         PixelRect {
                             x: rect.x + 2,
                             y: rect.y + 2,
@@ -392,7 +442,7 @@ fn build_scene(
                     height: rect.height.saturating_sub(inset_y),
                 };
                 push_text_run(
-                    &mut commands,
+                    &mut builder,
                     label_rect,
                     label,
                     TextAlignment::Start,
@@ -403,33 +453,33 @@ fn build_scene(
         }
     }
     if let Some(category) = state.fault_category {
-        commands.push(PaintCommand::Clear {
+        builder.push(PaintCommand::Clear {
             color: opaque(palette.fault_background),
         });
         push_text_run_at(
-            &mut commands,
+            &mut builder,
             16,
             16,
             "YOUTH APP FAULT",
             palette.fault_text,
             1,
         );
-        push_text_run_at(&mut commands, 16, 32, category, palette.fault_text, 1);
+        push_text_run_at(&mut builder, 16, 32, category, palette.fault_text, 1);
     }
-    PaintScene {
-        size: PhysicalSize {
-            width: physical_width,
-            height: physical_height,
-        },
-        commands,
-    }
+    builder.into_scene(PhysicalSize {
+        width: physical_width,
+        height: physical_height,
+    })
 }
 
 /// Interprets a validated [`PaintScene`] into an owned [`FrameBuffer`].
 /// This is the only place that turns paint intent into actual pixels; it
 /// has no knowledge of `NodeData`, palettes, or layout -- it only knows
-/// how to composite the six [`PaintCommand`] variants, in order, against a
-/// clip-rect stack.
+/// how to composite the [`PaintCommand`] variants, in order, against a
+/// clip-rect stack. (`FillRoundedRect` is part of the backend contract for
+/// `youth-render-vello-cpu`; this legacy interpreter has no rounded
+/// capability and silently skips one, since no producer in this increment
+/// emits it.)
 fn paint_scene(scene: &PaintScene) -> FrameBuffer {
     let mut frame = FrameBuffer {
         width: scene.size.width,
@@ -473,17 +523,23 @@ fn paint_scene(scene: &PaintScene) -> FrameBuffer {
                     );
                 }
             }
-            PaintCommand::GlyphMask {
+            PaintCommand::AlphaMask {
+                mask,
                 origin,
-                size,
-                alpha,
                 color,
             } => {
+                let Some(alpha_mask) = scene.masks.get(mask.0 as usize) else {
+                    // The legacy interpreter only ever sees scenes built by
+                    // `build_scene`, which always registers every mask it
+                    // references; an unknown id is a scene-construction bug
+                    // and safest to skip rather than panic on.
+                    continue;
+                };
                 let clip = current_clip(&clip_stack);
                 let rgb = rgb_u32(*color);
-                for row in 0..size.height {
-                    for col in 0..size.width {
-                        let coverage = alpha[(row * size.width + col) as usize];
+                for row in 0..alpha_mask.height {
+                    for col in 0..alpha_mask.width {
+                        let coverage = alpha_mask.alpha[(row * alpha_mask.width + col) as usize];
                         if coverage == 0 {
                             continue;
                         }
@@ -497,6 +553,11 @@ fn paint_scene(scene: &PaintScene) -> FrameBuffer {
                         frame.blend_pixel(x, y, rgb, coverage);
                     }
                 }
+            }
+            PaintCommand::FillRoundedRect { .. } => {
+                // No rounded capability in this legacy interpreter; no
+                // producer in this increment emits one, so skipping it
+                // preserves R0 behavior exactly.
             }
             PaintCommand::PushClip { rect } => {
                 let pixel_rect = to_pixel_rect(*rect);
@@ -616,12 +677,12 @@ fn blend_rect(frame: &mut FrameBuffer, rect: Rect, color: Color, clip: Option<Pi
     }
 }
 
-/// Emits one [`PaintCommand::GlyphMask`] for `value` drawn via the
+/// Emits one [`PaintCommand::AlphaMask`] for `value` drawn via the
 /// bitmap font, honoring `alignment` exactly as the old `draw_text`
 /// helper did. A no-op (emits nothing) for an empty string, matching the
 /// old code's behavior of simply not looping over any characters.
 fn push_text_run(
-    commands: &mut Vec<PaintCommand>,
+    builder: &mut SceneBuilder,
     rect: PixelRect,
     value: &str,
     alignment: TextAlignment,
@@ -638,17 +699,17 @@ fn push_text_run(
             .saturating_add(rect.width.saturating_sub(text_width) / 2),
         TextAlignment::End => rect.x.saturating_add(rect.width.saturating_sub(text_width)),
     };
-    push_text_run_at(commands, text_x, rect.y, value, color_rgb, glyph_scale);
+    push_text_run_at(builder, text_x, rect.y, value, color_rgb, glyph_scale);
 }
 
 /// Rasterizes `value` via the bitmap font into one synthetic alpha-mask
-/// [`PaintCommand::GlyphMask`], at absolute physical position `(x, y)`.
+/// [`PaintCommand::AlphaMask`], at absolute physical position `(x, y)`.
 /// This is the bitmap-font equivalent of a real glyph run: one command per
 /// drawn string, not per character -- an honest reflection of what the
 /// font actually is (filled squares from a fixed 5x7 bitmap), not a fake
 /// per-glyph scheme.
 fn push_text_run_at(
-    commands: &mut Vec<PaintCommand>,
+    builder: &mut SceneBuilder,
     x: u32,
     y: u32,
     value: &str,
@@ -687,15 +748,20 @@ fn push_text_run_at(
         }
         cursor = cursor.saturating_add(8 * scale);
     }
-    commands.push(PaintCommand::GlyphMask {
-        origin: Point {
+    builder.push_mask(
+        AlphaMask {
+            left: 0,
+            top: 0,
+            width,
+            height,
+            alpha: Arc::from(alpha),
+        },
+        Point {
             x: x as i32,
             y: y as i32,
         },
-        size: Size { width, height },
-        alpha: Arc::from(alpha),
-        color: opaque(color_rgb),
-    });
+        opaque(color_rgb),
+    );
 }
 
 /// Emits one live, host-owned Editor presentation (real glyph runs plus
@@ -707,7 +773,7 @@ fn push_text_run_at(
 /// conversion the old `draw_editor_presentation` performed, just emitting
 /// commands instead of writing pixels directly.
 fn push_editor_presentation(
-    commands: &mut Vec<PaintCommand>,
+    builder: &mut SceneBuilder,
     rect: PixelRect,
     presentation: &youth_runtime::TextPresentation,
     rasterizer: &mut GlyphRasterizer,
@@ -718,7 +784,7 @@ fn push_editor_presentation(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    commands.push(PaintCommand::PushClip {
+    builder.push(PaintCommand::PushClip {
         rect: to_rect(rect),
     });
 
@@ -733,7 +799,7 @@ fn push_editor_presentation(
         let width = (x1 - x0).max(0) as u32;
         let height = (y1 - y0).max(0) as u32;
         if width > 0 && height > 0 {
-            commands.push(PaintCommand::FillRect {
+            builder.push(PaintCommand::FillRect {
                 rect: Rect {
                     x: x0,
                     y: y0,
@@ -758,18 +824,20 @@ fn push_editor_presentation(
             let pen_y = (origin_y + glyph.y * scale).round() as i32;
             let base_x = pen_x + mask.left;
             let base_y = pen_y - mask.top;
-            commands.push(PaintCommand::GlyphMask {
-                origin: Point {
+            builder.push_mask(
+                AlphaMask {
+                    left: mask.left,
+                    top: mask.top,
+                    width: mask.width,
+                    height: mask.height,
+                    alpha: Arc::from(mask.alpha.as_slice()),
+                },
+                Point {
                     x: base_x,
                     y: base_y,
                 },
-                size: Size {
-                    width: mask.width,
-                    height: mask.height,
-                },
-                alpha: Arc::from(mask.alpha.as_slice()),
-                color: opaque(palette.text),
-            });
+                opaque(palette.text),
+            );
         }
     }
 
@@ -781,7 +849,7 @@ fn push_editor_presentation(
         let width = (x1 - x0).max(1) as u32;
         let height = (y1 - y0).max(0) as u32;
         if height > 0 {
-            commands.push(PaintCommand::FillRect {
+            builder.push(PaintCommand::FillRect {
                 rect: Rect {
                     x: x0,
                     y: y0,
@@ -793,7 +861,7 @@ fn push_editor_presentation(
         }
     }
 
-    commands.push(PaintCommand::PopClip);
+    builder.push(PaintCommand::PopClip);
 }
 
 /// Standard "over" alpha compositing of one 0x00RRGGBB color onto another,
@@ -1152,9 +1220,9 @@ mod tests {
             width: 120,
             height: 24,
         };
-        let mut commands = Vec::new();
+        let mut builder = SceneBuilder::new();
         push_editor_presentation(
-            &mut commands,
+            &mut builder,
             rect,
             &presentation,
             &mut rasterizer,
@@ -1162,18 +1230,18 @@ mod tests {
             0.0,
             1.0,
         );
+        let mut all = vec![PaintCommand::Clear {
+            color: opaque(palette.background),
+        }];
+        all.extend(builder.commands);
         let scene = PaintScene {
             size: PhysicalSize {
                 width: 160,
                 height: 32,
             },
-            commands: {
-                let mut all = vec![PaintCommand::Clear {
-                    color: opaque(palette.background),
-                }];
-                all.extend(commands);
-                all
-            },
+            commands: all,
+            masks: builder.masks,
+            images: vec![],
         };
         scene.validate().unwrap();
         let frame = paint_scene(&scene);
@@ -1225,11 +1293,12 @@ mod tests {
 
         let render_at = |scroll_offset_y: f32| -> FrameBuffer {
             let mut rasterizer = GlyphRasterizer::new();
-            let mut commands = vec![PaintCommand::Clear {
+            let mut builder = SceneBuilder::new();
+            builder.push(PaintCommand::Clear {
                 color: opaque(palette.background),
-            }];
+            });
             push_editor_presentation(
-                &mut commands,
+                &mut builder,
                 rect,
                 &presentation,
                 &mut rasterizer,
@@ -1237,13 +1306,10 @@ mod tests {
                 scroll_offset_y,
                 1.0,
             );
-            let scene = PaintScene {
-                size: PhysicalSize {
-                    width: 160,
-                    height: 32,
-                },
-                commands,
-            };
+            let scene = builder.into_scene(PhysicalSize {
+                width: 160,
+                height: 32,
+            });
             scene.validate().unwrap();
             paint_scene(&scene)
         };
@@ -1279,9 +1345,9 @@ mod tests {
         let mut engine = ParleyEditorEngine::with_text("Hi");
         let presentation: youth_runtime::TextPresentation = engine.presentation();
         let mut rasterizer = GlyphRasterizer::new();
-        let mut commands = Vec::new();
+        let mut builder = SceneBuilder::new();
         push_editor_presentation(
-            &mut commands,
+            &mut builder,
             PixelRect {
                 x: 0,
                 y: 0,
@@ -1295,7 +1361,7 @@ mod tests {
             1.0,
         );
         assert!(
-            commands.is_empty(),
+            builder.commands.is_empty() && builder.masks.is_empty(),
             "a zero-area rect must emit no paint commands"
         );
     }
@@ -1421,22 +1487,19 @@ mod tests {
         // `youth_paint::Color{r,g,b,a}` type has no such stray byte to
         // leak -- structurally enforcing the "top byte is always zero"
         // invariant this codebase already relied on everywhere else.
-        let mut commands = Vec::new();
+        let mut builder = SceneBuilder::new();
         push_text_run_at(
-            &mut commands,
+            &mut builder,
             0,
             0,
             "+/- * . = % @ [] {} ~ AaZz",
             0x00ff_ffff,
             1,
         );
-        let scene = PaintScene {
-            size: PhysicalSize {
-                width: 224,
-                height: 7,
-            },
-            commands,
-        };
+        let scene = builder.into_scene(PhysicalSize {
+            width: 224,
+            height: 7,
+        });
         scene.validate().unwrap();
         let frame = paint_scene(&scene);
         assert_eq!(frame_hash(&frame), 13_376_335_021_794_499_461);
@@ -1494,12 +1557,12 @@ mod tests {
         );
         scene.validate().unwrap();
 
-        // Clear, then exactly [FillRect, StrokeRect, GlyphMask] for the
+        // Clear, then exactly [FillRect, StrokeRect, AlphaMask] for the
         // one button node -- no focus ring since nothing is focused here.
         assert!(matches!(scene.commands[0], PaintCommand::Clear { .. }));
         assert!(matches!(scene.commands[1], PaintCommand::FillRect { .. }));
         assert!(matches!(scene.commands[2], PaintCommand::StrokeRect { .. }));
-        assert!(matches!(scene.commands[3], PaintCommand::GlyphMask { .. }));
+        assert!(matches!(scene.commands[3], PaintCommand::AlphaMask { .. }));
         assert_eq!(
             scene.commands.len(),
             4,
@@ -1579,8 +1642,13 @@ mod tests {
         assert!(matches!(scene.commands[0], PaintCommand::Clear { .. }));
         assert!(matches!(scene.commands[1], PaintCommand::FillRect { .. }));
         assert!(matches!(scene.commands[2], PaintCommand::StrokeRect { .. }));
-        assert!(matches!(scene.commands[3], PaintCommand::GlyphMask { .. }));
+        assert!(matches!(scene.commands[3], PaintCommand::AlphaMask { .. }));
         assert_eq!(scene.commands.len(), 4);
+        assert_eq!(
+            scene.masks.len(),
+            1,
+            "the fallback text's one alpha mask is registered in the scene"
+        );
 
         // Exercise the actual live-presentation command shape directly via
         // push_editor_presentation (what the live path emits once a real
@@ -1594,9 +1662,9 @@ mod tests {
             width: 100,
             height: 40,
         };
-        let mut editor_commands = Vec::new();
+        let mut editor_builder = SceneBuilder::new();
         push_editor_presentation(
-            &mut editor_commands,
+            &mut editor_builder,
             rect,
             &presentation,
             &mut rasterizer.borrow_mut(),
@@ -1604,6 +1672,7 @@ mod tests {
             0.0,
             1.0,
         );
+        let editor_commands = &editor_builder.commands;
         assert!(matches!(
             editor_commands.first(),
             Some(PaintCommand::PushClip { .. })
@@ -1612,15 +1681,22 @@ mod tests {
             editor_commands.last(),
             Some(PaintCommand::PopClip)
         ));
+        assert!(
+            editor_builder
+                .masks
+                .iter()
+                .all(|mask| mask.alpha.len() == mask.width as usize * mask.height as usize),
+            "every registered mask's alpha buffer matches its dimensions"
+        );
         // At least one selection FillRect, at least one glyph mask, and
-        // exactly the sequence PushClip -> [FillRect...] -> [GlyphMask...]
+        // exactly the sequence PushClip -> [FillRect...] -> [AlphaMask...]
         // -> FillRect (cursor) -> PopClip, in that relative order.
         let push_index = 0;
         let pop_index = editor_commands.len() - 1;
         let first_glyph_index = editor_commands
             .iter()
-            .position(|c| matches!(c, PaintCommand::GlyphMask { .. }))
-            .expect("at least one glyph mask for non-empty text");
+            .position(|c| matches!(c, PaintCommand::AlphaMask { .. }))
+            .expect("at least one alpha mask for non-empty text");
         let last_fill_before_pop = editor_commands[..pop_index]
             .iter()
             .rposition(|c| matches!(c, PaintCommand::FillRect { .. }))
@@ -1658,16 +1734,28 @@ mod tests {
 
         // The fault scene starts with exactly the normal scene's commands
         // unchanged, then appends the overlay: a second Clear, then two
-        // glyph masks (the fixed "YOUTH APP FAULT" heading and the fault
-        // category), with nothing else after.
+        // alpha masks (the fixed "YOUTH APP FAULT" heading and the fault
+        // category), with nothing else after. Both scenes register masks in
+        // the same deterministic order, so the alpha-mask ids in the
+        // command prefixes line up identically.
         assert_eq!(
             &fault.commands[..normal.commands.len()],
             &normal.commands[..]
         );
+        assert_eq!(
+            &fault.masks[..normal.masks.len()],
+            &normal.masks[..],
+            "the overlay appends its masks after the normal scene's"
+        );
         let overlay = &fault.commands[normal.commands.len()..];
-        assert_eq!(overlay.len(), 3, "Clear + 2 glyph masks for the overlay");
+        assert_eq!(overlay.len(), 3, "Clear + 2 alpha masks for the overlay");
         assert!(matches!(overlay[0], PaintCommand::Clear { .. }));
-        assert!(matches!(overlay[1], PaintCommand::GlyphMask { .. }));
-        assert!(matches!(overlay[2], PaintCommand::GlyphMask { .. }));
+        assert!(matches!(overlay[1], PaintCommand::AlphaMask { .. }));
+        assert!(matches!(overlay[2], PaintCommand::AlphaMask { .. }));
+        assert_eq!(
+            fault.masks.len(),
+            normal.masks.len() + 2,
+            "exactly the two overlay masks are registered"
+        );
     }
 }

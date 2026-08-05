@@ -1,0 +1,21 @@
+[package]
+name = "youth-render-vello-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vello CPU paint backend for Youth: renders youth-paint PaintScenes into a caller-owned premultiplied RGBA8 RenderTarget."
+
+[dependencies]
+youth-paint = { path = "../youth-paint" }
+
+# Pinned exactly, and intentionally so: vello_cpu's API is unstable and can
+# change without a semver bump (the crate is pre-1.0 and under active
+# development). Any upgrade requires (a) a changelog + API diff review of the
+# new version, (b) acceptance of whatever API it ships, and (c) a full re-run
+# of this crate's and youth-desktop's test suites. Default features are
+# reduced to what this backend actually uses: `std` for a normal host, the
+# `u8_pipeline` for the speed-focused RenderMode::OptimizeSpeed default. The
+# `text` feature (font rasterization) is deliberately excluded -- glyph
+# coverage already arrives rasterized as youth-paint AlphaMasks from
+# youth-text-render-cpu.
+vello_cpu = { version = "=0.1.0", default-features = false, features = ["std", "u8_pipeline"] }

@@ -9,6 +9,7 @@ pub mod geometry;
 pub mod input;
 pub mod native;
 pub mod raster;
+pub mod softbuffer_bridge;
 
 pub use controller::{
     AppErrorSummary, Controller, ControllerCommand, DesktopEvent, DesktopEventSink,
@@ -24,10 +25,11 @@ pub use geometry::{
 };
 pub use input::{InputChange, PointerState};
 pub use native::{
-    CapsuleLaunchOptions, DesktopError, DesktopOptions, document_picker_smoke, run,
+    CapsuleLaunchOptions, DesktopError, DesktopOptions, RenderBackend, document_picker_smoke, run,
     run_capsule_launch, run_with_shutdown, window_smoke,
 };
 pub use raster::{FrameBuffer, Palette, RasterError, RenderState, frame_hash, render};
+pub use softbuffer_bridge::{SoftbufferError, convert_rgba8_to_rgbx32, validate_scene_opacity};
 pub use youth_interaction::{
     EditorInput, EditorMovement, InteractionChange, InteractionSnapshot, InteractionState,
     LogicalKey, Modifiers, SemanticAction,

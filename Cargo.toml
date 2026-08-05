@@ -13,6 +13,7 @@ members = [
     "crates/youth-editor-engine",
     "crates/youth-text-render-cpu",
     "crates/youth-paint",
+    "crates/youth-render-vello-cpu",
     "crates/youth-desktop",
     "crates/youth-cli",
     "guests/counter",
@@ -59,5 +60,14 @@ lto = true
 
 # The profile that 'dist' will build with
 [profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Local benchmark profile: the release profile's fat LTO makes `cargo bench`
+# link the full youth-desktop dependency graph (winit/tokio/vello_cpu/accesskit)
+# impractically slowly. Thin LTO keeps cross-crate optimization for the
+# measured code while keeping `cargo bench` usable on a developer machine.
+# Shipped `release`/`dist` profiles are unaffected.
+[profile.bench]
 inherits = "release"
 lto = "thin"

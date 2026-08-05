@@ -33,6 +33,10 @@ youth-interaction = { path = "../youth-interaction" }
 youth-tree = { path = "../youth-tree" }
 youth-text-render-cpu = { path = "../youth-text-render-cpu" }
 youth-paint = { path = "../youth-paint" }
+# The opt-in Vello CPU paint backend, selected at runtime via
+# `YOUTH_RENDER_BACKEND=vello_cpu`; the legacy FrameBuffer path remains the
+# default comparison path (see native.rs's render-backend selector).
+youth-render-vello-cpu = { path = "../youth-render-vello-cpu" }
 
 # The portal backend avoids a GTK build-time dependency and is suitable for
 # later Flatpak/AppImage packaging. rfd may fall back to Zenity if the portal
@@ -48,3 +52,9 @@ rfd = { version = "=0.17.2", default-features = false }
 # end-to-end. Not a production dependency -- the youth-desktop binary itself never
 # imports youth-editor-engine (see raster.rs's editor_rasterizer field docs).
 youth-editor-engine = { path = "../youth-editor-engine" }
+# Benchmark harness for the softbuffer presentation bridge (softbuffer_bridge.rs).
+criterion = "0.5.1"
+
+[[bench]]
+name = "softbuffer_conversion"
+harness = false
