@@ -5953,8 +5953,11 @@ dependencies = [
 name = "youth-render-vello-cpu"
 version = "0.0.2"
 dependencies = [
+ "skrifa 0.44.0",
  "vello_cpu",
+ "youth-editor-engine",
  "youth-paint",
+ "youth-text-render-cpu",
 ]
 
 [[package]]

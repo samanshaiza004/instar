@@ -22,7 +22,6 @@ use crate::{
     SemanticAction, access, layout, raster, render, softbuffer_bridge,
 };
 use youth_interaction::EditorInput;
-use youth_paint::PaintBackend;
 use youth_render_vello_cpu::VelloCpuBackend;
 use youth_runtime::{
     AppId, PresentationReader, RuntimeErrorCategory, RuntimeEvent, RuntimeLimits, StateLocation,
@@ -57,55 +56,62 @@ pub enum DesktopError {
 
 /// The paint backend the native presentation uses to rasterize a frame.
 ///
-/// This is *not* a default flip to Vello: `Legacy` (the hand-rolled
-/// `FrameBuffer` interpreter) remains the default comparison path, and the
-/// Vello CPU backend is opt-in via `YOUTH_RENDER_BACKEND=vello_cpu` (Gate
-/// R3 selectable work, not Gate R5 adoption). See [`parse_render_backend`].
+/// Gate R5 adopts Vello CPU as the production default. The legacy
+/// `FrameBuffer` interpreter remains available explicitly through
+/// `YOUTH_RENDER_BACKEND=legacy` as a time-boxed comparison oracle. See
+/// [`parse_render_backend`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderBackend {
-    /// The existing `FrameBuffer` interpreter (the default). Keeps the exact
-    /// R0 pixel output and its `copy_from_slice` presentation copy.
+    /// The existing `FrameBuffer` interpreter, retained as an explicit
+    /// comparison oracle. Keeps the exact R0 pixel output and its
+    /// `copy_from_slice` presentation copy.
     Legacy,
-    /// The opt-in Vello CPU backend: rasters the same `PaintScene` into a
+    /// The Vello CPU backend: rasters the same `PaintScene` into a
     /// reusable premultiplied RGBA8 target and converts it directly into the
     /// acquired softbuffer buffer -- no intermediate `Vec<u32>`, no
     /// `copy_from_slice`.
     VelloCpu,
 }
 
-/// Environment variable that selects the render backend.
+/// Environment variable that selects the render backend. A development and
+/// certification switch, not a permanent public production interface: its
+/// values are not stable and an unrecognized value fails closed rather than
+/// silently launching the wrong renderer.
 pub const RENDER_BACKEND_ENV: &str = "YOUTH_RENDER_BACKEND";
 
 /// Parses a `YOUTH_RENDER_BACKEND` selector value into the backend it names.
 ///
-/// `None` (the variable is unset) and `"legacy"` select the default
-/// [`RenderBackend::Legacy`] comparison path; `"vello_cpu"` selects the
-/// opt-in [`RenderBackend::VelloCpu`] path. Any other value falls back to
-/// `Legacy` and returns the offending value as a tuple so the caller can log
-/// and diagnose the typo. The parse itself is pure -- it never touches the
-/// process environment -- so tests can exercise every branch without
-/// mutating `std::env` in parallel.
-pub fn parse_render_backend(value: Option<&str>) -> (RenderBackend, Option<&str>) {
+/// `None` (the variable is unset) selects the production
+/// [`RenderBackend::VelloCpu`] path; `"legacy"` selects the explicit
+/// comparison oracle; `"vello_cpu"` selects Vello explicitly. Any other value is
+/// rejected with the offending value as the error payload -- fail closed, so
+/// a typo cannot silently launch the wrong renderer. The parse itself is
+/// pure -- it never touches the process environment -- so tests can exercise
+/// every branch without mutating `std::env` in parallel.
+pub fn parse_render_backend(value: Option<&str>) -> Result<RenderBackend, String> {
     match value {
-        None | Some("legacy") => (RenderBackend::Legacy, None),
-        Some("vello_cpu") => (RenderBackend::VelloCpu, None),
-        Some(other) => (RenderBackend::Legacy, Some(other)),
+        None | Some("vello_cpu") => Ok(RenderBackend::VelloCpu),
+        Some("legacy") => Ok(RenderBackend::Legacy),
+        Some(other) => Err(other.to_owned()),
     }
 }
 
 /// Reads `YOUTH_RENDER_BACKEND` once and resolves it to a [`RenderBackend`],
-/// logging a diagnosable warning for an unrecognized value (which falls back
-/// to the legacy path). Called exactly once at app construction.
-fn select_render_backend() -> RenderBackend {
+/// failing closed with an [`DesktopError::Arguments`] configuration error for
+/// an unrecognized explicit value. Called exactly once at app construction,
+/// before the event loop exists, so an invalid configuration can never
+/// silently launch the wrong renderer.
+fn select_render_backend() -> Result<RenderBackend, DesktopError> {
     let selector = std::env::var(RENDER_BACKEND_ENV).ok();
-    let (backend, invalid) = parse_render_backend(selector.as_deref());
-    if let Some(value) = invalid {
-        tracing::warn!(
-            backend_selector = %value,
-            "unrecognized YOUTH_RENDER_BACKEND value; falling back to the legacy comparison backend",
-        );
-    }
-    backend
+    parse_render_backend(selector.as_deref()).map_err(backend_configuration_error)
+}
+
+/// Maps an unrecognized selector value to the explicit configuration error a
+/// caller should fail closed with.
+fn backend_configuration_error(value: String) -> DesktopError {
+    DesktopError::Arguments(format!(
+        "invalid {RENDER_BACKEND_ENV} value {value:?}; expected 'legacy' or 'vello_cpu'"
+    ))
 }
 
 enum NativeEvent {
@@ -259,6 +265,10 @@ pub fn document_picker_smoke() -> Result<(), DesktopError> {
 }
 
 fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result<(), DesktopError> {
+    // Resolve the render-backend selector before the event loop exists: an
+    // invalid `YOUTH_RENDER_BACKEND` must fail closed as a configuration
+    // error rather than silently launching the wrong renderer.
+    let render_backend = select_render_backend()?;
     let event_loop = EventLoop::<NativeEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
@@ -289,7 +299,7 @@ fn run_mode(mode: Mode, width: u32, height: u32, stdin_shutdown: bool) -> Result
         document_selection: None,
         window_title: None,
         smoke_presented: false,
-        render_backend: select_render_backend(),
+        render_backend,
         vello: None,
         vello_target: None,
     };
@@ -1100,6 +1110,16 @@ impl NativeApp {
     /// fault is recorded through the same native fault handling as legacy
     /// render failures. Stage timings are emitted as debug-level structured
     /// fields so idle normal operation does not print them.
+    ///
+    /// # Allocation wording
+    ///
+    /// The bridge conversion itself is allocation-free and both the Vello
+    /// render target and the softbuffer buffer are reused across frames, but
+    /// this is **not** an allocation-free pipeline: platform internals
+    /// (softbuffer's buffer re-acquisition and remap, the windowing system,
+    /// Vello's context recreation on a size change) may allocate or remap
+    /// memory as they see fit. `backend_resize_us` exists specifically to
+    /// make the size-change recreation visible and separately attributable.
     fn present_vello(&mut self, event_loop: &ActiveEventLoop) {
         let started = Instant::now();
         let (Some(window), Some(mirror), Some(layout)) = (&self.window, &self.mirror, &self.layout)
@@ -1131,6 +1151,13 @@ impl NativeApp {
             &state,
             Palette::default(),
         );
+        // The scene contract is checked exactly once here, at the
+        // paint/bridge seam: the first command must be an opaque Clear (a
+        // deliberate second Clear for the R0 fault overlay is the documented
+        // exception -- see softbuffer_bridge). The bridge then retains final
+        // per-pixel authority by rejecting any non-opaque pixel that
+        // survives compositing (convert_rgba8_to_rgbx32). These are the
+        // only two opacity protections; there is no redundant pass.
         if let Err(error) = softbuffer_bridge::validate_scene_opacity(&scene) {
             tracing::error!(
                 ?error,
@@ -1141,11 +1168,12 @@ impl NativeApp {
         }
         let scene_us = started.elapsed();
 
-        // Render into the reusable premultiplied RGBA8 target. The target is
-        // created lazily and resized in place by the backend when the
-        // physical size changes; the backend's render context is recreated
-        // there too, so nothing is freshly allocated per frame.
-        let render_started = Instant::now();
+        // Ensure the reusable premultiplied RGBA8 target exists (one-time
+        // lazy allocation on the first Vello frame). The backend then
+        // validates, prepares, and renders through its timed API, reporting
+        // how long context/Resources/target preparation took separately from
+        // scene recording and rasterization. The target is resized in place
+        // by the backend when the physical size changes.
         if self.vello_target.is_none() {
             match youth_paint::RenderTarget::new(scene.size) {
                 Ok(target) => self.vello_target = Some(target),
@@ -1157,31 +1185,39 @@ impl NativeApp {
         }
         let target = self.vello_target.as_mut().expect("initialized above");
         let backend = self.vello.get_or_insert_with(VelloCpuBackend::new);
-        if let Err(error) = backend.render_into(scene.size, &scene, target) {
-            tracing::error!(?error, "vello render failed; not presenting");
-            self.fault = Some("renderer_failure".to_owned());
-            return;
-        }
-        let render_us = render_started.elapsed();
+        let timings = match backend.render_into_timed(scene.size, &scene, target) {
+            Ok(timings) => timings,
+            Err(error) => {
+                tracing::error!(?error, "vello render failed; not presenting");
+                self.fault = Some("renderer_failure".to_owned());
+                return;
+            }
+        };
 
-        // Acquire the softbuffer buffer and convert the premultiplied RGBA8
-        // target directly into it. The surface was just resized, so the
-        // acquired buffer is exactly `width * height` words; a bridge error
-        // (including a late NonOpaquePixel, after which the destination may
-        // be partially modified) means we never present.
-        let convert_started = Instant::now();
+        // Resize the softbuffer surface, then acquire the buffer and convert
+        // the premultiplied RGBA8 target directly into it. The surface was
+        // just resized, so the acquired buffer is exactly `width * height`
+        // words; a bridge error (including a late NonOpaquePixel, after
+        // which the destination may be partially modified) means we never
+        // present. Surface resize and buffer acquisition are measured
+        // separately so platform remap cost is attributable.
         {
             let Some(surface) = &mut self.surface else {
                 return;
             };
+            let surface_resize_started = Instant::now();
             if surface.resize(width, height).is_err() {
                 self.fault = Some("surface_failure".to_owned());
                 return;
             }
+            let surface_resize_us = surface_resize_started.elapsed();
+            let acquire_started = Instant::now();
             let Ok(mut buffer) = surface.buffer_mut() else {
                 self.fault = Some("surface_failure".to_owned());
                 return;
             };
+            let acquire_us = acquire_started.elapsed();
+            let convert_started = Instant::now();
             if let Err(error) =
                 softbuffer_bridge::convert_rgba8_to_rgbx32(target.pixels(), &mut buffer, scene.size)
             {
@@ -1200,13 +1236,34 @@ impl NativeApp {
             }
             let present_us = present_started.elapsed();
             let total_us = started.elapsed();
+            let scene_us = scene_us.as_micros() as u64;
+            let surface_resize_us = surface_resize_us.as_micros() as u64;
+            let acquire_us = acquire_us.as_micros() as u64;
+            let convert_us = convert_us.as_micros() as u64;
+            let present_us = present_us.as_micros() as u64;
+            let total_us = total_us.as_micros() as u64;
+            // The stage timings are sequential sub-intervals of the total,
+            // so the accounted sum can never exceed total_us; the clamp keeps
+            // unaccounted_us non-negative against any sub-microsecond drift.
+            let accounted_us = scene_us
+                .saturating_add(timings.backend_resize_us)
+                .saturating_add(timings.render_us)
+                .saturating_add(surface_resize_us)
+                .saturating_add(acquire_us)
+                .saturating_add(convert_us)
+                .saturating_add(present_us);
+            let unaccounted_us = total_us.saturating_sub(accounted_us);
             tracing::debug!(
                 target: "youth_desktop::render",
-                scene_us = scene_us.as_micros() as u64,
-                render_us = render_us.as_micros() as u64,
-                convert_us = convert_us.as_micros() as u64,
-                present_us = present_us.as_micros() as u64,
-                total_us = total_us.as_micros() as u64,
+                scene_us,
+                backend_resize_us = timings.backend_resize_us,
+                render_us = timings.render_us,
+                surface_resize_us,
+                acquire_us,
+                convert_us,
+                present_us,
+                total_us,
+                unaccounted_us,
                 "vello present stage timings",
             );
         }
@@ -1639,33 +1696,50 @@ mod tests {
     }
 
     #[test]
-    fn render_backend_selector_defaults_to_legacy_and_accepts_vello_cpu() {
-        // Unset and the explicit legacy spelling both select the default
-        // comparison path.
-        assert_eq!(parse_render_backend(None), (RenderBackend::Legacy, None));
+    fn render_backend_selector_defaults_to_vello_and_accepts_legacy_override() {
+        // Unset selects the production Vello path; legacy remains an explicit
+        // diagnostic comparison override.
+        assert_eq!(parse_render_backend(None), Ok(RenderBackend::VelloCpu));
         assert_eq!(
             parse_render_backend(Some("legacy")),
-            (RenderBackend::Legacy, None)
+            Ok(RenderBackend::Legacy)
         );
-        // The opt-in selector enables the Vello CPU path.
+        // The explicit selector also enables Vello CPU.
         assert_eq!(
             parse_render_backend(Some("vello_cpu")),
-            (RenderBackend::VelloCpu, None)
+            Ok(RenderBackend::VelloCpu)
         );
     }
 
     #[test]
-    fn render_backend_selector_falls_back_to_legacy_and_reports_invalid_values() {
-        // An unrecognized value must safely fall back to the legacy path and
-        // be diagnosable -- never a hard failure and never a silent Vello
-        // flip.
+    fn render_backend_selector_fails_closed_on_invalid_values() {
+        // An unrecognized explicit value must fail closed with the offending
+        // value as the error -- never a warn-and-fallback. The caller turns
+        // this into a DesktopError::Arguments
+        // configuration error before the event loop exists.
         for value in ["", "vello", "VelloCpu", "velo_cpu", "gpu", "1"] {
             assert_eq!(
                 parse_render_backend(Some(value)),
-                (RenderBackend::Legacy, Some(value)),
-                "selector {value:?} must fall back to legacy and report the invalid value"
+                Err(value.to_owned()),
+                "selector {value:?} must fail closed with the offending value"
             );
         }
+    }
+
+    #[test]
+    fn render_backend_selector_error_names_the_offending_value() {
+        let error = parse_render_backend(Some("gpu")).map_err(backend_configuration_error);
+        let Err(DesktopError::Arguments(message)) = error else {
+            panic!("invalid selector must be an Arguments configuration error, got {error:?}");
+        };
+        assert!(
+            message.contains("gpu"),
+            "message names the offending value: {message}"
+        );
+        assert!(
+            message.contains(RENDER_BACKEND_ENV),
+            "message names the env var: {message}"
+        );
     }
 
     #[test]

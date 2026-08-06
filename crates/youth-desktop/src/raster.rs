@@ -163,6 +163,8 @@ pub enum RasterError {
     RevisionMismatch,
     #[error("scene construction produced an invalid paint scene: {0}")]
     InvalidScene(#[from] youth_paint::PaintSceneError),
+    #[error("the legacy framebuffer backend does not support GlyphRun")]
+    UnsupportedGlyphRun,
 }
 
 /// Accumulates a [`PaintScene`] while it is under construction: paint
@@ -205,6 +207,7 @@ impl SceneBuilder {
             size,
             commands: self.commands,
             masks: self.masks,
+            fonts: vec![],
             images: vec![],
         }
     }
@@ -243,7 +246,7 @@ pub fn render(
         palette,
     );
     scene.validate()?;
-    Ok(paint_scene(&scene))
+    paint_scene(&scene)
 }
 
 /// Translates `tree`/`layout`/`state` into paint intent: one deterministic
@@ -480,7 +483,7 @@ pub(crate) fn build_scene(
 /// `youth-render-vello-cpu`; this legacy interpreter has no rounded
 /// capability and silently skips one, since no producer in this increment
 /// emits it.)
-fn paint_scene(scene: &PaintScene) -> FrameBuffer {
+fn paint_scene(scene: &PaintScene) -> Result<FrameBuffer, RasterError> {
     let mut frame = FrameBuffer {
         width: scene.size.width,
         height: scene.size.height,
@@ -559,6 +562,13 @@ fn paint_scene(scene: &PaintScene) -> FrameBuffer {
                 // producer in this increment emits one, so skipping it
                 // preserves R0 behavior exactly.
             }
+            PaintCommand::GlyphRun { .. } => {
+                // R4 is Vello-only evaluation, so no producer in this
+                // increment emits a GlyphRun into a legacy scene. Fail
+                // explicitly rather than silently dropping text if that
+                // contract changes.
+                return Err(RasterError::UnsupportedGlyphRun);
+            }
             PaintCommand::PushClip { rect } => {
                 let pixel_rect = to_pixel_rect(*rect);
                 clip_stack.push(match current_clip(&clip_stack) {
@@ -571,7 +581,7 @@ fn paint_scene(scene: &PaintScene) -> FrameBuffer {
             }
         }
     }
-    frame
+    Ok(frame)
 }
 
 fn opaque(rgb: u32) -> Color {
@@ -1023,6 +1033,8 @@ fn glyph_rows(character: char) -> [u8; 7] {
 mod tests {
     use super::*;
     use crate::geometry::{LogicalSize, layout};
+    use youth_paint::{PaintBackend, RenderTarget};
+    use youth_render_vello_cpu::VelloCpuBackend;
     use youth_tree::{Node, TreeSnapshot};
 
     fn id(value: u64) -> NodeId {
@@ -1241,10 +1253,11 @@ mod tests {
             },
             commands: all,
             masks: builder.masks,
+            fonts: vec![],
             images: vec![],
         };
         scene.validate().unwrap();
-        let frame = paint_scene(&scene);
+        let frame = paint_scene(&scene).unwrap();
 
         let painted_pixels = frame
             .pixels()
@@ -1311,7 +1324,7 @@ mod tests {
                 height: 32,
             });
             scene.validate().unwrap();
-            paint_scene(&scene)
+            paint_scene(&scene).unwrap()
         };
 
         let unscrolled = render_at(0.0);
@@ -1464,6 +1477,122 @@ mod tests {
     }
 
     #[test]
+    fn vello_counter_fixtures_match_legacy_in_bounded_regions() {
+        let tree = counter();
+        let layout = layout(&tree, LogicalSize::new(320.0, 180.0).unwrap()).unwrap();
+        let cases = [
+            ("normal", RenderState::default()),
+            (
+                "hover",
+                RenderState {
+                    hovered: Some(id(4)),
+                    ..RenderState::default()
+                },
+            ),
+            (
+                "fault",
+                RenderState {
+                    fault_category: Some("guest_trap"),
+                    ..RenderState::default()
+                },
+            ),
+        ];
+
+        for (name, state) in cases {
+            let scene = build_scene(&tree, &layout, 320, 180, 1.0, &state, Palette::default());
+            scene.validate().unwrap();
+            let legacy = paint_scene(&scene).unwrap();
+            let mut backend = VelloCpuBackend::new();
+            let mut target = RenderTarget::new(scene.size).unwrap();
+            backend
+                .render_into(scene.size, &scene, &mut target)
+                .unwrap();
+
+            let mut differing_pixels = 0usize;
+            let mut max_channel_delta = 0u8;
+            for (index, legacy_pixel) in legacy.pixels.iter().enumerate() {
+                let rgba = &target.pixels()[index * 4..index * 4 + 4];
+                assert_eq!(rgba[3], 255, "{name}: pixel {index} lost opacity");
+                let legacy_channels = [
+                    ((legacy_pixel >> 16) & 0xff) as u8,
+                    ((legacy_pixel >> 8) & 0xff) as u8,
+                    (legacy_pixel & 0xff) as u8,
+                ];
+                let delta = legacy_channels
+                    .into_iter()
+                    .zip(rgba[..3].iter().copied())
+                    .map(|(expected, actual)| expected.abs_diff(actual))
+                    .max()
+                    .unwrap_or(0);
+                max_channel_delta = max_channel_delta.max(delta);
+                differing_pixels += usize::from(delta != 0);
+            }
+
+            // Integer-aligned control interiors and the opaque clear are
+            // exact. Antialiased boundaries may vary by backend, but a
+            // meaningful regression cannot hide in a whole-frame percentage.
+            assert_eq!(
+                target.pixels()[0..4],
+                [
+                    ((legacy.pixels[0] >> 16) & 0xff) as u8,
+                    ((legacy.pixels[0] >> 8) & 0xff) as u8,
+                    (legacy.pixels[0] & 0xff) as u8,
+                    255,
+                ],
+                "{name}: clear corner"
+            );
+            assert_eq!(
+                target.pixels()[4 * (179 * 320 + 319)..4 * (179 * 320 + 319) + 4],
+                [
+                    ((legacy.pixels[179 * 320 + 319] >> 16) & 0xff) as u8,
+                    ((legacy.pixels[179 * 320 + 319] >> 8) & 0xff) as u8,
+                    (legacy.pixels[179 * 320 + 319] & 0xff) as u8,
+                    255,
+                ],
+                "{name}: unaffected corner"
+            );
+            assert!(
+                max_channel_delta <= 1,
+                "{name}: max channel delta {max_channel_delta}, differing pixels {differing_pixels}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_backend_rejects_glyph_run_instead_of_dropping_text() {
+        let scene = PaintScene {
+            size: PhysicalSize {
+                width: 8,
+                height: 8,
+            },
+            commands: vec![PaintCommand::GlyphRun {
+                run: youth_paint::GlyphRun {
+                    font: youth_paint::FontId(0),
+                    font_size: 16.0,
+                    glyphs: Arc::from(
+                        [youth_paint::GlyphPosition {
+                            id: 0,
+                            x: 0.0,
+                            y: 0.0,
+                        }]
+                        .as_slice(),
+                    ),
+                    transform: youth_paint::AffineTransform::identity(),
+                    color: Color::opaque(0, 0, 0),
+                    hint: true,
+                },
+            }],
+            masks: vec![],
+            fonts: vec![],
+            images: vec![],
+        };
+        assert!(matches!(
+            paint_scene(&scene),
+            Err(RasterError::UnsupportedGlyphRun)
+        ));
+    }
+
+    #[test]
     fn printable_ascii_font_is_complete_and_representative_pixels_are_stable() {
         for byte in 0x20_u8..=0x7e {
             assert_ne!(
@@ -1501,7 +1630,7 @@ mod tests {
             height: 7,
         });
         scene.validate().unwrap();
-        let frame = paint_scene(&scene);
+        let frame = paint_scene(&scene).unwrap();
         assert_eq!(frame_hash(&frame), 13_376_335_021_794_499_461);
     }
 

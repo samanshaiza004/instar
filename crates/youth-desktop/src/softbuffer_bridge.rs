@@ -165,6 +165,7 @@ mod tests {
             },
             commands,
             masks: vec![],
+            fonts: vec![],
             images: vec![],
         }
     }

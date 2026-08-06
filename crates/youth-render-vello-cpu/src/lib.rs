@@ -19,25 +19,69 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "glyph-run")]
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use vello_cpu::color::{AlphaColor, PremulRgba8, Srgb};
 use vello_cpu::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape};
 use vello_cpu::peniko::{Extend, ImageBrush, ImageQuality, ImageSampler};
 use vello_cpu::{ImageSource, Pixmap, PixmapMut, RenderContext, Resources};
+#[cfg(feature = "glyph-run")]
+use youth_paint::{AffineTransform, FontId, FontKey, FontResource, GlyphPosition, GlyphRun};
 use youth_paint::{
     AlphaMask, Color, MaskId, PaintBackend, PaintCommand, PaintError, PaintScene, PhysicalSize,
     Point, Rect, RenderTarget,
 };
 
+#[cfg(feature = "glyph-run")]
+use skrifa::FontRef;
+#[cfg(feature = "glyph-run")]
+use skrifa::raw::TableProvider;
+#[cfg(feature = "glyph-run")]
+use vello_cpu::Glyph;
+#[cfg(feature = "glyph-run")]
+use vello_cpu::peniko::{Blob, FontData};
+
+// vello_cpu 0.1.0 stores the viewport in u16s and uses 128-pixel depth
+// buckets. Keeping dimensions below the next bucket boundary avoids the
+// upstream crate's u16 multiplication overflow near u16::MAX. Revisit this
+// guard when the pinned Vello version changes.
+const MAX_SAFE_DIMENSION: u32 = 65_280;
+
+/// Microsecond timings for one [`VelloCpuBackend::render_into_timed`] call,
+/// split so a presenter can attribute backend preparation (recreating the
+/// render context, its coupled [`Resources`], and resizing the render
+/// target) separately from actual scene recording and rasterization.
+///
+/// Backend-neutral: no Vello types appear here, so `youth-desktop` can
+/// consume this without importing anything from `vello_cpu`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VelloRenderTimings {
+    /// Time spent preparing and -- when the physical size changed --
+    /// recreating the render context, its coupled [`Resources`], and
+    /// resizing the caller's [`RenderTarget`] in place. Zero when the context
+    /// already exists at `size` and the target needs no resize.
+    pub backend_resize_us: u64,
+    /// Time spent starting a fresh frame, recording the scene's commands,
+    /// and rasterizing the result into the [`RenderTarget`].
+    pub render_us: u64,
+}
+
 /// A [`PaintBackend`] that rasterizes scenes with Vello's CPU renderer.
 ///
 /// Owns a Vello [`RenderContext`] and its coupled [`Resources`], plus the
-/// scratch buffers the alpha-mask bridging needs. The render context is
-/// recreated (never `reset_and_resize`d) whenever the physical render size
-/// changes, since Vello CPU's context size is wired into far more than the
-/// scene extent; a fresh context at the new size is the safe reading of the
-/// renderer's contract.
+/// scratch buffers the alpha-mask bridging needs. The lifecycle is explicit
+/// and single-owner: the context is *recreated* (never `reset_and_resize`d)
+/// alongside a fresh `Resources` whenever the physical render size changes
+/// (Vello CPU's context size is wired into far more than the scene extent,
+/// so a fresh context at the new size is the safe reading of the renderer's
+/// contract), and the caller's [`RenderTarget`] is resized in place at the
+/// same time. [`VelloCpuBackend::prepare`] is that single, testable seam:
+/// both [`render_into`](PaintBackend::render_into) and
+/// [`VelloCpuBackend::render_into_timed`] route their validation and
+/// preparation through it.
 #[derive(Debug)]
 pub struct VelloCpuBackend {
     /// The active render context. `None` only before the first render;
@@ -56,6 +100,16 @@ pub struct VelloCpuBackend {
     /// steady-state frame allocates no new mask pixmaps (only grows when a
     /// larger mask than seen before arrives).
     pool: Vec<Arc<Pixmap>>,
+    /// Backend-owned conversion of the scene's [`FontResource`]s into Vello
+    /// font handles, keyed by stable semantic `(FontKey, collection index)`.
+    /// Converted once per resource and reused across frames; cleared whenever
+    /// the render context and its coupled [`Resources`] are recreated.
+    #[cfg(feature = "glyph-run")]
+    fonts: HashMap<(FontKey, u32), FontData>,
+    /// Glyph count reported by each cached font's `maxp` table (when present),
+    /// used to bound run glyph ids without re-parsing the font per run.
+    #[cfg(feature = "glyph-run")]
+    glyph_counts: HashMap<(FontKey, u32), Option<u32>>,
 }
 
 impl Default for VelloCpuBackend {
@@ -78,6 +132,10 @@ impl VelloCpuBackend {
             },
             registered: Vec::new(),
             pool: Vec::new(),
+            #[cfg(feature = "glyph-run")]
+            fonts: HashMap::new(),
+            #[cfg(feature = "glyph-run")]
+            glyph_counts: HashMap::new(),
         }
     }
 
@@ -174,6 +232,17 @@ impl VelloCpuBackend {
                     .ok_or(PaintError::InvalidMask(mask_id))?;
                 self.draw_alpha_mask(mask_id, alpha_mask, *origin, *color)?;
             }
+            PaintCommand::GlyphRun { run } => {
+                #[cfg(feature = "glyph-run")]
+                {
+                    self.draw_glyph_run(run, scene)?;
+                }
+                #[cfg(not(feature = "glyph-run"))]
+                {
+                    let _ = run;
+                    return Err(PaintError::UnsupportedGlyphRun);
+                }
+            }
             PaintCommand::PushClip { rect } => {
                 let context = self.context_mut()?;
                 context.push_clip_path(&kurbo_rect(*rect).to_path(0.1));
@@ -267,20 +336,183 @@ impl VelloCpuBackend {
         Ok(())
     }
 
+    /// Rasterizes a [`GlyphRun`] directly with Vello's text pipeline, filling
+    /// each glyph outline with the run's color.
+    ///
+    /// This is the R4 evaluation path, compiled only with the `glyph-run`
+    /// feature. Font bytes are validated (parsed via skrifa) before they are
+    /// handed to Vello, whose pinned 0.1.0 text path panics on invalid data
+    /// rather than returning an error; the converted handle is cached per
+    /// [`FontId`] and reused across frames.
+    #[cfg(feature = "glyph-run")]
+    fn draw_glyph_run(&mut self, run: &GlyphRun, scene: &PaintScene) -> Result<(), PaintError> {
+        let font_id = run.font;
+        let (font_data, glyph_count) = self.font_data(font_id, scene)?;
+        if !run.font_size.is_finite() || run.font_size <= 0.0 {
+            return Err(PaintError::InvalidGlyphRun {
+                font: font_id,
+                reason: "font size must be finite and positive",
+            });
+        }
+        for glyph in &*run.glyphs {
+            if !glyph.x.is_finite() || !glyph.y.is_finite() {
+                return Err(PaintError::InvalidGlyphRun {
+                    font: font_id,
+                    reason: "glyph positions must be finite",
+                });
+            }
+            // glifo silently skips glyph ids outside the font, so a producer
+            // that mixed ids from a different face would misrender silently;
+            // bound them to the face's glyph count when one is known.
+            if glyph_count.is_some_and(|count| glyph.id >= count) {
+                return Err(PaintError::InvalidGlyphRun {
+                    font: font_id,
+                    reason: "glyph id is outside the font's glyph count",
+                });
+            }
+        }
+
+        // Draw with disjoint field borrows: `glyph_run` takes the context
+        // and `Resources` as separate mutable parameters, and the scene
+        // transform must be applied before the builder snapshots it.
+        let Self {
+            context, resources, ..
+        } = self;
+        let context = context
+            .as_mut()
+            .ok_or(PaintError::BackendFailure("render context unavailable"))?;
+        // Map the run's baseline positions into scene space exactly like the
+        // rest of the command walker does (scene transform is identity at
+        // command boundaries), then restore it afterwards so the next
+        // command's state is unaffected.
+        let saved_state = context.save_current_state();
+        context.set_transform(affine_transform(run.transform));
+        context.set_paint(alpha_color(run.color));
+        context
+            .glyph_run(resources, &font_data)
+            .font_size(run.font_size)
+            .hint(run.hint)
+            .fill_glyphs(run.glyphs.iter().map(positioned_glyph));
+        context.restore_state(saved_state);
+        Ok(())
+    }
+
+    /// Validates the scene's [`FontResource`] for `font_id` and returns a
+    /// cached Vello [`FontData`] handle, converting it the first time, plus
+    /// the font's glyph count (when its `maxp` table is present) for glyph-id
+    /// bounding.
+    ///
+    /// Validation is as deep as the pinned Vello text path requires: skrifa
+    /// must be able to parse the bytes at the requested collection index and
+    /// report a usable `head` table (Vello's glifo layer unwraps both, so
+    /// invalid data would otherwise panic).
+    #[cfg(feature = "glyph-run")]
+    fn font_data(
+        &mut self,
+        font_id: FontId,
+        scene: &PaintScene,
+    ) -> Result<(FontData, Option<u32>), PaintError> {
+        let resource = scene
+            .fonts
+            .get(font_id.0 as usize)
+            .ok_or(PaintError::InvalidFont(font_id))?;
+        let cache_key = (resource.key, resource.index);
+        if let Some(font) = self.fonts.get(&cache_key) {
+            return Ok((
+                font.clone(),
+                self.glyph_counts.get(&cache_key).copied().flatten(),
+            ));
+        }
+        let glyph_count = validate_font_resource(font_id, resource)?;
+        // The bytes stay where the scene owns them: `Arc<Arc<[u8]>>` points
+        // at the same `Arc<[u8]>` the FontResource holds (Arc's own
+        // `AsRef<T> for Arc<T>` makes the inner Arc the trait object), so
+        // conversion is a refcount bump, never a copy of the font data.
+        let font = FontData::new(Blob::new(Arc::new(resource.data.clone())), resource.index);
+        self.fonts.insert(cache_key, font.clone());
+        self.glyph_counts.insert(cache_key, glyph_count);
+        Ok((font, glyph_count))
+    }
+
     fn context_mut(&mut self) -> Result<&mut RenderContext, PaintError> {
         self.context
             .as_mut()
             .ok_or(PaintError::BackendFailure("render context unavailable"))
     }
-}
 
-impl PaintBackend for VelloCpuBackend {
-    fn render_into(
+    /// Validates `size` against the scene contract and the renderer's u16
+    /// limit, recreates the render context and its coupled [`Resources`]
+    /// whenever the physical size changed, and resizes the caller's
+    /// [`RenderTarget`] in place when it does not already match.
+    ///
+    /// This is the backend's single lifecycle seam: every render call routes
+    /// validation and preparation through it, so the "fresh context +
+    /// fresh `Resources` + in-place target resize on size change" rule is
+    /// explicit, tested, and shared between the plain
+    /// [`render_into`](PaintBackend::render_into) path and the timed
+    /// [`render_into_timed`](VelloCpuBackend::render_into_timed) path.
+    /// Returns the microseconds this preparation took; no per-frame
+    /// allocation happens beyond the recreation itself.
+    fn prepare(
+        &mut self,
+        size: PhysicalSize,
+        width: u16,
+        height: u16,
+        target: &mut RenderTarget,
+    ) -> Result<u64, PaintError> {
+        let started = Instant::now();
+        if self.size != size {
+            // Recreation, not `reset_and_resize`: the context's size is
+            // baked into its dispatcher, tile and strip allocations, so
+            // resizing in place would leave stale internals. The coupled
+            // Resources (image registry, glyph atlas, caches) are recreated
+            // alongside it, and the backend's font-handle cache is cleared
+            // with them so nothing from the old context survives.
+            self.context = Some(RenderContext::new(width, height));
+            self.resources = Resources::new();
+            self.registered.clear();
+            #[cfg(feature = "glyph-run")]
+            self.fonts.clear();
+            #[cfg(feature = "glyph-run")]
+            self.glyph_counts.clear();
+            self.size = size;
+        }
+        if target.size() != size {
+            target.resize(size)?;
+        }
+        Ok(started.elapsed().as_micros() as u64)
+    }
+
+    fn checked_dimensions(size: PhysicalSize) -> Result<(u16, u16), PaintError> {
+        if size.width > MAX_SAFE_DIMENSION || size.height > MAX_SAFE_DIMENSION {
+            return Err(PaintError::SizeExceedsBackendLimit(size));
+        }
+        let width =
+            u16::try_from(size.width).map_err(|_| PaintError::SizeExceedsBackendLimit(size))?;
+        let height =
+            u16::try_from(size.height).map_err(|_| PaintError::SizeExceedsBackendLimit(size))?;
+        Ok((width, height))
+    }
+
+    /// Renders `scene` into `target`, reporting how long backend
+    /// preparation took separately from scene recording and rasterization.
+    ///
+    /// Behavior is identical to [`render_into`](PaintBackend::render_into):
+    /// this is the single implementation, and the trait method delegates to
+    /// it so the two paths can never diverge. The timings are measured with
+    /// `Instant::now()` around the exact operations the plain path performs
+    /// -- no extra allocation per frame, no extra passes.
+    ///
+    /// Returns [`PaintError::SizeExceedsBackendLimit`] for a size past the
+    /// u16 renderer limit (before any narrowing cast), and the same errors
+    /// as [`render_into`](PaintBackend::render_into) for scene-contract
+    /// violations.
+    pub fn render_into_timed(
         &mut self,
         size: PhysicalSize,
         scene: &PaintScene,
         target: &mut RenderTarget,
-    ) -> Result<(), PaintError> {
+    ) -> Result<VelloRenderTimings, PaintError> {
         // Scene construction bugs must be reported, not silently rendered:
         // an imbalanced clip stack would pop a clip the backend never
         // pushed, and a scene size mismatch would rasterize commands built
@@ -292,28 +524,16 @@ impl PaintBackend for VelloCpuBackend {
                 requested: size,
             });
         }
-        // Vello CPU's context and pixmaps are u16-sized; reject anything
-        // larger rather than panicking on a truncated cast.
-        let width =
-            u16::try_from(size.width).map_err(|_| PaintError::SizeExceedsBackendLimit(size))?;
-        let height =
-            u16::try_from(size.height).map_err(|_| PaintError::SizeExceedsBackendLimit(size))?;
+        // Vello CPU's context and pixmaps are u16-sized, and 0.1.0 also
+        // requires a tile-safe upper bound. Reject anything larger rather
+        // than truncating or reaching the upstream tile-rounding panic.
+        let (width, height) = Self::checked_dimensions(size)?;
 
-        if self.size != size {
-            // Recreation, not `reset_and_resize`: the context's size is
-            // baked into its dispatcher, tile and strip allocations, so
-            // resizing in place would leave stale internals. The coupled
-            // Resources (image registry, caches) are recreated too.
-            self.context = Some(RenderContext::new(width, height));
-            self.resources = Resources::new();
-            self.registered.clear();
-            self.size = size;
-        }
-        if target.size() != size {
-            target.resize(size)?;
-        }
+        let backend_resize_us = self.prepare(size, width, height, target)?;
 
-        // Start a fresh frame on the (possibly just-recreated) context.
+        // Start a fresh frame on the (possibly just-recreated) context, then
+        // record the scene's commands and rasterize them into the target.
+        let render_started = Instant::now();
         if let Some(context) = self.context.as_mut() {
             context.reset();
         }
@@ -331,12 +551,29 @@ impl PaintBackend for VelloCpuBackend {
             };
             context.render(target_view, &mut self.resources);
         }
+        let render_us = render_started.elapsed().as_micros() as u64;
 
         // Drop the image registry's references and hand every registered
         // mask pixmap back to the reuse pool for the next frame.
         self.resources.clear_images();
         self.pool.append(&mut self.registered);
-        Ok(())
+        Ok(VelloRenderTimings {
+            backend_resize_us,
+            render_us,
+        })
+    }
+}
+
+impl PaintBackend for VelloCpuBackend {
+    fn render_into(
+        &mut self,
+        size: PhysicalSize,
+        scene: &PaintScene,
+        target: &mut RenderTarget,
+    ) -> Result<(), PaintError> {
+        // The timed path is the single implementation; the trait method
+        // delegates so plain rendering and timed rendering can never diverge.
+        self.render_into_timed(size, scene, target).map(|_| ())
     }
 }
 
@@ -355,6 +592,77 @@ fn kurbo_rect(rect: Rect) -> KurboRect {
         f64::from(rect.x) + f64::from(rect.width),
         f64::from(rect.y) + f64::from(rect.height),
     )
+}
+
+/// Maps a scene [`AffineTransform`] onto kurbo's coefficient layout. kurbo's
+/// augmented matrix is `| a c e | / | b d f |` (a column-vector convention),
+/// so the six f32 coefficients `{ xx, yx, xy, yy, dx, dy }` that satisfy
+/// `x' = xx*x + yx*y + dx`, `y' = xy*x + yy*y + dy` become
+/// `[xx, xy, yx, yy, dx, dy]`; widening the coefficients from f32 to f64
+/// preserves every input value.
+#[cfg(feature = "glyph-run")]
+fn affine_transform(transform: AffineTransform) -> Affine {
+    Affine::new([
+        f64::from(transform.xx),
+        f64::from(transform.xy),
+        f64::from(transform.yx),
+        f64::from(transform.yy),
+        f64::from(transform.dx),
+        f64::from(transform.dy),
+    ])
+}
+
+/// Borrows a scene [`GlyphPosition`] as the Vello `Glyph` the text pipeline
+/// consumes; the fields line up 1:1 (font-local id plus run-space x/y).
+#[cfg(feature = "glyph-run")]
+fn positioned_glyph(position: &GlyphPosition) -> Glyph {
+    Glyph {
+        id: position.id,
+        x: position.x,
+        y: position.y,
+    }
+}
+
+/// Validates a scene [`FontResource`] as deeply as the pinned Vello text
+/// path requires before the bytes reach Vello's glifo layer, which unwraps
+/// both the skrifa parse and the `head` lookup and would otherwise panic on
+/// invalid data. Returns the concrete [`PaintError::InvalidFontData`] error
+/// instead of panicking, plus the font's glyph count when a `maxp` table is
+/// present (used to bound run glyph ids).
+#[cfg(feature = "glyph-run")]
+fn validate_font_resource(
+    font_id: FontId,
+    resource: &FontResource,
+) -> Result<Option<u32>, PaintError> {
+    if resource.data.is_empty() {
+        return Err(PaintError::InvalidFontData {
+            font: font_id,
+            reason: "font data is empty",
+        });
+    }
+    let font_ref = FontRef::from_index(&resource.data, resource.index).map_err(|_| {
+        PaintError::InvalidFontData {
+            font: font_id,
+            reason: "font data does not parse as a font at the requested index",
+        }
+    })?;
+    let upem = font_ref
+        .head()
+        .map(|head| head.units_per_em())
+        .map_err(|_| PaintError::InvalidFontData {
+            font: font_id,
+            reason: "font has no usable head table",
+        })?;
+    if upem == 0 {
+        return Err(PaintError::InvalidFontData {
+            font: font_id,
+            reason: "font head table reports zero units per em",
+        });
+    }
+    Ok(font_ref
+        .maxp()
+        .ok()
+        .map(|maxp| u32::from(maxp.num_glyphs())))
 }
 
 /// Premultiplies a straight sRGB [`Color`] by an 8-bit `coverage` value:
@@ -400,6 +708,7 @@ mod tests {
             size: SIZE,
             commands,
             masks,
+            fonts: vec![],
             images: vec![],
         }
     }
@@ -789,6 +1098,7 @@ mod tests {
             size: big,
             commands: vec![clear(Color::opaque(0, 0, 255))],
             masks: vec![],
+            fonts: vec![],
             images: vec![],
         };
         backend.render_into(big, &big_scene, &mut target).unwrap();
@@ -868,6 +1178,7 @@ mod tests {
                     fill_rect(rect(0, 0, 4, 4), Color::opaque(255, 0, 0)),
                 ],
                 masks: vec![],
+                fonts: vec![],
                 images: vec![],
             };
             backend.render_into(size, &scene, &mut target).unwrap();
@@ -927,6 +1238,7 @@ mod tests {
             size: oversized,
             commands: vec![],
             masks: vec![],
+            fonts: vec![],
             images: vec![],
         };
         let mut big_target = RenderTarget::new(oversized).unwrap();
@@ -958,5 +1270,876 @@ mod tests {
             backend.render_into(SIZE, &huge_mask, &mut target),
             Err(PaintError::InvalidMaskData { .. })
         ));
+    }
+
+    #[test]
+    fn u16_boundary_validation_accepts_tile_safe_max_and_rejects_larger_sizes() {
+        // The pinned Vello release cannot safely round a u16::MAX viewport up
+        // to its internal tile/depth boundaries. The largest safe dimension
+        // is the depth-bucket-aligned 65_280; it renders without a panic. Both the exact
+        // u16::MAX boundary and one past it are rejected before narrowing,
+        // in both dimensions, with no giant allocation.
+        for (width, height) in [(MAX_SAFE_DIMENSION, 1u32), (1u32, MAX_SAFE_DIMENSION)] {
+            let size = PhysicalSize { width, height };
+            let mut backend = VelloCpuBackend::new();
+            let mut target = RenderTarget::new(size).unwrap();
+            let scene = PaintScene {
+                size,
+                commands: vec![clear(Color::opaque(0, 0, 0))],
+                masks: vec![],
+                fonts: vec![],
+                images: vec![],
+            };
+            backend
+                .render_into(size, &scene, &mut target)
+                .expect("tile-safe maximum dimension must render");
+            assert_eq!(target.size(), size);
+        }
+
+        for (width, height) in [
+            (u32::from(u16::MAX), 1u32),
+            (1u32, u32::from(u16::MAX)),
+            (u32::from(u16::MAX) + 1, 1u32),
+            (1u32, u32::from(u16::MAX) + 1),
+        ] {
+            let size = PhysicalSize { width, height };
+            let mut backend = VelloCpuBackend::new();
+            let mut target = RenderTarget::new(PhysicalSize {
+                width: 1,
+                height: 1,
+            })
+            .unwrap();
+            let scene = PaintScene {
+                size,
+                commands: vec![],
+                masks: vec![],
+                fonts: vec![],
+                images: vec![],
+            };
+            assert_eq!(
+                backend.render_into(size, &scene, &mut target),
+                Err(PaintError::SizeExceedsBackendLimit(size))
+            );
+        }
+    }
+
+    #[test]
+    fn render_into_timed_matches_plain_rendering_and_reports_both_stages() {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(SIZE).unwrap();
+
+        let first = scene(
+            vec![
+                clear(Color::opaque(255, 255, 255)),
+                fill_rect(rect(0, 0, 2, 2), Color::opaque(255, 0, 0)),
+            ],
+            vec![],
+        );
+        // Both stage timings are returned as plain u64 microsecond counts;
+        // their exact magnitudes are environment-dependent, so the test
+        // asserts the pixels (the shared behavioral contract with the plain
+        // trait path) rather than any timing value.
+        let _first_timings = backend
+            .render_into_timed(SIZE, &first, &mut target)
+            .unwrap();
+        assert_eq!(sample(&target, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(sample(&target, 15, 11), [255, 255, 255, 255]);
+
+        // A steady-state frame at the same size: no context recreation, and
+        // the target is not resized, so prepare is still reported as its own
+        // field and the pixels are fully replaced.
+        let second = scene(vec![clear(Color::opaque(0, 255, 0))], vec![]);
+        let _second_timings = backend
+            .render_into_timed(SIZE, &second, &mut target)
+            .unwrap();
+        assert_eq!(sample(&target, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(sample(&target, 15, 11), [0, 255, 0, 255]);
+
+        // A size change is still handled through the timed path, including
+        // an in-place target resize.
+        let big = PhysicalSize {
+            width: 20,
+            height: 14,
+        };
+        let big_scene = PaintScene {
+            size: big,
+            commands: vec![clear(Color::opaque(0, 0, 255))],
+            masks: vec![],
+            fonts: vec![],
+            images: vec![],
+        };
+        backend
+            .render_into_timed(big, &big_scene, &mut target)
+            .unwrap();
+        assert_eq!(target.size(), big);
+        assert_eq!(sample(&target, 19, 13), [0, 0, 255, 255]);
+
+        // Validation failures surface through the timed path exactly as
+        // they do through the trait method.
+        let oversized = PhysicalSize {
+            width: u32::from(u16::MAX) + 1,
+            height: 1,
+        };
+        let oversized_scene = PaintScene {
+            size: oversized,
+            commands: vec![],
+            masks: vec![],
+            fonts: vec![],
+            images: vec![],
+        };
+        assert_eq!(
+            backend.render_into_timed(oversized, &oversized_scene, &mut target),
+            Err(PaintError::SizeExceedsBackendLimit(oversized))
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "glyph-run"))]
+    fn glyph_run_without_the_feature_is_a_concrete_unsupported_error() {
+        // The default feature set (no `glyph-run`) must reject GlyphRun with
+        // the typed unsupported error rather than panic or silently render
+        // nothing. Compiled only in builds without the feature; with it,
+        // glyph_run_tests exercises the real path.
+        let run = youth_paint::GlyphRun {
+            font: youth_paint::FontId(0),
+            font_size: 16.0,
+            glyphs: std::sync::Arc::from(
+                vec![youth_paint::GlyphPosition {
+                    id: 0,
+                    x: 0.0,
+                    y: 0.0,
+                }]
+                .as_slice(),
+            ),
+            transform: youth_paint::AffineTransform::identity(),
+            color: Color::opaque(0, 0, 0),
+            hint: false,
+        };
+        let scene = PaintScene {
+            size: SIZE,
+            commands: vec![PaintCommand::GlyphRun { run }],
+            masks: vec![],
+            fonts: vec![],
+            images: vec![],
+        };
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(SIZE).unwrap();
+        assert_eq!(
+            backend.render_into(SIZE, &scene, &mut target),
+            Err(PaintError::UnsupportedGlyphRun)
+        );
+    }
+}
+
+/// Gate R4 evaluation tests for the opt-in `glyph-run` feature: the Vello
+/// GlyphRun path, its validation/state-isolation contract, and the
+/// comparison against the existing Swash-to-AlphaMask producer.
+#[cfg(all(test, feature = "glyph-run"))]
+mod glyph_run_tests {
+    use super::*;
+    use skrifa::MetadataProvider;
+    use youth_editor_engine::{EditorLayout, ParleyEditorEngine};
+    use youth_text_render_cpu::GlyphRasterizer;
+
+    /// Bundled Roboto Mono (OFL-1.1, see `assets/OFL.txt`), for deterministic
+    /// tests that must not depend on which fonts the host has installed.
+    const BUNDLED_TEST_FONT: &[u8] = include_bytes!("../assets/RobotoMono.ttf");
+
+    const GLYPH_SIZE: PhysicalSize = PhysicalSize {
+        width: 96,
+        height: 48,
+    };
+
+    fn clear(color: Color) -> PaintCommand {
+        PaintCommand::Clear { color }
+    }
+
+    /// Sample the premultiplied RGBA8 pixel at (x, y).
+    fn sample(target: &RenderTarget, x: u32, y: u32) -> [u8; 4] {
+        let index = (y * target.width() + x) as usize * 4;
+        target.pixels()[index..index + 4].try_into().unwrap()
+    }
+
+    fn font_resource() -> FontResource {
+        FontResource {
+            key: FontKey(1),
+            data: Arc::from(BUNDLED_TEST_FONT),
+            index: 0,
+        }
+    }
+
+    /// The bundled font's glyph id for `ch` (font-local, via its cmap).
+    fn glyph_id_for(ch: char) -> u32 {
+        let font = FontRef::from_index(BUNDLED_TEST_FONT, 0).expect("bundled font parses");
+        font.charmap()
+            .map(ch)
+            .expect("bundled font maps the character")
+            .to_u32()
+    }
+
+    fn run(font: FontId, font_size: f32, glyphs: &[GlyphPosition]) -> GlyphRun {
+        GlyphRun {
+            font,
+            font_size,
+            glyphs: Arc::from(glyphs),
+            transform: AffineTransform::identity(),
+            color: Color::opaque(0, 0, 0),
+            hint: false,
+        }
+    }
+
+    fn glyph_scene(run: GlyphRun, fonts: Vec<FontResource>) -> PaintScene {
+        PaintScene {
+            size: GLYPH_SIZE,
+            commands: vec![
+                clear(Color::opaque(255, 255, 255)),
+                PaintCommand::GlyphRun { run },
+            ],
+            masks: vec![],
+            fonts,
+            images: vec![],
+        }
+    }
+
+    /// Bounds and count of the pixels that differ from `backdrop`.
+    fn painted_region(target: &RenderTarget, backdrop: [u8; 4]) -> (usize, i32, i32, i32, i32) {
+        let mut count = 0usize;
+        let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+        let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+        for y in 0..target.height() {
+            for x in 0..target.width() {
+                if sample(target, x, y) != backdrop {
+                    count += 1;
+                    min_x = min_x.min(x as i32);
+                    min_y = min_y.min(y as i32);
+                    max_x = max_x.max(x as i32);
+                    max_y = max_y.max(y as i32);
+                }
+            }
+        }
+        (count, min_x, min_y, max_x, max_y)
+    }
+
+    #[test]
+    fn glyph_run_renders_ink_on_the_bundled_font() {
+        let scene = glyph_scene(
+            run(
+                FontId(0),
+                24.0,
+                &[GlyphPosition {
+                    id: glyph_id_for('A'),
+                    x: 12.0,
+                    y: 30.0,
+                }],
+            ),
+            vec![font_resource()],
+        );
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+        backend
+            .render_into(GLYPH_SIZE, &scene, &mut target)
+            .unwrap();
+
+        // Bounded-region assertions only: 'A' at 24px on the bundled font
+        // must paint ink near its baseline pen, well inside the scene. No
+        // byte-exact hash -- the exact rasterization is antialiased and
+        // renderer-specific.
+        let (count, min_x, min_y, max_x, max_y) = painted_region(&target, [255, 255, 255, 255]);
+        assert!(count > 0, "the glyph paints ink");
+        assert!(
+            (4..24).contains(&min_x),
+            "ink starts near the pen (min_x {min_x})"
+        );
+        assert!(
+            (0..24).contains(&min_y),
+            "ink reaches up from the baseline (min_y {min_y})"
+        );
+        assert!(max_x < 40, "ink stays bounded right (max_x {max_x})");
+        assert!(
+            max_y <= 31,
+            "ink stays at or above the baseline (max_y {max_y})"
+        );
+        assert_eq!(
+            sample(&target, 2, 2),
+            [255, 255, 255, 255],
+            "far corner stays white"
+        );
+    }
+
+    #[test]
+    fn missing_font_id_is_rejected() {
+        let scene = glyph_scene(
+            run(
+                FontId(7),
+                16.0,
+                &[GlyphPosition {
+                    id: glyph_id_for('A'),
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![font_resource()],
+        );
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+        assert_eq!(
+            backend.render_into(GLYPH_SIZE, &scene, &mut target),
+            Err(PaintError::InvalidFont(FontId(7)))
+        );
+    }
+
+    #[test]
+    fn empty_and_unparseable_font_data_are_rejected() {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+
+        // Empty font data.
+        let empty = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: glyph_id_for('A'),
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![FontResource {
+                key: FontKey(2),
+                data: Arc::from(Vec::<u8>::new().as_slice()),
+                index: 0,
+            }],
+        );
+        assert!(matches!(
+            backend.render_into(GLYPH_SIZE, &empty, &mut target),
+            Err(PaintError::InvalidFontData {
+                font: FontId(0),
+                ..
+            })
+        ));
+
+        // Bytes that do not parse as a font.
+        let garbage = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: 0,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![FontResource {
+                key: FontKey(3),
+                data: Arc::from(vec![0xde, 0xad, 0xbe, 0xef].as_slice()),
+                index: 0,
+            }],
+        );
+        assert!(matches!(
+            backend.render_into(GLYPH_SIZE, &garbage, &mut target),
+            Err(PaintError::InvalidFontData {
+                font: FontId(0),
+                ..
+            })
+        ));
+
+        // A valid single-face file but a collection index that does not exist.
+        let bad_index = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: 0,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![FontResource {
+                key: FontKey(4),
+                data: Arc::from(BUNDLED_TEST_FONT),
+                index: 9,
+            }],
+        );
+        assert!(matches!(
+            backend.render_into(GLYPH_SIZE, &bad_index, &mut target),
+            Err(PaintError::InvalidFontData {
+                font: FontId(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reusing_a_font_id_with_a_new_stable_key_uses_new_scene_bytes() {
+        let valid = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: glyph_id_for('A'),
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![font_resource()],
+        );
+        let invalid = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: 0,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![FontResource {
+                key: FontKey(2),
+                data: Arc::from(vec![0xde, 0xad, 0xbe, 0xef].as_slice()),
+                index: 0,
+            }],
+        );
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+        backend
+            .render_into(GLYPH_SIZE, &valid, &mut target)
+            .unwrap();
+        assert!(matches!(
+            backend.render_into(GLYPH_SIZE, &invalid, &mut target),
+            Err(PaintError::InvalidFontData {
+                font: FontId(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn non_positive_and_non_finite_font_sizes_are_rejected() {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+        for size in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let scene = glyph_scene(
+                run(
+                    FontId(0),
+                    size,
+                    &[GlyphPosition {
+                        id: glyph_id_for('A'),
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                ),
+                vec![font_resource()],
+            );
+            assert!(
+                matches!(
+                    backend.render_into(GLYPH_SIZE, &scene, &mut target),
+                    Err(PaintError::InvalidGlyphRun {
+                        font: FontId(0),
+                        ..
+                    })
+                ),
+                "font size {size} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_glyph_ids_and_non_finite_positions_are_rejected() {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+
+        // Glyph id beyond the font's maxp glyph count (glifo would silently
+        // skip it; the backend must reject it instead).
+        let num_glyphs = FontRef::from_index(BUNDLED_TEST_FONT, 0)
+            .unwrap()
+            .maxp()
+            .unwrap()
+            .num_glyphs();
+        let bad_id = glyph_scene(
+            run(
+                FontId(0),
+                16.0,
+                &[GlyphPosition {
+                    id: u32::from(num_glyphs) + 5,
+                    x: 0.0,
+                    y: 0.0,
+                }],
+            ),
+            vec![font_resource()],
+        );
+        assert!(matches!(
+            backend.render_into(GLYPH_SIZE, &bad_id, &mut target),
+            Err(PaintError::InvalidGlyphRun {
+                font: FontId(0),
+                ..
+            })
+        ));
+
+        // A non-finite position would poison the transform math downstream.
+        for (x, y) in [(f32::NAN, 0.0), (0.0, f32::INFINITY)] {
+            let scene = glyph_scene(
+                run(
+                    FontId(0),
+                    16.0,
+                    &[GlyphPosition {
+                        id: glyph_id_for('A'),
+                        x,
+                        y,
+                    }],
+                ),
+                vec![font_resource()],
+            );
+            assert!(
+                matches!(
+                    backend.render_into(GLYPH_SIZE, &scene, &mut target),
+                    Err(PaintError::InvalidGlyphRun {
+                        font: FontId(0),
+                        ..
+                    })
+                ),
+                "position ({x}, {y}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn run_transform_places_glyphs_and_render_state_is_restored() {
+        // Two runs of the same glyph translated to different pen positions,
+        // followed by a FillRect that must land exactly (state isolation:
+        // neither run's transform may leak into the next command).
+        let glyphs = vec![GlyphPosition {
+            id: glyph_id_for('A'),
+            x: 0.0,
+            y: 30.0,
+        }];
+        let left = GlyphRun {
+            transform: AffineTransform {
+                xx: 1.0,
+                yx: 0.0,
+                xy: 0.0,
+                yy: 1.0,
+                dx: 8.0,
+                dy: 0.0,
+            },
+            ..run(FontId(0), 24.0, &glyphs)
+        };
+        let right = GlyphRun {
+            transform: AffineTransform {
+                xx: 1.0,
+                yx: 0.0,
+                xy: 0.0,
+                yy: 1.0,
+                dx: 40.0,
+                dy: 0.0,
+            },
+            ..run(FontId(0), 24.0, &glyphs)
+        };
+        let scene = PaintScene {
+            size: GLYPH_SIZE,
+            commands: vec![
+                clear(Color::opaque(255, 255, 255)),
+                PaintCommand::GlyphRun { run: left },
+                PaintCommand::GlyphRun { run: right },
+                PaintCommand::FillRect {
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    },
+                    color: Color::opaque(255, 0, 0),
+                },
+            ],
+            masks: vec![],
+            fonts: vec![font_resource()],
+            images: vec![],
+        };
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+        backend
+            .render_into(GLYPH_SIZE, &scene, &mut target)
+            .unwrap();
+
+        // The trailing rect is exactly at its integer destination: the
+        // glyph-run scene transform was reset after each run.
+        assert_eq!(sample(&target, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(sample(&target, 3, 3), [255, 0, 0, 255]);
+
+        // Both translated 'A's painted ink: the left one near x=8, the right
+        // one near x=40, with a white gap between them (proving the
+        // translation really moved the glyphs).
+        let (count, min_x, min_y, max_x, _max_y) = painted_region(&target, [255, 255, 255, 255]);
+        assert!(count > 0, "both glyphs painted ink");
+        assert_eq!(
+            min_x, 0,
+            "leftmost ink is the trailing red rect's left edge (min_x {min_x})"
+        );
+        assert!(
+            min_y <= 14,
+            "glyph ink reaches up from its baseline (min_y {min_y})"
+        );
+        // The right run starts its ink somewhere after the left run's ink ends.
+        assert!(
+            max_x >= 40 && max_x < GLYPH_SIZE.width as i32,
+            "right-translated glyph painted near x=40 (max_x {max_x})"
+        );
+        // A white gap between the two glyphs.
+        assert_eq!(
+            sample(&target, 30, 20),
+            [255, 255, 255, 255],
+            "the gap between the translated runs stays white"
+        );
+    }
+
+    #[test]
+    fn repeated_rendering_reuses_the_converted_font_and_recreation_clears_it() {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(GLYPH_SIZE).unwrap();
+
+        let scene = glyph_scene(
+            run(
+                FontId(0),
+                24.0,
+                &[GlyphPosition {
+                    id: glyph_id_for('A'),
+                    x: 12.0,
+                    y: 30.0,
+                }],
+            ),
+            vec![font_resource()],
+        );
+
+        // First render converts the scene's font bytes once; the Vello Blob
+        // retains a second reference to the scene-owned Arc<[u8]>.
+        backend
+            .render_into(GLYPH_SIZE, &scene, &mut target)
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&scene.fonts[0].data),
+            2,
+            "the backend cache holds the converted font"
+        );
+
+        // A second frame at the same size reuses the cached conversion: no
+        // new reference is taken, so the count is unchanged.
+        backend
+            .render_into(GLYPH_SIZE, &scene, &mut target)
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&scene.fonts[0].data),
+            2,
+            "the converted font is reused, not re-converted"
+        );
+
+        // A physical-size change recreates the context and its coupled
+        // Resources, which clears the font cache with them.
+        let big = PhysicalSize {
+            width: 128,
+            height: 64,
+        };
+        let big_scene = PaintScene {
+            size: big,
+            commands: vec![clear(Color::opaque(255, 255, 255))],
+            masks: vec![],
+            fonts: vec![],
+            images: vec![],
+        };
+        backend.render_into(big, &big_scene, &mut target).unwrap();
+        assert_eq!(
+            Arc::strong_count(&scene.fonts[0].data),
+            1,
+            "the font cache is cleared when the context is recreated"
+        );
+    }
+
+    /// Rasterizes `presentation`'s first run through Swash into
+    /// [`AlphaMask`] commands (the existing producer path) at the run's own
+    /// absolute baseline positions.
+    fn swash_scene(
+        presentation: &youth_editor_engine::TextPresentation,
+        size: PhysicalSize,
+    ) -> PaintScene {
+        let run = presentation.runs.first().expect("at least one run");
+        let mut rasterizer = GlyphRasterizer::new();
+        let color = Color::opaque(0, 0, 0);
+        let mut masks = Vec::new();
+        let mut commands = vec![PaintCommand::Clear {
+            color: Color::opaque(255, 255, 255),
+        }];
+        for glyph in &run.glyphs {
+            let mask = rasterizer
+                .rasterize(&run.font, glyph.id, run.font_size)
+                .expect("the presentation's glyph rasterizes through Swash");
+            if mask.is_empty() {
+                continue;
+            }
+            let mask_id = MaskId(u32::try_from(masks.len()).expect("too many masks"));
+            let pen_x = glyph.x.round() as i32;
+            let pen_y = glyph.y.round() as i32;
+            masks.push(AlphaMask {
+                left: mask.left,
+                top: mask.top,
+                width: mask.width,
+                height: mask.height,
+                alpha: Arc::from(mask.alpha.as_slice()),
+            });
+            commands.push(PaintCommand::AlphaMask {
+                mask: mask_id,
+                // The mask's left/top are offsets from the pen; the AlphaMask
+                // command composites at its origin, so bake them in.
+                origin: Point {
+                    x: pen_x + mask.left,
+                    y: pen_y - mask.top,
+                },
+                color,
+            });
+        }
+        PaintScene {
+            size,
+            commands,
+            masks,
+            fonts: vec![],
+            images: vec![],
+        }
+    }
+
+    #[test]
+    fn glyph_run_is_structurally_comparable_to_swash_alphamask() {
+        // One host-repeatable fixture from a real Parley presentation: render
+        // the exact same glyph positions through (a) the existing
+        // Swash-to-AlphaMask producer and (b) the Vello GlyphRun path, and
+        // compare bounded-region metrics. No byte-exact hashes -- text
+        // rasterization is antialiased and renderer-specific.
+        let mut engine = ParleyEditorEngine::with_text("Hi");
+        let presentation = engine.presentation();
+        let run = presentation
+            .runs
+            .first()
+            .expect("visible text produces a glyph run");
+        assert!(!run.glyphs.is_empty(), "visible text produces glyphs");
+
+        // A generous scene so the baseline-anchored ink fits either way.
+        let size = PhysicalSize {
+            width: 128,
+            height: 64,
+        };
+        let color = Color::opaque(0, 0, 0);
+
+        let swash_scene = swash_scene(&presentation, size);
+        let glyphs: Vec<GlyphPosition> = run
+            .glyphs
+            .iter()
+            .map(|g| GlyphPosition {
+                id: g.id,
+                x: g.x,
+                y: g.y,
+            })
+            .collect();
+        let vello_scene = PaintScene {
+            size,
+            commands: vec![
+                PaintCommand::Clear {
+                    color: Color::opaque(255, 255, 255),
+                },
+                PaintCommand::GlyphRun {
+                    run: GlyphRun {
+                        font: FontId(0),
+                        font_size: run.font_size,
+                        glyphs: Arc::from(glyphs.as_slice()),
+                        transform: AffineTransform::identity(),
+                        color,
+                        hint: true,
+                    },
+                },
+            ],
+            masks: vec![],
+            fonts: vec![FontResource {
+                key: FontKey(1),
+                data: Arc::from(run.font.data.data()),
+                index: run.font.index,
+            }],
+            images: vec![],
+        };
+
+        let mut backend = VelloCpuBackend::new();
+        let mut swash_target = RenderTarget::new(size).unwrap();
+        backend
+            .render_into(size, &swash_scene, &mut swash_target)
+            .unwrap();
+        let mut vello_target = RenderTarget::new(size).unwrap();
+        backend
+            .render_into(size, &vello_scene, &mut vello_target)
+            .unwrap();
+
+        let white = [255, 255, 255, 255];
+        let (swash_count, swash_min_x, swash_min_y, swash_max_x, swash_max_y) =
+            painted_region(&swash_target, white);
+        let (vello_count, vello_min_x, vello_min_y, vello_max_x, vello_max_y) =
+            painted_region(&vello_target, white);
+        assert!(swash_count > 0 && vello_count > 0, "both paths paint ink");
+
+        // Bounded-region comparability: both must bound roughly the same area
+        // (a few pixels of hinting/AA slop either way), and the painted-pixel
+        // counts must be within a generous factor.
+        let bounds_ok = |a: i32, b: i32| (a - b).abs() <= 6;
+        assert!(
+            bounds_ok(swash_min_x, vello_min_x) && bounds_ok(swash_min_y, vello_min_y),
+            "min bounds comparable: swash ({swash_min_x},{swash_min_y}) vello ({vello_min_x},{vello_min_y})"
+        );
+        assert!(
+            bounds_ok(swash_max_x, vello_max_x) && bounds_ok(swash_max_y, vello_max_y),
+            "max bounds comparable: swash ({swash_max_x},{swash_max_y}) vello ({vello_max_x},{vello_max_y})"
+        );
+        let (bigger, smaller) = (swash_count.max(vello_count), swash_count.min(vello_count));
+        assert!(
+            smaller > 0 && bigger <= smaller * 3,
+            "painted-pixel counts within 3x: swash {swash_count}, vello {vello_count}"
+        );
+
+        // Overlap and per-pixel channel difference over the union of painted
+        // pixels (a pixel is "painted" when it differs from the white
+        // backdrop), reported as the comparison metrics. Both paths composite
+        // opaque text, so alpha is 255 everywhere and the interesting delta
+        // is in the RGB channels at antialiased edges.
+        let (mut overlap, mut union, mut max_alpha_delta) = (0usize, 0usize, 0u8);
+        let mut max_channel_delta = 0u8;
+        let mut sum_channel_delta = 0u64;
+        for y in 0..size.height {
+            for x in 0..size.width {
+                let sw = sample(&swash_target, x, y);
+                let ve = sample(&vello_target, x, y);
+                let s_painted = sw != white;
+                let v_painted = ve != white;
+                max_alpha_delta = max_alpha_delta.max(sw[3].abs_diff(ve[3]));
+                if s_painted || v_painted {
+                    union += 1;
+                    if s_painted && v_painted {
+                        overlap += 1;
+                    }
+                    let delta = (0..3).map(|ch| sw[ch].abs_diff(ve[ch])).max().unwrap();
+                    max_channel_delta = max_channel_delta.max(delta);
+                    sum_channel_delta += u64::from(delta);
+                }
+            }
+        }
+        let overlap_ratio = overlap as f64 / union as f64;
+        let mean_channel_delta = sum_channel_delta as f64 / union as f64;
+
+        println!(
+            "R4 fixture \"Hi\" @ {:.1}px: swash {{painted={swash_count}, bbox=({swash_min_x},{swash_min_y})-({swash_max_x},{swash_max_y})}}, \
+             vello {{painted={vello_count}, bbox=({vello_min_x},{vello_min_y})-({vello_max_x},{vello_max_y})}}, \
+             overlap={overlap}/{union} ({overlap_ratio:.2}), max_channel_delta={max_channel_delta}, \
+             mean_channel_delta={mean_channel_delta:.2}, max_alpha_delta={max_alpha_delta}",
+            run.font_size,
+        );
+
+        // Structural claim, not pixel parity: most painted pixels coincide
+        // even when edge AA/hinting differ. The per-pixel channel deltas are
+        // reported, not asserted, because antialiased edges can legitimately
+        // differ by a lot between two independent rasterizers.
+        assert!(
+            overlap_ratio >= 0.5,
+            "structurally comparable: overlap ratio {overlap_ratio:.2}"
+        );
     }
 }

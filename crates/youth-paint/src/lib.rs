@@ -10,17 +10,20 @@
 //! between those two; it has no rendering logic and no dependency on any
 //! specific backend (Vello, Swash, or otherwise).
 //!
-//! A [`PaintScene`] is three collections: `commands` (the ordered paint
+//! A [`PaintScene`] is four collections: `commands` (the ordered paint
 //! intent), `masks` (reusable alpha-coverage bitmaps referenced by
-//! [`AlphaMask`] commands via [`MaskId`]), and `images` (reserved for a
-//! future full-color image command; no command consumes it yet). Backends
-//! consume the scene through [`PaintBackend::render_into`], which renders
-//! premultiplied RGBA8 into a caller-owned [`RenderTarget`].
+//! [`AlphaMask`] commands via [`MaskId`]), `fonts` (owned [`FontResource`]s
+//! referenced by [`GlyphRun`] commands via [`FontId`]), and `images`
+//! (reserved for a future full-color image command; no command consumes it
+//! yet). Backends consume the scene through
+//! [`PaintBackend::render_into`], which renders premultiplied RGBA8 into a
+//! caller-owned [`RenderTarget`].
 //!
 //! Deliberately narrow for this increment: no paths, gradients, filters,
-//! layers, or transforms beyond the rectangular clip stack and the
-//! 1-physical-pixel stroke policy. Add those only when a real backend
-//! spike or a real control needs them, not speculatively.
+//! layers, or arbitrary path transforms beyond the rectangular clip stack,
+//! the 1-physical-pixel stroke policy, and the run-affine carried by
+//! [`GlyphRun`]. Add those only when a real backend spike or a real control
+//! needs them, not speculatively.
 
 #![forbid(unsafe_code)]
 
@@ -134,6 +137,100 @@ pub struct Image {
     pub pixels: Arc<[u8]>,
 }
 
+/// Indexes a [`PaintScene`]'s `fonts` collection from a
+/// [`PaintCommand::GlyphRun`]. Glyph runs reference fonts by this id rather
+/// than carrying bytes, so the same face is converted to a backend-native
+/// handle at most once per scene (and cached across frames by the backend).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FontId(pub u32);
+
+/// Stable semantic identity for a font resource. Producers must change this
+/// key whenever the bytes or collection face changes; it is not derived from
+/// pointer identity and is safe to use across scenes and frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FontKey(pub u64);
+
+/// An owned, shareable handle to one font face: stable identity, raw file
+/// bytes, and the face's index within a collection (`0` for a plain
+/// single-face file).
+///
+/// Deliberately dependency-free: `data` is just bytes, so no Parley, Swash,
+/// Vello, or Blob type leaks into the scene contract. A backend converts
+/// these bytes to its own font representation; `youth-paint` never does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontResource {
+    /// Stable semantic identity used by backend caches.
+    pub key: FontKey,
+    /// The font file's raw bytes (a `.ttf`, `.otf`, or collection file).
+    pub data: Arc<[u8]>,
+    /// The face's index within a collection file; `0` for a single face.
+    pub index: u32,
+}
+
+/// One glyph positioned within a [`GlyphRun`], at the run's font size.
+/// `x`/`y` are the pen (baseline) position in the run's local coordinate
+/// space, before the run's [`AffineTransform`] is applied to reach scene
+/// coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphPosition {
+    /// The glyph's id **within `run.font`** (a glyph index, not a Unicode
+    /// code point -- the same id `Parley`/Swash hand to a rasterizer).
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A renderer-neutral 2D affine transform over f32 coefficients, matching
+/// the layout convention of kurbo's `Affine` and hence Vello's: a point
+/// `(x, y)` maps to `(xx*x + yx*y + dx, xy*x + yy*y + dy)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AffineTransform {
+    pub xx: f32,
+    pub yx: f32,
+    pub xy: f32,
+    pub yy: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+impl AffineTransform {
+    /// The identity transform.
+    #[must_use]
+    pub const fn identity() -> Self {
+        Self {
+            xx: 1.0,
+            yx: 0.0,
+            xy: 0.0,
+            yy: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+        }
+    }
+}
+
+/// A run of glyphs sharing one font resource, size, color, transform, and
+/// hinting policy, ready for a renderer to rasterize directly.
+///
+/// `glyphs` is an `Arc` so a scene (and producers holding the same run) can
+/// share it without copying. Each glyph's `id` is **font-local**: it only
+/// means something within `font`'s [`FontResource`], and positions are
+/// baseline/scene positions in the run's local space before `transform` is
+/// applied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphRun {
+    pub font: FontId,
+    /// Size in pixels per em. Must be finite and positive for a backend to
+    /// render it.
+    pub font_size: f32,
+    pub glyphs: Arc<[GlyphPosition]>,
+    /// Maps the run's baseline positions into scene space.
+    pub transform: AffineTransform,
+    /// The color the run is filled with (straight sRGB).
+    pub color: Color,
+    /// Whether the backend should apply font hinting while rasterizing.
+    pub hint: bool,
+}
+
 /// One unit of paint intent. A [`PaintScene`]'s `commands` are consumed in
 /// order -- ordering is part of the contract (later commands paint over
 /// earlier ones; `PushClip`/`PopClip` bracket the commands they apply to).
@@ -178,6 +275,21 @@ pub enum PaintCommand {
         origin: Point,
         color: Color,
     },
+    /// Rasterizes a whole glyph run directly (no pre-rasterized coverage
+    /// bitmap): `scene.fonts[run.font]` provides the face, and the backend
+    /// fills `run`'s glyphs with `run.color` at `run.font_size`, hinting
+    /// per `run.hint`, after mapping baseline positions by `run.transform`.
+    ///
+    /// This is the renderer-neutral form of the R4 evaluation: a real
+    /// GlyphRun command with font-resource ownership, in contrast to
+    /// [`PaintCommand::AlphaMask`], which receives text already rasterized
+    /// by `youth-text-render-cpu`. No producer in this increment emits one
+    /// (youth-desktop stays on the Swash-to-AlphaMask path), and backends
+    /// built without glyph-run support reject it with
+    /// [`PaintError::UnsupportedGlyphRun`] rather than silently skipping it.
+    GlyphRun {
+        run: GlyphRun,
+    },
     /// Restricts every subsequent command (until the matching `PopClip`)
     /// to `rect`, intersected with any already-active clip.
     PushClip {
@@ -192,6 +304,7 @@ pub struct PaintScene {
     pub size: PhysicalSize,
     pub commands: Vec<PaintCommand>,
     pub masks: Vec<AlphaMask>,
+    pub fonts: Vec<FontResource>,
     pub images: Vec<Image>,
 }
 
@@ -255,6 +368,14 @@ pub enum PaintError {
     InvalidMaskData { mask: MaskId, reason: &'static str },
     #[error("stroke width {0} is not supported (only 1.0 is)")]
     UnsupportedStrokeWidth(f32),
+    #[error("font {0:?} is not present in the scene's fonts")]
+    InvalidFont(FontId),
+    #[error("font {font:?} data is invalid: {reason}")]
+    InvalidFontData { font: FontId, reason: &'static str },
+    #[error("glyph run for font {font:?} is invalid: {reason}")]
+    InvalidGlyphRun { font: FontId, reason: &'static str },
+    #[error("this backend was built without glyph-run support and cannot render GlyphRun commands")]
+    UnsupportedGlyphRun,
     #[error("backend failure: {0}")]
     BackendFailure(&'static str),
 }
@@ -370,6 +491,7 @@ mod tests {
             },
             commands,
             masks: vec![],
+            fonts: vec![],
             images: vec![],
         }
     }
@@ -504,10 +626,110 @@ mod tests {
                 color: Color::opaque(1, 2, 3),
             }],
             masks: vec![mask.clone()],
+            fonts: vec![],
             images: vec![image.clone()],
         };
         assert_eq!(scene.validate(), Ok(()));
         assert_eq!(scene.masks, vec![mask]);
         assert_eq!(scene.images, vec![image]);
+    }
+
+    #[test]
+    fn font_resource_is_owned_and_shareable_without_copying() {
+        let bytes = vec![1, 2, 3, 4];
+        let resource = FontResource {
+            key: FontKey(7),
+            data: Arc::from(bytes),
+            index: 2,
+        };
+        // Cloning shares the same buffer (a refcount bump), it does not copy
+        // the bytes.
+        let clone = resource.clone();
+        assert_eq!(resource, clone);
+        assert_eq!(resource.key, FontKey(7));
+        assert_eq!(resource.index, 2);
+        assert_eq!(&*resource.data, &[1, 2, 3, 4]);
+        assert_eq!(Arc::strong_count(&resource.data), 2);
+
+        // A FontId keys the scene's fonts collection exactly like MaskId
+        // keys masks.
+        assert_eq!(FontId(0), FontId(0));
+        assert_ne!(FontId(0), FontId(1));
+    }
+
+    #[test]
+    fn glyph_run_and_affine_transform_round_trip() {
+        let transform = AffineTransform {
+            xx: 1.5,
+            yx: 0.0,
+            xy: 0.0,
+            yy: 1.5,
+            dx: 10.0,
+            dy: 20.0,
+        };
+        assert_eq!(
+            AffineTransform::identity(),
+            AffineTransform {
+                xx: 1.0,
+                yx: 0.0,
+                xy: 0.0,
+                yy: 1.0,
+                dx: 0.0,
+                dy: 0.0,
+            }
+        );
+        // An identity transform maps any point to itself under the documented
+        // coefficient convention x' = xx*x + yx*y + dx, y' = xy*x + yy*y + dy.
+        let identity = AffineTransform::identity();
+        let (x, y) = (3.5_f32, -2.25_f32);
+        assert_eq!(identity.xx * x + identity.yx * y + identity.dx, x);
+        assert_eq!(identity.xy * x + identity.yy * y + identity.dy, y);
+
+        let run = GlyphRun {
+            font: FontId(0),
+            font_size: 16.0,
+            glyphs: Arc::from(
+                vec![
+                    GlyphPosition {
+                        id: 36,
+                        x: 0.0,
+                        y: 0.0,
+                    },
+                    GlyphPosition {
+                        id: 37,
+                        x: 9.6,
+                        y: 0.0,
+                    },
+                ]
+                .as_slice(),
+            ),
+            transform,
+            color: Color::opaque(0, 0, 0),
+            hint: true,
+        };
+        let scene = PaintScene {
+            size: PhysicalSize {
+                width: 10,
+                height: 10,
+            },
+            commands: vec![PaintCommand::GlyphRun { run: run.clone() }],
+            masks: vec![],
+            fonts: vec![FontResource {
+                key: FontKey(1),
+                data: Arc::from(vec![9u8; 64].as_slice()),
+                index: 0,
+            }],
+            images: vec![],
+        };
+        assert_eq!(scene.validate(), Ok(()));
+        assert_eq!(scene.fonts.len(), 1);
+        match &scene.commands[0] {
+            PaintCommand::GlyphRun { run: scene_run } => assert_eq!(scene_run, &run),
+            other => panic!("expected a GlyphRun command, got {other:?}"),
+        }
+        // Glyph ids are font-local integers; positions are baseline
+        // coordinates in the run's local space.
+        assert_eq!(run.glyphs[0].id, 36);
+        assert_eq!(run.glyphs[1].x, 9.6);
     }
 }

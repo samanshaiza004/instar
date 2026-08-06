@@ -2,6 +2,10 @@
 
 Date: 2026-08-05
 
+R5 later adopted the Vello CPU path as the unset/default backend. The selector
+and direct-buffer architecture described here remain valid; references below
+to Vello being opt-in describe the R3 implementation state before that flip.
+
 Scope of R3 (on top of the uncommitted R1+R2 worktree):
 
 1. **The converter moved to the presentation boundary.** `rgba8_to_rgbx32`
@@ -26,22 +30,33 @@ Scope of R3 (on top of the uncommitted R1+R2 worktree):
 5. **Scene-opacity validation** at the paint/bridge seam.
 6. This note.
 
+The pinned `vello_cpu = "=0.1.0"` path validates physical dimensions before
+narrowing them. Its internal u16/depth-bucket arithmetic makes `65_280` the
+largest safe dimension for this pin; `65_535` and `65_536` are rejected with a
+typed backend-limit error rather than reaching an upstream panic. Revisit this
+guard only as part of a reviewed Vello version upgrade.
+
 ## Render-backend selector
 
-- Env var: `YOUTH_RENDER_BACKEND`.
+- Env var: `YOUTH_RENDER_BACKEND`. A development/certification switch, not a
+  permanent public production interface: its values are not stable, and an
+  unrecognized value fails closed.
 - Unset, or the value `legacy`: the legacy `FrameBuffer` comparison path
   (unchanged R0 behavior and hashes; still uses its existing
   `copy_from_slice` presentation copy).
 - `vello_cpu`: the opt-in Vello CPU path (persistent `VelloCpuBackend` +
   reusable premultiplied RGBA8 `RenderTarget`, direct-buffer conversion, no
   `copy_from_slice`).
-- Any other value: falls back to `legacy` and emits a `tracing::warn!` naming
-  the offending value, so a typo is diagnosable rather than silently ignored.
-  The parse (`native::parse_render_backend`) is pure and unit-tested without
-  touching the process environment.
-
-The selector is read exactly once, at app construction, and stored on
-`NativeApp`.
+- Any other explicit value is a **startup/configuration error**
+  (`DesktopError::Arguments`) naming the offending value and the variable --
+  fail closed, never warn-and-fallback, so a typo cannot silently launch the
+  wrong renderer. The selector is resolved **before the event loop is
+  created**, so invalid configuration fails at `run`/`run_capsule_launch`
+  time rather than presenting a window.
+- The parse (`native::parse_render_backend`) is pure and unit-tested for
+  unset/`legacy`/`vello_cpu`/invalid without touching the process
+  environment; the env read happens exactly once, at app construction, and
+  is stored on `NativeApp`.
 
 ## Direct-buffer flow (Vello path)
 
@@ -53,9 +68,10 @@ Per frame, `native.rs::present_vello`:
 2. Validates the scene-opacity contract at the bridge seam
    (`softbuffer_bridge::validate_scene_opacity`).
 3. Renders into the reusable premultiplied RGBA8 `RenderTarget` with the
-   persistent `VelloCpuBackend`. The backend resizes the target in place and
-   recreates its own render context whenever the physical size changes —
-   nothing is freshly allocated per frame.
+   persistent `VelloCpuBackend` via `render_into_timed`, which validates the
+   size against the renderer's u16 limit, recreates the backend's render
+   context **and its coupled `Resources`** whenever the physical size
+   changes, and resizes the caller's target in place.
 4. Resizes the softbuffer surface **before** acquiring the buffer (so the
    acquired buffer is exactly `width * height` words), acquires it, and
    converts `target.pixels()` **directly into `&mut buffer[..]`** via the
@@ -66,6 +82,16 @@ The target/backend are created lazily on the first Vello frame and resized
 through the existing resize/scale-factor flow (scale-factor changes already
 trigger relayout + redraw, which reach `present_vello` with the new physical
 size).
+
+## Allocation wording
+
+The Vello path is **not** an allocation-free pipeline. The bridge conversion
+(`softbuffer_bridge::convert_rgba8_to_rgbx32`) is allocation-free, and both
+the Vello `RenderTarget` and the softbuffer buffer are reused across frames,
+but platform internals (softbuffer's buffer re-acquisition and remap, the
+windowing system, and Vello's context recreation on a size change) may
+allocate or remap memory as they see fit. `backend_resize_us` exists so the
+size-change recreation is separately attributable.
 
 ## Error / no-present behavior
 
@@ -80,16 +106,47 @@ size).
   documents that its length checks are atomic but a late `NonOpaquePixel`
   failure may leave earlier destination words written.
 
+## Opacity protections (exactly two, no redundant pass)
+
+There are exactly two opacity protections, unchanged in shape from R3:
+
+1. **One scene-contract check** at the paint/bridge seam: the scene's first
+   command must be an opaque `Clear` (`validate_scene_opacity`). The
+   intentional R0 fault-overlay *second* `Clear` is the documented exception
+   to a hypothetical exactly-one-clear rule and is deliberately not reworked.
+2. **Final per-pixel authority** in the bridge: `convert_rgba8_to_rgbx32`
+   rejects any non-opaque pixel that survives compositing
+   (`SoftbufferError::NonOpaquePixel`), so nothing translucent can reach the
+   alpha-less `0x00RRGGBB` output.
+
+No redundant opacity passes were added.
+
 ## Timing fields (Vello path, debug level)
 
 `present_vello` emits one `tracing::debug!` event (target
 `youth_desktop::render`) with structured fields, in microseconds:
 
-- `scene_us` — PaintScene construction (including opacity validation).
-- `render_us` — Vello CPU render into the reusable target.
-- `convert_us` — RGBA8 → 0x00RRGGBB conversion into the acquired buffer.
+- `scene_us` — PaintScene construction (including the opacity scene-contract
+  check).
+- `backend_resize_us` — backend preparation inside `render_into_timed`:
+  only when the physical size changed — recreating the
+  Vello render context and its coupled `Resources`, plus resizing the
+  reusable `RenderTarget` in place. Zero on a steady-state frame at an
+  unchanged size.
+- `render_us` — Vello CPU scene recording and rasterization into the
+  reusable target (reported by `render_into_timed` separately from
+  `backend_resize_us`).
+- `surface_resize_us` — the softbuffer `surface.resize` call, measured
+  separately from acquisition so platform remap cost is attributable.
+- `acquire_us` — softbuffer `surface.buffer_mut()` acquisition.
+- `convert_us` — the allocation-free RGBA8 → 0x00RRGGBB conversion directly
+  into the acquired buffer.
 - `present_us` — softbuffer `present()`.
 - `total_us` — total Vello present pipeline time.
+- `unaccounted_us` — `total_us` minus the sum of the accounted stage fields.
+  The stages are sequential sub-intervals of the total, so this is
+  non-negative; it is clamped with `saturating_sub` against sub-microsecond
+  rounding drift.
 
 Debug level means idle normal operation does not print these by default. The
 legacy path keeps its existing `info`-level `desktop.present` span and no
@@ -141,6 +198,14 @@ modification test. The R2 benchmark target moved from
 `youth-render-vello-cpu` to `youth-desktop` with the converter.
 
 ## Remaining R3.3–R3.5 certification work (not done here)
+
+### Local macOS snapshot
+
+The current optimized `youth` launcher is 30,075,392 bytes on this machine,
+and `youth --help` took 1.15 seconds wall-clock in one cold process run. These
+are raw single-host observations, not dependency deltas or first-window/first-
+editable-frame measurements, so they must not be used as the R5 package or
+startup decision.
 
 - **R3.3 — real-hardware fixture certification.** No real hardware claims are
   made in R3. The Vello path must be certified on macOS (arm64), Windows, and

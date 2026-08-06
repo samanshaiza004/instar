@@ -5,8 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Vello CPU paint backend for Youth: renders youth-paint PaintScenes into a caller-owned premultiplied RGBA8 RenderTarget."
 
+[features]
+# Opt-in evaluation surface for Gate R4: enables vello_cpu's `text` feature
+# so the backend can render youth-paint `GlyphRun` commands directly. Not a
+# default -- the default feature set stays exactly the AlphaMask-only one,
+# and nothing in youth-desktop enables this flag. `skrifa` (the same version
+# glifo uses) validates font bytes before handing them to Vello, whose 0.1.0
+# text path would otherwise panic on invalid data.
+glyph-run = ["vello_cpu/text", "dep:skrifa"]
+
 [dependencies]
 youth-paint = { path = "../youth-paint" }
+skrifa = { version = "=0.44.0", optional = true }
 
 # Pinned exactly, and intentionally so: vello_cpu's API is unstable and can
 # change without a semver bump (the crate is pre-1.0 and under active
@@ -15,7 +25,16 @@ youth-paint = { path = "../youth-paint" }
 # of this crate's and youth-desktop's test suites. Default features are
 # reduced to what this backend actually uses: `std` for a normal host, the
 # `u8_pipeline` for the speed-focused RenderMode::OptimizeSpeed default. The
-# `text` feature (font rasterization) is deliberately excluded -- glyph
-# coverage already arrives rasterized as youth-paint AlphaMasks from
-# youth-text-render-cpu.
+# `text` feature (font rasterization) is deliberately excluded from the
+# default feature set -- glyph coverage normally arrives rasterized as
+# youth-paint AlphaMasks from youth-text-render-cpu. The opt-in `glyph-run`
+# feature enables `text` for the R4 GlyphRun evaluation only.
 vello_cpu = { version = "=0.1.0", default-features = false, features = ["std", "u8_pipeline"] }
+
+[dev-dependencies]
+# Test-only: the R4 comparison fixture constructs a real Parley presentation
+# (youth-editor-engine) and rasterizes the same glyphs through the Swash
+# GlyphMask/AlphaMask producer (youth-text-render-cpu) to compare against the
+# Vello GlyphRun path. Neither is a runtime dependency of this backend.
+youth-editor-engine = { path = "../youth-editor-engine" }
+youth-text-render-cpu = { path = "../youth-text-render-cpu" }
