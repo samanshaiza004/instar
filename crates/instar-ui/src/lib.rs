@@ -752,3 +752,59 @@ mod tests {
         ));
     }
 }
+
+/// Pointer interaction state for one surface.
+///
+/// Lives here rather than in the host because it is presentation behaviour:
+/// deciding that a press followed by a release *over the same node* is an
+/// activation is a UI rule, not an orchestration one. Per docs/PHASE-1.md's
+/// layering, `instar-host` routes; `instar-ui` decides what input means.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Interaction {
+    /// The node a press landed on, if any. Cleared on release.
+    pressed: Option<NodeKey>,
+}
+
+impl Interaction {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pressed(&self) -> Option<NodeKey> {
+        self.pressed
+    }
+
+    /// A press landed at `(x, y)`. Records the target; activates nothing.
+    ///
+    /// Activation deliberately waits for the release, matching every desktop
+    /// convention: pressing a button and dragging away must not activate it.
+    pub fn on_press(&mut self, tree: &Tree, layout: &LayoutSnapshot, x: i32, y: i32) {
+        self.pressed = tree.hit_test(layout, x, y).map(|node| node.key);
+    }
+
+    /// A release landed at `(x, y)`.
+    ///
+    /// Activates only when the release lands on the same node the press did.
+    /// Releasing elsewhere cancels, which is what lets a user change their
+    /// mind mid-click.
+    pub fn on_release(
+        &mut self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        x: i32,
+        y: i32,
+    ) -> Option<UiAction> {
+        let pressed = self.pressed.take()?;
+        let released_on = tree.hit_test(layout, x, y)?.key;
+        (released_on == pressed).then_some(UiAction::ButtonActivated(pressed))
+    }
+
+    /// Abandons any in-progress press.
+    ///
+    /// The host calls this when geometry is invalidated: the press was
+    /// recorded against a layout that no longer exists, so completing it could
+    /// activate a node that has since moved elsewhere.
+    pub fn cancel(&mut self) {
+        self.pressed = None;
+    }
+}

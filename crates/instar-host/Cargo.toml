@@ -1,0 +1,12 @@
+[package]
+name = "instar-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's orchestration layer: routes window input to the UI layer, UI actions to the guest, and guest commits back to layout. The only crate that bridges logical presentation to physical rendering."
+
+[dependencies]
+# The three layers this crate composes, and the only place they meet.
+instar-kernel = { path = "../instar-kernel" }
+instar-ui = { path = "../instar-ui" }
+instar-window = { path = "../instar-window" }

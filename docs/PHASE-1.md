@@ -330,9 +330,33 @@ Exit gate, met: guest provides zero geometry; host produces a deterministic
 round-trip still works.
 
 **WP7B** — `instar-host` composition: compose window + ui + kernel. Enforce the
-metrics barrier (no render, no hit-test/activation while invalid), route
-`UiAction` to guest events via the kernel, own close policy and guest-trap
-presentation.
+metrics barrier, route `UiAction` to guest events, own close policy. (routing
+core done; kernel event-loop wiring and guest-trap presentation remain)
+
+Metrics capability is modelled directly rather than as flags:
+
+```rust
+enum MetricsState {
+    Blocked { last_valid: Option<WindowMetrics> },
+    Ready(WindowMetrics),
+}
+```
+
+`last_valid` is diagnostics and cache context only — never lay out, hit-test,
+or render from it. The only way to obtain usable metrics is `usable()`, which
+returns `None` unless `Ready`, so "stale but present" is not reachable as a
+usable value.
+
+```text
+Blocked:                          Ready(new):
+- no layout                       - recompute layout first
+- no UI hit testing               - replace LayoutSnapshot
+- no UI activation                - then process actionable input/render
+- no app-content render           - service pending redraw
+- redraw request becomes pending
+- pointer position may update
+- close/lifecycle still works
+```
 **WP8** — counter guest and fixtures
 **WP9** — CI rewrite; compare against the WP0.3 baseline
 

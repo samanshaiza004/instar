@@ -1271,6 +1271,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "instar-host"
+version = "0.0.2"
+dependencies = [
+ "instar-kernel",
+ "instar-ui",
+ "instar-window",
+]
+
+[[package]]
 name = "instar-kernel"
 version = "0.0.2"
 dependencies = [
