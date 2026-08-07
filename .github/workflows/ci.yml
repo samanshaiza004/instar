@@ -1,0 +1,170 @@
+name: CI
+
+# Instar's pipeline (WP9), replacing the kernel-only `gate0.yml` it grew out
+# of. The whole suite, on all three target platforms.
+#
+# The point of running on three OSes is not thoroughness for its own sake.
+# Instar's claims are about a *runtime*: "a guest suspends at zero cost" has to
+# hold on Windows' and Linux' scheduler and timer behaviour too, and "a click
+# round-trip stays prompt" has to hold wherever winit and Wasmtime actually
+# run. A single-platform green is evidence about this machine.
+#
+# What CI deliberately does **not** cover: the compositor. `softbuffer`'s
+# `present()` is the real platform presentation boundary, and asserting what
+# happens past it needs a display server and a human. That is the manual smoke
+# test in docs/PHASE-1.md, and building a screenshot harness to replace it
+# would be the same category error as tightening a latency budget against an
+# unloaded runner.
+
+on:
+  push:
+    branches: [master, instar-phase-1]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are worthless in CI (every job is a fresh checkout)
+  # and cost real disk and time to produce.
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Formatting and lints once, on the cheapest runner: they are
+  # platform-independent, and three copies of the same clippy failure is three
+  # times the noise for no extra information.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - run: cargo fmt --all --check
+      # --all-targets so tests and build scripts are linted too. The guests are
+      # separate workspaces and are linted in their own job below.
+      - run: cargo clippy --workspace --all-targets
+
+  # The guests are their own workspaces, so the command above never sees them.
+  # They are the code most likely to rot unnoticed — nothing imports them, and
+  # they only run inside a build script.
+  guests:
+    name: guest lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: guests
+      - name: Check every guest
+        shell: bash
+        run: |
+          set -euo pipefail
+          for guest in guests/*/; do
+            [ -f "$guest/Cargo.toml" ] || continue
+            echo "::group::$guest"
+            (cd "$guest" && cargo fmt --all --check)
+            (cd "$guest" && cargo clippy --target wasm32-wasip2 --all-targets)
+            echo "::endgroup::"
+          done
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel the other platforms when one fails: *which* platform
+      # failed is the information a cross-platform claim needs, and a
+      # fail-fast cancel destroys exactly that.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned per docs/TOOLCHAIN.md. Every guest is built by a build script,
+      # so the wasm target must be present even though no step names it.
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@1.255.0
+
+      # Split out from the workspace run so a Gate 0 failure is identifiable at
+      # a glance rather than buried in 300 passing tests. It is the finding
+      # every other decision here rests on.
+      - name: Gate 0 -- a settled guest costs nothing
+        run: cargo test -p instar-kernel --test gate0 -- --nocapture
+
+      - name: The rest of the suite
+        run: cargo test --workspace
+
+      # --nocapture so the p50/p95/p99 telemetry reaches the log. Not asserted
+      # on (see docs/PHASE-1.md); recorded so a regression has a paper trail
+      # from before it happened.
+      - name: Bridge round-trip latency
+        run: cargo test -p instar-host --test bridge -- --nocapture
+
+      # Linux only: ~35s of generation churn, and the RSS trend it asserts on
+      # is most stable on the runner with the least noisy memory accounting.
+      # The property is platform-independent; proving it three times costs
+      # minutes to learn nothing.
+      - name: Soak -- 1000 generation teardowns stay bounded
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p instar-kernel --test soak -- --ignored --nocapture
+
+      # Validates on each OS that the components the tests just ran against are
+      # well-formed and kept their async exports. Catches a platform-specific
+      # toolchain problem that would otherwise hide behind a passing test.
+      - name: Validate every built component
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r wasm; do
+            found=$((found + 1))
+            echo "validating $wasm"
+            wasm-tools validate --features all "$wasm"
+          done < <(find target/debug/build -name '*.wasm' -path '*wasm32-wasip2*')
+
+          if [ "$found" -eq 0 ]; then
+            echo "no components found under target/debug/build -- the guests did not build" >&2
+            exit 1
+          fi
+          echo "validated $found component(s)"
+
+      # The async export is the whole premise. If wit-bindgen or Wasmtime ever
+      # silently degrade it to a synchronous function, every idle claim Instar
+      # makes becomes false while the tests keep passing.
+      - name: The guests' exports are still async
+        shell: bash
+        run: |
+          set -euo pipefail
+          wasm=$(find target/debug/build -name 'counter.wasm' -path '*wasm32-wasip2*' | head -1)
+          [ -n "$wasm" ] || { echo "no counter component built" >&2; exit 1; }
+          wasm-tools component wit "$wasm" | grep -q 'export run: async func' \
+            || { echo "the counter guest lost its async export" >&2; exit 1; }
+
+  # Licences, advisories, and the source allowlist. Its own job because it
+  # needs no build and should not wait for one.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

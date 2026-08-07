@@ -1,4 +1,4 @@
-//! WP7B1 acceptance gate: the runtime/main-thread bridge.
+//! WP7B1 acceptance gate: the runtime/main-thread bridge, plus WP8's breadth.
 //!
 //! Every test here runs a real `wasm32-wasip2` guest in a real
 //! `instar-kernel` generation on a real second thread. Nothing between the
@@ -22,6 +22,12 @@
 //! | 9 | an old-generation commit is rejected before decoding | [`an_old_generation_commit_is_rejected_before_decoding`] |
 //! | 10 | 1,000 cycles leave queues and operation counts at baseline | [`a_thousand_click_cycles_return_to_baseline`] |
 //!
+//! WP8 adds the rest of what a guest is permitted to do wrong — garbage,
+//! well-formed nonsense, oversized batches, going silent, and failing with
+//! more text than the crash surface will hold. Those live at the bottom of the
+//! file, and each asserts the same thing after the refusal: that everything
+//! still works.
+//!
 //! # Promptness, not eventual completion
 //!
 //! Wasmtime warns that a future inside `run_concurrent` can go unpolled for an
@@ -41,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, Wake};
-use instar_host::{HostEffect, HostWindow};
+use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
 use instar_ui::protocol::{BatchEncoder, WireDimension, WireLayout, flags, opcode};
@@ -59,6 +65,11 @@ const LABEL: NodeKey = NodeKey(2);
 const COUNT: NodeKey = NodeKey(3);
 const BULK: NodeKey = NodeKey(5);
 const CRASH: NodeKey = NodeKey(6);
+const GARBAGE: NodeKey = NodeKey(7);
+const NONSENSE: NodeKey = NodeKey(8);
+const GIANT: NodeKey = NodeKey(9);
+const SILENT: NodeKey = NodeKey(10);
+const FLOOD: NodeKey = NodeKey(11);
 
 /// The bound a click-to-committed-tree round-trip must stay inside.
 ///
@@ -119,7 +130,7 @@ impl Latencies {
 }
 
 fn component() -> Vec<u8> {
-    std::fs::read(env!("HOST_GUEST_WASM")).expect("host-guest fixture built by build.rs")
+    std::fs::read(env!("HOSTILE_WASM")).expect("the hostile guest is built by build.rs")
 }
 
 fn metrics(scale: f64) -> WindowMetricsChanged {
@@ -163,6 +174,37 @@ fn ready() -> (HostBridge, Arc<Wakes>) {
     bridge.on_window_event(WindowOutput::MetricsChanged(metrics(1.0)));
     await_commit(&mut bridge).expect("the guest commits its opening interface");
     (bridge, wakes)
+}
+
+/// Waits for the host to refuse one more commit, returning how long it took.
+///
+/// A rejection is not a revision, so [`await_commit`] would sit here until it
+/// timed out — which is itself the shape of the bug this distinguishes: a host
+/// that quietly *applied* a bad batch would satisfy `await_commit` and fail
+/// this.
+fn await_rejection(bridge: &mut HostBridge) -> Option<Duration> {
+    let target = bridge.stats().rejected_commits + 1;
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        bridge.wait(Duration::from_millis(50));
+        if bridge.stats().rejected_commits >= target {
+            return Some(started.elapsed());
+        }
+    }
+    None
+}
+
+/// Waits for the guest to be reported gone, returning the error it died with.
+fn await_guest_gone(bridge: &mut HostBridge) -> Option<String> {
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        for effect in bridge.wait(Duration::from_millis(50)) {
+            if let HostEffect::GuestGone { error, .. } = effect {
+                return error;
+            }
+        }
+    }
+    panic!("the guest never reported that it was gone");
 }
 
 /// Waits for exactly one more applied commit, returning how long it took.
@@ -642,5 +684,168 @@ fn a_thousand_click_cycles_return_to_baseline() {
     assert!(
         bridge.pump().is_empty(),
         "and nothing should be left waiting on the runtime->main queue"
+    );
+}
+
+// --- WP8: the rest of what a guest is permitted to do wrong ---
+//
+// The ten tests above are WP7B1's gate. These are the breadth WP8 adds: every
+// failure mode the protocol allows, driven by clicking a button, with the
+// same assertion behind each one — the host refuses it, says so, keeps the
+// last good interface, and still works afterwards.
+//
+// "Still works afterwards" is the part worth having. A host that survives a
+// bad batch but is subtly poisoned by it passes a test that stops at the
+// rejection.
+
+/// Bytes that are not a batch at all: rejected at the wire layer, before
+/// anything is interpreted.
+#[test]
+fn a_guest_committing_garbage_is_refused_and_keeps_working() {
+    let (mut bridge, _wakes) = ready();
+    let before = label(&bridge);
+    let revision = bridge.revision();
+
+    click(&mut bridge, GARBAGE);
+    await_rejection(&mut bridge).expect("the host should refuse undecodable bytes");
+
+    assert_eq!(bridge.stats().rejected_commits, 1);
+    assert_eq!(
+        bridge.revision(),
+        revision,
+        "a refused batch is not a revision"
+    );
+    assert_eq!(
+        label(&bridge),
+        before,
+        "the last good interface still stands"
+    );
+
+    // The part that matters: the guest is not poisoned, and neither is the host.
+    click(&mut bridge, COUNT);
+    await_commit(&mut bridge).expect("the guest still answers clicks");
+    assert_eq!(label(&bridge), "Clicked 1 times, 0 bulk");
+    assert_eq!(bridge.stats().rejected_commits, 1, "and nothing else broke");
+}
+
+/// A batch that parses cleanly and describes an impossible tree — two roots.
+///
+/// Distinct from garbage on purpose. The wire layer reports what the bytes
+/// say; `instar-ui` decides whether that is a sensible interface. A host that
+/// only checked parsing would apply this one.
+#[test]
+fn a_batch_that_parses_but_means_nothing_is_refused_too() {
+    let (mut bridge, _wakes) = ready();
+    let before = label(&bridge);
+
+    click(&mut bridge, NONSENSE);
+    await_rejection(&mut bridge).expect("the host should refuse a nested root");
+
+    assert_eq!(bridge.stats().rejected_commits, 1);
+    assert_eq!(label(&bridge), before);
+
+    click(&mut bridge, COUNT);
+    await_commit(&mut bridge).expect("the guest still answers clicks");
+    assert_eq!(label(&bridge), "Clicked 1 times, 0 bulk");
+}
+
+/// A batch past the protocol's `MAX_BATCH_BYTES`.
+///
+/// The host must refuse it on size rather than attempt to decode a megabyte
+/// of guest-chosen bytes to find out whether it is any good.
+#[test]
+fn an_oversized_batch_is_refused_on_size() {
+    let (mut bridge, _wakes) = ready();
+    let before = label(&bridge);
+
+    click(&mut bridge, GIANT);
+    let elapsed = await_rejection(&mut bridge).expect("the host should refuse an oversized batch");
+
+    assert!(
+        elapsed < PROMPT,
+        "refusing an oversized batch took {elapsed:?}; a size check should be \
+         immediate, not proportional to what was sent"
+    );
+    assert_eq!(bridge.stats().rejected_commits, 1);
+    assert_eq!(label(&bridge), before);
+}
+
+/// A guest that simply stops describing an interface.
+///
+/// Not a trap, not an exit, not an error — and the host must not treat it as
+/// any of those. There is nothing to report and nothing to clean up; the last
+/// interface stays on screen and the guest stays alive.
+#[test]
+fn a_guest_that_goes_silent_is_not_mistaken_for_one_that_died() {
+    let (mut bridge, _wakes) = ready();
+    let before = label(&bridge);
+    let revision = bridge.revision();
+
+    click(&mut bridge, SILENT);
+
+    // Give it every chance to do something wrong.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(500) {
+        for effect in bridge.wait(Duration::from_millis(50)) {
+            if let HostEffect::GuestGone { .. } = effect {
+                panic!("a guest that stopped committing was reported as gone");
+            }
+        }
+    }
+
+    assert_eq!(bridge.revision(), revision, "nothing was committed");
+    assert_eq!(
+        label(&bridge),
+        before,
+        "and the last interface still stands"
+    );
+    assert_eq!(
+        bridge.stats().rejected_commits,
+        0,
+        "nothing was refused either"
+    );
+    assert_eq!(
+        bridge.generation(),
+        bridge.generation(),
+        "the generation is still current"
+    );
+    assert!(bridge.live_operations() == 0);
+}
+
+/// The crash surface's own boundedness, end to end.
+///
+/// The unit tests clamp a string. This clamps a real trap, from a real guest,
+/// that really panicked with far more text than the surface will hold — and
+/// checks that the complete diagnostic still reaches the caller for the log.
+#[test]
+fn a_trap_with_an_enormous_message_still_leaves_a_bounded_crash_surface() {
+    let (mut bridge, _wakes) = ready();
+
+    click(&mut bridge, FLOOD);
+    let error = await_guest_gone(&mut bridge).expect("a trap reports an error");
+
+    assert!(
+        error.len() > instar_host::present::MAX_CRASH_MESSAGE_BYTES,
+        "the fixture should trap with more text than the surface will hold, \
+         got {} bytes",
+        error.len()
+    );
+
+    let PresentationState::Crashed { message, .. } = bridge.host().presentation() else {
+        panic!("a trap should have crashed the presentation");
+    };
+    assert!(
+        message.len() <= instar_host::present::MAX_CRASH_MESSAGE_BYTES + 64,
+        "a {}-byte trap was retained as {} bytes",
+        error.len(),
+        message.len()
+    );
+    assert!(
+        bridge
+            .host()
+            .window(WINDOW)
+            .and_then(HostWindow::scene)
+            .is_some(),
+        "and it still produces a frame"
     );
 }

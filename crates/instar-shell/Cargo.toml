@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 instar-host = { path = "../instar-host" }
-instar-kernel = { path = "../instar-kernel" }
 instar-paint = { path = "../instar-paint" }
 instar-window = { path = "../instar-window" }
 
@@ -32,3 +31,6 @@ skrifa = "=0.44.0"
 
 [dev-dependencies]
 instar-ui = { path = "../instar-ui" }
+
+[build-dependencies]
+instar-guest-build = { path = "../instar-guest-build" }

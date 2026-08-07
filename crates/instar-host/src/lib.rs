@@ -52,12 +52,21 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, LayoutSnapshot, Tree, TreeError, UiAction, Viewport};
+use instar_ui::{Interaction, TreeError, UiAction, Viewport};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
 };
 
 pub use present::{GlyphSource, PresentationState, SceneBuilder, Theme};
+
+/// The `instar-ui` vocabulary this crate's own API already speaks.
+///
+/// Re-exported so a consumer can name what [`HostWindow::layout`] and
+/// [`HostWindow::tree`] hand back without taking a direct dependency on the UI
+/// layer. That edge would not be *wrong* — this crate is above it — but a
+/// caller adding a dependency purely to spell a return type is a caller being
+/// made to know something it does not need to.
+pub use instar_ui::{LayoutSnapshot, NodeKey, Rect, Tree};
 
 /// Whether a window's geometry can be used right now.
 ///

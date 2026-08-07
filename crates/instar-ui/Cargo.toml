@@ -23,3 +23,6 @@ taffy = "0.12.2"
 # meaning, so the interaction tests live here rather than in the kernel.
 instar-kernel = { path = "../instar-kernel" }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[build-dependencies]
+instar-guest-build = { path = "../instar-guest-build" }

@@ -1,11 +1,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/youth-tree",
-    "crates/youth-sdk",
-    "crates/youth-interaction",
-    "crates/youth-editor-engine",
-    "crates/youth-text-render-cpu",
     "crates/instar-paint",
     "crates/instar-render-vello-cpu",
     "crates/instar-kernel",
@@ -14,15 +9,18 @@ members = [
     "crates/instar-window",
     "crates/instar-host",
     "crates/instar-shell",
+    "crates/instar-guest-build",
 ]
 
-# youth-runtime and youth-desktop are temporarily out of the workspace: both
-# have a stale path dependency on the deleted youth-state crate, and both are
-# source-only salvage material for Instar Phase 1 (instar-kernel extracted its
-# engine-config seed from youth-runtime in WP2; instar-window/instar-host will
-# extract from youth-desktop in WP6/WP7) rather than crates that get fixed in
-# place. Their files remain on disk for reference; re-add or delete them once
-# WP6/WP7 land.
+# The predecessor's crates are gone as of WP10. Every one was either salvaged
+# (instar-kernel's engine config from youth-runtime; instar-window and
+# instar-host from youth-desktop; instar-paint and instar-render-vello-cpu
+# renamed wholesale in WP0.4) or superseded, and nothing in Instar linked any
+# of them -- only comments referred to them, which they still do, because
+# provenance is worth keeping.
+#
+# The source is not lost: it is all at the `managed-youth-final` tag (78650bc),
+# which is also what docs/baselines/ measures against.
 
 [workspace.package]
 version = "0.0.2"

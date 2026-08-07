@@ -146,11 +146,14 @@ impl std::fmt::Debug for MonoFont {
 
 /// The face the shell ships.
 ///
-/// Borrowed from `youth-text-render-cpu`'s assets rather than copied: it is
-/// the same file, it is already in the repository under the OFL, and a second
-/// copy would be 180KB of drift waiting to happen. Instar has no font story of
-/// its own yet — when it grows one, this constant is where it starts.
-pub const ROBOTO_MONO: &[u8] = include_bytes!("../../youth-text-render-cpu/assets/RobotoMono.ttf");
+/// Roboto Mono, under the SIL Open Font License; `assets/OFL.txt` is the
+/// licence text. Inherited from the predecessor codebase's text renderer and
+/// moved here in WP10, when that crate was removed — a shipped binary should
+/// not reach into a deleted crate's directory for the font it draws with.
+///
+/// Instar has no font story of its own yet. When it grows one, this constant
+/// is where it starts.
+pub const ROBOTO_MONO: &[u8] = include_bytes!("../assets/RobotoMono.ttf");
 
 /// The shipped face, ready to use.
 pub fn default_font() -> Result<MonoFont, FontError> {

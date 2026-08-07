@@ -1,0 +1,8 @@
+[package]
+name = "instar-guest-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-script support for compiling Instar guests to wasm32-wasip2. Used only as a build-dependency; nothing links it at runtime."
+
+[dependencies]

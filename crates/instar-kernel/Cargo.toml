@@ -8,10 +8,10 @@ description = "Pure Wasmtime Component Model async runtime for Instar: engine co
 [dependencies]
 wasmtime = "47.0.3"
 wasmtime-wasi = "47.0.3"
-thiserror = "2.0.19"
-tracing = "0.1.44"
 tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[build-dependencies]
+instar-guest-build = { path = "../instar-guest-build" }

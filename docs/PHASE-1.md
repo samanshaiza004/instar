@@ -709,18 +709,28 @@ WP10  docs, dependency audit, dead-code/dependency cleanup
       -> Phase 1 closed
 ```
 
-**WP8** — counter guest and fixture consolidation. Partly landed: the counter
-guest the shell runs lives in `crates/instar-shell/guests/counter`, built from
-source by the shell's build script and guarded by
-`crates/instar-shell/tests/layering.rs`. What remains is consolidating the
-three near-duplicate fixtures (`ui-guest`, `host-guest`, `counter`) and adding
-breadth — guests that misbehave in more ways than trapping on demand.
+**WP8 — counter and fixture consolidation. DONE.** Every component now lives
+in one `guests/` tree, built from source by `instar-guest-build` (which replaced
+four near-identical build scripts). The three near-duplicate counter fixtures
+became one: `guests/counter` is the guest the shell ships *and* what
+`instar-ui`'s interaction tests run against, because a fixture that drifts from
+the real guest tests a program nobody has. `guests/hostile` gained the breadth —
+it commits garbage, commits well-formed nonsense, commits past the protocol's
+size limit, goes silent, traps, and fails with more text than the crash surface
+will hold. Each mode is reachable by clicking, through the ordinary wire format,
+with no back door in the host.
 
-**WP9** — CI rewrite; compare against the WP0.3 baseline; overhead profiles
-A–D.
+**WP9 — CI and overhead. DONE.** `.github/workflows/ci.yml` replaces the
+kernel-only `gate0.yml`: the full suite on all three platforms, plus fmt,
+clippy, the guests as their own workspaces, `cargo-deny`, and component
+validation. Overhead profiles A–D are in `OVERHEAD.md`.
 
-**WP10** — docs, dependency audit, dead-code and dependency cleanup. The
-`youth-*` crates still in the workspace are the obvious candidates.
+**WP10 — audit and cleanup. DONE.** The layering rules are tests rather than
+prose (`crates/instar-shell/tests/layering.rs`). Three dead dependency edges
+removed: `tracing` and `thiserror` from `instar-kernel`, `instar-kernel` from
+`instar-shell`. All seven `youth-*` crates deleted — every one had been salvaged
+or superseded, nothing in Instar linked any of them, and the source remains at
+the `managed-youth-final` tag.
 
 #### The final Phase 1 gate is manual, and that is correct [directive]
 

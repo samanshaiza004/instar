@@ -1,4 +1,5 @@
 /target
+target/
 /skills
 /website/dist
 .DS_Store
