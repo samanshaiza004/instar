@@ -1,149 +1,76 @@
-# Youth
+# Instar
 
-Youth is a native host for untrusted, architecture-independent WebAssembly
+Instar is a native host for untrusted, architecture-independent WebAssembly
 application components. Applications describe semantic retained UI through a
-typed WIT contract; the host owns rendering, input, durable state, and the
-transaction boundary around every guest turn.
+typed WIT contract; the host owns rendering, input, and the boundary around
+every guest turn.
 
-## Create an application
+> **Status: early. Not usable yet.**
+>
+> Instar is a ground-up rewrite, currently in Phase 1. What exists today is a
+> validated runtime premise and a kernel spike — not an application host you
+> can build against. The public API, the WIT protocol, and the crate layout are
+> all still expected to change. Much of the tree is still salvage material from
+> the previous codebase (see [Inheritance](#inheritance)).
 
-Install the CLI, check the local toolchain, and generate a standalone Tally
-application:
+## Why the rewrite
 
-```bash
-youth doctor
-youth new tally
-cd tally
-youth check
-youth test
-youth build --release
-youth dev
-```
+The predecessor codebase drove its runtime with a polling loop and a 10ms
+ticker thread. Instar's premise is that a guest should sit idle at *zero* cost
+and be woken by the host — which is only worth building on if the underlying
+runtime genuinely supports it.
 
-`youth new tally` derives the durable application ID `dev.youth.tally` from
-the project name. The ID is not a display name: it namespaces the project's
-durable state and other host-owned resources so two applications cannot
-accidentally share them. Choose a different stable identity when you need
-one, for example `youth new tally --id dev.saman.tally`.
+That premise was tested before anything was built on it. **Gate 0 passed**: a
+real WebAssembly Component Model guest suspends on an async host import, is
+woken by the host, makes concurrent progress across independent async
+operations, and shuts down cleanly — with an idle guest costing no polls at
+all. The measurements, the method, and the one limitation it exposed are in
+[docs/GATE-0.md](docs/GATE-0.md).
 
-The generated application uses a revision-pinned `youth-sdk`, a strict
-language-neutral project manifest and lock, an inspectable WIT snapshot, and
-semantic tests backed by the real runtime. New projects currently target
-`youth:app@0.0.9`. See the [Quickstart](docs/book/src/quickstart.md), the
-historical [DP0 contract](docs/DEVELOPER-PREVIEW-0.md), and the durable
-[tooling findings](docs/DEVELOPER-PREVIEW-FINDINGS.md).
-
-## Utility Suite status
-
-The completed Utility Suite applications are independent architecture probes:
-
-| Application | Capability pressure | Release evidence |
-| --- | --- | --- |
-| [Calculator](https://github.com/samanshaiza004/youth-calculator) | Rows, grid layout, keyboard focus, commands, formatting | Canonical component certified on Ubuntu, Windows, and macOS |
-| [Timer](https://github.com/samanshaiza004/youth-timer) | Host clocks, durable schedules, elapsed delivery, recovery | Gate C-4 recovery complete |
-| [Todo](https://github.com/samanshaiza004/youth-todo) | Dynamic collections, stable identities, structural updates, migration | `utility-todo-gate-d-release`; canonical component certified on all three hosts |
-| Scratchpad | Host-owned text editing, one capability-granted file, transactional Save effects | Gate B implemented on `codex/scratchpad-gate-b`; cross-platform certification pending |
-
-Todo remains on `youth:app@0.0.5`. Its findings are evidence for future
-platform decisions, not an authorization for list nodes, structured state,
-state enumeration, or automatic tree diffing.
-
-## Editor capability and text entry
-
-The host now owns a native text-editing surface: a stable `Editor` node
-identity owns one host-local session (live buffer, cursor, selection, IME
-composition, undo/redo, clipboard, scrolling) with zero guest turns for
-ordinary typing. The guest sees only whole-buffer `snapshot`/`accept`/
-`replace` through the `youth:editor` capability (`youth:app@0.0.6`), never
-raw byte offsets or platform key events. `youth:app@0.0.7` additively adds a
-modifier field to declared shortcuts, so a focused Editor and an app-level
-`Primary+S` Save command coexist. `youth:app@0.0.8` adds one narrowly granted
-host-owned text document, exact-byte conflict detection, post-commit atomic
-Save, coalesced dirty notification, and opaque host-issued document versions.
-`youth:app@0.0.9` adds a `grow` field to the wire node record for a forthcoming
-responsive-layout capability; the host layout engine does not use it yet.
-File contents remain out of guest memory and Youth state. See
-[docs/MILESTONE-2.md](docs/MILESTONE-2.md) for the full contract, lifecycle,
-and input-precedence rules and
-[docs/SCRATCHPAD-GATE-B.md](docs/SCRATCHPAD-GATE-B.md) for the file effect.
-Scratchpad, developed as a separate application
-repository the same way Calculator, Timer, and Todo were, is the first
-Editor-capable application and exercises this boundary end to end.
-
-## Transactional Visible Counter foundation
-
-Milestone 1 presents the counter in a native window while preserving the
-headless protocol core. A turn becomes visible only after its semantic output
-and durable state agree:
-
-```text
-clone authoritative tree
-→ begin SQLite transaction
-→ run the guest against staged state
-→ validate acknowledgements and staged semantic tree
-→ commit SQLite
-→ install the authoritative tree
-→ publish the exact patch to the renderer
-```
-
-Traps, invalid output, quota failures, and failed commits roll back state and
-leave the prior tree authoritative. The runtime also exposes a host-owned
-snapshot for renderer recovery without calling the guest. See
-[docs/MILESTONE-1.md](docs/MILESTONE-1.md) for the complete contract and
-[docs/MILESTONE-0.md](docs/MILESTONE-0.md) for the preserved protocol base.
+That limitation shapes the design rather than blocking it: a suspended guest
+task owns a wasm stack nothing can force-unwind, so **the guest lifetime
+boundary is the `Store` plus component instance**. Cancelling a guest means
+tearing down its whole generation and starting a fresh one; per-operation
+cancellation is a protocol concern, handled by the guest cancelling its own
+subtask.
 
 ## Layout
 
-| Path | Purpose |
-| --- | --- |
-| `wit/youth-app-v0.0.9/` … `wit/youth-app-v0.0.3/`, `wit/youth-app/` | Versioned `youth:app` contracts, `0.0.2` through `0.0.9`, all frozen and simultaneously supported; new projects embed the `0.0.9` snapshot from the CLI template |
-| `crates/youth-tree` | Pure retained semantic-tree engine (no Wasm, no async) |
-| `crates/youth-state` | Typed, quota-limited SQLite state and offline verification/repair |
-| `crates/youth-runtime` | Wasmtime host: loading, containment, serialized app worker, host-owned Editor sessions |
-| `crates/youth-sdk` | Guest-facing builders, typed state, lifecycle, and component export adapter |
-| `crates/youth-project` | Strict `Youth.toml`, `Youth.lock`, Cargo, and vendored-WIT contract |
-| `crates/youth-test` | Semantic `.youth-test` parser and real headless runner |
-| `crates/youth-interaction` | Renderer-independent focus, shortcut, and Editor-input policy (no Wasm) |
-| `crates/youth-editor-engine` | Unicode-correct text editing/layout on Parley; the only crate depending on `parley` |
-| `crates/youth-text-render-cpu` | Swash-backed CPU glyph rasterization for Editor rendering |
-| `crates/youth-desktop` | Deterministic layout/raster/input plus the native window (winit, softbuffer, AccessKit) |
-| `crates/youth-cli` | Project generation, doctor/check/build/test/dev, native run, and state tools; the packaged `youth` binary |
-| `guests/counter` | Durable counter component (Rust, `wasm32-wasip2`) |
-| `test-components/` | Malicious/invalid fixtures and SDK-backed capability fixtures for containment and integration tests |
+| Crate | What it is |
+|---|---|
+| `instar-kernel` | Wasmtime Component Model async runtime: engine config, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind. |
+| `instar-paint` | Paint/display-list types. |
+| `instar-render-vello-cpu` | CPU rendering backend. |
 
-## Building
+## Running the gates
+
+The Gate 0 suite builds a real `wasm32-wasip2` guest component from source and
+drives it through suspend/wake, concurrency, cancellation, and shutdown:
 
 ```bash
-cargo build --workspace
-cargo build -p youth-counter --target wasm32-wasip2 --release
-wasm-tools component wit target/wasm32-wasip2/release/youth_counter.wasm
+cargo test -p instar-kernel --test gate0
 ```
 
-Run the counter with durable state (the default) or an in-memory database:
+It runs on Linux, macOS, and Windows in CI — the claims are about a runtime,
+not about one machine.
 
-```bash
-cargo run -p youth-cli -- run \
-  target/wasm32-wasip2/release/youth_counter.wasm \
-  --app-id dev.youth.counter
+## Toolchain
 
-cargo run -p youth-cli -- run \
-  target/wasm32-wasip2/release/youth_counter.wasm \
-  --app-id dev.youth.counter --ephemeral
-```
+Pinned deliberately, by comparison rather than by inheritance:
+Wasmtime 47.0.3, wit-bindgen 0.60.0, Rust 1.97.1 stable, `wasm32-wasip2`. The
+reasoning — including which specific upstream async fixes drove each pin — is
+in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
 
-## Distribution
+## Inheritance
 
-The `youth` CLI binary is packaged for release with [`dist`](https://github.com/axodotdev/cargo-dist)
-(`dist-workspace.toml`, `.github/workflows/release.yml`). See
-[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for supported platforms, install
-paths, prerequisites, uninstall steps, and the release procedure.
+Instar began from a codebase called Youth and keeps its git history. Several
+`youth-*` crates are still present as salvage material — source that later work
+packages extract from and then delete, not code that gets fixed in place. They
+are not part of Instar's design and should not be treated as current.
 
-Offline maintenance never prints stored values. An explicit state root and app
-ID select `state/<app-id>/state.sqlite3`:
+`docs/baselines/managed-youth-final/` records the pre-rewrite baseline so the
+rewrite can be measured against it later. It is deliberately kept.
 
-```bash
-cargo run -p youth-cli -- state inspect \
-  --app-id dev.youth.counter --state-dir ./state
-cargo run -p youth-cli -- state verify \
-  --app-id dev.youth.counter --state-dir ./state
-```
+## License
+
+MIT OR Apache-2.0.

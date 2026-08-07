@@ -259,7 +259,6 @@ jobs:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@wasm-tools
-      - uses: taiki-e/install-action@mdbook
       - name: Install Linux window dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y xvfb libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
@@ -297,8 +296,6 @@ jobs:
         run: cargo test --workspace --features youth-runtime/test-support
       - name: SDK documentation and doctests
         run: cargo doc -p youth-sdk --no-deps && cargo test -p youth-sdk --doc
-      - name: Developer guide
-        run: mdbook build docs/book
       - name: Deterministic framebuffer fixture
         run: cargo test -p youth-desktop raster::tests::raw_frame_fixtures_are_deterministic
       - name: Cross-platform canonical snapshot gate
