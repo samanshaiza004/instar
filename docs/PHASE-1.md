@@ -347,6 +347,12 @@ or render from it. The only way to obtain usable metrics is `usable()`, which
 returns `None` unless `Ready`, so "stale but present" is not reachable as a
 usable value.
 
+**Invalidating geometry cancels any interaction captured against that
+geometry.** Normative, not incidental: a press recorded against a layout that
+no longer describes the screen must not be completable, because the node under
+the pointer may have moved. Enforced by `Interaction::cancel()` on
+invalidation.
+
 ```text
 Blocked:                          Ready(new):
 - no layout                       - recompute layout first
@@ -357,6 +363,75 @@ Blocked:                          Ready(new):
 - pointer position may update
 - close/lifecycle still works
 ```
+### WP7B1 — the runtime/main-thread bridge [directive]
+
+Two threads, actor-style. Winit and `run_concurrent` must **not** cooperatively
+own one thread: winit requires its event loop on the main thread and its
+`EventLoop` is deliberately not `Send`/`Sync`, while Wasmtime ships no executor
+and expects the embedder to own polling. `EventLoopProxy` is `Send + Sync` and
+exists precisely to wake the loop from another thread.
+
+```text
+MAIN THREAD                       RUNTIME THREAD
+winit EventLoop                   instar-kernel
+instar-window        bounded      RuntimeGeneration
+instar-ui           messages      Wasmtime Store
+layout/hit-test/render  <----->   guest run_concurrent task
+```
+
+```rust
+enum RuntimeCommand { DeliverEvent(GuestEvent), CancelOperation(OperationId), Shutdown }
+
+enum HostUserEvent {
+    UiCommit { generation: RuntimeGeneration, request: CommitRequest },
+    GuestTrapped { generation: RuntimeGeneration, error: GuestError },
+    GuestExited { generation: RuntimeGeneration },
+}
+```
+
+Flow: click -> `UiAction` -> `RuntimeCommand::DeliverEvent` -> runtime wakes
+guest -> guest commits -> `HostUserEvent::UiCommit` via `EventLoopProxy` ->
+main validates and applies -> layout -> `request_redraw`.
+
+**UI commit becomes async at the guest boundary.** The authoritative retained
+tree belongs to the main/presentation side. Do *not* share it as
+`Arc<Mutex<UiTree>>` for the runtime thread to mutate synchronously — that
+risks blocking the window thread and muddles ownership. Instead the guest's
+`commit(batch).await` suspends while the main thread applies atomically and
+replies over a oneshot. Wasmtime's concurrent calls are designed to suspend
+while waiting on host work, so this is a genuine proof that host services can
+marshal onto thread-affine platform owners without blocking the Wasm task.
+
+Queues are bounded at 256 in each direction, and interactive sends from the
+winit thread use non-blocking `try_send`: never block winit waiting for queue
+capacity.
+
+The Store-per-generation rule is unaffected — Wasmtime documents that
+cancelling a concurrent task requires dropping the `Store`, and that dropping
+the Rust future alone does not cancel the guest task, which matches Gate 0's
+Finding 5.
+
+### WP7B2 — rendering and crash presentation [directive]
+
+```text
+UiCommit accepted -> recompute layout if needed -> lower to PaintScene -> request_redraw
+RedrawRequested   -> if MetricsState::Ready render, else defer
+GuestTrapped      -> PresentationState::Crashed -> request_redraw
+```
+
+```rust
+enum PresentationState {
+    App { tree_revision: u64 },
+    Crashed { generation: RuntimeGeneration, message: String },
+}
+```
+
+The crash screen is host-owned; showing it requires no guest tree mutation.
+
+**WP7B1 gates the first real windowed counter.** WP5 proved Wasm/UI semantics
+and WP6 proved OS semantics; the two-thread crossing is the remaining
+architectural risk after Gate 0. WP8 fixture work may proceed in parallel.
+
 **WP8** — counter guest and fixtures
 **WP9** — CI rewrite; compare against the WP0.3 baseline
 
