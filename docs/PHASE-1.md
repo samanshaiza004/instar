@@ -411,6 +411,45 @@ cancelling a concurrent task requires dropping the `Store`, and that dropping
 the Rust future alone does not cancel the guest task, which matches Gate 0's
 Finding 5.
 
+#### WP7B1 acceptance gate [directive]
+
+Main-thread ordering, which is normative:
+
+```text
+receive UiCommit
+-> check RuntimeGeneration      (before anything else)
+-> only then decode bytes
+-> validate semantics
+-> apply atomically
+-> layout
+-> request redraw
+-> reply
+```
+
+Rejecting a stale generation *before decoding* means a dead guest cannot make
+the host spend parser and allocation work on its behalf.
+
+Required tests:
+
+1. click -> guest event -> async commit -> accepted result -> guest re-suspends
+2. an invalid commit returns rejection without mutating the tree
+3. 100 rapid activations preserve order
+4. a full main->runtime queue never blocks winit
+5. runtime->main wake works while the event loop is in `Wait`
+6. a pending bulk async operation does not delay a UI commit
+7. a guest trap while a commit awaits produces no later mutation
+8. teardown while a commit awaits resolves or cancels cleanly
+9. an old-generation `UiCommit` is rejected before decoding
+10. 1,000 complete click/commit cycles leave queue and operation counts at
+    baseline
+
+**Measure promptness, not just completion.** Wasmtime warns that a future
+inside `run_concurrent` can go unpolled for an extended period even after its
+waker fires, so "eventually completes" is not the property that matters here —
+a round-trip that resolves in three seconds passes that test and is a broken
+UI. The gate is that runtime->main->runtime round-trips make *prompt* progress
+under concurrent load, with a measured bound rather than an eventual one.
+
 ### WP7B2 — rendering and crash presentation [directive]
 
 ```text
