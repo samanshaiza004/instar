@@ -2,58 +2,33 @@
 resolver = "3"
 members = [
     "crates/youth-tree",
-    "crates/youth-state",
     "crates/youth-sdk",
-    "crates/youth-project",
-    "crates/youth-capsule",
-    "crates/youth-capsule-launcher",
-    "crates/youth-test",
-    "crates/youth-runtime",
     "crates/youth-interaction",
     "crates/youth-editor-engine",
     "crates/youth-text-render-cpu",
-    "crates/youth-paint",
-    "crates/youth-render-vello-cpu",
-    "crates/youth-desktop",
-    "crates/youth-cli",
-    "guests/counter",
-    "test-components/legacy-v003",
-    "test-components/sdk-tally",
-    "test-components/sdk-todo",
-    "test-components/sdk-time",
-    "test-components/sdk-editor",
-    "test-components/time-stub",
-    "test-components/instant-now",
-    "test-components/trap-on-mount",
-    "test-components/trap-on-handle",
-    "test-components/invalid-snapshot",
-    "test-components/invalid-patch",
-    "test-components/infinite-loop",
-    "test-components/memory-bomb",
-    "test-components/invalid-revision",
-    "test-components/invalid-sequence",
-    "test-components/oversized-snapshot",
-    "test-components/oversized-patch",
-    "test-components/trap-after-state-write",
-    "test-components/invalid-patch-after-state-write",
-    "test-components/bad-revision-after-state-write",
-    "test-components/app-error-after-state-write",
-    "test-components/sdk-elapsed",
-    "test-components/countdown-presentation",
-    "test-components/editor-v006",
-    "test-components/editor-capability-v006",
-    "test-components/shortcut-primary-v007",
-    "test-components/sdk-text-document",
-    "test-components/elapsed-trap",
-    "test-components/elapsed-invalid-patch",
+    "crates/instar-paint",
+    "crates/instar-render-vello-cpu",
+    "crates/instar-kernel",
+    "crates/instar-ui",
+    "crates/instar-ui-protocol",
+    "crates/instar-window",
+    "crates/instar-host",
+    "crates/instar-shell",
 ]
-exclude = ["crates/youth-cli/templates/tally"]
+
+# youth-runtime and youth-desktop are temporarily out of the workspace: both
+# have a stale path dependency on the deleted youth-state crate, and both are
+# source-only salvage material for Instar Phase 1 (instar-kernel extracted its
+# engine-config seed from youth-runtime in WP2; instar-window/instar-host will
+# extract from youth-desktop in WP6/WP7) rather than crates that get fixed in
+# place. Their files remain on disk for reference; re-add or delete them once
+# WP6/WP7 land.
 
 [workspace.package]
 version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/samanshaiza004/youth"
+repository = "https://github.com/samanshaiza004/instar"
 
 [profile.release]
 lto = true

@@ -1,0 +1,17 @@
+[package]
+name = "instar-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure Wasmtime Component Model async runtime for Instar: engine config, component loading/validation, WASI context, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind -- see docs/PHASE-1.md's forbidden-dependency list."
+
+[dependencies]
+wasmtime = "47.0.3"
+wasmtime-wasi = "47.0.3"
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

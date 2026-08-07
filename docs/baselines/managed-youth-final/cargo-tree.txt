@@ -1,0 +1,1173 @@
+youth-app-error-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/app-error-after-state-write)
+└── wit-bindgen v0.51.0
+    ├── bitflags v2.13.1
+    └── wit-bindgen-rust-macro v0.51.0 (proc-macro)
+        ├── anyhow v1.0.103
+        ├── prettyplease v0.2.37
+        │   ├── proc-macro2 v1.0.106
+        │   │   └── unicode-ident v1.0.24
+        │   └── syn v2.0.119
+        │       ├── proc-macro2 v1.0.106 (*)
+        │       ├── quote v1.0.46
+        │       │   └── proc-macro2 v1.0.106 (*)
+        │       └── unicode-ident v1.0.24
+        ├── proc-macro2 v1.0.106 (*)
+        ├── quote v1.0.46 (*)
+        ├── syn v2.0.119 (*)
+        ├── wit-bindgen-core v0.51.0
+        │   ├── anyhow v1.0.103
+        │   ├── heck v0.5.0
+        │   └── wit-parser v0.244.0
+        │       ├── anyhow v1.0.103
+        │       ├── id-arena v2.3.0
+        │       ├── indexmap v2.14.0
+        │       │   ├── equivalent v1.0.2
+        │       │   ├── hashbrown v0.17.1
+        │       │   │   └── foldhash v0.2.0
+        │       │   └── serde_core v1.0.228
+        │       ├── log v0.4.33
+        │       ├── semver v1.0.28
+        │       ├── serde v1.0.228
+        │       │   ├── serde_core v1.0.228
+        │       │   └── serde_derive v1.0.228 (proc-macro)
+        │       │       ├── proc-macro2 v1.0.106 (*)
+        │       │       ├── quote v1.0.46 (*)
+        │       │       └── syn v2.0.119 (*)
+        │       ├── serde_derive v1.0.228 (proc-macro) (*)
+        │       ├── serde_json v1.0.150
+        │       │   ├── itoa v1.0.18
+        │       │   ├── memchr v2.8.3
+        │       │   ├── serde_core v1.0.228
+        │       │   └── zmij v1.0.23
+        │       ├── unicode-xid v0.2.6
+        │       └── wasmparser v0.244.0
+        │           ├── bitflags v2.13.1
+        │           ├── hashbrown v0.15.5
+        │           │   └── foldhash v0.1.5
+        │           ├── indexmap v2.14.0 (*)
+        │           └── semver v1.0.28
+        └── wit-bindgen-rust v0.51.0
+            ├── anyhow v1.0.103
+            ├── heck v0.5.0
+            ├── indexmap v2.14.0 (*)
+            ├── prettyplease v0.2.37 (*)
+            ├── syn v2.0.119 (*)
+            ├── wasm-metadata v0.244.0
+            │   ├── anyhow v1.0.103
+            │   ├── indexmap v2.14.0 (*)
+            │   ├── wasm-encoder v0.244.0
+            │   │   ├── leb128fmt v0.1.0
+            │   │   └── wasmparser v0.244.0 (*)
+            │   └── wasmparser v0.244.0 (*)
+            ├── wit-bindgen-core v0.51.0 (*)
+            └── wit-component v0.244.0
+                ├── anyhow v1.0.103
+                ├── bitflags v2.13.1
+                ├── indexmap v2.14.0 (*)
+                ├── log v0.4.33
+                ├── serde v1.0.228 (*)
+                ├── serde_derive v1.0.228 (proc-macro) (*)
+                ├── serde_json v1.0.150 (*)
+                ├── wasm-encoder v0.244.0 (*)
+                ├── wasm-metadata v0.244.0 (*)
+                ├── wasmparser v0.244.0 (*)
+                └── wit-parser v0.244.0 (*)
+
+youth-bad-revision-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/bad-revision-after-state-write)
+└── wit-bindgen v0.51.0 (*)
+
+youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule)
+├── serde v1.0.228
+│   ├── serde_core v1.0.228
+│   └── serde_derive v1.0.228 (proc-macro) (*)
+├── sha2 v0.10.9
+│   ├── cfg-if v1.0.4
+│   ├── cpufeatures v0.2.17
+│   │   └── libc v0.2.186
+│   └── digest v0.10.7
+│       ├── block-buffer v0.10.4
+│       │   └── generic-array v0.14.7
+│       │       └── typenum v1.20.1
+│       │       [build-dependencies]
+│       │       └── version_check v0.9.5
+│       └── crypto-common v0.1.7
+│           ├── generic-array v0.14.7 (*)
+│           └── typenum v1.20.1
+├── thiserror v2.0.19
+│   └── thiserror-impl v2.0.19 (proc-macro)
+│       ├── proc-macro2 v1.0.106 (*)
+│       ├── quote v1.0.46 (*)
+│       └── syn v3.0.0
+│           ├── proc-macro2 v1.0.106 (*)
+│           ├── quote v1.0.46 (*)
+│           └── unicode-ident v1.0.24
+├── toml v0.9.12+spec-1.1.0
+│   ├── serde_core v1.0.228
+│   ├── serde_spanned v1.1.1
+│   │   └── serde_core v1.0.228
+│   ├── toml_datetime v0.7.5+spec-1.1.0
+│   │   └── serde_core v1.0.228
+│   ├── toml_parser v1.1.2+spec-1.1.0
+│   │   └── winnow v1.0.4
+│   ├── toml_writer v1.1.2+spec-1.1.0
+│   └── winnow v0.7.15
+└── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state)
+    ├── rusqlite v0.40.1
+    │   ├── bitflags v2.13.1
+    │   ├── fallible-iterator v0.3.0
+    │   ├── fallible-streaming-iterator v0.1.9
+    │   ├── libsqlite3-sys v0.38.1
+    │   │   [build-dependencies]
+    │   │   ├── cc v1.3.0
+    │   │   │   ├── find-msvc-tools v0.1.9
+    │   │   │   ├── jobserver v0.1.35
+    │   │   │   │   └── libc v0.2.186
+    │   │   │   ├── libc v0.2.186
+    │   │   │   └── shlex v2.0.1
+    │   │   ├── pkg-config v0.3.33
+    │   │   └── vcpkg v0.2.15
+    │   └── smallvec v1.15.2
+    │       └── serde v1.0.228 (*)
+    ├── thiserror v2.0.19 (*)
+    └── tracing v0.1.44
+        ├── pin-project-lite v0.2.17
+        ├── tracing-attributes v0.1.31 (proc-macro)
+        │   ├── proc-macro2 v1.0.106 (*)
+        │   ├── quote v1.0.46 (*)
+        │   └── syn v2.0.119 (*)
+        └── tracing-core v0.1.36
+            └── once_cell v1.21.4
+    [dev-dependencies]
+    └── tempfile v3.27.0
+        ├── fastrand v2.4.1
+        ├── getrandom v0.4.3
+        │   ├── cfg-if v1.0.4
+        │   ├── libc v0.2.186
+        │   └── rand_core v0.10.1
+        ├── once_cell v1.21.4
+        └── rustix v1.1.4
+            ├── bitflags v2.13.1
+            ├── errno v0.3.14
+            │   └── libc v0.2.186
+            └── libc v0.2.186
+[dev-dependencies]
+└── tempfile v3.27.0 (*)
+
+youth-capsule-launcher v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule-launcher)
+├── clap v4.6.2
+│   ├── clap_builder v4.6.2
+│   │   ├── anstream v1.0.0
+│   │   │   ├── anstyle v1.0.14
+│   │   │   ├── anstyle-parse v1.0.0
+│   │   │   │   └── utf8parse v0.2.2
+│   │   │   ├── anstyle-query v1.1.5
+│   │   │   ├── colorchoice v1.0.5
+│   │   │   ├── is_terminal_polyfill v1.70.2
+│   │   │   └── utf8parse v0.2.2
+│   │   ├── anstyle v1.0.14
+│   │   ├── clap_lex v1.1.0
+│   │   └── strsim v0.11.1
+│   └── clap_derive v4.6.1 (proc-macro)
+│       ├── heck v0.5.0
+│       ├── proc-macro2 v1.0.106 (*)
+│       ├── quote v1.0.46 (*)
+│       └── syn v2.0.119 (*)
+├── directories v6.0.0
+│   └── dirs-sys v0.5.0
+│       ├── libc v0.2.186
+│       └── option-ext v0.2.0
+├── thiserror v2.0.19 (*)
+├── youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule) (*)
+├── youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop)
+│   ├── accesskit v0.24.1
+│   │   └── uuid v1.24.0
+│   │       └── getrandom v0.4.3 (*)
+│   ├── accesskit_winit v0.33.2
+│   │   ├── accesskit v0.24.1 (*)
+│   │   ├── accesskit_macos v0.26.3
+│   │   │   ├── accesskit v0.24.1 (*)
+│   │   │   ├── accesskit_consumer v0.38.0
+│   │   │   │   ├── accesskit v0.24.1 (*)
+│   │   │   │   └── hashbrown v0.16.1
+│   │   │   │       └── foldhash v0.2.0
+│   │   │   ├── hashbrown v0.16.1 (*)
+│   │   │   ├── objc2 v0.5.2
+│   │   │   │   ├── objc-sys v0.3.5
+│   │   │   │   └── objc2-encode v4.1.0
+│   │   │   ├── objc2-app-kit v0.2.2
+│   │   │   │   ├── bitflags v2.13.1
+│   │   │   │   ├── objc2 v0.5.2 (*)
+│   │   │   │   └── objc2-foundation v0.2.2
+│   │   │   │       ├── bitflags v2.13.1
+│   │   │   │       ├── block2 v0.5.1
+│   │   │   │       │   └── objc2 v0.5.2 (*)
+│   │   │   │       ├── dispatch v0.2.0
+│   │   │   │       └── objc2 v0.5.2 (*)
+│   │   │   └── objc2-foundation v0.2.2 (*)
+│   │   ├── raw-window-handle v0.6.2
+│   │   └── winit v0.30.12
+│   │       ├── bitflags v2.13.1
+│   │       ├── block2 v0.5.1 (*)
+│   │       ├── core-foundation v0.9.4
+│   │       │   ├── core-foundation-sys v0.8.7
+│   │       │   └── libc v0.2.186
+│   │       ├── core-graphics v0.23.2
+│   │       │   ├── bitflags v1.3.2
+│   │       │   ├── core-foundation v0.9.4 (*)
+│   │       │   ├── core-graphics-types v0.1.3
+│   │       │   │   ├── bitflags v1.3.2
+│   │       │   │   ├── core-foundation v0.9.4 (*)
+│   │       │   │   └── libc v0.2.186
+│   │       │   ├── foreign-types v0.5.0
+│   │       │   │   ├── foreign-types-macros v0.2.3 (proc-macro)
+│   │       │   │   │   ├── proc-macro2 v1.0.106 (*)
+│   │       │   │   │   ├── quote v1.0.46 (*)
+│   │       │   │   │   └── syn v2.0.119 (*)
+│   │       │   │   └── foreign-types-shared v0.3.1
+│   │       │   └── libc v0.2.186
+│   │       ├── cursor-icon v1.2.0
+│   │       ├── dpi v0.1.2
+│   │       ├── objc2 v0.5.2 (*)
+│   │       ├── objc2-app-kit v0.2.2 (*)
+│   │       ├── objc2-foundation v0.2.2 (*)
+│   │       ├── raw-window-handle v0.6.2
+│   │       ├── smol_str v0.2.2
+│   │       └── tracing v0.1.44 (*)
+│   │       [build-dependencies]
+│   │       └── cfg_aliases v0.2.2
+│   ├── rfd v0.17.2
+│   │   ├── block2 v0.6.2
+│   │   │   └── objc2 v0.6.4
+│   │   │       └── objc2-encode v4.1.0
+│   │   ├── dispatch2 v0.3.1
+│   │   │   ├── bitflags v2.13.1
+│   │   │   ├── block2 v0.6.2 (*)
+│   │   │   ├── libc v0.2.186
+│   │   │   └── objc2 v0.6.4 (*)
+│   │   ├── log v0.4.33
+│   │   ├── objc2 v0.6.4 (*)
+│   │   ├── objc2-app-kit v0.3.2
+│   │   │   ├── bitflags v2.13.1
+│   │   │   ├── block2 v0.6.2 (*)
+│   │   │   ├── objc2 v0.6.4 (*)
+│   │   │   ├── objc2-core-graphics v0.3.2
+│   │   │   │   ├── bitflags v2.13.1
+│   │   │   │   ├── objc2 v0.6.4 (*)
+│   │   │   │   └── objc2-core-foundation v0.3.2
+│   │   │   │       ├── bitflags v2.13.1
+│   │   │   │       └── objc2 v0.6.4 (*)
+│   │   │   └── objc2-foundation v0.3.2
+│   │   │       ├── bitflags v2.13.1
+│   │   │       ├── block2 v0.6.2 (*)
+│   │   │       ├── libc v0.2.186
+│   │   │       ├── objc2 v0.6.4 (*)
+│   │   │       └── objc2-core-foundation v0.3.2 (*)
+│   │   ├── objc2-core-foundation v0.3.2 (*)
+│   │   ├── objc2-foundation v0.3.2 (*)
+│   │   └── raw-window-handle v0.6.2
+│   ├── softbuffer v0.4.8
+│   │   ├── objc2 v0.6.4 (*)
+│   │   ├── objc2-core-foundation v0.3.2 (*)
+│   │   ├── objc2-core-graphics v0.3.2 (*)
+│   │   ├── objc2-foundation v0.3.2 (*)
+│   │   ├── objc2-quartz-core v0.3.2
+│   │   │   ├── bitflags v2.13.1
+│   │   │   ├── objc2 v0.6.4 (*)
+│   │   │   ├── objc2-core-foundation v0.3.2 (*)
+│   │   │   └── objc2-foundation v0.3.2 (*)
+│   │   ├── raw-window-handle v0.6.2
+│   │   └── tracing v0.1.44 (*)
+│   ├── taffy v0.12.2
+│   │   ├── arrayvec v0.7.8
+│   │   ├── grid v1.0.1
+│   │   └── slotmap v1.1.1
+│   │       [build-dependencies]
+│   │       └── version_check v0.9.5
+│   ├── thiserror v2.0.19 (*)
+│   ├── tokio v1.53.0
+│   │   ├── bytes v1.12.1
+│   │   ├── libc v0.2.186
+│   │   ├── mio v1.2.2
+│   │   │   └── libc v0.2.186
+│   │   ├── pin-project-lite v0.2.17
+│   │   ├── signal-hook-registry v1.4.8
+│   │   │   ├── errno v0.3.14 (*)
+│   │   │   └── libc v0.2.186
+│   │   ├── socket2 v0.6.5
+│   │   │   └── libc v0.2.186
+│   │   └── tokio-macros v2.7.1 (proc-macro)
+│   │       ├── proc-macro2 v1.0.106 (*)
+│   │       ├── quote v1.0.46 (*)
+│   │       └── syn v2.0.119 (*)
+│   ├── tracing v0.1.44 (*)
+│   ├── winit v0.30.12 (*)
+│   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction)
+│   │   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree)
+│   │       ├── serde v1.0.228 (*)
+│   │       └── thiserror v2.0.19 (*)
+│   │       [dev-dependencies]
+│   │       └── proptest v1.11.0
+│   │           ├── bit-set v0.8.0
+│   │           │   └── bit-vec v0.8.0
+│   │           ├── bit-vec v0.8.0
+│   │           ├── bitflags v2.13.1
+│   │           ├── num-traits v0.2.19
+│   │           │   [build-dependencies]
+│   │           │   └── autocfg v1.5.1
+│   │           ├── rand v0.9.5
+│   │           │   └── rand_core v0.9.5
+│   │           │       └── getrandom v0.3.4
+│   │           │           ├── cfg-if v1.0.4
+│   │           │           └── libc v0.2.186
+│   │           ├── rand_chacha v0.9.0
+│   │           │   ├── ppv-lite86 v0.2.21
+│   │           │   │   └── zerocopy v0.8.54
+│   │           │   │       └── zerocopy-derive v0.8.54 (proc-macro)
+│   │           │   │           ├── proc-macro2 v1.0.106 (*)
+│   │           │   │           ├── quote v1.0.46 (*)
+│   │           │   │           └── syn v2.0.119 (*)
+│   │           │   └── rand_core v0.9.5 (*)
+│   │           ├── rand_xorshift v0.4.0
+│   │           │   └── rand_core v0.9.5 (*)
+│   │           ├── regex-syntax v0.8.11
+│   │           ├── rusty-fork v0.3.1
+│   │           │   ├── fnv v1.0.7
+│   │           │   ├── quick-error v1.2.3
+│   │           │   ├── tempfile v3.27.0 (*)
+│   │           │   └── wait-timeout v0.2.1
+│   │           │       └── libc v0.2.186
+│   │           ├── tempfile v3.27.0 (*)
+│   │           └── unarray v0.1.4
+│   ├── youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint)
+│   │   └── thiserror v2.0.19 (*)
+│   ├── youth-render-vello-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-render-vello-cpu)
+│   │   ├── vello_cpu v0.1.0
+│   │   │   ├── bytemuck v1.25.2
+│   │   │   │   └── bytemuck_derive v1.11.0 (proc-macro)
+│   │   │   │       ├── proc-macro2 v1.0.106 (*)
+│   │   │   │       ├── quote v1.0.46 (*)
+│   │   │   │       └── syn v2.0.119 (*)
+│   │   │   ├── hashbrown v0.17.1
+│   │   │   │   ├── foldhash v0.2.0
+│   │   │   │   └── serde_core v1.0.228
+│   │   │   └── vello_common v0.1.0
+│   │   │       ├── bytemuck v1.25.2 (*)
+│   │   │       ├── fearless_simd v0.4.1
+│   │   │       ├── guillotiere v0.7.0
+│   │   │       │   └── euclid v0.22.14
+│   │   │       │       └── num-traits v0.2.19 (*)
+│   │   │       ├── log v0.4.33
+│   │   │       ├── peniko v0.6.1
+│   │   │       │   ├── bytemuck v1.25.2 (*)
+│   │   │       │   ├── color v0.3.3
+│   │   │       │   │   └── bytemuck v1.25.2 (*)
+│   │   │       │   ├── kurbo v0.13.1
+│   │   │       │   │   ├── arrayvec v0.7.8
+│   │   │       │   │   ├── polycool v0.4.0
+│   │   │       │   │   │   └── arrayvec v0.7.8
+│   │   │       │   │   └── smallvec v1.15.2 (*)
+│   │   │       │   ├── linebender_resource_handle v0.1.1
+│   │   │       │   └── smallvec v1.15.2 (*)
+│   │   │       ├── smallvec v1.15.2 (*)
+│   │   │       └── thiserror v2.0.19 (*)
+│   │   └── youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint) (*)
+│   │   [dev-dependencies]
+│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine)
+│   │   │   ├── accesskit v0.24.1 (*)
+│   │   │   └── parley v0.11.0
+│   │   │       ├── accesskit v0.24.1 (*)
+│   │   │       ├── fontique v0.11.0
+│   │   │       │   ├── hashbrown v0.17.1 (*)
+│   │   │       │   ├── linebender_resource_handle v0.1.1
+│   │   │       │   ├── memmap2 v0.9.11
+│   │   │       │   │   └── libc v0.2.186
+│   │   │       │   ├── objc2 v0.6.4 (*)
+│   │   │       │   ├── objc2-core-foundation v0.3.2 (*)
+│   │   │       │   ├── objc2-core-text v0.3.2
+│   │   │       │   │   ├── bitflags v2.13.1
+│   │   │       │   │   └── objc2-core-foundation v0.3.2 (*)
+│   │   │       │   ├── objc2-foundation v0.3.2 (*)
+│   │   │       │   ├── parlance v0.1.0
+│   │   │       │   ├── read-fonts v0.40.2
+│   │   │       │   │   ├── bytemuck v1.25.2 (*)
+│   │   │       │   │   ├── font-types v0.12.2
+│   │   │       │   │   │   └── bytemuck v1.25.2 (*)
+│   │   │       │   │   └── once_cell v1.21.4
+│   │   │       │   └── smallvec v1.15.2 (*)
+│   │   │       ├── harfrust v0.10.0
+│   │   │       │   ├── bitflags v2.13.1
+│   │   │       │   ├── bytemuck v1.25.2 (*)
+│   │   │       │   ├── read-fonts v0.40.2 (*)
+│   │   │       │   └── smallvec v1.15.2 (*)
+│   │   │       ├── hashbrown v0.17.1 (*)
+│   │   │       ├── icu_normalizer v2.2.0
+│   │   │       │   ├── icu_collections v2.2.0
+│   │   │       │   │   ├── displaydoc v0.2.6 (proc-macro)
+│   │   │       │   │   │   ├── proc-macro2 v1.0.106 (*)
+│   │   │       │   │   │   ├── quote v1.0.46 (*)
+│   │   │       │   │   │   └── syn v2.0.119 (*)
+│   │   │       │   │   ├── potential_utf v0.1.5
+│   │   │       │   │   │   ├── writeable v0.6.3
+│   │   │       │   │   │   └── zerovec v0.11.6
+│   │   │       │   │   │       ├── yoke v0.8.3
+│   │   │       │   │   │       │   ├── stable_deref_trait v1.2.1
+│   │   │       │   │   │       │   ├── yoke-derive v0.8.2 (proc-macro)
+│   │   │       │   │   │       │   │   ├── proc-macro2 v1.0.106 (*)
+│   │   │       │   │   │       │   │   ├── quote v1.0.46 (*)
+│   │   │       │   │   │       │   │   ├── syn v2.0.119 (*)
+│   │   │       │   │   │       │   │   └── synstructure v0.13.2
+│   │   │       │   │   │       │   │       ├── proc-macro2 v1.0.106 (*)
+│   │   │       │   │   │       │   │       ├── quote v1.0.46 (*)
+│   │   │       │   │   │       │   │       └── syn v2.0.119 (*)
+│   │   │       │   │   │       │   └── zerofrom v0.1.8
+│   │   │       │   │   │       │       └── zerofrom-derive v0.1.7 (proc-macro)
+│   │   │       │   │   │       │           ├── proc-macro2 v1.0.106 (*)
+│   │   │       │   │   │       │           ├── quote v1.0.46 (*)
+│   │   │       │   │   │       │           ├── syn v2.0.119 (*)
+│   │   │       │   │   │       │           └── synstructure v0.13.2 (*)
+│   │   │       │   │   │       ├── zerofrom v0.1.8 (*)
+│   │   │       │   │   │       └── zerovec-derive v0.11.3 (proc-macro)
+│   │   │       │   │   │           ├── proc-macro2 v1.0.106 (*)
+│   │   │       │   │   │           ├── quote v1.0.46 (*)
+│   │   │       │   │   │           └── syn v2.0.119 (*)
+│   │   │       │   │   ├── utf8_iter v1.0.4
+│   │   │       │   │   ├── yoke v0.8.3 (*)
+│   │   │       │   │   ├── zerofrom v0.1.8 (*)
+│   │   │       │   │   └── zerovec v0.11.6 (*)
+│   │   │       │   ├── icu_normalizer_data v2.2.0
+│   │   │       │   ├── icu_provider v2.2.0
+│   │   │       │   │   ├── displaydoc v0.2.6 (proc-macro) (*)
+│   │   │       │   │   ├── icu_locale_core v2.2.0
+│   │   │       │   │   │   ├── displaydoc v0.2.6 (proc-macro) (*)
+│   │   │       │   │   │   ├── litemap v0.8.2
+│   │   │       │   │   │   ├── tinystr v0.8.3
+│   │   │       │   │   │   │   ├── displaydoc v0.2.6 (proc-macro) (*)
+│   │   │       │   │   │   │   └── zerovec v0.11.6 (*)
+│   │   │       │   │   │   ├── writeable v0.6.3
+│   │   │       │   │   │   └── zerovec v0.11.6 (*)
+│   │   │       │   │   ├── stable_deref_trait v1.2.1
+│   │   │       │   │   ├── writeable v0.6.3
+│   │   │       │   │   ├── yoke v0.8.3 (*)
+│   │   │       │   │   ├── zerofrom v0.1.8 (*)
+│   │   │       │   │   ├── zerotrie v0.2.4
+│   │   │       │   │   │   ├── displaydoc v0.2.6 (proc-macro) (*)
+│   │   │       │   │   │   ├── yoke v0.8.3 (*)
+│   │   │       │   │   │   └── zerofrom v0.1.8 (*)
+│   │   │       │   │   └── zerovec v0.11.6 (*)
+│   │   │       │   ├── smallvec v1.15.2 (*)
+│   │   │       │   └── zerovec v0.11.6 (*)
+│   │   │       ├── icu_properties v2.2.0
+│   │   │       │   ├── icu_collections v2.2.0 (*)
+│   │   │       │   ├── icu_locale_core v2.2.0 (*)
+│   │   │       │   ├── icu_properties_data v2.2.0
+│   │   │       │   ├── icu_provider v2.2.0 (*)
+│   │   │       │   ├── zerotrie v0.2.4 (*)
+│   │   │       │   └── zerovec v0.11.6 (*)
+│   │   │       ├── icu_segmenter v2.2.0
+│   │   │       │   ├── icu_collections v2.2.0 (*)
+│   │   │       │   ├── icu_locale v2.2.0
+│   │   │       │   │   ├── icu_collections v2.2.0 (*)
+│   │   │       │   │   ├── icu_locale_core v2.2.0 (*)
+│   │   │       │   │   ├── icu_locale_data v2.2.0
+│   │   │       │   │   ├── icu_provider v2.2.0 (*)
+│   │   │       │   │   ├── potential_utf v0.1.5 (*)
+│   │   │       │   │   ├── tinystr v0.8.3 (*)
+│   │   │       │   │   └── zerovec v0.11.6 (*)
+│   │   │       │   ├── icu_provider v2.2.0 (*)
+│   │   │       │   ├── icu_segmenter_data v2.2.0
+│   │   │       │   ├── potential_utf v0.1.5 (*)
+│   │   │       │   ├── utf8_iter v1.0.4
+│   │   │       │   └── zerovec v0.11.6 (*)
+│   │   │       ├── linebender_resource_handle v0.1.1
+│   │   │       ├── parlance v0.1.0
+│   │   │       ├── parley_data v0.11.0
+│   │   │       │   └── icu_properties v2.2.0 (*)
+│   │   │       └── skrifa v0.43.2
+│   │   │           ├── bytemuck v1.25.2 (*)
+│   │   │           └── read-fonts v0.40.2 (*)
+│   │   └── youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu)
+│   │       ├── swash v0.2.10
+│   │       │   ├── skrifa v0.43.2 (*)
+│   │       │   ├── yazi v0.2.1
+│   │       │   └── zeno v0.3.3
+│   │       └── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+│   ├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime)
+│   │   ├── accesskit v0.24.1 (*)
+│   │   ├── arboard v3.6.1
+│   │   │   ├── objc2 v0.6.4 (*)
+│   │   │   ├── objc2-app-kit v0.3.2 (*)
+│   │   │   └── objc2-foundation v0.3.2 (*)
+│   │   ├── cap-std v4.0.2
+│   │   │   ├── cap-primitives v4.0.2
+│   │   │   │   ├── ambient-authority v0.0.2
+│   │   │   │   ├── fs-set-times v0.20.3
+│   │   │   │   │   ├── io-lifetimes v2.0.4
+│   │   │   │   │   └── rustix v1.1.4 (*)
+│   │   │   │   ├── io-extras v0.19.0
+│   │   │   │   │   └── io-lifetimes v3.0.1
+│   │   │   │   ├── io-lifetimes v3.0.1
+│   │   │   │   ├── ipnet v2.12.0
+│   │   │   │   ├── maybe-owned v0.3.4
+│   │   │   │   └── rustix v1.1.4 (*)
+│   │   │   ├── io-extras v0.19.0 (*)
+│   │   │   ├── io-lifetimes v3.0.1
+│   │   │   └── rustix v1.1.4 (*)
+│   │   ├── cap-tempfile v4.0.2
+│   │   │   ├── cap-std v4.0.2 (*)
+│   │   │   ├── rustix v1.1.4 (*)
+│   │   │   └── uuid v1.24.0 (*)
+│   │   ├── notify-rust v4.18.0
+│   │   │   ├── log v0.4.33
+│   │   │   └── mac-notification-sys v0.6.15
+│   │   │       ├── log v0.4.33
+│   │   │       ├── objc2 v0.6.4 (*)
+│   │   │       ├── objc2-foundation v0.3.2 (*)
+│   │   │       ├── time v0.3.54
+│   │   │       │   ├── deranged v0.5.8
+│   │   │       │   ├── num-conv v0.2.2
+│   │   │       │   ├── powerfmt v0.2.0
+│   │   │       │   └── time-core v0.1.9
+│   │   │       └── uuid v1.24.0 (*)
+│   │   │       [build-dependencies]
+│   │   │       └── cc v1.3.0 (*)
+│   │   ├── sha2 v0.10.9 (*)
+│   │   ├── thiserror v2.0.19 (*)
+│   │   ├── tokio v1.53.0 (*)
+│   │   ├── tracing v0.1.44 (*)
+│   │   ├── wasmtime v46.0.1
+│   │   │   ├── addr2line v0.26.1
+│   │   │   │   └── gimli v0.33.0
+│   │   │   │       ├── fnv v1.0.7
+│   │   │   │       ├── hashbrown v0.16.1 (*)
+│   │   │   │       └── indexmap v2.14.0 (*)
+│   │   │   ├── async-trait v0.1.91 (proc-macro)
+│   │   │   │   ├── proc-macro2 v1.0.106 (*)
+│   │   │   │   ├── quote v1.0.46 (*)
+│   │   │   │   └── syn v3.0.0 (*)
+│   │   │   ├── bitflags v2.13.1
+│   │   │   ├── bumpalo v3.20.3
+│   │   │   │   └── allocator-api2 v0.2.21
+│   │   │   ├── cfg-if v1.0.4
+│   │   │   ├── encoding_rs v0.8.35
+│   │   │   │   └── cfg-if v1.0.4
+│   │   │   ├── futures v0.3.33
+│   │   │   │   ├── futures-channel v0.3.33
+│   │   │   │   │   ├── futures-core v0.3.33
+│   │   │   │   │   └── futures-sink v0.3.33
+│   │   │   │   ├── futures-core v0.3.33
+│   │   │   │   ├── futures-io v0.3.33
+│   │   │   │   ├── futures-sink v0.3.33
+│   │   │   │   ├── futures-task v0.3.33
+│   │   │   │   └── futures-util v0.3.33
+│   │   │   │       ├── futures-channel v0.3.33 (*)
+│   │   │   │       ├── futures-core v0.3.33
+│   │   │   │       ├── futures-io v0.3.33
+│   │   │   │       ├── futures-sink v0.3.33
+│   │   │   │       ├── futures-task v0.3.33
+│   │   │   │       ├── memchr v2.8.3
+│   │   │   │       ├── pin-project-lite v0.2.17
+│   │   │   │       └── slab v0.4.12
+│   │   │   ├── fxprof-processed-profile v0.8.1
+│   │   │   │   ├── bitflags v2.13.1
+│   │   │   │   ├── debugid v0.8.0
+│   │   │   │   │   └── uuid v1.24.0 (*)
+│   │   │   │   ├── rustc-hash v2.1.3
+│   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   └── serde_json v1.0.150 (*)
+│   │   │   ├── gimli v0.33.0 (*)
+│   │   │   ├── libc v0.2.186
+│   │   │   ├── log v0.4.33
+│   │   │   ├── mach2 v0.6.0
+│   │   │   ├── object v0.39.1
+│   │   │   │   ├── crc32fast v1.5.0
+│   │   │   │   │   └── cfg-if v1.0.4
+│   │   │   │   ├── hashbrown v0.17.1 (*)
+│   │   │   │   ├── indexmap v2.14.0 (*)
+│   │   │   │   └── memchr v2.8.3
+│   │   │   ├── once_cell v1.21.4
+│   │   │   ├── postcard v1.1.3
+│   │   │   │   ├── cobs v0.3.0
+│   │   │   │   │   └── thiserror v2.0.19 (*)
+│   │   │   │   └── serde v1.0.228 (*)
+│   │   │   ├── pulley-interpreter v46.0.1
+│   │   │   │   ├── cranelift-bitset v0.133.1
+│   │   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   │   └── wasmtime-internal-core v46.0.1
+│   │   │   │   │       ├── anyhow v1.0.103
+│   │   │   │   │       ├── hashbrown v0.17.1 (*)
+│   │   │   │   │       ├── libm v0.2.16
+│   │   │   │   │       └── serde v1.0.228 (*)
+│   │   │   │   ├── log v0.4.33
+│   │   │   │   ├── pulley-macros v46.0.1 (proc-macro)
+│   │   │   │   │   ├── proc-macro2 v1.0.106 (*)
+│   │   │   │   │   ├── quote v1.0.46 (*)
+│   │   │   │   │   └── syn v2.0.119 (*)
+│   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   ├── rayon v1.12.0
+│   │   │   │   ├── either v1.16.0
+│   │   │   │   └── rayon-core v1.13.0
+│   │   │   │       ├── crossbeam-deque v0.8.7
+│   │   │   │       │   ├── crossbeam-epoch v0.9.20
+│   │   │   │       │   │   └── crossbeam-utils v0.8.22
+│   │   │   │       │   └── crossbeam-utils v0.8.22
+│   │   │   │       └── crossbeam-utils v0.8.22
+│   │   │   ├── rustix v1.1.4 (*)
+│   │   │   ├── semver v1.0.28
+│   │   │   │   └── serde_core v1.0.228
+│   │   │   ├── serde v1.0.228 (*)
+│   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   ├── serde_json v1.0.150 (*)
+│   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   ├── target-lexicon v0.13.5
+│   │   │   ├── tempfile v3.27.0 (*)
+│   │   │   ├── wasm-compose v0.251.0
+│   │   │   │   ├── anyhow v1.0.103
+│   │   │   │   ├── heck v0.5.0
+│   │   │   │   ├── indexmap v2.14.0 (*)
+│   │   │   │   ├── log v0.4.33
+│   │   │   │   ├── petgraph v0.6.5
+│   │   │   │   │   ├── fixedbitset v0.4.2
+│   │   │   │   │   └── indexmap v2.14.0 (*)
+│   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   ├── wasm-encoder v0.251.0
+│   │   │   │   │   ├── leb128fmt v0.1.0
+│   │   │   │   │   └── wasmparser v0.251.0
+│   │   │   │   │       ├── bitflags v2.13.1
+│   │   │   │   │       ├── semver v1.0.28 (*)
+│   │   │   │   │       └── serde v1.0.228 (*)
+│   │   │   │   ├── wasmparser v0.251.0 (*)
+│   │   │   │   └── wat v1.253.0
+│   │   │   │       └── wast v253.0.0
+│   │   │   │           ├── bumpalo v3.20.3 (*)
+│   │   │   │           ├── leb128fmt v0.1.0
+│   │   │   │           ├── memchr v2.8.3
+│   │   │   │           ├── unicode-width v0.2.2
+│   │   │   │           └── wasm-encoder v0.253.0
+│   │   │   │               └── leb128fmt v0.1.0
+│   │   │   ├── wasm-encoder v0.251.0 (*)
+│   │   │   ├── wasmparser v0.251.0 (*)
+│   │   │   ├── wasmtime-environ v46.0.1
+│   │   │   │   ├── anyhow v1.0.103
+│   │   │   │   ├── cpp_demangle v0.4.5
+│   │   │   │   │   └── cfg-if v1.0.4
+│   │   │   │   ├── cranelift-bforest v0.133.1
+│   │   │   │   │   ├── cranelift-entity v0.133.1
+│   │   │   │   │   │   ├── cranelift-bitset v0.133.1 (*)
+│   │   │   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   │   ├── cranelift-bitset v0.133.1 (*)
+│   │   │   │   ├── cranelift-entity v0.133.1 (*)
+│   │   │   │   ├── gimli v0.33.0 (*)
+│   │   │   │   ├── hashbrown v0.17.1 (*)
+│   │   │   │   ├── indexmap v2.14.0 (*)
+│   │   │   │   ├── log v0.4.33
+│   │   │   │   ├── object v0.39.1 (*)
+│   │   │   │   ├── postcard v1.1.3 (*)
+│   │   │   │   ├── rustc-demangle v0.1.28
+│   │   │   │   ├── semver v1.0.28 (*)
+│   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   ├── sha2 v0.10.9 (*)
+│   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   ├── target-lexicon v0.13.5
+│   │   │   │   ├── wasm-encoder v0.251.0 (*)
+│   │   │   │   ├── wasmparser v0.251.0 (*)
+│   │   │   │   ├── wasmprinter v0.251.0
+│   │   │   │   │   ├── anyhow v1.0.103
+│   │   │   │   │   ├── termcolor v1.4.1
+│   │   │   │   │   └── wasmparser v0.251.0 (*)
+│   │   │   │   ├── wasmtime-internal-component-util v46.0.1
+│   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   ├── wasmtime-internal-cache v46.0.1
+│   │   │   │   ├── base64 v0.22.1
+│   │   │   │   ├── directories-next v2.0.0
+│   │   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   │   └── dirs-sys-next v0.1.2
+│   │   │   │   │       └── libc v0.2.186
+│   │   │   │   ├── log v0.4.33
+│   │   │   │   ├── postcard v1.1.3 (*)
+│   │   │   │   ├── rustix v1.1.4 (*)
+│   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   ├── sha2 v0.10.9 (*)
+│   │   │   │   ├── toml v0.9.12+spec-1.1.0 (*)
+│   │   │   │   ├── wasmtime-environ v46.0.1 (*)
+│   │   │   │   └── zstd v0.13.3
+│   │   │   │       └── zstd-safe v7.2.4
+│   │   │   │           └── zstd-sys v2.0.16+zstd.1.5.7
+│   │   │   │               [build-dependencies]
+│   │   │   │               ├── cc v1.3.0 (*)
+│   │   │   │               └── pkg-config v0.3.33
+│   │   │   ├── wasmtime-internal-component-macro v46.0.1 (proc-macro)
+│   │   │   │   ├── anyhow v1.0.103
+│   │   │   │   ├── proc-macro2 v1.0.106 (*)
+│   │   │   │   ├── quote v1.0.46 (*)
+│   │   │   │   ├── syn v2.0.119 (*)
+│   │   │   │   ├── wasmtime-internal-component-util v46.0.1
+│   │   │   │   ├── wasmtime-internal-wit-bindgen v46.0.1
+│   │   │   │   │   ├── anyhow v1.0.103
+│   │   │   │   │   ├── bitflags v2.13.1
+│   │   │   │   │   ├── heck v0.5.0
+│   │   │   │   │   ├── indexmap v2.14.0 (*)
+│   │   │   │   │   └── wit-parser v0.251.0
+│   │   │   │   │       ├── anyhow v1.0.103
+│   │   │   │   │       ├── hashbrown v0.17.1 (*)
+│   │   │   │   │       ├── id-arena v2.3.0
+│   │   │   │   │       ├── indexmap v2.14.0 (*)
+│   │   │   │   │       ├── log v0.4.33
+│   │   │   │   │       ├── semver v1.0.28
+│   │   │   │   │       ├── serde v1.0.228 (*)
+│   │   │   │   │       ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   │       ├── serde_json v1.0.150 (*)
+│   │   │   │   │       ├── unicode-xid v0.2.6
+│   │   │   │   │       └── wasmparser v0.251.0 (*)
+│   │   │   │   └── wit-parser v0.251.0 (*)
+│   │   │   ├── wasmtime-internal-component-util v46.0.1
+│   │   │   ├── wasmtime-internal-core v46.0.1 (*)
+│   │   │   ├── wasmtime-internal-cranelift v46.0.1
+│   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   ├── cranelift-codegen v0.133.1
+│   │   │   │   │   ├── bumpalo v3.20.3 (*)
+│   │   │   │   │   ├── cranelift-assembler-x64 v0.133.1
+│   │   │   │   │   │   [build-dependencies]
+│   │   │   │   │   │   └── cranelift-assembler-x64-meta v0.133.1
+│   │   │   │   │   │       └── cranelift-srcgen v0.133.1
+│   │   │   │   │   ├── cranelift-bforest v0.133.1 (*)
+│   │   │   │   │   ├── cranelift-bitset v0.133.1 (*)
+│   │   │   │   │   ├── cranelift-codegen-shared v0.133.1
+│   │   │   │   │   ├── cranelift-control v0.133.1
+│   │   │   │   │   │   └── arbitrary v1.4.2
+│   │   │   │   │   ├── cranelift-entity v0.133.1 (*)
+│   │   │   │   │   ├── gimli v0.33.0 (*)
+│   │   │   │   │   ├── hashbrown v0.17.1 (*)
+│   │   │   │   │   ├── libm v0.2.16
+│   │   │   │   │   ├── log v0.4.33
+│   │   │   │   │   ├── postcard v1.1.3 (*)
+│   │   │   │   │   ├── pulley-interpreter v46.0.1 (*)
+│   │   │   │   │   ├── regalloc2 v0.15.1
+│   │   │   │   │   │   ├── allocator-api2 v0.2.21
+│   │   │   │   │   │   ├── bumpalo v3.20.3 (*)
+│   │   │   │   │   │   ├── hashbrown v0.17.1 (*)
+│   │   │   │   │   │   ├── log v0.4.33
+│   │   │   │   │   │   ├── rustc-hash v2.1.3
+│   │   │   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   │   │   └── smallvec v1.15.2 (*)
+│   │   │   │   │   ├── rustc-hash v2.1.3
+│   │   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   │   │   ├── sha2 v0.10.9 (*)
+│   │   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   │   ├── target-lexicon v0.13.5
+│   │   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   │   │   [build-dependencies]
+│   │   │   │   │   ├── cranelift-codegen-meta v0.133.1
+│   │   │   │   │   │   ├── cranelift-assembler-x64-meta v0.133.1 (*)
+│   │   │   │   │   │   ├── cranelift-codegen-shared v0.133.1
+│   │   │   │   │   │   ├── cranelift-srcgen v0.133.1
+│   │   │   │   │   │   ├── heck v0.5.0
+│   │   │   │   │   │   └── pulley-interpreter v46.0.1
+│   │   │   │   │   │       ├── cranelift-bitset v0.133.1 (*)
+│   │   │   │   │   │       ├── log v0.4.33
+│   │   │   │   │   │       └── pulley-macros v46.0.1 (proc-macro) (*)
+│   │   │   │   │   └── cranelift-isle v0.133.1
+│   │   │   │   ├── cranelift-control v0.133.1 (*)
+│   │   │   │   ├── cranelift-entity v0.133.1 (*)
+│   │   │   │   ├── cranelift-frontend v0.133.1
+│   │   │   │   │   ├── cranelift-codegen v0.133.1 (*)
+│   │   │   │   │   ├── hashbrown v0.17.1 (*)
+│   │   │   │   │   ├── log v0.4.33
+│   │   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   │   └── target-lexicon v0.13.5
+│   │   │   │   ├── cranelift-native v0.133.1
+│   │   │   │   │   ├── cranelift-codegen v0.133.1 (*)
+│   │   │   │   │   └── target-lexicon v0.13.5
+│   │   │   │   ├── gimli v0.33.0 (*)
+│   │   │   │   ├── itertools v0.14.0
+│   │   │   │   │   └── either v1.16.0
+│   │   │   │   ├── log v0.4.33
+│   │   │   │   ├── object v0.39.1 (*)
+│   │   │   │   ├── pulley-interpreter v46.0.1 (*)
+│   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   ├── target-lexicon v0.13.5
+│   │   │   │   ├── thiserror v2.0.19 (*)
+│   │   │   │   ├── wasmparser v0.251.0 (*)
+│   │   │   │   ├── wasmtime-environ v46.0.1 (*)
+│   │   │   │   ├── wasmtime-internal-core v46.0.1 (*)
+│   │   │   │   ├── wasmtime-internal-unwinder v46.0.1
+│   │   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   │   ├── cranelift-codegen v0.133.1 (*)
+│   │   │   │   │   ├── log v0.4.33
+│   │   │   │   │   ├── object v0.39.1 (*)
+│   │   │   │   │   └── wasmtime-environ v46.0.1 (*)
+│   │   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro)
+│   │   │   │       ├── proc-macro2 v1.0.106 (*)
+│   │   │   │       ├── quote v1.0.46 (*)
+│   │   │   │       └── syn v2.0.119 (*)
+│   │   │   ├── wasmtime-internal-fiber v46.0.1
+│   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   ├── libc v0.2.186
+│   │   │   │   ├── rustix v1.1.4 (*)
+│   │   │   │   ├── wasmtime-environ v46.0.1 (*)
+│   │   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   │   │   [build-dependencies]
+│   │   │   │   ├── cc v1.3.0 (*)
+│   │   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   │   ├── wasmtime-internal-jit-debug v46.0.1
+│   │   │   │   ├── object v0.39.1 (*)
+│   │   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   │   │   [build-dependencies]
+│   │   │   │   ├── cc v1.3.0 (*)
+│   │   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   │   ├── wasmtime-internal-jit-icache-coherence v46.0.1
+│   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   ├── libc v0.2.186
+│   │   │   │   └── wasmtime-internal-core v46.0.1 (*)
+│   │   │   ├── wasmtime-internal-unwinder v46.0.1 (*)
+│   │   │   ├── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   │   ├── wat v1.253.0 (*)
+│   │   │   └── wit-parser v0.251.0 (*)
+│   │   │   [build-dependencies]
+│   │   │   ├── cc v1.3.0 (*)
+│   │   │   └── wasmtime-internal-versioned-export-macros v46.0.1 (proc-macro) (*)
+│   │   ├── wasmtime-wasi v46.0.1
+│   │   │   ├── async-trait v0.1.91 (proc-macro) (*)
+│   │   │   ├── bitflags v2.13.1
+│   │   │   ├── bytes v1.12.1
+│   │   │   ├── cap-fs-ext v3.4.5
+│   │   │   │   ├── cap-primitives v3.4.5
+│   │   │   │   │   ├── ambient-authority v0.0.2
+│   │   │   │   │   ├── fs-set-times v0.20.3 (*)
+│   │   │   │   │   ├── io-extras v0.18.4
+│   │   │   │   │   │   └── io-lifetimes v2.0.4
+│   │   │   │   │   ├── io-lifetimes v2.0.4
+│   │   │   │   │   ├── ipnet v2.12.0
+│   │   │   │   │   ├── maybe-owned v0.3.4
+│   │   │   │   │   └── rustix v1.1.4 (*)
+│   │   │   │   ├── cap-std v3.4.5
+│   │   │   │   │   ├── cap-primitives v3.4.5 (*)
+│   │   │   │   │   ├── io-extras v0.18.4 (*)
+│   │   │   │   │   ├── io-lifetimes v2.0.4
+│   │   │   │   │   └── rustix v1.1.4 (*)
+│   │   │   │   └── io-lifetimes v2.0.4
+│   │   │   ├── cap-net-ext v3.4.5
+│   │   │   │   ├── cap-primitives v3.4.5 (*)
+│   │   │   │   ├── cap-std v3.4.5 (*)
+│   │   │   │   ├── rustix v1.1.4 (*)
+│   │   │   │   └── smallvec v1.15.2 (*)
+│   │   │   ├── cap-std v3.4.5 (*)
+│   │   │   ├── cap-time-ext v3.4.5
+│   │   │   │   ├── ambient-authority v0.0.2
+│   │   │   │   ├── cap-primitives v3.4.5 (*)
+│   │   │   │   ├── iana-time-zone v0.1.65
+│   │   │   │   │   └── core-foundation-sys v0.8.7
+│   │   │   │   └── rustix v1.1.4 (*)
+│   │   │   ├── cfg-if v1.0.4
+│   │   │   ├── futures v0.3.33 (*)
+│   │   │   ├── io-lifetimes v2.0.4
+│   │   │   ├── rand v0.10.2
+│   │   │   │   ├── chacha20 v0.10.1
+│   │   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   │   └── rand_core v0.10.1
+│   │   │   │   ├── getrandom v0.4.3 (*)
+│   │   │   │   └── rand_core v0.10.1
+│   │   │   ├── rustix v1.1.4 (*)
+│   │   │   ├── thiserror v2.0.19 (*)
+│   │   │   ├── tokio v1.53.0 (*)
+│   │   │   ├── tracing v0.1.44 (*)
+│   │   │   ├── url v2.5.8
+│   │   │   │   ├── form_urlencoded v1.2.2
+│   │   │   │   │   └── percent-encoding v2.3.2
+│   │   │   │   ├── idna v1.1.0
+│   │   │   │   │   ├── idna_adapter v1.2.2
+│   │   │   │   │   │   ├── icu_normalizer v2.2.0 (*)
+│   │   │   │   │   │   └── icu_properties v2.2.0 (*)
+│   │   │   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   │   │   └── utf8_iter v1.0.4
+│   │   │   │   └── percent-encoding v2.3.2
+│   │   │   ├── wasmtime v46.0.1 (*)
+│   │   │   ├── wasmtime-wasi-io v46.0.1
+│   │   │   │   ├── async-trait v0.1.91 (proc-macro) (*)
+│   │   │   │   ├── bytes v1.12.1
+│   │   │   │   ├── futures v0.3.33 (*)
+│   │   │   │   ├── tracing v0.1.44 (*)
+│   │   │   │   └── wasmtime v46.0.1 (*)
+│   │   │   └── wiggle v46.0.1
+│   │   │       ├── bitflags v2.13.1
+│   │   │       ├── thiserror v2.0.19 (*)
+│   │   │       ├── tracing v0.1.44 (*)
+│   │   │       ├── wasmtime v46.0.1 (*)
+│   │   │       ├── wasmtime-environ v46.0.1 (*)
+│   │   │       └── wiggle-macro v46.0.1 (proc-macro)
+│   │   │           ├── proc-macro2 v1.0.106 (*)
+│   │   │           ├── quote v1.0.46 (*)
+│   │   │           ├── syn v2.0.119 (*)
+│   │   │           └── wiggle-generate v46.0.1
+│   │   │               ├── heck v0.5.0
+│   │   │               ├── proc-macro2 v1.0.106 (*)
+│   │   │               ├── quote v1.0.46 (*)
+│   │   │               ├── syn v2.0.119 (*)
+│   │   │               ├── wasmtime-environ v46.0.1
+│   │   │               │   ├── anyhow v1.0.103
+│   │   │               │   ├── cranelift-bforest v0.133.1 (*)
+│   │   │               │   ├── cranelift-bitset v0.133.1 (*)
+│   │   │               │   ├── cranelift-entity v0.133.1 (*)
+│   │   │               │   ├── gimli v0.33.0
+│   │   │               │   ├── hashbrown v0.17.1 (*)
+│   │   │               │   ├── indexmap v2.14.0 (*)
+│   │   │               │   ├── log v0.4.33
+│   │   │               │   ├── object v0.39.1
+│   │   │               │   │   └── memchr v2.8.3
+│   │   │               │   ├── postcard v1.1.3
+│   │   │               │   │   ├── cobs v0.3.0 (*)
+│   │   │               │   │   └── serde v1.0.228 (*)
+│   │   │               │   ├── serde v1.0.228 (*)
+│   │   │               │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │               │   ├── sha2 v0.10.9
+│   │   │               │   │   ├── cfg-if v1.0.4
+│   │   │               │   │   ├── cpufeatures v0.2.17 (*)
+│   │   │               │   │   └── digest v0.10.7
+│   │   │               │   │       ├── block-buffer v0.10.4 (*)
+│   │   │               │   │       └── crypto-common v0.1.7
+│   │   │               │   │           ├── generic-array v0.14.7 (*)
+│   │   │               │   │           └── typenum v1.20.1
+│   │   │               │   ├── smallvec v1.15.2
+│   │   │               │   │   └── serde v1.0.228 (*)
+│   │   │               │   ├── target-lexicon v0.13.5
+│   │   │               │   ├── wasmparser v0.251.0 (*)
+│   │   │               │   └── wasmtime-internal-core v46.0.1
+│   │   │               │       ├── hashbrown v0.17.1 (*)
+│   │   │               │       ├── libm v0.2.16
+│   │   │               │       └── serde v1.0.228 (*)
+│   │   │               └── witx v0.9.1
+│   │   │                   ├── anyhow v1.0.103
+│   │   │                   ├── log v0.4.33
+│   │   │                   ├── thiserror v1.0.69
+│   │   │                   │   └── thiserror-impl v1.0.69 (proc-macro)
+│   │   │                   │       ├── proc-macro2 v1.0.106 (*)
+│   │   │                   │       ├── quote v1.0.46 (*)
+│   │   │                   │       └── syn v2.0.119 (*)
+│   │   │                   └── wast v35.0.2
+│   │   │                       └── leb128 v0.2.7
+│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+│   │   ├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+│   │   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
+│   │   [dev-dependencies]
+│   │   ├── criterion v0.5.1
+│   │   │   ├── anes v0.1.6
+│   │   │   ├── cast v0.3.0
+│   │   │   ├── ciborium v0.2.2
+│   │   │   │   ├── ciborium-io v0.2.2
+│   │   │   │   ├── ciborium-ll v0.2.2
+│   │   │   │   │   ├── ciborium-io v0.2.2
+│   │   │   │   │   └── half v2.7.1
+│   │   │   │   │       ├── cfg-if v1.0.4
+│   │   │   │   │       └── zerocopy v0.8.54 (*)
+│   │   │   │   └── serde v1.0.228 (*)
+│   │   │   ├── clap v4.6.2 (*)
+│   │   │   ├── criterion-plot v0.5.0
+│   │   │   │   ├── cast v0.3.0
+│   │   │   │   └── itertools v0.10.5
+│   │   │   │       └── either v1.16.0
+│   │   │   ├── is-terminal v0.4.17
+│   │   │   │   └── libc v0.2.186
+│   │   │   ├── itertools v0.10.5 (*)
+│   │   │   ├── num-traits v0.2.19 (*)
+│   │   │   ├── once_cell v1.21.4
+│   │   │   ├── oorandom v11.1.5
+│   │   │   ├── plotters v0.3.7
+│   │   │   │   ├── num-traits v0.2.19 (*)
+│   │   │   │   ├── plotters-backend v0.3.7
+│   │   │   │   └── plotters-svg v0.3.7
+│   │   │   │       └── plotters-backend v0.3.7
+│   │   │   ├── rayon v1.12.0 (*)
+│   │   │   ├── regex v1.13.1
+│   │   │   │   ├── regex-automata v0.4.16
+│   │   │   │   │   └── regex-syntax v0.8.11
+│   │   │   │   └── regex-syntax v0.8.11
+│   │   │   ├── serde v1.0.228 (*)
+│   │   │   ├── serde_derive v1.0.228 (proc-macro) (*)
+│   │   │   ├── serde_json v1.0.150 (*)
+│   │   │   ├── tinytemplate v1.2.1
+│   │   │   │   ├── serde v1.0.228 (*)
+│   │   │   │   └── serde_json v1.0.150 (*)
+│   │   │   └── walkdir v2.5.0
+│   │   │       └── same-file v1.0.6
+│   │   ├── tempfile v3.27.0 (*)
+│   │   ├── tracing-subscriber v0.3.23
+│   │   │   ├── matchers v0.2.0
+│   │   │   │   └── regex-automata v0.4.16 (*)
+│   │   │   ├── nu-ansi-term v0.50.3
+│   │   │   ├── once_cell v1.21.4
+│   │   │   ├── regex-automata v0.4.16 (*)
+│   │   │   ├── sharded-slab v0.1.7
+│   │   │   │   └── lazy_static v1.5.0
+│   │   │   ├── smallvec v1.15.2 (*)
+│   │   │   ├── thread_local v1.1.10
+│   │   │   │   └── cfg-if v1.0.4
+│   │   │   ├── tracing v0.1.44 (*)
+│   │   │   ├── tracing-core v0.1.36 (*)
+│   │   │   └── tracing-log v0.2.0
+│   │   │       ├── log v0.4.33
+│   │   │       ├── once_cell v1.21.4
+│   │   │       └── tracing-core v0.1.36 (*)
+│   │   ├── wat v1.253.0 (*)
+│   │   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
+│   │   └── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk)
+│   │       └── wit-bindgen v0.51.0 (*)
+│   ├── youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
+│   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
+│   [dev-dependencies]
+│   ├── criterion v0.5.1 (*)
+│   └── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+└── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+[dev-dependencies]
+└── tempfile v3.27.0 (*)
+
+youth-cli v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-cli)
+├── clap v4.6.2 (*)
+├── directories v6.0.0 (*)
+├── serde_json v1.0.150 (*)
+├── sha2 v0.10.9 (*)
+├── tokio v1.53.0 (*)
+├── toml v0.9.12+spec-1.1.0 (*)
+├── tracing-subscriber v0.3.23 (*)
+├── youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule) (*)
+├── youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop) (*)
+├── youth-project v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-project)
+│   ├── serde v1.0.228 (*)
+│   ├── sha2 v0.10.9 (*)
+│   ├── thiserror v2.0.19 (*)
+│   ├── toml v0.9.12+spec-1.1.0 (*)
+│   ├── walkdir v2.5.0 (*)
+│   └── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+│   [dev-dependencies]
+│   └── tempfile v3.27.0 (*)
+├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+├── youth-test v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-test)
+│   ├── base64 v0.22.1
+│   ├── serde_json v1.0.150 (*)
+│   ├── tempfile v3.27.0 (*)
+│   ├── thiserror v2.0.19 (*)
+│   ├── tokio v1.53.0 (*)
+│   ├── unicode-segmentation v1.13.3
+│   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
+│   ├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+│   ├── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+│   ├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+│   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
+└── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
+[dev-dependencies]
+└── tempfile v3.27.0 (*)
+
+youth-countdown-presentation v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/countdown-presentation)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-counter v0.0.2 (/private/tmp/managed-youth-final-worktree/guests/counter)
+└── wit-bindgen v0.51.0 (*)
+
+youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop) (*)
+
+youth-editor-capability-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-capability-v006)
+└── wit-bindgen v0.51.0 (*)
+
+youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+
+youth-editor-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-v006)
+└── wit-bindgen v0.51.0 (*)
+
+youth-elapsed-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-invalid-patch)
+└── wit-bindgen v0.51.0 (*)
+
+youth-elapsed-trap v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-trap)
+└── wit-bindgen v0.51.0 (*)
+
+youth-infinite-loop v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/infinite-loop)
+└── wit-bindgen v0.51.0 (*)
+
+youth-instant-now v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/instant-now)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
+
+youth-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch)
+└── wit-bindgen v0.51.0 (*)
+
+youth-invalid-patch-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch-after-state-write)
+└── wit-bindgen v0.51.0 (*)
+
+youth-invalid-revision v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-revision)
+└── wit-bindgen v0.51.0 (*)
+
+youth-invalid-sequence v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-sequence)
+└── wit-bindgen v0.51.0 (*)
+
+youth-invalid-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-snapshot)
+└── wit-bindgen v0.51.0 (*)
+
+youth-legacy-v003 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/legacy-v003)
+└── wit-bindgen v0.51.0 (*)
+
+youth-memory-bomb v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/memory-bomb)
+└── wit-bindgen v0.51.0 (*)
+
+youth-oversized-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-patch)
+└── wit-bindgen v0.51.0 (*)
+
+youth-oversized-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-snapshot)
+└── wit-bindgen v0.51.0 (*)
+
+youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint) (*)
+
+youth-project v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-project) (*)
+
+youth-render-vello-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-render-vello-cpu) (*)
+
+youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+
+youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-editor v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-editor)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-elapsed v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-elapsed)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-tally v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-tally)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-text-document v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-text-document)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-time v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-time)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-sdk-todo v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-todo)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+
+youth-shortcut-primary-v007 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/shortcut-primary-v007)
+└── wit-bindgen v0.51.0 (*)
+
+youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+
+youth-test v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-test) (*)
+
+youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
+
+youth-time-stub v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/time-stub)
+└── wit-bindgen v0.51.0 (*)
+
+youth-trap-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-after-state-write)
+└── wit-bindgen v0.51.0 (*)
+
+youth-trap-on-handle v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-handle)
+└── wit-bindgen v0.51.0 (*)
+
+youth-trap-on-mount v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-mount)
+└── wit-bindgen v0.51.0 (*)
+
+youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)

@@ -1,0 +1,29 @@
+[package]
+name = "instar-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's orchestration layer: routes window input to the UI layer, UI actions to the guest, and guest commits back to layout. The only crate that bridges logical presentation to physical rendering."
+
+[dependencies]
+# The three layers this crate composes, and the only place they meet.
+instar-kernel = { path = "../instar-kernel" }
+instar-ui = { path = "../instar-ui" }
+instar-window = { path = "../instar-window" }
+
+# Paint *intent* only: scene types, no renderer. This crate is the layer that
+# bridges logical presentation to physical rendering (docs/PHASE-1.md), so
+# lowering a laid-out tree to a PaintScene belongs here -- but choosing a
+# backend does not, and nothing here links Vello, softbuffer, or a font stack.
+instar-paint = { path = "../instar-paint" }
+
+# The runtime thread's executor, and the queue the main thread sends commands
+# over. Nothing async escapes into the main-thread half of this crate: winit
+# owns that thread, and it stays synchronous.
+tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
+# Surfaced only in the runtime thread's guest-outcome types, which are
+# Wasmtime's own results.
+wasmtime = "47.0.3"
+
+[dev-dependencies]
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

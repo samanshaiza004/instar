@@ -1,0 +1,132 @@
+package instar:kernel@0.1.0;
+
+// The Instar kernel world (WP4). Unlike `world.wit`'s `kernel-spike`, this one
+// is meant to survive: it encodes the guest lifecycle rules Gate 0 forced.
+//
+// The central rule (docs/PHASE-1.md, "Guest lifetime boundary"): a guest's
+// lifetime boundary is its Store plus component instance. Cancelling a guest
+// means destroying its whole generation. That is why cancellation appears
+// twice in this file at two very different scales, and why only one of them is
+// visible to the guest:
+//
+//   - Per-operation cancellation IS in this world (`ops.cancel`). The guest
+//     asks the host to cancel one operation; the host cancels it; the guest
+//     task stays alive and keeps running.
+//   - Whole-generation teardown is NOT in this world, and deliberately so.
+//     It is a host-side decision executed by dropping the instance and Store,
+//     and a guest cannot request or observe it -- from the guest's point of
+//     view its generation simply ceases to exist.
+
+interface kernel-types {
+    /// Failure returned by `kernel-runtime.next-event`.
+    variant runtime-error {
+        /// No more events; leave the event loop and return from `run`.
+        shutdown,
+        /// The host could not produce an event.
+        internal(string),
+    }
+
+    /// Failure returned by `kernel-ui.commit`.
+    variant commit-error {
+        /// The batch failed to decode or validate.
+        invalid-batch(string),
+        /// The committing generation is no longer current, so the host
+        /// discarded the batch. A guest should not normally see this: by the
+        /// time a generation is superseded its instance is being dropped. It
+        /// exists so that a stale commit is *rejected explicitly* rather than
+        /// silently applied to a successor generation's state.
+        stale-generation,
+        /// The host side that owns the retained tree is gone or shutting down,
+        /// so no verdict on this batch will ever arrive.
+        ///
+        /// Only reachable because `commit` is async: the batch has been handed
+        /// to a thread-affine owner and the guest is suspended waiting for it.
+        /// If that owner disappears mid-flight the guest must be told, rather
+        /// than left parked on a reply that is never coming.
+        host-unavailable,
+    }
+
+    record commit-result {
+        revision: u64,
+    }
+
+    /// Failure returned by `ops.await-op`.
+    variant op-error {
+        /// The operation was cancelled before it completed -- either because
+        /// the guest asked (`ops.cancel`), or because the host cancelled it
+        /// while tearing down the operation's generation.
+        cancelled,
+        /// The operation ran and failed.
+        failed(string),
+        /// No such operation in this generation. Also what a guest gets if it
+        /// names an operation belonging to a previous generation.
+        unknown,
+    }
+}
+
+/// Host-provided event delivery. Suspending here must cost nothing (see
+/// docs/PHASE-1.md WP3's hard idle gates, proven by Gate 0).
+interface kernel-runtime {
+    use kernel-types.{runtime-error};
+
+    next-event: async func() -> result<list<u8>, runtime-error>;
+}
+
+/// Host-provided UI commit.
+///
+/// Async as of WP7B1, and the reason is ownership rather than cost. The
+/// authoritative retained tree belongs to the host's main/presentation thread,
+/// because that is where winit's event loop must live; the guest runs on a
+/// separate runtime thread. A synchronous commit would therefore have to
+/// either block the runtime thread on the main thread, or share the tree as a
+/// mutex the runtime thread mutates behind the window's back -- and that
+/// second option risks blocking the window thread and muddles who owns the
+/// interface.
+///
+/// So the guest suspends here instead. The host marshals the batch onto the
+/// thread that owns the tree, applies it atomically, and replies. Suspending a
+/// concurrent guest call while the host does work elsewhere is exactly what
+/// the Component Model's async support is for.
+interface kernel-ui {
+    use kernel-types.{commit-result, commit-error};
+
+    commit: async func(batch: list<u8>) -> result<commit-result, commit-error>;
+}
+
+/// Host-owned long-running operations.
+///
+/// Operations are owned by the host and by exactly one generation. Starting
+/// one is synchronous and cheap (it hands back an id); awaiting it is where
+/// the guest task suspends; cancelling it is a normal, expected part of guest
+/// control flow rather than an error path.
+interface ops {
+    use kernel-types.{op-error};
+
+    /// Starts an operation and returns its id immediately, without suspending.
+    ///
+    /// Splitting `start` from `await-op` is what makes cancellation
+    /// expressible at all: the guest holds an id it can act on while the
+    /// operation is still in flight.
+    start: func(kind: string, payload: list<u8>) -> u64;
+
+    /// Suspends until the operation completes, fails, or is cancelled.
+    await-op: async func(id: u64) -> result<list<u8>, op-error>;
+
+    /// Asks the host to cancel an in-flight operation.
+    ///
+    /// Returns whether an operation was actually cancelled (false if it had
+    /// already finished, or was never known). A pending `await-op` for this id
+    /// resolves with `op-error.cancelled`. **The calling guest task stays
+    /// alive** -- this is the per-operation cancellation path, and it must
+    /// never be confused with tearing down a generation.
+    cancel: func(id: u64) -> bool;
+}
+
+world kernel {
+    import kernel-runtime;
+    import kernel-ui;
+    import ops;
+
+    /// The guest's entire program: run until the host says shutdown.
+    export run: async func() -> result<_, string>;
+}

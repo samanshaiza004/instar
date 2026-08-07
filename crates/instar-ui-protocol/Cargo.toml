@@ -1,0 +1,12 @@
+[package]
+name = "instar-ui-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's UI wire format and nothing else: version, opcodes, primitives, encoder, bounded decoder helpers. Shared verbatim by guests and the host; deliberately dependency-free."
+
+# No dependencies, on purpose. Every guest links this to speak the protocol, so
+# anything added here is added to every guest -- including its build time. That
+# is also why the errors below implement Display by hand rather than pulling in
+# a derive macro.
+[dependencies]

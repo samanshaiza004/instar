@@ -1,0 +1,21 @@
+[package]
+name = "ui-guest"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+description = "WP5 interaction guest fixture: a counter with a button. Not part of the Instar workspace; targets wasm32-wasip2 and is built on demand by instar-ui's build script."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60.0"
+# The wire format only -- deliberately NOT instar-ui. A guest needs to speak
+# the encoding, not to link the host's UI implementation, and instar-ui is
+# about to grow a layout engine that has no business in a guest. This is also
+# what removes the build-script recursion WP5 hit: nothing the fixture depends
+# on has a build script that builds the fixture.
+instar-ui-protocol = { path = "../../../../instar-ui-protocol" }
+
+[workspace]

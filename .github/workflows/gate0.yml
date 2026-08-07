@@ -1,0 +1,87 @@
+name: Kernel
+
+# The Instar Phase 1 kernel gates: Gate 0 (WP3) and the guest lifecycle
+# rules that Gate 0's findings forced (WP4).
+#
+# Currently the entire pipeline: the inherited Youth-era ci.yml and release.yml
+# were deleted rather than repaired, since they built workspace members that no
+# longer exist. WP9 writes Instar-native CI to replace them.
+#
+# The point of running on three OSes is that Gate 0's claims are about a
+# *runtime*, not about this machine: "suspends without polling" has to hold on
+# Windows' and Linux' timer and scheduler behaviour too, or the finding doesn't
+# generalize.
+
+on:
+  push:
+    branches: [master, instar-phase-1]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel the other OSes when one fails: which platforms fail is
+      # exactly the information a Gate 0 no-go needs.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned per docs/TOOLCHAIN.md. The guest fixture is built by
+      # instar-kernel's build script, so the wasm target must be present here
+      # even though no CI step names it directly.
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fixture's build artifacts live under instar-kernel's OUT_DIR
+          # and are keyed separately from the host build.
+          key: gate0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@1.255.0
+
+      - name: Run Gate 0
+        run: cargo test -p instar-kernel --test gate0 -- --nocapture
+
+      - name: Run guest lifecycle tests (WP4)
+        run: cargo test -p instar-kernel --test lifecycle -- --nocapture
+
+      - name: Run UI interaction tests (WP5)
+        run: cargo test -p instar-ui -p instar-ui-protocol -p instar-window -p instar-host -- --nocapture
+
+      # Linux only: ~35s of generation churn, and the RSS trend it asserts on
+      # is most stable on the runner with the least noisy memory accounting.
+      # The properties it proves are platform-independent; running it three
+      # times would cost minutes to re-verify the same claim.
+      - name: Soak -- 1000 generation teardowns stay bounded
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p instar-kernel --test soak -- --ignored --nocapture
+
+      # Validates on each OS that the fixture the gates just ran against is a
+      # well-formed component with the async export intact -- catches a
+      # platform-specific toolchain problem that might otherwise be invisible
+      # behind a passing test.
+      - name: Validate the guest fixture component
+        shell: bash
+        run: |
+          set -euo pipefail
+          wasm=$(find target/debug/build -name 'kernel_spike_guest.wasm' | head -1)
+          if [ -z "$wasm" ]; then
+            echo "no kernel-spike guest component found under target/debug/build" >&2
+            exit 1
+          fi
+          echo "validating $wasm"
+          wasm-tools validate --features all "$wasm"
+          wasm-tools component wit "$wasm" | grep -q 'export run: async func' \
+            || { echo "guest component lost its async export" >&2; exit 1; }
