@@ -1,0 +1,98 @@
+   Compiling fnv v1.0.7
+   Compiling num-traits v0.2.19
+   Compiling regex-syntax v0.8.11
+   Compiling zerocopy v0.8.54
+   Compiling zerocopy-derive v0.8.54
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling itertools v0.10.5
+   Compiling gimli v0.33.0
+   Compiling cast v0.3.0
+   Compiling plotters-svg v0.3.7
+   Compiling tinytemplate v1.2.1
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling getrandom v0.3.4
+   Compiling wait-timeout v0.2.1
+   Compiling criterion-plot v0.5.0
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling plotters v0.3.7
+   Compiling euclid v0.22.14
+   Compiling rand_core v0.9.5
+   Compiling regex-automata v0.4.16
+   Compiling unarray v0.1.4
+   Compiling youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu)
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling guillotiere v0.7.0
+   Compiling youth-project v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-project)
+   Compiling vello_common v0.1.0
+   Compiling youth-instant-now v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/instant-now)
+   Compiling wasmtime-environ v46.0.1
+   Compiling cranelift-codegen v0.133.1
+   Compiling addr2line v0.26.1
+   Compiling matchers v0.2.0
+   Compiling half v2.7.1
+   Compiling regex v1.13.1
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling criterion v0.5.1
+   Compiling vello_cpu v0.1.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling youth-render-vello-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-render-vello-cpu)
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+   Compiling youth-sdk-text-document v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-text-document)
+   Compiling wasmtime-internal-cache v46.0.1
+   Compiling wasmtime-internal-fiber v46.0.1
+   Compiling youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree)
+   Compiling youth-sdk-todo v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-todo)
+   Compiling youth-sdk-editor v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-editor)
+   Compiling youth-countdown-presentation v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/countdown-presentation)
+   Compiling youth-sdk-tally v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-tally)
+   Compiling youth-sdk-elapsed v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-elapsed)
+   Compiling youth-sdk-time v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-time)
+   Compiling youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction)
+   Compiling youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule)
+   Compiling wasmtime-internal-unwinder v46.0.1
+   Compiling cranelift-native v0.133.1
+   Compiling cranelift-frontend v0.133.1
+   Compiling wasmtime-internal-cranelift v46.0.1
+   Compiling youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine)
+   Compiling youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state)
+   Compiling youth-trap-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-after-state-write)
+   Compiling youth-elapsed-trap v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-trap)
+   Compiling wasmtime v46.0.1
+   Compiling youth-legacy-v003 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/legacy-v003)
+   Compiling youth-invalid-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-snapshot)
+   Compiling youth-time-stub v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/time-stub)
+   Compiling youth-invalid-revision v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-revision)
+   Compiling youth-invalid-sequence v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-sequence)
+   Compiling youth-trap-on-mount v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-mount)
+   Compiling youth-oversized-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-patch)
+   Compiling youth-elapsed-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-invalid-patch)
+   Compiling wasmtime-wasi-io v46.0.1
+   Compiling wiggle v46.0.1
+   Compiling wasmtime-wasi v46.0.1
+   Compiling youth-memory-bomb v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/memory-bomb)
+   Compiling youth-invalid-patch-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch-after-state-write)
+   Compiling youth-editor-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-v006)
+   Compiling youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk)
+   Compiling youth-oversized-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-snapshot)
+   Compiling youth-trap-on-handle v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-handle)
+   Compiling youth-app-error-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/app-error-after-state-write)
+   Compiling youth-shortcut-primary-v007 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/shortcut-primary-v007)
+   Compiling youth-editor-capability-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-capability-v006)
+   Compiling youth-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch)
+   Compiling youth-infinite-loop v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/infinite-loop)
+   Compiling youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime)
+   Compiling youth-counter v0.0.2 (/private/tmp/managed-youth-final-worktree/guests/counter)
+   Compiling youth-bad-revision-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/bad-revision-after-state-write)
+   Compiling youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint)
+   Compiling youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop)
+   Compiling youth-test v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-test)

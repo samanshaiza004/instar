@@ -1,64 +1,75 @@
 # managed-youth-final baseline: partial result
 
-## Status: incomplete, stopped due to a host disk-space constraint
+Pre-rewrite baseline of the `managed-youth-final` tag (`fac5f8d`), captured
+2026-08-06/07. **Partial**: the build and size numbers are complete, the
+runtime measurements are not.
 
-WP0.3 (docs/PHASE-1.md) called for a full baseline of the `managed-youth-final`
-tag: commit hash, `cargo metadata`/`cargo tree`, build/test results, release
-binary size, release build time, desktop startup time, desktop committed RSS,
-desktop reserved virtual memory, desktop thread count, desktop idle CPU over
-30 seconds, and counter component size.
+> Correction: an earlier version of this file said the release build stalled
+> and that binary sizes were never captured. That was wrong — it described a
+> second, redundant capture attempt that did stall on a disk-space problem,
+> while an earlier attempt had already completed the release build and
+> recorded sizes. The completed data is what is in this directory now.
 
-What was actually captured, in a standalone checkout of `managed-youth-final`:
+## Captured
 
-- `commit.txt` — commit hash and `git log -1`. Complete.
-- `cargo-metadata.json` — `cargo metadata --format-version=1`. Complete.
-- `cargo-tree.txt` — `cargo tree`. Complete.
-- `build-log.txt` — **incomplete**. `cargo build --release --workspace` got
-  through compiling essentially the entire 39-crate workspace but stalled on
-  the final three LTO-linked binaries (`youth`, `youth-capsule-launcher`,
-  `youth-desktop`) for close to an hour without completing. This machine's
-  disk ran critically low during the session (down to ~1.8-2.8GB free on a
-  494GB volume, most of which is consumed by something outside this
-  project — see the conversation this baseline was captured in). Fat-LTO
-  linking needs substantial scratch space; the stall is almost certainly
-  disk-pressure-induced I/O degradation, not a problem with the build itself
-  or the pinned toolchain. The process was killed and its worktree removed to
-  reclaim ~1.8GB rather than let it continue competing for disk indefinitely.
-- Test results, binary sizes, counter component size, startup time, RSS,
-  reserved VM, thread count, idle CPU: **not captured**. All of these need
-  either the completed release build (binary sizes, startup/RSS/etc.) or a
-  `cargo test --release` pass (test results) that was never reached.
+| Artifact | File | Notes |
+|---|---|---|
+| Commit hash | `commit.txt` | `fac5f8d`, plus `git log -1` |
+| Dependency metadata | `cargo-metadata.json` | `cargo metadata --format-version=1` |
+| Dependency tree | `cargo-tree.txt` | `cargo tree` |
+| Release build log + timing | `build-log.txt` | `cargo build --release --workspace`, finished in **42m 17s** (2538s wall, 2197s user, 1131s sys) |
+| Release binary sizes | `binary-sizes.txt` | `youth` 30.07 MB, `youth-capsule-launcher` 26.28 MB, `youth-desktop` 25.57 MB (Mach-O arm64) |
 
-## This is an acceptable partial outcome, not a blocker
+## Not captured
 
-Per docs/PHASE-1.md: "Memory and startup are discovery metrics during Phase
-1. Do not invent targets before measuring the actual baseline" — these
-numbers were always exploratory, not a gate Phase 1's other work packages
-depend on. WP1-WP3 (toolchain lock, kernel scaffold, headless async spike)
-do not need this baseline to proceed, and did in fact proceed while this was
-still running.
+- **Test results.** `test-results.txt` holds only compilation output; the run
+  never reached a single `test result:` line, so it records nothing about
+  whether the suite passed. Treat the file as evidence of an attempt, not as a
+  result.
+- **Counter component size.**
+- **Runtime measurements**: startup time, committed RSS, reserved virtual
+  memory, thread count, idle CPU over 30s. These need the built `youth` binary
+  driven against the counter component, which was never done.
 
-## Redo later, on a machine/session with more headroom
+## Why this is an acceptable place to stop
 
-To finish this baseline: free up disk space (well clear of the ~5GB+ fat-LTO
-linking three winit/tokio/vello/accesskit/wasmtime binaries appears to need
-as scratch space, based on this attempt), then re-run using the same
-methodology this file documents:
+Per the Phase 1 plan, memory and startup are *discovery* metrics — "do not
+invent targets before measuring the actual baseline" — not a gate that other
+work packages depend on. WP1–WP3 (toolchain lock, kernel scaffold, Gate 0
+spike) did not need any of this and proceeded independently. The missing
+numbers matter later, for the WP9 comparison, not now.
+
+The build and size numbers are also the ones most expensive to reproduce (42
+minutes of release build) and they are done. What remains is comparatively
+cheap once someone has a built binary in hand.
+
+## Finishing it later
+
+Runtime measurements, using the already-built binaries:
 
 ```bash
-git clone <repo> <scratch-dir> && cd <scratch-dir> && git checkout managed-youth-final
-git rev-parse HEAD && git log -1                          # commit.txt
-cargo metadata --format-version=1                          # cargo-metadata.json
-cargo tree                                                  # cargo-tree.txt
-time cargo build --release --workspace                     # build-log.txt
-cargo test --release --workspace                            # test-results.txt
-# binary-sizes.txt: ls -la target/release/{youth,youth-desktop}
-# counter-component-size.txt: build guests/counter for wasm32-wasip2, record .wasm size
-# runtime metrics: launch the built `youth` binary against the counter
-# component, sample `ps -o rss=,vsz=,%cpu= -p <pid>` over a settled 30s
-# idle window, and count threads via `ps -M -p <pid>`.
+# startup + steady-state, driven against the counter component
+/usr/bin/time -l target/release/youth <counter-component.wasm>
+ps -o rss=,vsz=,%cpu= -p <pid>     # sample over a settled 30s idle window
+ps -M -p <pid>                      # thread count
 ```
 
-This methodology is the one WP3.2 and WP9 reuse for the equivalent Instar
-measurements, so whenever this gets redone, keep it identical for a valid
-comparison rather than improvising a different one.
+Test results, from a checkout of the tag:
+
+```bash
+cargo test --release --workspace
+```
+
+Counter component size: build `guests/counter` for `wasm32-wasip2` and record
+the `.wasm` byte size.
+
+Keep this methodology identical when it is redone — WP9 compares Instar's
+numbers against these, and a differently-measured baseline is not a baseline.
+
+## Note for whoever redoes this
+
+Two captures were run concurrently against the same tag, in two different
+scratch worktrees, and the second overwrote parts of the first's output before
+stalling. That is why the files here span two runs and why this document needed
+a correction. If you re-run it: use one worktree, and write to a fresh output
+directory rather than over an existing one.

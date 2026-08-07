@@ -1,4 +1,4 @@
-youth-app-error-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/app-error-after-state-write)
+youth-app-error-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/app-error-after-state-write)
 └── wit-bindgen v0.51.0
     ├── bitflags v2.13.1
     └── wit-bindgen-rust-macro v0.51.0 (proc-macro)
@@ -73,10 +73,10 @@ youth-app-error-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-d
                 ├── wasmparser v0.244.0 (*)
                 └── wit-parser v0.244.0 (*)
 
-youth-bad-revision-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/bad-revision-after-state-write)
+youth-bad-revision-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/bad-revision-after-state-write)
 └── wit-bindgen v0.51.0 (*)
 
-youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule)
+youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule)
 ├── serde v1.0.228
 │   ├── serde_core v1.0.228
 │   └── serde_derive v1.0.228 (proc-macro) (*)
@@ -111,7 +111,7 @@ youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e
 │   │   └── winnow v1.0.4
 │   ├── toml_writer v1.1.2+spec-1.1.0
 │   └── winnow v0.7.15
-└── youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state)
+└── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state)
     ├── rusqlite v0.40.1
     │   ├── bitflags v2.13.1
     │   ├── fallible-iterator v0.3.0
@@ -153,7 +153,7 @@ youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e
 [dev-dependencies]
 └── tempfile v3.27.0 (*)
 
-youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule-launcher)
+youth-capsule-launcher v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule-launcher)
 ├── clap v4.6.2
 │   ├── clap_builder v4.6.2
 │   │   ├── anstream v1.0.0
@@ -177,8 +177,8 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │       ├── libc v0.2.186
 │       └── option-ext v0.2.0
 ├── thiserror v2.0.19 (*)
-├── youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule) (*)
-├── youth-desktop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-desktop)
+├── youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule) (*)
+├── youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop)
 │   ├── accesskit v0.24.1
 │   │   └── uuid v1.24.0
 │   │       └── getrandom v0.4.3 (*)
@@ -301,8 +301,8 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │       └── syn v2.0.119 (*)
 │   ├── tracing v0.1.44 (*)
 │   ├── winit v0.30.12 (*)
-│   ├── youth-interaction v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-interaction)
-│   │   └── youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree)
+│   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction)
+│   │   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree)
 │   │       ├── serde v1.0.228 (*)
 │   │       └── thiserror v2.0.19 (*)
 │   │       [dev-dependencies]
@@ -338,9 +338,9 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │           │       └── libc v0.2.186
 │   │           ├── tempfile v3.27.0 (*)
 │   │           └── unarray v0.1.4
-│   ├── youth-paint v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-paint)
+│   ├── youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint)
 │   │   └── thiserror v2.0.19 (*)
-│   ├── youth-render-vello-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-render-vello-cpu)
+│   ├── youth-render-vello-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-render-vello-cpu)
 │   │   ├── vello_cpu v0.1.0
 │   │   │   ├── bytemuck v1.25.2
 │   │   │   │   └── bytemuck_derive v1.11.0 (proc-macro)
@@ -370,9 +370,9 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │   │       │   └── smallvec v1.15.2 (*)
 │   │   │       ├── smallvec v1.15.2 (*)
 │   │   │       └── thiserror v2.0.19 (*)
-│   │   └── youth-paint v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-paint) (*)
+│   │   └── youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint) (*)
 │   │   [dev-dependencies]
-│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine)
+│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine)
 │   │   │   ├── accesskit v0.24.1 (*)
 │   │   │   └── parley v0.11.0
 │   │   │       ├── accesskit v0.24.1 (*)
@@ -485,13 +485,13 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │   │       └── skrifa v0.43.2
 │   │   │           ├── bytemuck v1.25.2 (*)
 │   │   │           └── read-fonts v0.40.2 (*)
-│   │   └── youth-text-render-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-text-render-cpu)
+│   │   └── youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu)
 │   │       ├── swash v0.2.10
 │   │       │   ├── skrifa v0.43.2 (*)
 │   │       │   ├── yazi v0.2.1
 │   │       │   └── zeno v0.3.3
-│   │       └── youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine) (*)
-│   ├── youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime)
+│   │       └── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+│   ├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime)
 │   │   ├── accesskit v0.24.1 (*)
 │   │   ├── arboard v3.6.1
 │   │   │   ├── objc2 v0.6.4 (*)
@@ -952,9 +952,9 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │   │                   │       └── syn v2.0.119 (*)
 │   │   │                   └── wast v35.0.2
 │   │   │                       └── leb128 v0.2.7
-│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine) (*)
-│   │   ├── youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state) (*)
-│   │   └── youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree) (*)
+│   │   ├── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+│   │   ├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+│   │   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
 │   │   [dev-dependencies]
 │   │   ├── criterion v0.5.1
 │   │   │   ├── anes v0.1.6
@@ -1015,19 +1015,19 @@ youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9
 │   │   │       ├── once_cell v1.21.4
 │   │   │       └── tracing-core v0.1.36 (*)
 │   │   ├── wat v1.253.0 (*)
-│   │   ├── youth-interaction v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-interaction) (*)
-│   │   └── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk)
+│   │   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
+│   │   └── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk)
 │   │       └── wit-bindgen v0.51.0 (*)
-│   ├── youth-text-render-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
-│   └── youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree) (*)
+│   ├── youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
+│   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
 │   [dev-dependencies]
 │   ├── criterion v0.5.1 (*)
-│   └── youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine) (*)
-└── youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime) (*)
+│   └── youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+└── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
 [dev-dependencies]
 └── tempfile v3.27.0 (*)
 
-youth-cli v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-cli)
+youth-cli v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-cli)
 ├── clap v4.6.2 (*)
 ├── directories v6.0.0 (*)
 ├── serde_json v1.0.150 (*)
@@ -1035,139 +1035,139 @@ youth-cli v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-
 ├── tokio v1.53.0 (*)
 ├── toml v0.9.12+spec-1.1.0 (*)
 ├── tracing-subscriber v0.3.23 (*)
-├── youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule) (*)
-├── youth-desktop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-desktop) (*)
-├── youth-project v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-project)
+├── youth-capsule v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-capsule) (*)
+├── youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop) (*)
+├── youth-project v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-project)
 │   ├── serde v1.0.228 (*)
 │   ├── sha2 v0.10.9 (*)
 │   ├── thiserror v2.0.19 (*)
 │   ├── toml v0.9.12+spec-1.1.0 (*)
 │   ├── walkdir v2.5.0 (*)
-│   └── youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state) (*)
+│   └── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
 │   [dev-dependencies]
 │   └── tempfile v3.27.0 (*)
-├── youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime) (*)
-├── youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state) (*)
-├── youth-test v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-test)
+├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+├── youth-test v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-test)
 │   ├── base64 v0.22.1
 │   ├── serde_json v1.0.150 (*)
 │   ├── tempfile v3.27.0 (*)
 │   ├── thiserror v2.0.19 (*)
 │   ├── tokio v1.53.0 (*)
 │   ├── unicode-segmentation v1.13.3
-│   ├── youth-interaction v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-interaction) (*)
-│   ├── youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime) (*)
-│   ├── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
-│   ├── youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state) (*)
-│   └── youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree) (*)
-└── youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree) (*)
+│   ├── youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
+│   ├── youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
+│   ├── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
+│   ├── youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
+│   └── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
+└── youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
 [dev-dependencies]
 └── tempfile v3.27.0 (*)
 
-youth-countdown-presentation v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/countdown-presentation)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-countdown-presentation v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/countdown-presentation)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-counter v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/guests/counter)
+youth-counter v0.0.2 (/private/tmp/managed-youth-final-worktree/guests/counter)
 └── wit-bindgen v0.51.0 (*)
 
-youth-desktop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-desktop) (*)
+youth-desktop v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-desktop) (*)
 
-youth-editor-capability-v006 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/editor-capability-v006)
+youth-editor-capability-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-capability-v006)
 └── wit-bindgen v0.51.0 (*)
 
-youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine) (*)
+youth-editor-engine v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-editor-engine) (*)
 
-youth-editor-v006 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/editor-v006)
+youth-editor-v006 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/editor-v006)
 └── wit-bindgen v0.51.0 (*)
 
-youth-elapsed-invalid-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/elapsed-invalid-patch)
+youth-elapsed-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-invalid-patch)
 └── wit-bindgen v0.51.0 (*)
 
-youth-elapsed-trap v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/elapsed-trap)
+youth-elapsed-trap v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/elapsed-trap)
 └── wit-bindgen v0.51.0 (*)
 
-youth-infinite-loop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/infinite-loop)
+youth-infinite-loop v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/infinite-loop)
 └── wit-bindgen v0.51.0 (*)
 
-youth-instant-now v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/instant-now)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-instant-now v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/instant-now)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-interaction v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-interaction) (*)
+youth-interaction v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-interaction) (*)
 
-youth-invalid-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-patch)
+youth-invalid-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch)
 └── wit-bindgen v0.51.0 (*)
 
-youth-invalid-patch-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-patch-after-state-write)
+youth-invalid-patch-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-patch-after-state-write)
 └── wit-bindgen v0.51.0 (*)
 
-youth-invalid-revision v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-revision)
+youth-invalid-revision v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-revision)
 └── wit-bindgen v0.51.0 (*)
 
-youth-invalid-sequence v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-sequence)
+youth-invalid-sequence v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-sequence)
 └── wit-bindgen v0.51.0 (*)
 
-youth-invalid-snapshot v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-snapshot)
+youth-invalid-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/invalid-snapshot)
 └── wit-bindgen v0.51.0 (*)
 
-youth-legacy-v003 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/legacy-v003)
+youth-legacy-v003 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/legacy-v003)
 └── wit-bindgen v0.51.0 (*)
 
-youth-memory-bomb v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/memory-bomb)
+youth-memory-bomb v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/memory-bomb)
 └── wit-bindgen v0.51.0 (*)
 
-youth-oversized-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/oversized-patch)
+youth-oversized-patch v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-patch)
 └── wit-bindgen v0.51.0 (*)
 
-youth-oversized-snapshot v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/oversized-snapshot)
+youth-oversized-snapshot v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/oversized-snapshot)
 └── wit-bindgen v0.51.0 (*)
 
-youth-paint v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-paint) (*)
+youth-paint v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-paint) (*)
 
-youth-project v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-project) (*)
+youth-project v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-project) (*)
 
-youth-render-vello-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-render-vello-cpu) (*)
+youth-render-vello-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-render-vello-cpu) (*)
 
-youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime) (*)
+youth-runtime v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-runtime) (*)
 
-youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-editor v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-editor)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-editor v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-editor)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-elapsed v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-elapsed)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-elapsed v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-elapsed)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-tally v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-tally)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-tally v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-tally)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-text-document v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-text-document)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-text-document v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-text-document)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-time v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-time)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-time v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-time)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-sdk-todo v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-todo)
-└── youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk) (*)
+youth-sdk-todo v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/sdk-todo)
+└── youth-sdk v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-sdk) (*)
 
-youth-shortcut-primary-v007 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/shortcut-primary-v007)
+youth-shortcut-primary-v007 v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/shortcut-primary-v007)
 └── wit-bindgen v0.51.0 (*)
 
-youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state) (*)
+youth-state v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-state) (*)
 
-youth-test v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-test) (*)
+youth-test v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-test) (*)
 
-youth-text-render-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
+youth-text-render-cpu v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-text-render-cpu) (*)
 
-youth-time-stub v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/time-stub)
+youth-time-stub v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/time-stub)
 └── wit-bindgen v0.51.0 (*)
 
-youth-trap-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-after-state-write)
+youth-trap-after-state-write v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-after-state-write)
 └── wit-bindgen v0.51.0 (*)
 
-youth-trap-on-handle v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-on-handle)
+youth-trap-on-handle v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-handle)
 └── wit-bindgen v0.51.0 (*)
 
-youth-trap-on-mount v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-on-mount)
+youth-trap-on-mount v0.0.2 (/private/tmp/managed-youth-final-worktree/test-components/trap-on-mount)
 └── wit-bindgen v0.51.0 (*)
 
-youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree) (*)
+youth-tree v0.0.2 (/private/tmp/managed-youth-final-worktree/crates/youth-tree) (*)
