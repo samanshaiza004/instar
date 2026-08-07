@@ -62,21 +62,36 @@ pub mod limits {
     pub const MAX_TEXT_BYTES: usize = 4096;
     /// Maximum size of an entire encoded batch.
     pub const MAX_BATCH_BYTES: usize = 1 << 20;
-    /// Maximum entries in a layout snapshot.
-    pub const MAX_LAYOUT_ENTRIES: usize = MAX_NODES;
+    /// Largest accepted fixed dimension, padding, or gap, in logical pixels.
+    /// Bounds layout arithmetic to values that cannot overflow downstream.
+    pub const MAX_LENGTH: u16 = 1 << 14;
 }
 
 /// Node kind opcodes.
+///
+/// Deliberately four. Phase 1's layout vocabulary is meant to stay small
+/// enough to reason about completely; a general CSS surface is not a goal, and
+/// every kind added here is one the host must lay out, hit-test, and paint
+/// forever.
 pub mod opcode {
-    pub const NODE_CONTAINER: u8 = 0;
-    pub const NODE_LABEL: u8 = 1;
-    pub const NODE_BUTTON: u8 = 2;
+    /// The single outermost node. Fills the viewport.
+    pub const NODE_ROOT: u8 = 0;
+    /// Stacks its children vertically.
+    pub const NODE_COLUMN: u8 = 1;
+    /// Displays text. Measured, not sized by the guest.
+    pub const NODE_TEXT: u8 = 2;
+    /// Interactive, with a text label.
+    pub const NODE_BUTTON: u8 = 3;
 
     pub const SECTION_END: u8 = 0;
     pub const SECTION_TREE: u8 = 1;
-    pub const SECTION_LAYOUT: u8 = 2;
 
     pub const EVENT_CLICK: u8 = 0;
+
+    /// Dimension tags. See [`super::WireDimension`].
+    pub const DIM_FILL: u8 = 0;
+    pub const DIM_CONTENT: u8 = 1;
+    pub const DIM_FIXED: u8 = 2;
 }
 
 /// Node flag bits.
@@ -120,18 +135,76 @@ impl WireRect {
     }
 }
 
+/// How a node is sized along one axis.
+///
+/// The entire Phase 1 sizing vocabulary. Note what is absent: no percentages,
+/// no min/max, no arbitrary positioning, no grid. A guest states intent; the
+/// host decides the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireDimension {
+    /// Take all the space the parent offers.
+    Fill,
+    /// Be as large as the content needs.
+    Content,
+    /// Exactly this many logical pixels.
+    Fixed(u16),
+}
+
+impl WireDimension {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Fill => opcode::DIM_FILL,
+            Self::Content => opcode::DIM_CONTENT,
+            Self::Fixed(_) => opcode::DIM_FIXED,
+        }
+    }
+
+    pub fn value(self) -> u16 {
+        match self {
+            Self::Fixed(px) => px,
+            _ => 0,
+        }
+    }
+}
+
+/// A node's layout intent.
+///
+/// **Intent, not geometry.** A guest says "fill the width, pad by 8"; it never
+/// says "you are at (10, 40) and 100x30". Geometry is computed by the host and
+/// never travels on this wire in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireLayout {
+    pub width: WireDimension,
+    pub height: WireDimension,
+    /// Inset applied on all four sides, in logical pixels.
+    pub padding: u16,
+    /// Space between children, in logical pixels. Ignored by leaf nodes.
+    pub gap: u16,
+}
+
+impl Default for WireLayout {
+    fn default() -> Self {
+        Self {
+            width: WireDimension::Content,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        }
+    }
+}
+
 /// One node as it appears on the wire, in pre-order.
 ///
 /// Flat, with an explicit `child_count`, so a decoder can rebuild the
-/// hierarchy with a bounded stack. Carries no geometry — see
-/// [`WireBatch::layout`].
+/// hierarchy with a bounded stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireNode {
     pub kind: u8,
     pub key: NodeKey,
     pub flags: u8,
-    /// Present for label and button nodes.
+    /// Present for text and button nodes.
     pub text: Option<String>,
+    pub layout: WireLayout,
     pub child_count: u16,
 }
 
@@ -141,23 +214,17 @@ impl WireNode {
     }
 }
 
-/// A decoded batch: the tree, plus an optional layout snapshot.
+/// A decoded batch.
+///
+/// Just the tree. There is no geometry section and no way to express one: as
+/// of WP7A the host computes all geometry from layout intent, and a guest
+/// cannot state a rectangle even if it wants to. That is the point — a guest
+/// authoritative over geometry would undermine the retained host presentation
+/// model.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WireBatch {
     /// Pre-order nodes.
     pub nodes: Vec<WireNode>,
-    /// **Provisional, and scheduled for removal.**
-    ///
-    /// Geometry is deliberately *not* part of the tree: the host owns
-    /// presentation, and a guest that dictates rects would quietly become
-    /// authoritative over geometry. This section exists only so WP5 could
-    /// prove an interaction round-trip before a layout engine existed.
-    ///
-    /// When the host computes layout (WP7), it produces the snapshot itself
-    /// and this section is deleted — a change to the tree format is not
-    /// required, which is the entire reason it is a separate section rather
-    /// than fields on `WireNode`.
-    pub layout: Vec<(NodeKey, WireRect)>,
 }
 
 /// Why a batch or event was rejected.
@@ -177,7 +244,8 @@ pub enum ProtocolError {
     TooDeep,
     TextTooLong(usize),
     InvalidUtf8,
-    TooManyLayoutEntries,
+    /// A fixed dimension, padding, or gap exceeded [`limits::MAX_LENGTH`].
+    LengthTooLarge(u16),
     /// The pre-order child counts do not describe one well-formed tree.
     MalformedTree(&'static str),
     TrailingBytes(usize),
@@ -210,10 +278,10 @@ impl fmt::Display for ProtocolError {
                 limits::MAX_TEXT_BYTES
             ),
             Self::InvalidUtf8 => write!(f, "text is not valid UTF-8"),
-            Self::TooManyLayoutEntries => write!(
+            Self::LengthTooLarge(n) => write!(
                 f,
-                "layout snapshot has more than {} entries",
-                limits::MAX_LAYOUT_ENTRIES
+                "layout length {n} exceeds the {} pixel limit",
+                limits::MAX_LENGTH
             ),
             Self::MalformedTree(why) => write!(f, "malformed tree: {why}"),
             Self::TrailingBytes(n) => write!(f, "{n} trailing bytes after the message"),
@@ -281,6 +349,33 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::InvalidUtf8)
     }
 
+    /// Reads a bounded length. Layout arithmetic downstream assumes these fit
+    /// comfortably in an f32 without surprises.
+    pub fn length(&mut self, while_reading: &'static str) -> Result<u16, ProtocolError> {
+        let value = self.u16(while_reading)?;
+        if value > limits::MAX_LENGTH {
+            return Err(ProtocolError::LengthTooLarge(value));
+        }
+        Ok(value)
+    }
+
+    pub fn dimension(
+        &mut self,
+        while_reading: &'static str,
+    ) -> Result<WireDimension, ProtocolError> {
+        let tag = self.u8(while_reading)?;
+        let value = self.length(while_reading)?;
+        match tag {
+            opcode::DIM_FILL => Ok(WireDimension::Fill),
+            opcode::DIM_CONTENT => Ok(WireDimension::Content),
+            opcode::DIM_FIXED => Ok(WireDimension::Fixed(value)),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "dimension",
+                value,
+            }),
+        }
+    }
+
     pub fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
     }
@@ -310,8 +405,6 @@ pub fn write_text(out: &mut Vec<u8>, text: &str) {
 pub struct BatchEncoder {
     nodes: Vec<u8>,
     node_count: usize,
-    layout: Vec<u8>,
-    layout_count: usize,
 }
 
 impl BatchEncoder {
@@ -327,6 +420,7 @@ impl BatchEncoder {
         key: NodeKey,
         flags: u8,
         text: Option<&str>,
+        layout: WireLayout,
         child_count: u16,
     ) -> &mut Self {
         self.nodes.push(kind);
@@ -335,36 +429,27 @@ impl BatchEncoder {
         if let Some(text) = text {
             write_text(&mut self.nodes, text);
         }
+        self.nodes.push(layout.width.tag());
+        self.nodes
+            .extend_from_slice(&layout.width.value().to_le_bytes());
+        self.nodes.push(layout.height.tag());
+        self.nodes
+            .extend_from_slice(&layout.height.value().to_le_bytes());
+        self.nodes.extend_from_slice(&layout.padding.to_le_bytes());
+        self.nodes.extend_from_slice(&layout.gap.to_le_bytes());
         self.nodes.extend_from_slice(&child_count.to_le_bytes());
         self.node_count += 1;
         self
     }
 
-    /// Appends a layout entry. See [`WireBatch::layout`] — provisional.
-    pub fn layout_entry(&mut self, key: NodeKey, rect: WireRect) -> &mut Self {
-        self.layout.extend_from_slice(&key.0.to_le_bytes());
-        self.layout.extend_from_slice(&rect.x.to_le_bytes());
-        self.layout.extend_from_slice(&rect.y.to_le_bytes());
-        self.layout.extend_from_slice(&rect.width.to_le_bytes());
-        self.layout.extend_from_slice(&rect.height.to_le_bytes());
-        self.layout_count += 1;
-        self
-    }
-
     pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + self.nodes.len() + self.layout.len());
+        let mut out = Vec::with_capacity(16 + self.nodes.len());
         out.extend_from_slice(&BATCH_MAGIC);
         out.push(PROTOCOL_VERSION);
 
         out.push(opcode::SECTION_TREE);
         out.extend_from_slice(&(self.node_count.min(u16::MAX as usize) as u16).to_le_bytes());
         out.extend_from_slice(&self.nodes);
-
-        if self.layout_count > 0 {
-            out.push(opcode::SECTION_LAYOUT);
-            out.extend_from_slice(&(self.layout_count.min(u16::MAX as usize) as u16).to_le_bytes());
-            out.extend_from_slice(&self.layout);
-        }
 
         out.push(opcode::SECTION_END);
         out
@@ -401,9 +486,6 @@ pub fn decode_batch(bytes: &[u8]) -> Result<WireBatch, ProtocolError> {
                 }
                 seen_tree = true;
                 batch.nodes = decode_tree_section(&mut reader)?;
-            }
-            opcode::SECTION_LAYOUT => {
-                batch.layout = decode_layout_section(&mut reader)?;
             }
             value => {
                 return Err(ProtocolError::UnknownOpcode {
@@ -446,8 +528,8 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
         let key = NodeKey(reader.u32("node key")?);
         let node_flags = reader.u8("node flags")?;
         let text = match kind {
-            opcode::NODE_CONTAINER => None,
-            opcode::NODE_LABEL => Some(reader.text("label text")?),
+            opcode::NODE_ROOT | opcode::NODE_COLUMN => None,
+            opcode::NODE_TEXT => Some(reader.text("text content")?),
             opcode::NODE_BUTTON => Some(reader.text("button label")?),
             value => {
                 return Err(ProtocolError::UnknownOpcode {
@@ -455,6 +537,12 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
                     value,
                 });
             }
+        };
+        let layout = WireLayout {
+            width: reader.dimension("width")?,
+            height: reader.dimension("height")?,
+            padding: reader.length("padding")?,
+            gap: reader.length("gap")?,
         };
         let child_count = reader.u16("child count")?;
 
@@ -472,6 +560,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             key,
             flags: node_flags,
             text,
+            layout,
             child_count,
         });
 
@@ -500,37 +589,6 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
     }
 
     Ok(nodes)
-}
-
-fn decode_layout_section(
-    reader: &mut Reader<'_>,
-) -> Result<Vec<(NodeKey, WireRect)>, ProtocolError> {
-    let count = reader.u16("layout entry count")? as usize;
-    if count > limits::MAX_LAYOUT_ENTRIES {
-        return Err(ProtocolError::TooManyLayoutEntries);
-    }
-    // Each entry is 20 bytes; refuse a count the input cannot possibly satisfy
-    // before allocating for it.
-    if count.saturating_mul(20) > reader.remaining() {
-        return Err(ProtocolError::Truncated {
-            while_reading: "layout entries",
-        });
-    }
-
-    let mut entries = Vec::with_capacity(count.min(64));
-    for _ in 0..count {
-        let key = NodeKey(reader.u32("layout key")?);
-        entries.push((
-            key,
-            WireRect {
-                x: reader.i32("layout x")?,
-                y: reader.i32("layout y")?,
-                width: reader.i32("layout width")?,
-                height: reader.i32("layout height")?,
-            },
-        ));
-    }
-    Ok(entries)
 }
 
 /// A host-to-guest interaction event on the wire.
@@ -587,47 +645,68 @@ impl WireEvent {
 mod tests {
     use super::*;
 
+    fn fill_width() -> WireLayout {
+        WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 8,
+            gap: 4,
+        }
+    }
+
     fn sample() -> Vec<u8> {
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_CONTAINER, NodeKey(0), 0, None, 2)
+            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill_width(), 1)
+            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill_width(), 2)
             .node(
-                opcode::NODE_LABEL,
-                NodeKey(1),
+                opcode::NODE_TEXT,
+                NodeKey(2),
                 0,
                 Some("Clicked 0 times"),
+                WireLayout::default(),
                 0,
             )
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(2),
+                NodeKey(3),
                 flags::ENABLED,
                 Some("Press me"),
+                WireLayout {
+                    width: WireDimension::Fixed(100),
+                    height: WireDimension::Fixed(30),
+                    padding: 4,
+                    gap: 0,
+                },
                 0,
-            )
-            .layout_entry(NodeKey(0), WireRect::new(0, 0, 200, 100))
-            .layout_entry(NodeKey(2), WireRect::new(10, 40, 100, 30));
+            );
         encoder.finish()
     }
 
     #[test]
     fn round_trips() {
         let batch = decode_batch(&sample()).unwrap();
-        assert_eq!(batch.nodes.len(), 3);
-        assert_eq!(batch.nodes[0].child_count, 2);
-        assert_eq!(batch.nodes[1].text.as_deref(), Some("Clicked 0 times"));
-        assert!(batch.nodes[2].is_enabled());
-        assert_eq!(batch.layout.len(), 2);
-        assert_eq!(batch.layout[1].1, WireRect::new(10, 40, 100, 30));
+        assert_eq!(batch.nodes.len(), 4);
+        assert_eq!(batch.nodes[0].kind, opcode::NODE_ROOT);
+        assert_eq!(batch.nodes[0].layout.width, WireDimension::Fill);
+        assert_eq!(batch.nodes[0].layout.padding, 8);
+        assert_eq!(batch.nodes[0].layout.gap, 4);
+        assert_eq!(batch.nodes[2].text.as_deref(), Some("Clicked 0 times"));
+        assert!(batch.nodes[3].is_enabled());
+        assert_eq!(batch.nodes[3].layout.width, WireDimension::Fixed(100));
+        assert_eq!(batch.nodes[3].layout.height, WireDimension::Fixed(30));
     }
 
+    /// There is no way to put geometry on the wire. WP7A removed the layout
+    /// section outright rather than deprecating it, so a guest cannot be
+    /// authoritative over geometry even by accident.
     #[test]
-    fn a_batch_without_layout_is_valid() {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(opcode::NODE_CONTAINER, NodeKey(0), 0, None, 0);
-        let batch = decode_batch(&encoder.finish()).unwrap();
-        assert_eq!(batch.nodes.len(), 1);
-        assert!(batch.layout.is_empty());
+    fn a_batch_carries_only_a_tree() {
+        let batch = decode_batch(&sample()).unwrap();
+        // `WireBatch` has exactly one field; this fails to compile if a
+        // geometry channel is ever reintroduced alongside it.
+        let WireBatch { nodes } = batch;
+        assert_eq!(nodes.len(), 4);
     }
 
     #[test]
@@ -688,6 +767,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_dimension_tags() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        let mut bytes = encoder.finish();
+        // The width tag sits just past kind(1) + key(4) + flags(1) in the node,
+        // which itself starts after magic(4) + version(1) + section(1) + count(2).
+        bytes[8 + 6] = 99;
+        assert!(matches!(
+            decode_batch(&bytes),
+            Err(ProtocolError::UnknownOpcode {
+                context: "dimension",
+                value: 99
+            })
+        ));
+    }
+
+    /// Layout lengths are bounded so downstream arithmetic cannot be handed
+    /// absurd values by a hostile guest.
+    #[test]
+    fn rejects_oversized_layout_lengths() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BATCH_MAGIC);
+        bytes.push(PROTOCOL_VERSION);
+        bytes.push(opcode::SECTION_TREE);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(opcode::NODE_ROOT);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(opcode::DIM_FIXED);
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_batch(&bytes),
+            Err(ProtocolError::LengthTooLarge(_))
+        ));
+    }
+
+    #[test]
     fn rejects_oversized_batches() {
         let huge = vec![0u8; limits::MAX_BATCH_BYTES + 1];
         assert!(matches!(
@@ -700,7 +823,14 @@ mod tests {
     fn rejects_excessive_depth_without_overflowing_the_stack() {
         let mut encoder = BatchEncoder::new();
         for id in 0..(limits::MAX_DEPTH + 50) {
-            encoder.node(opcode::NODE_CONTAINER, NodeKey(id as u32), 0, None, 1);
+            encoder.node(
+                opcode::NODE_COLUMN,
+                NodeKey(id as u32),
+                0,
+                None,
+                WireLayout::default(),
+                1,
+            );
         }
         assert_eq!(decode_batch(&encoder.finish()), Err(ProtocolError::TooDeep));
     }
@@ -708,7 +838,14 @@ mod tests {
     #[test]
     fn rejects_a_child_count_larger_than_the_remaining_input() {
         let mut encoder = BatchEncoder::new();
-        encoder.node(opcode::NODE_CONTAINER, NodeKey(0), 0, None, u16::MAX);
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey(0),
+            0,
+            None,
+            WireLayout::default(),
+            u16::MAX,
+        );
         assert!(matches!(
             decode_batch(&encoder.finish()),
             Err(ProtocolError::Truncated { .. })
@@ -717,15 +854,24 @@ mod tests {
 
     #[test]
     fn rejects_a_forest_pretending_to_be_a_tree() {
-        // Two roots: the pre-order stream would be well-formed for a forest,
-        // but a batch describes exactly one tree.
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_CONTAINER, NodeKey(0), 0, None, 0)
-            .node(opcode::NODE_CONTAINER, NodeKey(1), 0, None, 0);
-        // The second root is never consumed by the tree walk, so it shows up
-        // as an unknown section tag or trailing input rather than being
-        // silently accepted.
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey(0),
+                0,
+                None,
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey(1),
+                0,
+                None,
+                WireLayout::default(),
+                0,
+            );
         assert!(decode_batch(&encoder.finish()).is_err());
     }
 
@@ -736,58 +882,12 @@ mod tests {
         bytes.push(PROTOCOL_VERSION);
         bytes.push(opcode::SECTION_TREE);
         bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(opcode::NODE_LABEL);
+        bytes.push(opcode::NODE_TEXT);
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&2u16.to_le_bytes());
         bytes.extend_from_slice(&[0xff, 0xfe]);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.push(opcode::SECTION_END);
         assert_eq!(decode_batch(&bytes), Err(ProtocolError::InvalidUtf8));
-    }
-
-    /// A count over the hard limit is refused by the limit, before the
-    /// remaining-input check ever runs.
-    #[test]
-    fn rejects_a_layout_count_over_the_limit() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BATCH_MAGIC);
-        bytes.push(PROTOCOL_VERSION);
-        bytes.push(opcode::SECTION_TREE);
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(opcode::NODE_CONTAINER);
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.push(opcode::SECTION_LAYOUT);
-        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
-        assert_eq!(
-            decode_batch(&bytes),
-            Err(ProtocolError::TooManyLayoutEntries)
-        );
-    }
-
-    /// A count *under* the limit but larger than the input can supply is
-    /// refused before allocating for it. This is the path the limit check
-    /// above would otherwise hide.
-    #[test]
-    fn rejects_a_layout_count_larger_than_the_remaining_input() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BATCH_MAGIC);
-        bytes.push(PROTOCOL_VERSION);
-        bytes.push(opcode::SECTION_TREE);
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(opcode::NODE_CONTAINER);
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.push(opcode::SECTION_LAYOUT);
-        // 100 entries promised, zero bytes of entries supplied.
-        bytes.extend_from_slice(&100u16.to_le_bytes());
-        assert!(matches!(
-            decode_batch(&bytes),
-            Err(ProtocolError::Truncated { .. })
-        ));
     }
 
     #[test]

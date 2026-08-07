@@ -230,16 +230,38 @@ request, or close one window of several. The window layer reports
 types. `WindowId` is an Instar newtype, so a future alternate window backend
 and headless tests both stay clean.
 
-### Guest-supplied geometry is temporary [directive]
+### Geometry is the host's, entirely [directive] — DONE in WP7A
 
-The explicit rects a guest sends today are WP5 scaffolding, not protocol
-semantics. They travel in a separate, optional layout section rather than on
-tree nodes, and feed `LayoutSnapshot::from_wire`. When the host computes layout
-(WP7), it produces the snapshot itself and that section is deleted — with no
-change to the tree format, which is the reason for the separation.
+Guest-supplied rectangles are gone. The layout section was **removed from the
+protocol outright** rather than deprecated: a guest cannot express a rectangle
+even deliberately, so it cannot become authoritative over geometry.
 
-Leaving them would make the guest authoritative over geometry and undermine the
-retained host presentation model.
+A guest sends layout *intent*; the host computes every number:
+
+```text
+width:   Fill | Content | Fixed
+height:  Content | Fixed          (no Fill -- see below)
+padding
+gap
+```
+
+Node kinds are `Root`, `Column`, `Text`, `Button`. No grid, no general CSS
+surface, no arbitrary positioning. Everything is a flex column.
+
+`Fill` height is rejected: a column of fill-height children has no defined
+distribution, and choosing one silently would be inventing layout semantics
+rather than implementing them.
+
+**`LayoutSnapshot` is an internal `instar-ui` product, not protocol state.**
+Taffy is an implementation detail of `instar-ui/src/layout.rs`; no Taffy type,
+`NodeId`, or tree handle appears in any public API, and Taffy's output is
+translated immediately into Instar's own `NodeKey -> Rect` snapshot.
+
+Text measurement is currently a placeholder (fixed character metrics) so that
+layout is deterministic and testable before a font stack exists. Layout tests
+assert *relative* geometry — ordering, containment, non-overlap, monotonicity —
+rather than exact pixels, so real shaping can replace it without invalidating
+them.
 
 ## Toolchain [artifact]
 
@@ -298,9 +320,19 @@ contains no `instar-ui` (done)
 **WP6** — `instar-window`: winit translation only. No hit-testing, no
 `NodeKey` knowledge, `ControlFlow::Wait`. (done)
 
-**WP7** — `instar-host`: compose window + ui + kernel; replace the test rects
-with host layout; UI owns hit-testing and interaction; host turns a `UiAction`
-into a guest event.
+**WP7A** — host layout: Taffy into `instar-ui`; guest layout section removed;
+minimal layout properties; intrinsic text/button measurement; logical viewport
+input; `LayoutSnapshot` generated host-side; button round-trip rewritten
+against host layout. (done)
+
+Exit gate, met: guest provides zero geometry; host produces a deterministic
+`LayoutSnapshot`; hit-testing uses that snapshot; the counter fixture
+round-trip still works.
+
+**WP7B** — `instar-host` composition: compose window + ui + kernel. Enforce the
+metrics barrier (no render, no hit-test/activation while invalid), route
+`UiAction` to guest events via the kernel, own close policy and guest-trap
+presentation.
 **WP8** — counter guest and fixtures
 **WP9** — CI rewrite; compare against the WP0.3 baseline
 

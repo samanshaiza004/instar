@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use instar_kernel::runtime::{GenerationHandle, Runtime, RuntimeGeneration};
 use instar_ui::protocol::decode_batch;
-use instar_ui::{LayoutSnapshot, NodeKey, NodeKind, ProtocolError, Tree, TreeError, UiAction};
+use instar_ui::{
+    LayoutSnapshot, NodeKey, NodeKind, ProtocolError, Tree, TreeError, UiAction, Viewport,
+};
 
 macro_rules! run_for {
     ($fut:expr, $window:expr) => {
@@ -41,17 +43,30 @@ async fn started() -> (Runtime, RuntimeGeneration, GenerationHandle) {
     (runtime, generation, handle)
 }
 
-/// The tree and layout the guest most recently committed.
+/// The viewport these tests lay out against. A host would take this from
+/// `WindowMetricsChanged`; nothing here needs a real window.
+const VIEWPORT: Viewport = Viewport::new(400.0, 300.0);
+
+/// The tree the guest most recently committed, plus the geometry *the host*
+/// computed for it.
 ///
-/// The host does the assembly and the layout separately, which is the shape
-/// WP7 keeps: only `LayoutSnapshot::from_wire` gets replaced, by real layout.
+/// The guest sends no rectangles. Every coordinate these tests hit-test
+/// against was produced here, which is the WP7A exit gate in one function.
 fn latest(kernel: &instar_kernel::runtime::SharedKernel) -> (Tree, LayoutSnapshot) {
     let commits = kernel.commits();
     let (_, bytes) = commits.last().expect("guest has committed at least once");
     let batch = decode_batch(bytes).expect("guest commits a decodable batch");
     let tree = Tree::from_wire(&batch).expect("guest commits a meaningful tree");
-    let layout = LayoutSnapshot::from_wire(&batch, &tree).expect("layout names known nodes");
+    let layout = tree.layout(VIEWPORT);
     (tree, layout)
+}
+
+/// Hit-tests the centre of whatever the host placed at `key`.
+fn click_point(layout: &LayoutSnapshot, key: NodeKey) -> (i32, i32) {
+    let rect = layout
+        .get(key)
+        .unwrap_or_else(|| panic!("{key} should have host-computed geometry"));
+    (rect.x + rect.width / 2, rect.y + rect.height / 2)
 }
 
 /// The whole point of WP5: click a button, watch the guest's state change.
@@ -67,18 +82,20 @@ async fn clicking_a_button_updates_the_committed_tree() {
         // The guest's first commit describes its initial interface.
         let (tree, layout) = latest(&kernel);
         assert_eq!(
-            tree.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            tree.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 0 times".to_string()
             })
         );
 
-        // Hit-test a point over the button, exactly as a windowed host would
-        // with a real cursor position.
+        // Hit-test the button, exactly as a windowed host would with a real
+        // cursor position -- at coordinates the *host* computed, since the
+        // guest supplied none.
+        let (x, y) = click_point(&layout, NodeKey(3));
         let hit = tree
-            .hit_test(&layout, 20, 50)
-            .expect("the button is at (20, 50)");
-        assert_eq!(hit.key, NodeKey(2));
+            .hit_test(&layout, x, y)
+            .expect("the button the host laid out should be hit-testable");
+        assert_eq!(hit.key, NodeKey(3));
 
         // Deliver the click. The host addresses the node it hit -- it does not
         // know or care what the guest will do about it.
@@ -88,8 +105,8 @@ async fn clicking_a_button_updates_the_committed_tree() {
         run_for!(run, Duration::from_millis(300));
 
         assert_eq!(
-            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            latest(&kernel).0.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 1 times".to_string()
             }),
             "the guest should have re-committed with an updated label"
@@ -98,7 +115,8 @@ async fn clicking_a_button_updates_the_committed_tree() {
         // Again, to show it accumulates rather than toggling.
         for _ in 0..3 {
             let (tree, layout) = latest(&kernel);
-            let hit = tree.hit_test(&layout, 20, 50).expect("button still there");
+            let (x, y) = click_point(&layout, NodeKey(3));
+            let hit = tree.hit_test(&layout, x, y).expect("button still there");
             handle
                 .send(UiAction::ButtonActivated(hit.key).encode())
                 .expect("guest accepts events");
@@ -106,8 +124,8 @@ async fn clicking_a_button_updates_the_committed_tree() {
         }
 
         assert_eq!(
-            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            latest(&kernel).0.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 4 times".to_string()
             })
         );
@@ -130,40 +148,43 @@ async fn a_disabled_button_cannot_be_clicked() {
         // Reset starts disabled, because the count is zero.
         let (tree, layout) = latest(&kernel);
         assert_eq!(
-            tree.find(NodeKey(3)).map(|n| &n.kind),
+            tree.find(NodeKey(4)).map(|n| &n.kind),
             Some(&NodeKind::Button {
                 label: "Reset".to_string(),
                 enabled: false
             })
         );
+        let (x, y) = click_point(&layout, NodeKey(4));
         assert_eq!(
-            tree.hit_test(&layout, 150, 50),
+            tree.hit_test(&layout, x, y),
             None,
-            "a disabled button must not be hit-testable"
+            "a disabled button must not be hit-testable, even though the host \
+             gave it geometry"
         );
 
         // Click the counter once; Reset becomes enabled and now hit-tests.
-        handle
-            .send(UiAction::ButtonActivated(NodeKey(2)).encode())
-            .expect("guest accepts events");
-        run_for!(run, Duration::from_millis(300));
-
-        let (tree, layout) = latest(&kernel);
-        assert_eq!(
-            tree.hit_test(&layout, 150, 50).map(|n| n.key),
-            Some(NodeKey(3)),
-            "Reset should be live once there is something to reset"
-        );
-
-        // And it works.
         handle
             .send(UiAction::ButtonActivated(NodeKey(3)).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
 
+        let (tree, layout) = latest(&kernel);
+        let (x, y) = click_point(&layout, NodeKey(4));
         assert_eq!(
-            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            tree.hit_test(&layout, x, y).map(|n| n.key),
+            Some(NodeKey(4)),
+            "Reset should be live once there is something to reset"
+        );
+
+        // And it works.
+        handle
+            .send(UiAction::ButtonActivated(NodeKey(4)).encode())
+            .expect("guest accepts events");
+        run_for!(run, Duration::from_millis(300));
+
+        assert_eq!(
+            latest(&kernel).0.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 0 times".to_string()
             })
         );
@@ -183,12 +204,12 @@ async fn a_new_generation_starts_from_a_clean_interface() {
         let mut run = std::pin::pin!(generation.run());
         run_for!(run, Duration::from_millis(300));
         handle
-            .send(UiAction::ButtonActivated(NodeKey(2)).encode())
+            .send(UiAction::ButtonActivated(NodeKey(3)).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
         assert_eq!(
-            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            latest(&kernel).0.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 1 times".to_string()
             })
         );
@@ -202,8 +223,8 @@ async fn a_new_generation_starts_from_a_clean_interface() {
         let mut run = std::pin::pin!(generation.run());
         run_for!(run, Duration::from_millis(300));
         assert_eq!(
-            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
-            Some(&NodeKind::Label {
+            latest(&kernel).0.find(NodeKey(2)).map(|n| &n.kind),
+            Some(&NodeKind::Text {
                 text: "Clicked 0 times".to_string()
             }),
             "a fresh generation should start from a fresh interface"
