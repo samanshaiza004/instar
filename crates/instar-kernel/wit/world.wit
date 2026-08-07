@@ -1,0 +1,88 @@
+// Gate 0 spike world for Instar Phase 1 -- see docs/PHASE-1.md WP2/WP3.
+//
+// This is NOT the final Instar protocol. It exists to answer one question:
+// can a Wasmtime Component Model guest genuinely suspend on `next-event`
+// and be woken by the host, with zero idle polling, while a separate
+// concurrent async call (`test-support.delay`) makes independent progress?
+// The real protocol (Part IV/V of the Phase 1 plan) gets designed once
+// Gate 0's answer is known, and will very likely live under a shared
+// top-level `wit/` directory once it stabilizes -- this file stays inside
+// the kernel crate deliberately, so it's obvious it's spike-scoped.
+package instar:kernel@0.1.0;
+
+interface types {
+    /// Failure returned by `runtime.next-event`.
+    variant runtime-error {
+        /// The host has no more events to deliver; the guest should exit
+        /// its event loop and let its `run` export return.
+        shutdown,
+        /// The host received an event it could not decode -- kernel-spike
+        /// only exercises `next-event` with opaque bytes, so this exists
+        /// for completeness, not because the spike guest needs to produce
+        /// malformed events itself.
+        internal(string),
+    }
+
+    /// Failure returned by `ui.commit`.
+    variant commit-error {
+        /// The batch bytes failed to decode or validate against parser
+        /// bounds. Carries a short human-readable reason for test assertions.
+        invalid-batch(string),
+    }
+
+    /// Successful result of `ui.commit`.
+    record commit-result {
+        /// Monotonically increasing revision assigned by the host after
+        /// accepting the batch. The spike doesn't validate real UI
+        /// mutations yet (see instar-ui, WP5) -- this just proves the host
+        /// can receive and acknowledge a synchronous commit call from
+        /// within an otherwise-async guest task.
+        revision: u64,
+    }
+}
+
+/// Host-provided event delivery. The one async import in this world --
+/// suspend/wake here is what Gate 0 is actually testing.
+interface runtime {
+    use types.{runtime-error};
+
+    /// Suspends the calling guest task until the host has a new event.
+    /// A guest that calls this in a loop and does nothing else between
+    /// calls must show zero host-import calls, zero polling, and zero
+    /// CPU use while settled -- see docs/PHASE-1.md WP3's hard idle gates.
+    next-event: async func() -> result<list<u8>, runtime-error>;
+}
+
+/// Host-provided UI commit. Deliberately synchronous: bounded, in-memory
+/// work shouldn't need the Component Model's async machinery, and keeping
+/// it sync removes an experimental variable from Gate 0's result. See
+/// docs/TOOLCHAIN.md and docs/PHASE-1.md WP2.1 for the rationale.
+interface ui {
+    use types.{commit-result, commit-error};
+
+    commit: func(batch: list<u8>) -> result<commit-result, commit-error>;
+}
+
+/// Synthetic host-provided concurrency primitive, spike-only. Exists so
+/// kernel-spike fixtures can exercise genuine Component Model concurrent
+/// async calls (independent progress, cancellation, no head-of-line
+/// blocking) without needing real I/O. This interface does not appear in
+/// the eventual Instar protocol -- see docs/PHASE-1.md WP3.3 and section
+/// "Tests may use synthetic timers and delayed futures internally... They
+/// do not become public Phase 1 services."
+interface test-support {
+    /// Resolves to `millis` after approximately that many milliseconds
+    /// have elapsed. Used to prove a long-running delay in flight doesn't
+    /// block a concurrent short delay or an incoming `next-event` wake.
+    delay: async func(millis: u32) -> u32;
+}
+
+world kernel-spike {
+    import runtime;
+    import ui;
+    import test-support;
+
+    /// The guest's entire program. Expected shape: submit an initial
+    /// commit, then loop on `next-event` until `runtime-error.shutdown`.
+    export run: async func() -> result<_, string>;
+}

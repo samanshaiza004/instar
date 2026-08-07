@@ -8,14 +8,16 @@ members = [
     "crates/youth-text-render-cpu",
     "crates/instar-paint",
     "crates/instar-render-vello-cpu",
+    "crates/instar-kernel",
 ]
 
 # youth-runtime and youth-desktop are temporarily out of the workspace: both
 # have a stale path dependency on the deleted youth-state crate, and both are
-# source-only salvage material for Instar Phase 1 (instar-kernel extracts from
-# youth-runtime in WP2, instar-window/instar-host extract from youth-desktop in
-# WP6/WP7) rather than crates that get fixed in place. Their files remain on
-# disk for reference; re-add or delete them once WP2/WP6/WP7 land.
+# source-only salvage material for Instar Phase 1 (instar-kernel extracted its
+# engine-config seed from youth-runtime in WP2; instar-window/instar-host will
+# extract from youth-desktop in WP6/WP7) rather than crates that get fixed in
+# place. Their files remain on disk for reference; re-add or delete them once
+# WP6/WP7 land.
 
 [workspace.package]
 version = "0.0.2"
