@@ -421,6 +421,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "instar-paint"
+version = "0.0.2"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "instar-render-vello-cpu"
+version = "0.0.2"
+dependencies = [
+ "instar-paint",
+ "skrifa 0.44.0",
+ "vello_cpu",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,24 +1366,6 @@ name = "youth-interaction"
 version = "0.0.2"
 dependencies = [
  "youth-tree",
-]
-
-[[package]]
-name = "youth-paint"
-version = "0.0.2"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "youth-render-vello-cpu"
-version = "0.0.2"
-dependencies = [
- "skrifa 0.44.0",
- "vello_cpu",
- "youth-editor-engine",
- "youth-paint",
- "youth-text-render-cpu",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! Renderer-neutral paint intent for Youth's desktop presentation.
+//! Renderer-neutral paint intent for Instar's desktop presentation.
 //!
 //! `PaintScene`/`PaintCommand` are the seam between two concerns that used
 //! to live in one function: deciding what a semantic tree, its layout, and
@@ -6,7 +6,7 @@
 //! construction, owned by `youth-desktop::raster`) and turning that intent
 //! into pixels (a paint backend -- today the existing hand-rolled
 //! `FrameBuffer`, later a real rasterizer such as
-//! `youth-render-vello-cpu`). This crate holds only the shared vocabulary
+//! `instar-render-vello-cpu`). This crate holds only the shared vocabulary
 //! between those two; it has no rendering logic and no dependency on any
 //! specific backend (Vello, Swash, or otherwise).
 //!
@@ -156,7 +156,7 @@ pub struct FontKey(pub u64);
 ///
 /// Deliberately dependency-free: `data` is just bytes, so no Parley, Swash,
 /// Vello, or Blob type leaks into the scene contract. A backend converts
-/// these bytes to its own font representation; `youth-paint` never does.
+/// these bytes to its own font representation; `instar-paint` never does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontResource {
     /// Stable semantic identity used by backend caches.

@@ -6,8 +6,8 @@ members = [
     "crates/youth-interaction",
     "crates/youth-editor-engine",
     "crates/youth-text-render-cpu",
-    "crates/youth-paint",
-    "crates/youth-render-vello-cpu",
+    "crates/instar-paint",
+    "crates/instar-render-vello-cpu",
 ]
 
 # youth-runtime and youth-desktop are temporarily out of the workspace: both
