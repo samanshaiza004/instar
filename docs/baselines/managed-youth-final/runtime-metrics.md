@@ -33,7 +33,7 @@ runtime measurements are not.
 
 ## Why this is an acceptable place to stop
 
-Per the Phase 1 plan, memory and startup are *discovery* metrics — "do not
+Per docs/PHASE-1.md, memory and startup are *discovery* metrics — "do not
 invent targets before measuring the actual baseline" — not a gate that other
 work packages depend on. WP1–WP3 (toolchain lock, kernel scaffold, Gate 0
 spike) did not need any of this and proceeded independently. The missing

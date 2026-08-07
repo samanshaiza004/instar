@@ -4,7 +4,7 @@ use wasmtime::{Config, Engine, Strategy, WasmBacktraceDetails};
 /// set. Seeded from `youth-runtime/src/engine.rs`'s `configured_engine`,
 /// with one deliberate change: Component Model async is turned **on**
 /// (`wasm_component_model_async(true)`) -- this is the entire premise of
-/// Gate 0. See the Phase 1 plan's WP2/WP3 and docs/TOOLCHAIN.md.
+/// Gate 0. See docs/PHASE-1.md WP2/WP3 and docs/TOOLCHAIN.md.
 ///
 /// Two things are deliberately *not* carried over from `youth-runtime`:
 ///

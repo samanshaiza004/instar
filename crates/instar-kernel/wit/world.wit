@@ -1,4 +1,4 @@
-// Gate 0 spike world for Instar Phase 1 -- see the Phase 1 plan's WP2/WP3.
+// Gate 0 spike world for Instar Phase 1 -- see docs/PHASE-1.md WP2/WP3.
 //
 // This is NOT the final Instar protocol. It exists to answer one question:
 // can a Wasmtime Component Model guest genuinely suspend on `next-event`
@@ -49,14 +49,14 @@ interface runtime {
     /// Suspends the calling guest task until the host has a new event.
     /// A guest that calls this in a loop and does nothing else between
     /// calls must show zero host-import calls, zero polling, and zero
-    /// CPU use while settled -- see the Phase 1 plan's WP3's hard idle gates.
+    /// CPU use while settled -- see docs/PHASE-1.md WP3's hard idle gates.
     next-event: async func() -> result<list<u8>, runtime-error>;
 }
 
 /// Host-provided UI commit. Deliberately synchronous: bounded, in-memory
 /// work shouldn't need the Component Model's async machinery, and keeping
 /// it sync removes an experimental variable from Gate 0's result. See
-/// docs/TOOLCHAIN.md and the Phase 1 plan's WP2.1 for the rationale.
+/// docs/TOOLCHAIN.md and docs/PHASE-1.md WP2.1 for the rationale.
 interface ui {
     use types.{commit-result, commit-error};
 
@@ -67,7 +67,7 @@ interface ui {
 /// kernel-spike fixtures can exercise genuine Component Model concurrent
 /// async calls (independent progress, cancellation, no head-of-line
 /// blocking) without needing real I/O. This interface does not appear in
-/// the eventual Instar protocol -- see the Phase 1 plan's WP3.3 and section
+/// the eventual Instar protocol -- see docs/PHASE-1.md WP3.3 and section
 /// "Tests may use synthetic timers and delayed futures internally... They
 /// do not become public Phase 1 services."
 interface test-support {

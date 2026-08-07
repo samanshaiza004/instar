@@ -4,7 +4,7 @@
 //! loading/validation, WASI context, guest lifecycle, event delivery,
 //! operation registry, cancellation, and runtime generations. It has no
 //! rendering, windowing, layout, or UI dependency of any kind -- see
-//! the Phase 1 plan's forbidden-dependency list (`instar-kernel` must never
+//! docs/PHASE-1.md's forbidden-dependency list (`instar-kernel` must never
 //! depend on winit, Taffy, Vello, softbuffer, a text renderer, `instar-ui`,
 //! or counter-specific types).
 //!
