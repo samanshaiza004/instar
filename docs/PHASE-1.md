@@ -128,6 +128,39 @@ else it needs precisely because none of it can reach a guest.
 
 Encoding stays manual and byte-defined. No Serde, no bincode, no `repr(C)`.
 
+### DPI: converted in `instar-window`, not hidden from the host [directive]
+
+Winit reports cursor positions in physical pixels and expects the application
+to convert using the window's current per-window scale factor, which can change
+at runtime when a window moves between monitors or display settings change.
+`instar-window` owns that conversion — but scale factor is *not* hidden from the
+whole host, because the renderer needs it for physical rasterization and text
+quality, and future IME candidate geometry needs converting back to OS
+coordinates.
+
+```rust
+RawPointerEvent { window_id, logical_pos: LogicalPoint, button, state }
+
+WindowMetricsChanged { logical_size, physical_size, scale_factor }
+```
+
+```text
+instar-window   owns physical<->logical conversion; tracks ScaleFactorChanged;
+                emits logical input and WindowMetricsChanged
+instar-host     knows physical size + scale; gives a logical viewport to
+                instar-ui and a physical target + scale to the renderer
+instar-ui       operates entirely in logical coordinates; never sees DPI
+```
+
+**Invariant:** `instar-window` normalizes OS coordinates; `instar-ui` speaks
+logical coordinates; `instar-host` is the only layer bridging logical
+presentation to physical rendering. UI semantics and hit-testing stay
+scale-free; presentation does not.
+
+Scale changes are atomic with metrics: the stored factor is updated before any
+subsequent pointer event is translated. `ScaleFactorChanged` is winit's
+documented way to track runtime DPI changes.
+
 ### Guest-supplied geometry is temporary [directive]
 
 The explicit rects a guest sends today are WP5 scaffolding, not protocol
@@ -194,7 +227,7 @@ dependency; keep every attack and round-trip test; verify the guest graph
 contains no `instar-ui` (done)
 
 **WP6** — `instar-window`: winit translation only. No hit-testing, no
-`NodeKey` knowledge, `ControlFlow::Wait`.
+`NodeKey` knowledge, `ControlFlow::Wait`. (done)
 
 **WP7** — `instar-host`: compose window + ui + kernel; replace the test rects
 with host layout; UI owns hit-testing and interaction; host turns a `UiAction`

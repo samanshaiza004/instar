@@ -1,0 +1,16 @@
+[package]
+name = "instar-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's OS windowing layer: creates windows and translates winit input into logical-coordinate events. Knows nothing about UI trees, node identity, or hit-testing."
+
+[dependencies]
+# Pinned one patch above the version the predecessor codebase carried
+# (0.30.12). The 0.31 line is still beta as of 2026-08 and is not a foundation
+# to build a windowing boundary on.
+winit = "=0.30.13"
+
+# Deliberately absent, and enforced by a test: instar-ui. This crate must never
+# learn what a NodeKey is, what a tree revision means, or how to hit-test.
+# See docs/PHASE-1.md, "UI layering".
