@@ -169,6 +169,37 @@ pub struct WindowMetricsChanged {
 pub enum WindowOutput {
     Pointer(RawPointerEvent),
     MetricsChanged(WindowMetricsChanged),
+    /// The window's presentation geometry is temporarily unusable.
+    ///
+    /// Emitted when the scale factor changes, before a coherent
+    /// scale-and-size pair is known. It deliberately **carries no size and no
+    /// scale**: its entire meaning is *"whatever you last computed from
+    /// geometry is now invalid"*. Adding values would invite a host to use
+    /// them, which is precisely what this exists to prevent.
+    ///
+    /// It opens a barrier that the matching [`WindowOutput::MetricsChanged`]
+    /// closes. While it is open, a host must not:
+    ///
+    /// - render, or
+    /// - hit-test or activate anything from pointer input.
+    ///
+    /// The second half matters as much as the first and is easier to miss: a
+    /// cursor position converted with the *new* scale is still meaningless
+    /// against a layout computed for the *old* logical viewport, so a click
+    /// during the barrier would resolve to the wrong node rather than to
+    /// nothing. Retaining the latest pointer position is fine; acting on it is
+    /// not.
+    ///
+    /// Close requests and other native lifecycle events are unaffected —
+    /// none of them depend on geometry, and a window that cannot be closed
+    /// during a monitor switch would be a worse bug than the one this
+    /// prevents.
+    ///
+    /// Enforcement belongs to the host: this crate signals, `instar-host`
+    /// obeys. `instar-window` has no idea what a render or a hit-test is.
+    MetricsInvalidated {
+        window_id: WindowId,
+    },
     /// The user asked to close the window; the host decides what that means.
     CloseRequested {
         window_id: WindowId,
@@ -437,6 +468,54 @@ mod tests {
             state.on_mouse_input(PointerButton::Primary, PointerState::Pressed),
             None,
             "a click must not be attributed to a position computed at the old scale"
+        );
+    }
+
+    /// The barrier carries no geometry. If it did, a host could use those
+    /// values -- which is the exact mistake it exists to prevent.
+    #[test]
+    fn the_invalidation_signal_carries_no_geometry() {
+        let output = WindowOutput::MetricsInvalidated {
+            window_id: WindowId::from_raw(1),
+        };
+        match output {
+            WindowOutput::MetricsInvalidated { window_id } => {
+                assert_eq!(window_id, WindowId::from_raw(1));
+            }
+            other => panic!("expected an invalidation, got {other:?}"),
+        }
+    }
+
+    /// The barrier stays open until coherent metrics close it, and
+    /// `metrics_pending` is the state a host can read to know that.
+    #[test]
+    fn the_barrier_stays_open_until_coherent_metrics_arrive() {
+        let mut state = state(1.0);
+        assert!(!state.metrics_pending(), "no barrier before a scale change");
+
+        state.on_scale_factor_changed(2.0);
+        assert!(
+            state.metrics_pending(),
+            "the barrier opens on a scale change"
+        );
+
+        // Pointer input still converts -- the host may retain the position --
+        // but the barrier is still open, so it must not be acted on.
+        state.on_cursor_moved(200.0, 100.0);
+        assert_eq!(state.last_cursor(), Some(LogicalPoint::new(100.0, 50.0)));
+        assert!(
+            state.metrics_pending(),
+            "receiving pointer input must not close the barrier: a position in \
+             the new scale is still meaningless against the old layout"
+        );
+
+        state.on_resized(PhysicalSize {
+            width: 1600,
+            height: 1200,
+        });
+        assert!(
+            !state.metrics_pending(),
+            "coherent metrics close the barrier"
         );
     }
 

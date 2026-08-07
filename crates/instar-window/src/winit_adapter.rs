@@ -79,12 +79,19 @@ pub fn translate(
 
         // Winit's documented way to track runtime DPI changes. The new scale is
         // stored immediately, so the next pointer event converts with it, but
-        // nothing is emitted: the matching physical size is not available here.
-        // The driver flushes coherent metrics once it is -- see
-        // `WindowState::on_scale_factor_changed`.
+        // no *metrics* are emitted: the matching physical size is not available
+        // here. What is emitted is the barrier -- everything the host derived
+        // from the old geometry is now stale, and it needs to know that before
+        // it processes any further event, not after.
+        //
+        // Ordering is the whole reason this is a distinct signal: winit runs
+        // `about_to_wait` after queued window events and redraw callbacks, so a
+        // `RedrawRequested` can arrive between the scale change and the flush.
         WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
             state.on_scale_factor_changed(*scale_factor);
-            None
+            Some(WindowOutput::MetricsInvalidated {
+                window_id: state.window_id(),
+            })
         }
 
         WindowEvent::CursorMoved { position, .. } => {

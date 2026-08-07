@@ -184,6 +184,43 @@ Winit applies the OS-suggested size after the scale callback unless the
 application overrides it, so flushing at the end of the event cycle yields a
 coherent scale + actual size even where no separate resize arrives.
 
+### The metrics barrier [directive]
+
+A scale change opens a barrier that a coherent `WindowMetricsChanged` closes.
+`instar-window` signals it; `instar-host` enforces it.
+
+```text
+ScaleFactorChanged
+  -> window updates conversion scale
+  -> clears old cursor
+  -> emits MetricsInvalidated(window)
+  -> metrics_pending = true
+
+while metrics_pending:
+  -> no render
+  -> no pointer hit-testing/activation
+  -> close/native lifecycle still works
+  -> latest pointer position may be retained
+
+Resized / about_to_wait
+  -> publish coherent WindowMetricsChanged
+  -> metrics_pending = false
+  -> host recomputes layout
+  -> then interaction and rendering resume
+```
+
+This is a synchronization barrier, not a render guard. Input needs it as much
+as rendering: a cursor position converted with the new scale is still
+meaningless against a layout computed for the old logical viewport, so a click
+during the barrier resolves to the *wrong* node rather than to nothing. Winit
+runs `about_to_wait` after queued window events and redraw callbacks, so a
+`RedrawRequested` can arrive between the scale change and the flush — which is
+why the barrier is signalled immediately rather than inferred from the flush.
+
+`MetricsInvalidated` deliberately carries no size and no scale. Its entire
+meaning is "previous presentation geometry is temporarily unusable"; values
+would invite a host to use them.
+
 Close policy lives in `instar-host`, not `instar-window`: winit leaves it to
 the application, and a host may want to ask its guest first, ignore the
 request, or close one window of several. The window layer reports
