@@ -1,0 +1,18 @@
+[package]
+name = "instar-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's retained semantic UI tree and its wire encoding: what a guest commits, and how the host decodes, hit-tests, and dispatches interaction against it. No rendering or windowing dependency."
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+# Dependency direction matters here and only goes one way: instar-ui may
+# depend on instar-kernel, never the reverse (docs/PHASE-1.md's
+# forbidden-dependency list). The kernel carries committed batches as opaque
+# bytes and must not know what they mean; this crate is what gives them
+# meaning, so the interaction tests live here rather than in the kernel.
+instar-kernel = { path = "../instar-kernel" }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

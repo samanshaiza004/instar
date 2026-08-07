@@ -1,0 +1,20 @@
+[package]
+name = "ui-guest"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+description = "WP5 interaction guest fixture: a counter with a button. Not part of the Instar workspace; targets wasm32-wasip2 and is built on demand by instar-ui's build script."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60.0"
+# The guest builds trees with the same code the host decodes them with, so the
+# encoding has exactly one definition. This is also the first real check that
+# instar-ui compiles for wasm32-wasip2, which it must: guests are its primary
+# consumer.
+instar-ui = { path = "../../../../instar-ui" }
+
+[workspace]

@@ -121,7 +121,7 @@ WP0–WP3 are complete. [artifact — task history and commits]
 
 Remaining sequence [directive]:
 
-**WP4 — runtime lifecycle** (in progress)
+**WP4 — runtime lifecycle** (done)
 - `RuntimeGeneration`
 - one `Store` per generation
 - operation registry
@@ -134,7 +134,7 @@ Remaining sequence [directive]:
   asserting host bookkeeping stays bounded, RSS does not grow linearly, and
   active-task count returns to baseline
 
-**WP5** — `instar-ui` plus minimal button interaction, together
+**WP5** — `instar-ui` plus minimal button interaction, together (done)
 **WP6** — `instar-window`
 **WP7** — `instar-host`
 **WP8** — counter guest and fixtures

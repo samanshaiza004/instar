@@ -57,6 +57,9 @@ jobs:
       - name: Run guest lifecycle tests (WP4)
         run: cargo test -p instar-kernel --test lifecycle -- --nocapture
 
+      - name: Run UI interaction tests (WP5)
+        run: cargo test -p instar-ui -- --nocapture
+
       # Linux only: ~35s of generation churn, and the RSS trend it asserts on
       # is most stable on the runner with the least noisy memory accounting.
       # The properties it proves are platform-independent; running it three
