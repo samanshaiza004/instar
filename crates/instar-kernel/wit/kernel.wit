@@ -36,6 +36,14 @@ interface kernel-types {
         /// exists so that a stale commit is *rejected explicitly* rather than
         /// silently applied to a successor generation's state.
         stale-generation,
+        /// The host side that owns the retained tree is gone or shutting down,
+        /// so no verdict on this batch will ever arrive.
+        ///
+        /// Only reachable because `commit` is async: the batch has been handed
+        /// to a thread-affine owner and the guest is suspended waiting for it.
+        /// If that owner disappears mid-flight the guest must be told, rather
+        /// than left parked on a reply that is never coming.
+        host-unavailable,
     }
 
     record commit-result {
@@ -64,12 +72,25 @@ interface kernel-runtime {
     next-event: async func() -> result<list<u8>, runtime-error>;
 }
 
-/// Host-provided UI commit. Synchronous on purpose: bounded, in-memory work
-/// does not need the async machinery.
+/// Host-provided UI commit.
+///
+/// Async as of WP7B1, and the reason is ownership rather than cost. The
+/// authoritative retained tree belongs to the host's main/presentation thread,
+/// because that is where winit's event loop must live; the guest runs on a
+/// separate runtime thread. A synchronous commit would therefore have to
+/// either block the runtime thread on the main thread, or share the tree as a
+/// mutex the runtime thread mutates behind the window's back -- and that
+/// second option risks blocking the window thread and muddles who owns the
+/// interface.
+///
+/// So the guest suspends here instead. The host marshals the batch onto the
+/// thread that owns the tree, applies it atomically, and replies. Suspending a
+/// concurrent guest call while the host does work elsewhere is exactly what
+/// the Component Model's async support is for.
 interface kernel-ui {
     use kernel-types.{commit-result, commit-error};
 
-    commit: func(batch: list<u8>) -> result<commit-result, commit-error>;
+    commit: async func(batch: list<u8>) -> result<commit-result, commit-error>;
 }
 
 /// Host-owned long-running operations.

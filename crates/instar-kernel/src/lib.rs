@@ -23,6 +23,7 @@
 //! runtime generations -- is not written yet, and the spike's event
 //! "protocol" is a test fixture, not a draft of it.
 
+pub mod bridge;
 pub mod engine;
 pub mod runtime;
 pub mod spike;

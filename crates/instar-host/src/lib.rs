@@ -33,14 +33,31 @@
 //! | pointer position may update | |
 //! | close/lifecycle still works | |
 
+//!
+//! # Two threads
+//!
+//! Winit's event loop must own the main thread and its `EventLoop` is not
+//! `Send`; Wasmtime ships no executor and expects the embedder to poll. Those
+//! two facts do not fit on one thread, so [`bridge`] puts the guest on a
+//! runtime thread of its own and marshals between them. Everything in *this*
+//! module is the main thread's half, and stays synchronous.
+
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+pub mod bridge;
+pub mod present;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use instar_kernel::runtime::GenerationId;
+use instar_paint::PaintScene;
 use instar_ui::{Interaction, LayoutSnapshot, Tree, TreeError, UiAction, Viewport};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
 };
+
+pub use present::{GlyphSource, PresentationState, SceneBuilder, Theme};
 
 /// Whether a window's geometry can be used right now.
 ///
@@ -114,9 +131,24 @@ impl MetricsState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEffect {
     /// Deliver these encoded bytes to the guest.
+    ///
+    /// [`bridge::HostBridge`] consumes this one rather than returning it: on
+    /// the two-thread arrangement it becomes a
+    /// [`bridge::RuntimeCommand::DeliverEvent`] on the queue to the runtime
+    /// thread. It stays in the vocabulary because the routing rules are worth
+    /// testing without a runtime attached.
     SendToGuest(Vec<u8>),
     /// Render this window's current layout.
     Render { window: WindowId },
+    /// The guest generation ended — it trapped, or its `run` returned.
+    ///
+    /// WP7B2 turns this into a crash screen. WP7B1's only obligation is that
+    /// nothing the dead generation committed can still be applied afterwards.
+    GuestGone {
+        generation: GenerationId,
+        /// `None` if the guest exited cleanly.
+        error: Option<String>,
+    },
     /// Exit the application.
     Exit,
 }
@@ -129,6 +161,10 @@ pub struct HostWindow {
     /// the *geometry* that goes stale, not the interface description.
     tree: Option<Tree>,
     layout: Option<LayoutSnapshot>,
+    /// Paint intent for the current frame, lowered when the interface or the
+    /// geometry changes rather than when a frame is asked for. See
+    /// [`present`]: a redraw callback is the worst place to discover work.
+    scene: Option<PaintScene>,
     interaction: Interaction,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
@@ -152,6 +188,20 @@ impl HostWindow {
 
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
+    }
+
+    /// The paint intent to present, if there is any that may be shown.
+    ///
+    /// Gated on readiness for the same reason [`HostWindow::layout`] is, and
+    /// more sharply: a scene carries *physical* rectangles built for a
+    /// specific window size and scale, so presenting one across an
+    /// invalidation would draw the last frame's geometry into the new
+    /// window's buffer.
+    pub fn scene(&self) -> Option<&PaintScene> {
+        self.metrics
+            .is_ready()
+            .then_some(self.scene.as_ref())
+            .flatten()
     }
 
     pub fn redraw_pending(&self) -> bool {
@@ -182,6 +232,12 @@ impl HostWindow {
 #[derive(Debug, Default)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
+    /// What the window is showing — the guest's interface, or the host's own
+    /// account of why it no longer can. Not per-window: Phase 1 is one guest
+    /// and one window, and a dead guest is a fact about the runtime rather
+    /// than about a surface.
+    presentation: PresentationState,
+    scenes: SceneBuilder,
 }
 
 impl Host {
@@ -189,8 +245,105 @@ impl Host {
         Self::default()
     }
 
+    /// A host that can draw text.
+    ///
+    /// Without one, scenes come out with every rectangle in place and no
+    /// glyphs — which is what the headless tests want, and is why the font is
+    /// injected rather than reached for.
+    pub fn with_glyphs(glyphs: Arc<dyn GlyphSource>) -> Self {
+        Self {
+            scenes: SceneBuilder::with_glyphs(glyphs),
+            ..Self::default()
+        }
+    }
+
     pub fn window(&self, id: WindowId) -> Option<&HostWindow> {
         self.windows.get(&id)
+    }
+
+    pub fn presentation(&self) -> &PresentationState {
+        &self.presentation
+    }
+
+    pub fn theme(&self) -> &Theme {
+        self.scenes.theme()
+    }
+
+    /// Re-lowers a window's paint intent from whatever is current.
+    ///
+    /// The single place a [`PaintScene`] is produced, so the rule that a scene
+    /// is only ever built against usable metrics has one site to hold at —
+    /// and so the crash screen's precedence over the guest's interface is
+    /// stated once instead of at every caller.
+    fn rebuild_scene(&mut self, window_id: WindowId) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let Some(metrics) = window.metrics.usable() else {
+            // Blocked. Discard rather than keep: this scene's rectangles were
+            // computed for geometry that no longer describes the window.
+            window.scene = None;
+            return;
+        };
+
+        window.scene = Some(match &self.presentation {
+            // First, and unconditionally. A crashed guest's last interface is
+            // still in `window.tree` and must not come back on screen because
+            // something asked for a frame.
+            PresentationState::Crashed {
+                generation,
+                message,
+            } => self.scenes.crash_scene(*generation, message, metrics),
+            PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
+                (Some(tree), Some(layout)) => {
+                    self.scenes
+                        .app_scene(tree, layout, metrics, window.interaction.pressed())
+                }
+                // Ready, but the guest has not committed anything yet. An
+                // empty background beats an unpainted buffer, which on most
+                // platforms is whatever was in memory.
+                _ => self.scenes.blank_scene(metrics),
+            },
+        });
+    }
+
+    /// The guest generation ended.
+    ///
+    /// A trap becomes [`PresentationState::Crashed`] and a frame; a clean exit
+    /// does not. A guest whose `run` returned did what it meant to, and
+    /// replacing its last interface with an error screen would be the host
+    /// reporting a failure that did not happen.
+    ///
+    /// The message is clamped *here*, where the state is built, rather than
+    /// where it is drawn. A trap message is guest-influenced and unbounded, and
+    /// bounding it at the point of storage means nothing downstream can be
+    /// handed an unbounded one — not the scene builder, not a `Debug` print,
+    /// not whatever reads `presentation()` next. The full diagnostic still
+    /// travels on [`HostEffect::GuestGone`] for the log.
+    pub fn on_guest_gone(
+        &mut self,
+        window_id: WindowId,
+        generation: GenerationId,
+        error: Option<String>,
+    ) -> Vec<HostEffect> {
+        let Some(message) = error else {
+            return Vec::new();
+        };
+        self.presentation = PresentationState::Crashed {
+            generation,
+            message: present::clamp_diagnostic(&message),
+        };
+        self.rebuild_scene(window_id);
+
+        let window = self.windows.entry(window_id).or_default();
+        if window.metrics.is_ready() {
+            vec![HostEffect::Render { window: window_id }]
+        } else {
+            // The crash screen waits for coherent geometry like anything else;
+            // it is still the thing that will be shown when one arrives.
+            window.redraw_pending = true;
+            Vec::new()
+        }
     }
 
     /// Routes one window event, returning what should happen as a result.
@@ -218,35 +371,54 @@ impl Host {
         window_id: WindowId,
         batch: &[u8],
     ) -> Result<Vec<HostEffect>, TreeError> {
-        let tree = Tree::decode(batch)?;
+        Ok(self.apply_tree(window_id, Tree::decode(batch)?))
+    }
+
+    /// Installs an already-decoded, already-validated tree.
+    ///
+    /// Split from [`Host::on_guest_commit`] because the two-thread bridge must
+    /// decode at a specific point in a normative sequence — after the
+    /// generation check, before anything is mutated — and so cannot use a
+    /// function that does both at once. The swap below is the "apply
+    /// atomically" step: one assignment, after all validation, so a rejected
+    /// commit can never leave the tree half-updated.
+    pub fn apply_tree(&mut self, window_id: WindowId, tree: Tree) -> Vec<HostEffect> {
         let window = self.windows.entry(window_id).or_default();
         window.tree = Some(tree);
         window.recompute_layout();
+        // Lowered here rather than on the next frame callback: the caller is
+        // about to tell a guest its interface was accepted, and "accepted"
+        // should mean the host has everything it needs to show it.
+        self.rebuild_scene(window_id);
 
-        Ok(if window.metrics.is_ready() {
+        let window = self.windows.entry(window_id).or_default();
+        if window.metrics.is_ready() {
             vec![HostEffect::Render { window: window_id }]
         } else {
             // Nothing to draw against yet; remember that something wants
             // drawing once there is.
             window.redraw_pending = true;
             Vec::new()
-        })
+        }
     }
 
     fn on_metrics_changed(&mut self, metrics: WindowMetricsChanged) -> Vec<HostEffect> {
-        let window = self.windows.entry(metrics.window_id).or_default();
+        let window_id = metrics.window_id;
+        let window = self.windows.entry(window_id).or_default();
         window.metrics.ready(metrics);
 
         // Order matters and is the barrier's exit rule: layout first, then the
-        // snapshot is replaced, and only then may anything be rendered.
+        // snapshot is replaced, then the scene is lowered against it, and only
+        // then may anything be rendered.
         window.recompute_layout();
+        let wanted = window.redraw_pending || window.layout.is_some();
+        self.rebuild_scene(window_id);
 
+        let window = self.windows.entry(window_id).or_default();
         let mut effects = Vec::new();
-        if window.redraw_pending || window.layout.is_some() {
+        if wanted {
             window.redraw_pending = false;
-            effects.push(HostEffect::Render {
-                window: metrics.window_id,
-            });
+            effects.push(HostEffect::Render { window: window_id });
         }
         effects
     }
@@ -257,6 +429,10 @@ impl Host {
         // A press recorded against the old geometry must not be completable
         // against the new: the node under the pointer may have moved.
         window.interaction.cancel();
+        // And the lowered scene goes with it, for the same reason: its
+        // rectangles are physical, and they were computed for a window that
+        // has since changed size or scale.
+        window.scene = None;
         Vec::new()
     }
 
@@ -280,7 +456,8 @@ impl Host {
         };
 
         let (x, y) = event.logical_pos.round();
-        match event.state {
+        let held = window.interaction.pressed();
+        let mut effects = match event.state {
             PointerState::Pressed => {
                 window.interaction.on_press(tree, layout, x, y);
                 Vec::new()
@@ -290,7 +467,19 @@ impl Host {
                 .on_release(tree, layout, x, y)
                 .map(|action: UiAction| vec![HostEffect::SendToGuest(action.encode())])
                 .unwrap_or_default(),
+        };
+
+        // Press state is drawn, so changing it is a visual change, and it is
+        // the host's to show: the guest hears about a *completed* click and
+        // would be far too late to provide the feedback for one in progress.
+        let window = self.windows.entry(event.window_id).or_default();
+        if window.interaction.pressed() != held {
+            self.rebuild_scene(event.window_id);
+            effects.push(HostEffect::Render {
+                window: event.window_id,
+            });
         }
+        effects
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -367,6 +556,22 @@ mod tests {
             button: PointerButton::Primary,
             state,
         })
+    }
+
+    /// Just the events bound for the guest.
+    ///
+    /// Pointer handling also emits [`HostEffect::Render`] when the pressed
+    /// look changes, and that is a different question from what the guest
+    /// hears about — a press is visible immediately and is *not* reported,
+    /// because only a completed click is an interaction.
+    fn to_guest(effects: &[HostEffect]) -> Vec<&Vec<u8>> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                HostEffect::SendToGuest(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A host with a laid-out counter, ready for input.
@@ -538,7 +743,7 @@ mod tests {
         let (x, y) = button_centre(&host);
         host.handle(pointer(PointerState::Pressed, x, y));
         assert_eq!(
-            host.handle(pointer(PointerState::Released, x, y)).len(),
+            to_guest(&host.handle(pointer(PointerState::Released, x, y))).len(),
             1,
             "clicks should work again once metrics are coherent"
         );
@@ -568,18 +773,37 @@ mod tests {
         let mut host = ready_host();
         let (x, y) = button_centre(&host);
 
+        let press = host.handle(pointer(PointerState::Pressed, x, y));
         assert!(
-            host.handle(pointer(PointerState::Pressed, x, y)).is_empty(),
+            to_guest(&press).is_empty(),
             "a press alone activates nothing"
         );
 
-        let effects = host.handle(pointer(PointerState::Released, x, y));
+        let release = host.handle(pointer(PointerState::Released, x, y));
         assert_eq!(
-            effects,
-            vec![HostEffect::SendToGuest(
-                UiAction::ButtonActivated(NodeKey(3)).encode()
-            )],
+            to_guest(&release),
+            vec![&UiAction::ButtonActivated(NodeKey(3)).encode()],
             "a completed click should be routed to the guest as an encoded event"
+        );
+    }
+
+    /// Press feedback is the host's, and is immediate. Waiting for the guest
+    /// to describe a held button would put a runtime round-trip between the
+    /// finger and the pixel, for a state the guest is never even told about.
+    #[test]
+    fn pressing_and_releasing_each_ask_for_a_frame() {
+        let mut host = ready_host();
+        let (x, y) = button_centre(&host);
+
+        assert!(
+            host.handle(pointer(PointerState::Pressed, x, y))
+                .contains(&HostEffect::Render { window: WINDOW }),
+            "a button that does not visibly depress has no feedback at all"
+        );
+        assert!(
+            host.handle(pointer(PointerState::Released, x, y))
+                .contains(&HostEffect::Render { window: WINDOW }),
+            "and it has to come back up"
         );
     }
 
@@ -589,9 +813,9 @@ mod tests {
         let (x, y) = button_centre(&host);
 
         host.handle(pointer(PointerState::Pressed, x, y));
+        let release = host.handle(pointer(PointerState::Released, x + 5_000.0, y));
         assert!(
-            host.handle(pointer(PointerState::Released, x + 5_000.0, y))
-                .is_empty(),
+            to_guest(&release).is_empty(),
             "dragging off a button before releasing must cancel it"
         );
     }
@@ -602,7 +826,8 @@ mod tests {
         host.handle(pointer(PointerState::Pressed, 5_000.0, 5_000.0));
         assert!(
             host.handle(pointer(PointerState::Released, 5_000.0, 5_000.0))
-                .is_empty()
+                .is_empty(),
+            "nothing was hit, so there is neither an event nor anything to redraw"
         );
     }
 
@@ -638,6 +863,187 @@ mod tests {
         assert!(
             window.tree().is_some() && window.layout().is_some(),
             "a rejected commit should leave the last good interface in place"
+        );
+    }
+
+    // --- Presentation (WP7B2) ---
+
+    const GEN1: GenerationId = GenerationId(1);
+
+    fn scene_clear(host: &Host) -> Option<instar_paint::Color> {
+        match host.window(WINDOW)?.scene()?.commands.first() {
+            Some(instar_paint::PaintCommand::Clear { color }) => Some(*color),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_ready_window_has_something_to_present_before_the_guest_commits() {
+        let mut host = Host::new();
+        host.handle(WindowOutput::MetricsChanged(metrics(1.0)));
+        assert_eq!(
+            scene_clear(&host),
+            Some(host.theme().background),
+            "an unpainted buffer shows whatever was in that memory; a window \
+             with no interface yet should look deliberately blank"
+        );
+    }
+
+    #[test]
+    fn a_commit_lowers_a_scene_rather_than_leaving_it_for_the_frame_callback() {
+        let host = ready_host();
+        let scene = host.window(WINDOW).unwrap().scene().expect("lowered");
+        assert!(
+            scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, instar_paint::PaintCommand::FillRect { .. })),
+            "the fixture has a button, so its paint intent should contain one"
+        );
+    }
+
+    #[test]
+    fn a_trap_shows_the_host_crash_screen_and_asks_for_a_frame() {
+        let mut host = ready_host();
+        let effects = host.on_guest_gone(WINDOW, GEN1, Some("guest trapped".to_string()));
+
+        assert_eq!(effects, vec![HostEffect::Render { window: WINDOW }]);
+        assert_eq!(
+            host.presentation(),
+            &PresentationState::Crashed {
+                generation: GEN1,
+                message: "guest trapped".to_string()
+            }
+        );
+        assert_eq!(scene_clear(&host), Some(host.theme().crash_background));
+    }
+
+    /// The rule the crash screen exists to keep: it is *presentation*, not an
+    /// interface. Nothing the host shows after a trap may pass itself off as
+    /// something the guest committed.
+    #[test]
+    fn the_crash_screen_is_not_written_into_the_guests_tree() {
+        let mut host = ready_host();
+        let before = host.window(WINDOW).unwrap().tree().cloned();
+
+        host.on_guest_gone(WINDOW, GEN1, Some("guest trapped".to_string()));
+
+        assert_eq!(
+            host.window(WINDOW).unwrap().tree(),
+            before.as_ref(),
+            "the retained tree must still say exactly what the guest last said"
+        );
+        assert!(
+            host.window(WINDOW).unwrap().layout().is_some(),
+            "and it is still laid out -- the guest died, the geometry did not"
+        );
+    }
+
+    /// A dead generation's commits are screened out upstream, but presentation
+    /// must not depend on that being the only guard: once the host has taken
+    /// over the window, a tree arriving from anywhere does not take it back.
+    #[test]
+    fn a_commit_after_a_trap_cannot_put_the_app_back_on_screen() {
+        let mut host = ready_host();
+        host.on_guest_gone(WINDOW, GEN1, Some("guest trapped".to_string()));
+
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("valid batch");
+
+        assert_eq!(
+            scene_clear(&host),
+            Some(host.theme().crash_background),
+            "the crash screen outranks anything a tree can say"
+        );
+    }
+
+    /// The crash surface exists because something already went wrong, so it is
+    /// the last place that may be overwhelmed by guest-influenced input. The
+    /// clamp lives at the point the state is built, which is what makes it
+    /// impossible for anything downstream to be handed the unbounded version.
+    #[test]
+    fn a_huge_trap_message_is_bounded_before_it_is_ever_stored() {
+        let flood = "frame\n".repeat(200_000);
+        assert!(flood.len() > present::MAX_CRASH_MESSAGE_BYTES);
+
+        let mut host = ready_host();
+        host.on_guest_gone(WINDOW, GEN1, Some(flood.clone()));
+
+        let PresentationState::Crashed { message, .. } = host.presentation() else {
+            panic!("a trap should have crashed the presentation");
+        };
+        assert!(
+            message.len() <= present::MAX_CRASH_MESSAGE_BYTES + 64,
+            "a {}-byte trap message was retained as {} bytes",
+            flood.len(),
+            message.len()
+        );
+        assert!(
+            message.lines().count() <= present::MAX_CRASH_MESSAGE_LINES + 1,
+            "the line cap should have bound first for a backtrace shape"
+        );
+        // And it still draws.
+        assert_eq!(scene_clear(&host), Some(host.theme().crash_background));
+    }
+
+    #[test]
+    fn a_clean_exit_leaves_the_last_interface_standing() {
+        let mut host = ready_host();
+        let effects = host.on_guest_gone(WINDOW, GEN1, None);
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            host.presentation(),
+            &PresentationState::App,
+            "a guest whose run returned did what it meant to; an error screen \
+             would report a failure that did not happen"
+        );
+        assert_eq!(scene_clear(&host), Some(host.theme().background));
+    }
+
+    #[test]
+    fn a_crash_while_blocked_waits_for_geometry_like_anything_else() {
+        let mut host = ready_host();
+        host.handle(WindowOutput::MetricsInvalidated { window_id: WINDOW });
+
+        let effects = host.on_guest_gone(WINDOW, GEN1, Some("guest trapped".to_string()));
+        assert!(effects.is_empty(), "no render may happen while blocked");
+        assert!(host.window(WINDOW).unwrap().redraw_pending());
+
+        host.handle(WindowOutput::MetricsChanged(metrics(1.0)));
+        assert_eq!(
+            scene_clear(&host),
+            Some(host.theme().crash_background),
+            "and the crash screen is what the deferred frame shows"
+        );
+    }
+
+    /// The barrier applies to paint intent too, and more sharply than to
+    /// layout: a scene's rectangles are physical, so presenting one across an
+    /// invalidation draws the old window's geometry into the new buffer.
+    #[test]
+    fn no_scene_is_presentable_while_blocked() {
+        let mut host = ready_host();
+        assert!(host.window(WINDOW).unwrap().scene().is_some());
+
+        host.handle(WindowOutput::MetricsInvalidated { window_id: WINDOW });
+        assert!(host.window(WINDOW).unwrap().scene().is_none());
+    }
+
+    #[test]
+    fn leaving_the_barrier_lowers_a_scene_for_the_new_geometry() {
+        let mut host = ready_host();
+        host.handle(WindowOutput::MetricsInvalidated { window_id: WINDOW });
+        host.handle(WindowOutput::MetricsChanged(metrics(2.0)));
+
+        let scene = host.window(WINDOW).unwrap().scene().expect("re-lowered");
+        assert_eq!(
+            scene.size,
+            instar_paint::PhysicalSize {
+                width: 800,
+                height: 600
+            },
+            "the new scene must be built for the window that exists now"
         );
     }
 

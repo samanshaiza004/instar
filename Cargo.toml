@@ -13,6 +13,7 @@ members = [
     "crates/instar-ui-protocol",
     "crates/instar-window",
     "crates/instar-host",
+    "crates/instar-shell",
 ]
 
 # youth-runtime and youth-desktop are temporarily out of the workspace: both

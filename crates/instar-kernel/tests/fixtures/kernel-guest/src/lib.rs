@@ -89,13 +89,17 @@ async fn handle(payload: Vec<u8>) -> Result<Vec<u8>, String> {
 
 impl Guest for Component {
     async fn run() -> Result<(), String> {
-        kernel_ui::commit(b"ready").map_err(|e| format!("initial commit failed: {e:?}"))?;
+        kernel_ui::commit(b"ready".to_vec())
+            .await
+            .map_err(|e| format!("initial commit failed: {e:?}"))?;
 
         loop {
             match kernel_runtime::next_event().await {
                 Ok(payload) => {
                     let response = handle(payload).await?;
-                    kernel_ui::commit(&response).map_err(|e| format!("commit failed: {e:?}"))?;
+                    kernel_ui::commit(response)
+                        .await
+                        .map_err(|e| format!("commit failed: {e:?}"))?;
                 }
                 Err(RuntimeError::Shutdown) => return Ok(()),
                 Err(RuntimeError::Internal(message)) => return Err(message),

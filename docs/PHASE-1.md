@@ -107,13 +107,23 @@ instar-host
 instar-kernel -> guest
 ```
 
-Dependencies:
+Dependencies (`instar-paint` and `instar-shell` added in WP7B2):
 
 ```text
 instar-window --+
-                +--> instar-host --> instar-kernel
-instar-ui ------+
+                |
+instar-ui ------+--> instar-host --> instar-kernel
+                |         ^
+instar-paint ---+         |
+                    instar-shell --> instar-render-vello-cpu, softbuffer,
+                                     winit, skrifa
 ```
+
+`instar-host` takes `instar-paint` for scene *types* only — no backend, no
+font, no window. It is the layer that bridges logical presentation to physical
+rendering, so lowering a laid-out tree to a `PaintScene` belongs to it;
+choosing what rasterizes that scene does not, and lives one layer up in
+`instar-shell`.
 
 **No `instar-window -> instar-ui` edge.** `instar-window` must never know
 `NodeKey`, tree revisions, button semantics, or hit-testing: winit is window
@@ -330,8 +340,9 @@ Exit gate, met: guest provides zero geometry; host produces a deterministic
 round-trip still works.
 
 **WP7B** — `instar-host` composition: compose window + ui + kernel. Enforce the
-metrics barrier, route `UiAction` to guest events, own close policy. (routing
-core done; kernel event-loop wiring and guest-trap presentation remain)
+metrics barrier, route `UiAction` to guest events, own close policy. (done:
+routing core in WP7B core, the two-thread bridge in WP7B1, rendering and crash
+presentation in WP7B2)
 
 Metrics capability is modelled directly rather than as flags:
 
@@ -363,7 +374,7 @@ Blocked:                          Ready(new):
 - pointer position may update
 - close/lifecycle still works
 ```
-### WP7B1 — the runtime/main-thread bridge [directive]
+### WP7B1 — the runtime/main-thread bridge [directive] — DONE
 
 Two threads, actor-style. Winit and `run_concurrent` must **not** cooperatively
 own one thread: winit requires its event loop on the main thread and its
@@ -450,7 +461,77 @@ a round-trip that resolves in three seconds passes that test and is a broken
 UI. The gate is that runtime->main->runtime round-trips make *prompt* progress
 under concurrent load, with a measured bound rather than an eventual one.
 
-### WP7B2 — rendering and crash presentation [directive]
+#### What the gate found [artifact]
+
+All ten tests live in `crates/instar-host/tests/bridge.rs`, each against a real
+`wasm32-wasip2` guest in a real generation on a real second thread. The
+promptness bound is 250ms per click-to-committed-tree round-trip, asserted with
+a 3-second host operation in flight and again as the *slowest* of 1,000
+consecutive cycles. Measured values sit two orders of magnitude below it.
+
+The bound is asserted; the *distribution* is not. p50/p95/p99 are collected
+over the 1,000-cycle run and printed, and stay observational until there are
+numbers from a real windowed host to calibrate against — tightening CI against
+an unloaded developer machine with no display server attached would be
+inventing a target before the baseline exists, which is what the measurement
+policy above rules out for memory and startup. The max is what the gate
+asserts, deliberately: a p99 bound would permit ten of a thousand clicks to
+take arbitrarily long, and the tail is exactly where a broken UI shows up.
+
+**250ms is a deadlock and regression detector, not a performance target.**
+[directive] Measured on a developer machine: p50 206µs, p95 215µs, p99 225µs,
+max 475µs — roughly 0.2ms for a full guest→main→guest commit round trip,
+against an 8–16ms display budget. The headroom is two orders of magnitude, so
+the assertion's job is to catch something *stopping*, and the percentiles are
+kept as telemetry rather than promoted into the assertion.
+
+Two things the gate changed rather than confirmed. Both are now normative.
+
+**Back-pressure must extend to the final consumer. A bounded queue feeding an
+unbounded one is not bounded.** The guest's own event inbox was unbounded, so
+the bounded main->runtime queue drained into it regardless of how far behind
+the guest was: the "full queue" test could not make anything drop. The inbox is
+now bounded too (`EVENT_QUEUE_CAPACITY`), and the runtime thread takes a permit
+for it *before* dequeuing a command, so pressure propagates back to the winit
+thread instead of pooling in a hidden reservoir:
+
+```text
+runtime command waiting
+  -> reserve guest inbox capacity
+  -> only then dequeue DeliverEvent
+  -> deliver
+```
+
+Only event delivery back-pressures this way. Cancellation is deliberately not
+held behind a full inbox, since a saturated inbox is exactly when cancelling is
+most wanted.
+
+**Lifecycle control must not compete with normal work for bounded queue
+capacity.** Sending `Shutdown` over the same bounded queue meant it was
+discarded in precisely the state that needed it — a full queue and a guest
+suspended on an unanswered commit — and the thread never joined. Teardown must
+stay deliverable while ordinary queues are saturated, so it travels out of band
+and jumps the queue. `RuntimeCommand::Shutdown` remains for the ordered case,
+where a caller genuinely wants the guest to see its pending events first.
+
+**Every accepted commit resolves exactly once.** `Accepted`, `Invalid`,
+`StaleGeneration`, or `HostUnavailable` — and the last is the *default*, not a
+case an exit path has to remember. The reply one-shot is owned by a guard whose
+`Drop` answers `HostUnavailable`, so a request dropped by a panicking main
+thread, an early return, a disconnected queue, or a shutdown between submission
+and application still wakes its guest. A guest parked forever inside
+`commit().await` is the worst failure this bridge can produce — silent,
+timeout-proof, and invisible to every counter — so it is made structurally
+unreachable rather than merely avoided.
+
+**UI commit became async at the guest boundary**, as specified:
+`kernel-ui.commit` is an `async func` in `wit/kernel.wit`, and a new
+`commit-error.host-unavailable` variant exists so a guest suspended on a reply
+that will never arrive is woken with a verdict rather than left parked. The
+kernel keeps its synchronous in-memory commit log for embedders that install no
+sink, which is why WP4's and WP5's headless tests needed no rewrite.
+
+### WP7B2 — rendering and crash presentation [directive] — DONE
 
 ```text
 UiCommit accepted -> recompute layout if needed -> lower to PaintScene -> request_redraw
@@ -460,7 +541,7 @@ GuestTrapped      -> PresentationState::Crashed -> request_redraw
 
 ```rust
 enum PresentationState {
-    App { tree_revision: u64 },
+    App,
     Crashed { generation: RuntimeGeneration, message: String },
 }
 ```
@@ -471,8 +552,199 @@ The crash screen is host-owned; showing it requires no guest tree mutation.
 and WP6 proved OS semantics; the two-thread crossing is the remaining
 architectural risk after Gate 0. WP8 fixture work may proceed in parallel.
 
-**WP8** — counter guest and fixtures
-**WP9** — CI rewrite; compare against the WP0.3 baseline
+#### Lowering happens on commit, not on redraw [directive]
+
+A frame callback is the worst place to discover work. Lowering at commit time
+means the redraw path is "hand the backend a scene that already exists", and it
+means everything that could still have refused a batch has happened before the
+host promises a frame. The full normative order, extending WP7B1's:
+
+```text
+receive UiCommit
+-> check RuntimeGeneration      (before anything else)
+-> only then decode bytes
+-> validate semantics
+-> apply atomically
+-> layout
+-> lower to PaintScene
+-> request redraw
+-> reply
+```
+
+**The reply comes after layout, not after the tree mutates.** A guest resuming
+from `commit().await` should mean "the host accepted this as a usable
+presentation state", not "the bytes entered a tree". Rendering itself need not
+have completed — only the work that could still have refused the batch.
+
+#### The scene is subject to the metrics barrier, more sharply than layout is
+
+A `LayoutSnapshot` is logical; a `PaintScene` is *physical*, built for one
+window size and scale. Presenting one across an invalidation would draw the old
+window's geometry into the new window's buffer, so invalidation discards the
+scene outright and `HostWindow::scene()` is gated on `Ready` exactly as
+`layout()` is.
+
+#### The crash screen is host-owned, and is not a UI tree [directive]
+
+When a guest traps there is no guest left to describe anything, so the crash
+screen is emitted as paint commands directly. Synthesizing an Instar tree that
+says "the app crashed" and pushing it through the normal path is **rejected**:
+it would mean the host can author interfaces in the guest's name, and every
+downstream consumer — hit-testing, the commit log, anything that later asks
+what the guest committed — would be told a lie by a layer whose whole job is
+transcription. The retained tree keeps saying whatever the guest last said;
+what the window *shows* is a separate question.
+
+A clean exit is not a crash. A guest whose `run` returned did what it meant to,
+and replacing its last interface with an error screen would report a failure
+that did not happen.
+
+**The crash surface must itself be impossible to overwhelm.** [directive] Trap
+text is guest-influenced and effectively unbounded — a wasm backtrace runs to
+hundreds of lines, and a guest may panic with a megabyte of its own choosing.
+The surface the host puts up *because* something went wrong is the last place
+that may become a way to make things worse, so what it retains and draws is
+capped at **32 KiB / 512 lines**, whichever binds first, cut on a character
+boundary and marked as truncated.
+
+The cap is applied where the state is *built*, not where it is drawn: nothing
+downstream — the scene builder, a `Debug` print, whatever reads `presentation()`
+next — can then be handed the unbounded version. Truncation costs nothing,
+because `HostEffect::GuestGone` still carries the complete diagnostic and the
+shell logs it in full.
+
+#### Press feedback is the host's [directive]
+
+A pressed button is drawn pressed, and that frame is requested by
+`instar-host` without consulting the guest — the guest is told about a
+*completed* click and would be a runtime round-trip too late to provide
+feedback for one in progress.
+
+Generalized: **transient interaction state is host-owned and must never
+require a Wasm round trip.** The same rule will cover hover, scrolling, caret
+blink, selection, sliders, and drag previews. The guest hears about outcomes;
+the host owns everything that happens between the finger going down and the
+outcome existing.
+
+#### Painting uses the advance layout measured with [directive]
+
+`instar_ui::TEXT_METRICS` is public for exactly one reason: whoever draws text
+must place glyphs at the same advance layout measured its boxes with. A painter
+using its font's own advances produces text that drifts out of the rectangles
+the host computed for it — and the host's geometry is the authority, not the
+font's. The shell inverts its face's advance to pick the em size at which one
+glyph occupies one layout column. Both sides are placeholders and are replaced
+together, when real shaping lands.
+
+That constraint is why the shipped face is monospaced. A proportional face
+rendered at a fixed pitch would look wrong in a way that is nobody's bug in
+particular.
+
+> **Phase 2 debt — do not build on this.** [directive]
+>
+> `TEXT_METRICS` is acceptable Phase 1 scaffolding and must not become
+> architecture. "Invert a real glyph advance until it matches fake layout
+> columns" has to die *before* the UI service expands — every widget added on
+> top of it is another thing to unpick, and the trick is only invisible while
+> everything is monospaced and left-aligned.
+>
+> The end state is one shaped result driving both sides, rather than two
+> approximations kept in sync by a shared constant:
+>
+> ```text
+> text + style
+>    ↓
+> Parley shape/layout
+>    ├── intrinsic size      → Taffy
+>    └── positioned glyphs   → Vello CPU
+> ```
+>
+> Parley already produces shaped width/height and positioned runs, and Vello
+> CPU already accepts positioned glyph runs — `instar-paint`'s `GlyphRun` is
+> that shape today. The pieces exist; what is missing is the font context, and
+> introducing one is Phase 2 work.
+>
+> **Phase 1 is not to be expanded to fix this.** The signal to do the
+> replacement is the first requirement that needs more from text than a
+> fixed-pitch rectangle: a proportional face, wrapping inside a widget, mixed
+> sizes, bidi, or a caret.
+
+#### `instar-shell` [artifact]
+
+A new topmost crate, and the only one that links a window, a renderer, and a
+font at once: winit's event loop, `EventLoopProxy` as the bridge's wake, the
+Vello CPU backend (its opt-in `glyph-run` feature enabled here and nowhere
+else), softbuffer presentation, and the real counter guest built from source by
+its build script. Everything below it stays testable without a display server,
+and stays that way because none of it can reach these types.
+
+**A frame that cannot be represented is not presented.** softbuffer's
+`0x00RRGGBB` output carries no alpha, so a scene is checked for its opening
+opaque `Clear` before anything is rasterized, and any error between rasterizing
+and presenting drops the frame — a partially packed buffer is a torn mix of two
+frames, and a stale frame is a far smaller problem than a half-drawn one.
+
+Verified in `crates/instar-shell/tests/render.rs`: the real guest, on a real
+thread, through the real host, rasterized by the real backend with the real
+font, asserted on the resulting **pixels** — every pixel opaque, the host's own
+colors on screen, glyph ink inside the boxes layout computed, a click visibly
+changing the window, and a guest that really traps ending up as the host's
+crash screen with the guest's last tree still intact underneath it.
+
+**WP7 is complete.** [directive] The premise is proven end to end, not in
+pieces: a guest that costs nothing while idle, woken by the host, describing an
+interface it owns no geometry in, presented by a host that owns every pixel of
+it — and replaced by a host-owned surface when it dies.
+
+### Phase 1 closure [directive]
+
+What remains is consolidation, not architecture. Adding architecture from here
+is the failure mode to avoid.
+
+```text
+WP8   counter + fixture consolidation
+WP9   full 3-OS CI + overhead profiles A–D
+WP10  docs, dependency audit, dead-code/dependency cleanup
+      final manual 3-OS window smoke
+      -> Phase 1 closed
+```
+
+**WP8** — counter guest and fixture consolidation. Partly landed: the counter
+guest the shell runs lives in `crates/instar-shell/guests/counter`, built from
+source by the shell's build script and guarded by
+`crates/instar-shell/tests/layering.rs`. What remains is consolidating the
+three near-duplicate fixtures (`ui-guest`, `host-guest`, `counter`) and adding
+breadth — guests that misbehave in more ways than trapping on demand.
+
+**WP9** — CI rewrite; compare against the WP0.3 baseline; overhead profiles
+A–D.
+
+**WP10** — docs, dependency audit, dead-code and dependency cleanup. The
+`youth-*` crates still in the workspace are the obvious candidates.
+
+#### The final Phase 1 gate is manual, and that is correct [directive]
+
+`softbuffer::Buffer::present()` is the actual platform presentation boundary,
+and softbuffer backs AppKit, Win32, and Wayland/X11. The pixel tests in
+`crates/instar-shell/tests/render.rs` prove everything immediately *before*
+that call and deliberately do not claim to prove compositor presentation —
+a claim that needs a compositor.
+
+So the closing gate is a human running the app once per OS:
+
+```text
+window appears
+-> Click me
+-> visible count changes
+-> Crash on purpose
+-> visible host crash screen
+-> window closes normally
+```
+
+**No screenshot automation.** Manual evidence is sufficient and appropriate for
+this boundary; building a screenshot harness to assert what a person can see in
+ten seconds would be the same category error as tightening a latency budget
+against an unloaded machine.
 
 ## Gate contingency [directive] — CLOSED
 

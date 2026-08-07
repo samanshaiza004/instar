@@ -24,11 +24,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+use crate::bridge::{CommitRejection, CommitSink};
 
 wasmtime::component::bindgen!({
     path: "wit",
@@ -112,6 +114,24 @@ impl OperationRegistry {
         self.ops.is_empty()
     }
 
+    /// Cancels one operation on the host's initiative.
+    ///
+    /// The guest-facing path is `ops.cancel`; this is the same mechanism
+    /// reached from the other side, so that a host which knows a piece of work
+    /// is no longer wanted (its window closed, its result superseded) can stop
+    /// it without waiting to be asked. It is still *per-operation*: the guest
+    /// task keeps running and simply sees its `await-op` resolve as cancelled.
+    fn cancel(&mut self, generation: GenerationId, id: u64) -> bool {
+        match self.ops.get_mut(&id) {
+            Some(op) if op.generation == generation && !op.cancelled => {
+                op.abort.abort();
+                op.cancelled = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Cancels every operation belonging to `generation`. Step 3 of the
     /// teardown sequence: host-owned children die with their parent, rather
     /// than outliving it and completing into a generation that no longer
@@ -144,6 +164,18 @@ pub struct SharedKernel {
     commits: Mutex<Vec<(GenerationId, Vec<u8>)>>,
     revision: AtomicU64,
     stale_commits_rejected: AtomicU64,
+    /// Where commits go when an embedder owns the retained tree (WP7B1).
+    ///
+    /// Absent by default, and the absence is a supported mode rather than an
+    /// unconfigured one: a headless test that only wants to see what a guest
+    /// committed has no presentation thread to marshal onto, and gets the
+    /// in-memory log below instead.
+    ///
+    /// `OnceLock` because a sink may be installed exactly once, before any
+    /// generation runs. Swapping the owner of the retained tree underneath a
+    /// live guest is not a thing this design has an answer for, so it is not
+    /// expressible.
+    commit_sink: OnceLock<Arc<dyn CommitSink>>,
 }
 
 impl Default for SharedKernel {
@@ -157,6 +189,7 @@ impl Default for SharedKernel {
             commits: Mutex::default(),
             revision: AtomicU64::new(0),
             stale_commits_rejected: AtomicU64::new(0),
+            commit_sink: OnceLock::new(),
         }
     }
 }
@@ -193,6 +226,83 @@ impl SharedKernel {
     pub fn live_operations(&self) -> usize {
         self.operations.lock().expect("registry poisoned").len()
     }
+
+    /// Cancels one in-flight operation on the host's initiative.
+    ///
+    /// Per-operation, never whole-generation: the guest task stays alive. See
+    /// this module's opening table for why the distinction is load-bearing.
+    pub fn cancel_operation(&self, generation: GenerationId, id: u64) -> bool {
+        self.operations
+            .lock()
+            .expect("registry poisoned")
+            .cancel(generation, id)
+    }
+
+    /// Installs the side that owns the retained tree. Once only; a second
+    /// attempt is refused rather than silently ignored.
+    pub fn install_commit_sink(&self, sink: Arc<dyn CommitSink>) -> Result<(), &'static str> {
+        self.commit_sink
+            .set(sink)
+            .map_err(|_| "a commit sink is already installed")
+    }
+
+    pub fn has_commit_sink(&self) -> bool {
+        self.commit_sink.get().is_some()
+    }
+
+    /// Answers one guest `commit` call.
+    ///
+    /// The generation check happens twice on purpose. Here it is the cheap
+    /// local one, so a superseded guest's batch never crosses a thread at all.
+    /// The main thread checks again on arrival, because by then the answer may
+    /// have changed — a generation can be torn down while its commit is in
+    /// flight, and `docs/PHASE-1.md` makes that second check the *first* thing
+    /// the main thread does.
+    async fn commit_batch(
+        &self,
+        generation: GenerationId,
+        batch: Vec<u8>,
+    ) -> Result<CommitResult, CommitError> {
+        if !self.is_current(generation) {
+            self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
+            return Err(CommitError::StaleGeneration);
+        }
+
+        let Some(sink) = self.commit_sink.get() else {
+            // No owner installed: keep the batch here so a headless caller can
+            // read back what the guest said. Note this log is *not* written on
+            // the sink path — a host that owns the tree does not need the
+            // kernel hoarding every batch it was ever handed.
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+            self.commits
+                .lock()
+                .expect("commit log poisoned")
+                .push((generation, batch));
+            return Ok(CommitResult { revision });
+        };
+
+        let (request, reply) = crate::bridge::commit_request(generation, batch);
+        if sink.submit(request).is_err() {
+            // The request came back, so nobody took ownership of answering it.
+            // Dropping it here is the answer.
+            return Err(CommitError::HostUnavailable);
+        }
+
+        match reply.await {
+            Ok(Ok(revision)) => Ok(CommitResult { revision }),
+            Ok(Err(CommitRejection::Invalid(reason))) => Err(CommitError::InvalidBatch(reason)),
+            Ok(Err(CommitRejection::StaleGeneration)) => {
+                self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
+                Err(CommitError::StaleGeneration)
+            }
+            Ok(Err(CommitRejection::HostUnavailable)) => Err(CommitError::HostUnavailable),
+            // The reply channel was dropped without an answer, which is what
+            // tearing the presentation side down mid-commit looks like from
+            // here. Waking the guest with a verdict it can act on beats
+            // leaving it parked on a reply that is never coming.
+            Err(_) => Err(CommitError::HostUnavailable),
+        }
+    }
 }
 
 /// Per-generation store data.
@@ -201,7 +311,7 @@ struct GenerationState {
     table: ResourceTable,
     kernel: Arc<SharedKernel>,
     generation: GenerationId,
-    events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>>,
+    events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Event>>>,
 }
 
 impl WasiView for GenerationState {
@@ -245,24 +355,29 @@ impl instar::kernel::ops::Host for GenerationState {
     }
 }
 
-impl instar::kernel::kernel_ui::Host for GenerationState {
-    fn commit(&mut self, batch: Vec<u8>) -> wasmtime::Result<Result<CommitResult, CommitError>> {
-        // Step 2 of teardown, enforced at the point of effect rather than
-        // trusted: a superseded generation's commits are refused, not applied.
-        if !self.kernel.is_current(self.generation) {
-            self.kernel
-                .stale_commits_rejected
-                .fetch_add(1, Ordering::SeqCst);
-            return Ok(Err(CommitError::StaleGeneration));
-        }
+impl instar::kernel::kernel_ui::Host for GenerationState {}
 
-        let revision = self.kernel.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        self.kernel
-            .commits
-            .lock()
-            .expect("commit log poisoned")
-            .push((self.generation, batch));
-        Ok(Ok(CommitResult { revision }))
+/// Committing suspends the guest (WP7B1).
+///
+/// Step 2 of teardown is enforced inside `commit_batch` at the point of effect
+/// rather than trusted: a superseded generation's commits are refused, not
+/// applied. What is new here is *where* the applying happens — off this
+/// thread, on whichever thread owns the retained tree — which is why this is
+/// an async import now and not a plain method.
+impl instar::kernel::kernel_ui::HostWithStore<GenerationState>
+    for wasmtime::component::HasSelf<GenerationState>
+{
+    fn commit(
+        accessor: &wasmtime::component::Accessor<GenerationState, Self>,
+        batch: Vec<u8>,
+    ) -> impl std::future::Future<Output = wasmtime::Result<Result<CommitResult, CommitError>>> + Send
+    {
+        let (kernel, generation) = accessor.with(|mut access| {
+            let state = access.get();
+            (Arc::clone(&state.kernel), state.generation)
+        });
+
+        async move { Ok(kernel.commit_batch(generation, batch).await) }
     }
 }
 
@@ -376,7 +491,35 @@ pub struct RuntimeGeneration {
     id: GenerationId,
     store: Store<GenerationState>,
     bindings: Kernel,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: tokio::sync::mpsc::Sender<Event>,
+}
+
+/// How many events may be queued for a guest that has not yet asked for them.
+///
+/// Bounded, and it matters that it is: a guest suspended inside an unanswered
+/// `commit` stops draining this queue entirely, and an unbounded inbox would
+/// turn "the guest is behind" into "the host grows without limit". The bound
+/// is also what makes a bounded queue *above* this one mean anything — a
+/// backlog that simply moves from one unbounded place to another has not been
+/// bounded, only relocated.
+pub const EVENT_QUEUE_CAPACITY: usize = 256;
+
+/// Reserved room in a guest's inbox.
+///
+/// Taking one of these before dequeuing work is how a caller applies
+/// back-pressure to *itself* rather than to the guest: acquiring the permit is
+/// the thing that waits, and it can be raced against the guest's own progress
+/// so that nothing is blocked while it waits.
+pub struct EventPermit<'a>(tokio::sync::mpsc::Permit<'a, Event>);
+
+impl EventPermit<'_> {
+    pub fn send(self, payload: impl Into<Vec<u8>>) {
+        self.0.send(Event::Payload(payload.into()));
+    }
+
+    pub fn shutdown(self) {
+        self.0.send(Event::Shutdown);
+    }
 }
 
 /// Sends events to a generation's guest.
@@ -394,7 +537,7 @@ pub struct RuntimeGeneration {
 #[derive(Clone)]
 pub struct GenerationHandle {
     id: GenerationId,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: tokio::sync::mpsc::Sender<Event>,
 }
 
 impl GenerationHandle {
@@ -402,17 +545,43 @@ impl GenerationHandle {
         self.id
     }
 
-    /// Queues an event for this generation's guest.
+    /// Queues an event for this generation's guest, without waiting.
+    ///
+    /// Fails rather than blocks when the guest is [`EVENT_QUEUE_CAPACITY`]
+    /// events behind. A caller that can afford to wait — and can keep the
+    /// guest running while it does — should [`GenerationHandle::reserve`]
+    /// instead.
     pub fn send(&self, payload: impl Into<Vec<u8>>) -> Result<(), &'static str> {
         self.events
-            .send(Event::Payload(payload.into()))
-            .map_err(|_| "generation is no longer receiving events")
+            .try_send(Event::Payload(payload.into()))
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    "the guest's event queue is full"
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    "generation is no longer receiving events"
+                }
+            })
     }
 
     /// Asks the guest to leave its event loop and return from `run`.
     pub fn shutdown(&self) -> Result<(), &'static str> {
         self.events
-            .send(Event::Shutdown)
+            .try_send(Event::Shutdown)
+            .map_err(|_| "generation is no longer receiving events")
+    }
+
+    /// Waits for room in the guest's inbox and holds it.
+    ///
+    /// Await this *before* taking work off whatever queue feeds it: then a
+    /// guest that has fallen behind stops that upstream queue draining, which
+    /// lets the bound at the top of the chain do its job instead of the
+    /// backlog quietly relocating one layer down.
+    pub async fn reserve(&self) -> Result<EventPermit<'_>, &'static str> {
+        self.events
+            .reserve()
+            .await
+            .map(EventPermit)
             .map_err(|_| "generation is no longer receiving events")
     }
 }
@@ -484,7 +653,7 @@ impl Runtime {
     pub async fn new_generation(&mut self) -> wasmtime::Result<RuntimeGeneration> {
         let id = GenerationId(self.kernel.current.fetch_add(1, Ordering::SeqCst) + 1);
 
-        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_CAPACITY);
         let state = GenerationState {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),

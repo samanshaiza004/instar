@@ -29,7 +29,7 @@ pub mod layout;
 
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{NodeKey, ProtocolError, WireDimension, WireLayout, limits};
-pub use layout::{LayoutSnapshot, Rect, Viewport};
+pub use layout::{LayoutSnapshot, Rect, TEXT_METRICS, TextMetrics, Viewport};
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};
 

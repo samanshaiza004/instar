@@ -111,16 +111,49 @@ struct MeasureContext {
 /// Placeholder text metrics.
 ///
 /// Real shaping belongs to the text renderer, which does not exist yet. These
-/// constants exist so layout is *deterministic and testable* now, and are the
-/// one thing in this module expected to be replaced rather than extended:
-/// when a real font stack lands, `measure` takes a font context and these go
-/// away. Assertions in tests are written against relative geometry (ordering,
+/// exist so layout is *deterministic and testable* now, and are the one thing
+/// in this module expected to be replaced rather than extended: when a real
+/// font stack lands, `measure` takes a font context and these go away.
+/// Assertions in tests are written against relative geometry (ordering,
 /// containment, stacking) rather than exact pixel values, so that replacement
 /// does not invalidate them.
-const CHAR_WIDTH: f32 = 8.0;
-const LINE_HEIGHT: f32 = 16.0;
-/// Extra space a button reserves around its label.
-const BUTTON_PADDING: f32 = 8.0;
+///
+/// Public because painting has to agree with them. A painter that places
+/// glyphs at its font's own advances, against boxes measured at these, gets
+/// text that drifts out of the rectangles the host computed for it — and the
+/// host's geometry is the authority, not the font's. Whoever draws the text
+/// reads its advance from here, so the two cannot disagree, and both are
+/// replaced together.
+///
+/// # This is scaffolding, not architecture
+///
+/// Recorded as Phase 2 debt in `docs/PHASE-1.md`. Making a real face fit these
+/// columns — inverting its advance until one glyph is one fake column — is a
+/// Phase 1 expedient and must not outlive it. The end state is one shaped
+/// result feeding both sides:
+///
+/// ```text
+/// text + style -> shape/layout -> intrinsic size    -> Taffy
+///                              -> positioned glyphs -> the renderer
+/// ```
+///
+/// Do not build on `TEXT_METRICS`. Anything that needs more from text than a
+/// fixed-pitch rectangle is the signal to do the replacement instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextMetrics {
+    /// Advance per character. Fixed pitch, which is the whole reason these are
+    /// a placeholder.
+    pub char_width: f32,
+    pub line_height: f32,
+    /// Extra space a button reserves around its label, per side.
+    pub button_padding: f32,
+}
+
+pub const TEXT_METRICS: TextMetrics = TextMetrics {
+    char_width: 8.0,
+    line_height: 16.0,
+    button_padding: 8.0,
+};
 
 fn measure(context: &MeasureContext) -> Size<f32> {
     let Some(text) = context.text.as_deref() else {
@@ -128,15 +161,15 @@ fn measure(context: &MeasureContext) -> Size<f32> {
     };
     // `chars()` rather than `len()`: a byte count would make non-ASCII labels
     // measure absurdly wide. Still not correct shaping -- see above.
-    let width = text.chars().count() as f32 * CHAR_WIDTH;
+    let width = text.chars().count() as f32 * TEXT_METRICS.char_width;
     let padding = if context.is_button {
-        BUTTON_PADDING * 2.0
+        TEXT_METRICS.button_padding * 2.0
     } else {
         0.0
     };
     Size {
         width: width + padding,
-        height: LINE_HEIGHT + padding,
+        height: TEXT_METRICS.line_height + padding,
     }
 }
 

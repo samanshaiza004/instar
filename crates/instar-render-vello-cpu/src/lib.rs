@@ -24,16 +24,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use vello_cpu::color::{AlphaColor, PremulRgba8, Srgb};
-use vello_cpu::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape};
-use vello_cpu::peniko::{Extend, ImageBrush, ImageQuality, ImageSampler};
-use vello_cpu::{ImageSource, Pixmap, PixmapMut, RenderContext, Resources};
 #[cfg(feature = "glyph-run")]
 use instar_paint::{AffineTransform, FontId, FontKey, FontResource, GlyphPosition, GlyphRun};
 use instar_paint::{
     AlphaMask, Color, MaskId, PaintBackend, PaintCommand, PaintError, PaintScene, PhysicalSize,
     Point, Rect, RenderTarget,
 };
+use vello_cpu::color::{AlphaColor, PremulRgba8, Srgb};
+use vello_cpu::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape};
+use vello_cpu::peniko::{Extend, ImageBrush, ImageQuality, ImageSampler};
+use vello_cpu::{ImageSource, Pixmap, PixmapMut, RenderContext, Resources};
 
 #[cfg(feature = "glyph-run")]
 use skrifa::FontRef;

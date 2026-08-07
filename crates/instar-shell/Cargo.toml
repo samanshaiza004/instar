@@ -1,0 +1,34 @@
+[package]
+name = "instar-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instar's desktop shell: owns the winit event loop, presents host-lowered PaintScenes through the Vello CPU backend and softbuffer, and runs a real guest. The only crate that links a window, a renderer, and a font at once."
+
+[[bin]]
+name = "instar"
+path = "src/main.rs"
+
+[dependencies]
+instar-host = { path = "../instar-host" }
+instar-kernel = { path = "../instar-kernel" }
+instar-paint = { path = "../instar-paint" }
+instar-window = { path = "../instar-window" }
+
+# The renderer, and the one place its `glyph-run` feature is switched on:
+# `instar-host` emits GlyphRun commands, and this is the crate that has to be
+# able to rasterize them.
+instar-render-vello-cpu = { path = "../instar-render-vello-cpu", features = ["glyph-run"] }
+
+# Presentation. softbuffer draws into the window a winit `Window` owns, which
+# is why both live here and nowhere below.
+softbuffer = "0.4.8"
+winit = "=0.30.13"
+
+# Character-to-glyph mapping, and the font's advance so the shell can pick the
+# size at which it matches the layout's. The same version the renderer
+# validates fonts with, so a face this crate accepts is one that crate can draw.
+skrifa = "=0.44.0"
+
+[dev-dependencies]
+instar-ui = { path = "../instar-ui" }

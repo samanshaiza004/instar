@@ -83,8 +83,11 @@ impl Counter {
         encoder.finish()
     }
 
-    fn commit(&self) -> Result<(), String> {
-        kernel_ui::commit(&self.encode())
+    async fn commit(&self) -> Result<(), String> {
+        // Suspends: the host applies this on whichever thread owns the
+        // retained tree, and answers when it has (WP7B1).
+        kernel_ui::commit(self.encode())
+            .await
             .map(|_| ())
             .map_err(|e| format!("commit failed: {e:?}"))
     }
@@ -105,7 +108,7 @@ struct Component;
 impl Guest for Component {
     async fn run() -> Result<(), String> {
         let mut counter = Counter { count: 0 };
-        counter.commit()?;
+        counter.commit().await?;
 
         loop {
             match kernel_runtime::next_event().await {
@@ -113,7 +116,7 @@ impl Guest for Component {
                     let event = WireEvent::decode(&payload)
                         .map_err(|e| format!("undecodable host event: {e}"))?;
                     counter.handle(event);
-                    counter.commit()?;
+                    counter.commit().await?;
                 }
                 Err(RuntimeError::Shutdown) => return Ok(()),
                 Err(RuntimeError::Internal(message)) => return Err(message),
