@@ -4,17 +4,24 @@
 //! loading/validation, WASI context, guest lifecycle, event delivery,
 //! operation registry, cancellation, and runtime generations. It has no
 //! rendering, windowing, layout, or UI dependency of any kind -- see
-//! docs/PHASE-1.md's forbidden-dependency list (`instar-kernel` must never
+//! the Phase 1 plan's forbidden-dependency list (`instar-kernel` must never
 //! depend on winit, Taffy, Vello, softbuffer, a text renderer, `instar-ui`,
 //! or counter-specific types).
 //!
-//! As of WP2, this crate is a scaffold: the engine configuration (see
-//! [`engine`]) is proven to build with Component Model async enabled and
-//! no polling thread, and the Gate 0 spike WIT world lives at
-//! `wit/world.wit`. Wiring `wasmtime::component::bindgen!` against that
-//! world, instantiating a guest, and driving the actual suspend/wake proof
-//! is WP3's job (docs/PHASE-1.md) -- getting the exact `bindgen!`
-//! configuration right for genuinely async WIT imports is itself part of
-//! what Gate 0 is testing, not something to assume in advance.
+//! As of WP3 this crate is still a spike, not a runtime. What exists:
+//!
+//! - [`engine`] -- the engine configuration, with Component Model async
+//!   enabled and no polling thread.
+//! - [`spike`] -- the Gate 0 harness: `bindgen!` wired against
+//!   `wit/world.wit`, a linked WASI context, and a guest fixture driven
+//!   through real suspend/wake, concurrency, and cancellation.
+//!
+//! Gate 0 passed on this toolchain; see `docs/GATE-0.md` for the findings and,
+//! importantly, the one limitation it turned up (abandoned guest tasks retain
+//! runtime state until their `Store` is dropped). The real kernel API --
+//! component loading and validation, guest lifecycle, an operation registry,
+//! runtime generations -- is not written yet, and the spike's event
+//! "protocol" is a test fixture, not a draft of it.
 
 pub mod engine;
+pub mod spike;
