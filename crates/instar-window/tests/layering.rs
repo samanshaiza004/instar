@@ -56,18 +56,18 @@ fn instar_window_does_not_depend_on_instar_ui() {
     );
 }
 
-/// The window layer's public surface must not leak winit types.
+/// The window layer's public surface must not leak winit types at all.
 ///
 /// If `RawPointerEvent` carried `winit::event::MouseButton`, every layer above
-/// would depend on winit's release cadence for no benefit. `WindowId` is the
-/// deliberate exception: it is an opaque identity token with no behaviour, and
-/// inventing a parallel one would mean maintaining a mapping for nothing.
+/// would depend on winit's release cadence for no benefit -- and a future
+/// alternate window backend would have to keep speaking winit's vocabulary.
+/// `instar-window` is the only crate whose public types may mention winit.
 #[test]
 fn pointer_events_use_instar_types_not_winit_types() {
     use instar_window::{LogicalPoint, PointerButton, PointerState, RawPointerEvent, WindowId};
 
     let event = RawPointerEvent {
-        window_id: WindowId::dummy(),
+        window_id: WindowId::from_raw(1),
         logical_pos: LogicalPoint::new(1.0, 2.0),
         button: PointerButton::Primary,
         state: PointerState::Pressed,

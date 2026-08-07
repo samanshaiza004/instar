@@ -161,6 +161,38 @@ Scale changes are atomic with metrics: the stored factor is updated before any
 subsequent pointer event is translated. `ScaleFactorChanged` is winit's
 documented way to track runtime DPI changes.
 
+Metrics are never published mixed. Winit reports the new scale alongside an
+`InnerSizeWriter` rather than the resulting physical size, and a following
+`Resized` is not a documented cross-platform guarantee:
+
+```text
+ScaleFactorChanged
+  -> update scale immediately
+  -> clear stale cursor
+  -> mark metrics_pending          (emit nothing)
+
+Resized
+  -> update physical size
+  -> emit coherent WindowMetricsChanged
+
+AboutToWait, if still pending
+  -> query window.inner_size()
+  -> emit coherent WindowMetricsChanged
+```
+
+Winit applies the OS-suggested size after the scale callback unless the
+application overrides it, so flushing at the end of the event cycle yields a
+coherent scale + actual size even where no separate resize arrives.
+
+Close policy lives in `instar-host`, not `instar-window`: winit leaves it to
+the application, and a host may want to ask its guest first, ignore the
+request, or close one window of several. The window layer reports
+`CloseRequested` and does nothing about it.
+
+`instar-window` is the only crate whose public vocabulary may contain winit
+types. `WindowId` is an Instar newtype, so a future alternate window backend
+and headless tests both stay clean.
+
 ### Guest-supplied geometry is temporary [directive]
 
 The explicit rects a guest sends today are WP5 scaffolding, not protocol

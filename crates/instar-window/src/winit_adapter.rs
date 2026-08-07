@@ -11,9 +11,14 @@
 //! part that cannot be tested in CI is the part with no logic in it.
 
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::window::WindowId;
 
-use crate::{PhysicalSize, PointerButton, PointerState, WindowOutput, WindowState};
+use crate::{PhysicalSize, PointerButton, PointerState, WindowId, WindowOutput, WindowState};
+
+impl From<winit::window::WindowId> for WindowId {
+    fn from(id: winit::window::WindowId) -> Self {
+        WindowId::from_raw(u64::from(id))
+    }
+}
 
 impl From<MouseButton> for PointerButton {
     fn from(button: MouseButton) -> Self {
@@ -72,21 +77,14 @@ pub fn translate(
             state.on_resized((*physical).into()),
         )),
 
-        // Winit's documented way to track runtime DPI changes. The new scale
-        // is stored before this returns, so the next pointer event converts
-        // with it -- see `WindowState::on_scale_factor_changed`.
-        WindowEvent::ScaleFactorChanged {
-            scale_factor,
-            inner_size_writer: _,
-        } => {
-            // Winit hands the new *scale* here but communicates the new size
-            // through a writer rather than a value. Keeping the current
-            // physical size means the metrics stay self-consistent; the
-            // `Resized` that follows carries the authoritative size.
-            let physical = state.physical_size();
-            Some(WindowOutput::MetricsChanged(
-                state.on_scale_factor_changed(*scale_factor, physical),
-            ))
+        // Winit's documented way to track runtime DPI changes. The new scale is
+        // stored immediately, so the next pointer event converts with it, but
+        // nothing is emitted: the matching physical size is not available here.
+        // The driver flushes coherent metrics once it is -- see
+        // `WindowState::on_scale_factor_changed`.
+        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            state.on_scale_factor_changed(*scale_factor);
+            None
         }
 
         WindowEvent::CursorMoved { position, .. } => {

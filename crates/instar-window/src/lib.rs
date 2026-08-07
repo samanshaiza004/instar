@@ -48,12 +48,37 @@
 
 #![forbid(unsafe_code)]
 
+use core::fmt;
+
 pub mod driver;
 pub mod winit_adapter;
 
-pub use driver::WindowDriver;
+pub use driver::{HostDecision, WindowDriver};
 
-pub use winit::window::WindowId;
+/// Identifies a window, without exposing winit's type for it.
+///
+/// `instar-window` is the only crate whose public vocabulary may contain winit
+/// types, and this is what keeps that true: an opaque token the host and a
+/// future alternate window backend can both use, and that headless tests can
+/// construct without a display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for WindowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "window{}", self.0)
+    }
+}
 
 /// A point in logical pixels — device-independent, scale-free, and the only
 /// coordinate space anything above this crate should be using for input.
@@ -168,6 +193,9 @@ pub struct WindowState {
     /// from `CursorMoved` is what a press or release is attributed to. That is
     /// how winit expects this to work, not a shortcut.
     last_cursor: Option<LogicalPoint>,
+    /// Set when the scale factor changed but the matching physical size has
+    /// not arrived yet. See [`WindowState::on_scale_factor_changed`].
+    metrics_pending: bool,
 }
 
 impl WindowState {
@@ -177,6 +205,7 @@ impl WindowState {
             scale_factor: sanitize_scale(scale_factor),
             physical_size,
             last_cursor: None,
+            metrics_pending: false,
         }
     }
 
@@ -212,25 +241,59 @@ impl WindowState {
     }
 
     /// The window was resized. Scale is unchanged.
+    ///
+    /// Also resolves any metrics left pending by a scale change: this is the
+    /// authoritative new size, so the pair is now coherent.
     pub fn on_resized(&mut self, physical_size: PhysicalSize) -> WindowMetricsChanged {
         self.physical_size = physical_size;
+        self.metrics_pending = false;
         self.metrics()
+    }
+
+    /// Whether a scale change is still waiting for its physical size.
+    pub fn metrics_pending(&self) -> bool {
+        self.metrics_pending
+    }
+
+    /// Resolves pending metrics against a size queried from the window.
+    ///
+    /// Called at the end of an event cycle. Winit applies the OS-suggested
+    /// size after the scale-change callback unless the application overrides
+    /// it, so querying `inner_size()` once the cycle settles yields a size that
+    /// genuinely matches the new scale — even on a platform where no separate
+    /// `Resized` arrives.
+    ///
+    /// Returns `None` when nothing is pending, so the caller can invoke this
+    /// unconditionally.
+    pub fn take_pending_metrics(
+        &mut self,
+        physical_size: PhysicalSize,
+    ) -> Option<WindowMetricsChanged> {
+        if !self.metrics_pending {
+            return None;
+        }
+        self.physical_size = physical_size;
+        self.metrics_pending = false;
+        Some(self.metrics())
     }
 
     /// The scale factor changed — a monitor switch or a display-settings
     /// change.
     ///
     /// The stored factor is updated *before* this returns, so every subsequent
-    /// translation uses the new one. Winit also supplies the new physical size
-    /// alongside, because the two change together and applying one without the
-    /// other leaves a frame of inconsistent geometry.
-    pub fn on_scale_factor_changed(
-        &mut self,
-        scale_factor: f64,
-        physical_size: PhysicalSize,
-    ) -> WindowMetricsChanged {
+    /// translation uses the new one.
+    ///
+    /// Deliberately emits **nothing**. Winit reports the new scale alongside an
+    /// `InnerSizeWriter` rather than the resulting physical size, and a
+    /// following `Resized` is not a documented cross-platform guarantee.
+    /// Emitting here would therefore mean publishing a new scale paired with a
+    /// stale size — metrics that are individually true and jointly wrong, which
+    /// a renderer sizing a surface would act on. Instead the metrics are marked
+    /// pending and flushed once a coherent size is known, by either
+    /// [`WindowState::on_resized`] or [`WindowState::take_pending_metrics`].
+    pub fn on_scale_factor_changed(&mut self, scale_factor: f64) {
         self.scale_factor = sanitize_scale(scale_factor);
-        self.physical_size = physical_size;
+        self.metrics_pending = true;
 
         // The cursor has not moved in physical space, but the logical position
         // recorded for it was computed under the old factor and is now wrong.
@@ -239,8 +302,6 @@ impl WindowState {
         // back-computed position is the kind of "nearly right" behaviour that
         // hides DPI bugs instead of surfacing them.
         self.last_cursor = None;
-
-        self.metrics()
     }
 
     /// The cursor moved, in physical coordinates.
@@ -300,10 +361,8 @@ mod tests {
     use super::*;
 
     fn state(scale: f64) -> WindowState {
-        // `WindowId` cannot be constructed without a window on all platforms,
-        // so tests go through winit's documented dummy id.
         WindowState::new(
-            WindowId::dummy(),
+            WindowId::from_raw(1),
             scale,
             PhysicalSize {
                 width: 800,
@@ -356,21 +415,8 @@ mod tests {
             LogicalPoint::new(200.0, 100.0)
         );
 
-        let metrics = state.on_scale_factor_changed(
-            2.0,
-            PhysicalSize {
-                width: 1600,
-                height: 1200,
-            },
-        );
-        assert_eq!(metrics.scale_factor, 2.0);
-        assert_eq!(
-            metrics.logical_size,
-            LogicalSize {
-                width: 800.0,
-                height: 600.0
-            }
-        );
+        state.on_scale_factor_changed(2.0);
+        assert_eq!(state.scale_factor(), 2.0);
 
         // The very next pointer event must use 2.0, not the old 1.0.
         assert_eq!(
@@ -384,19 +430,107 @@ mod tests {
     fn a_stale_cursor_is_dropped_across_a_scale_change() {
         let mut state = state(1.0);
         state.on_cursor_moved(200.0, 100.0);
-        state.on_scale_factor_changed(
-            2.0,
-            PhysicalSize {
-                width: 1600,
-                height: 1200,
-            },
-        );
+        state.on_scale_factor_changed(2.0);
         // Rather than report a position computed under the old factor, there
         // is simply no position until the next move.
         assert_eq!(
             state.on_mouse_input(PointerButton::Primary, PointerState::Pressed),
             None,
             "a click must not be attributed to a position computed at the old scale"
+        );
+    }
+
+    /// A scale change alone must publish nothing: the new scale paired with
+    /// the old size would be individually true and jointly wrong, and a
+    /// renderer would size a surface from it.
+    #[test]
+    fn a_scale_change_alone_publishes_no_metrics() {
+        let mut state = state(1.0);
+        state.on_scale_factor_changed(2.0);
+
+        assert!(
+            state.metrics_pending(),
+            "a scale change should leave metrics pending, not publish them"
+        );
+        assert_eq!(
+            state.scale_factor(),
+            2.0,
+            "the scale itself still applies immediately, for coordinate conversion"
+        );
+    }
+
+    /// The `Resized` that usually follows resolves the pending metrics.
+    #[test]
+    fn a_following_resize_publishes_coherent_metrics() {
+        let mut state = state(1.0);
+        state.on_scale_factor_changed(2.0);
+
+        let metrics = state.on_resized(PhysicalSize {
+            width: 1600,
+            height: 1200,
+        });
+        assert_eq!(metrics.scale_factor, 2.0);
+        assert_eq!(
+            metrics.physical_size,
+            PhysicalSize {
+                width: 1600,
+                height: 1200
+            }
+        );
+        assert_eq!(
+            metrics.logical_size,
+            LogicalSize {
+                width: 800.0,
+                height: 600.0
+            },
+            "logical size must be derived from the new scale and the new size together"
+        );
+        assert!(!state.metrics_pending(), "the resize resolved it");
+    }
+
+    /// And where no `Resized` arrives -- which winit does not guarantee across
+    /// platforms -- the end-of-cycle flush publishes the same coherent pair.
+    #[test]
+    fn a_pending_flush_publishes_coherent_metrics_without_a_resize() {
+        let mut state = state(1.0);
+        state.on_scale_factor_changed(2.0);
+
+        let metrics = state
+            .take_pending_metrics(PhysicalSize {
+                width: 1600,
+                height: 1200,
+            })
+            .expect("metrics were pending");
+        assert_eq!(metrics.scale_factor, 2.0);
+        assert_eq!(
+            metrics.logical_size,
+            LogicalSize {
+                width: 800.0,
+                height: 600.0
+            }
+        );
+
+        assert_eq!(
+            state.take_pending_metrics(PhysicalSize {
+                width: 1600,
+                height: 1200
+            }),
+            None,
+            "flushing twice must not publish the same change again"
+        );
+    }
+
+    #[test]
+    fn nothing_is_pending_without_a_scale_change() {
+        let mut state = state(2.0);
+        assert!(!state.metrics_pending());
+        assert_eq!(
+            state.take_pending_metrics(PhysicalSize {
+                width: 800,
+                height: 600
+            }),
+            None,
+            "an unconditional end-of-cycle flush must be a no-op when idle"
         );
     }
 
