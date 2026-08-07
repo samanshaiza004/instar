@@ -6,6 +6,9 @@ license.workspace = true
 description = "Instar's retained semantic UI tree and its wire encoding: what a guest commits, and how the host decodes, hit-tests, and dispatches interaction against it. No rendering or windowing dependency."
 
 [dependencies]
+# The wire format, shared verbatim with guests. This crate adds meaning on
+# top; the protocol crate stays dependency-free so guests stay light.
+instar-ui-protocol = { path = "../instar-ui-protocol" }
 thiserror = "2"
 
 [dev-dependencies]

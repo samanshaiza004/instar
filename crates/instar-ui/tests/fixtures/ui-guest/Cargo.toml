@@ -11,10 +11,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.60.0"
-# The guest builds trees with the same code the host decodes them with, so the
-# encoding has exactly one definition. This is also the first real check that
-# instar-ui compiles for wasm32-wasip2, which it must: guests are its primary
-# consumer.
-instar-ui = { path = "../../../../instar-ui" }
+# The wire format only -- deliberately NOT instar-ui. A guest needs to speak
+# the encoding, not to link the host's UI implementation, and instar-ui is
+# about to grow a layout engine that has no business in a guest. This is also
+# what removes the build-script recursion WP5 hit: nothing the fixture depends
+# on has a build script that builds the fixture.
+instar-ui-protocol = { path = "../../../../instar-ui-protocol" }
 
 [workspace]

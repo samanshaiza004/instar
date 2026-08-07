@@ -3,30 +3,19 @@
 //!
 //! Same reasoning as `instar-kernel`'s build script: the component under test
 //! is always built from the source next to it, with the pinned toolchain, on
-//! whatever OS the test runs on. Here it does double duty — the fixture
-//! depends on `instar-ui` itself, so this is also what proves this crate
-//! compiles for wasm32, which it must, since guests are its main consumer.
+//! whatever OS the test runs on.
+//!
+//! This used to need a re-entry guard, because the fixture depended on
+//! `instar-ui` and so building it re-entered this script forever. It does not
+//! any more: the fixture depends on `instar-ui-protocol`, which has no build
+//! script. If a future fixture starts depending on this crate again, the
+//! recursion comes back -- and its signature is memorable, hundreds of nested
+//! cargo invocations each indented one level further than the last.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Set while building the fixture, to stop this script recursing.
-///
-/// The fixture depends on `instar-ui` (deliberately — the guest and host must
-/// share one definition of the encoding), so building it builds this crate
-/// again, which runs this script again, which builds the fixture again. That
-/// recursion is infinite and its failure mode is memorable: hundreds of nested
-/// cargo invocations, each indented one level further than the last.
-const REENTRY_GUARD: &str = "INSTAR_UI_BUILDING_FIXTURE";
-
 fn main() {
-    if std::env::var_os(REENTRY_GUARD).is_some() {
-        // This is the nested build of `instar-ui` for wasm32-wasip2, as a
-        // dependency of the fixture. It needs no fixture of its own, and
-        // nothing in the library reads `UI_GUEST_WASM` — only the tests do.
-        return;
-    }
-
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -51,7 +40,6 @@ fn main() {
         .arg("--target")
         .arg("wasm32-wasip2")
         .env("CARGO_TARGET_DIR", &target_dir)
-        .env(REENTRY_GUARD, "1")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")

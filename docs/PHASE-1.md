@@ -86,6 +86,59 @@ if completion.generation != current_generation {
 }
 ```
 
+## UI layering [directive]
+
+Established at WP5.5, after WP5 exposed that a guest was linking the host's UI
+implementation just to share an encoding.
+
+```text
+winit WindowEvent
+      |
+instar-window        translates OS input only
+  RawPointerEvent { logical_pos, button, state, window_id }
+      |
+instar-host          orchestration
+      |
+instar-ui            hit test, disabled check, pressed/capture state
+  UiAction::ButtonActivated(NodeKey)
+      |
+instar-host
+      |
+instar-kernel -> guest
+```
+
+Dependencies:
+
+```text
+instar-window --+
+                +--> instar-host --> instar-kernel
+instar-ui ------+
+```
+
+**No `instar-window -> instar-ui` edge.** `instar-window` must never know
+`NodeKey`, tree revisions, button semantics, or hit-testing: winit is window
+and event infrastructure, and widget routing belongs above it. Hit-testing
+lives in `instar-ui` because it is tree and presentation behaviour.
+
+`instar-ui-protocol` is a fourth, tiny crate underneath: wire format only —
+version, opcodes, primitives, `NodeKey` representation, explicit
+encoder/decoder helpers, hard bounds. Zero dependencies, and the *only* Instar
+crate a guest links for UI. `instar-ui` is free to take on Taffy and anything
+else it needs precisely because none of it can reach a guest.
+
+Encoding stays manual and byte-defined. No Serde, no bincode, no `repr(C)`.
+
+### Guest-supplied geometry is temporary [directive]
+
+The explicit rects a guest sends today are WP5 scaffolding, not protocol
+semantics. They travel in a separate, optional layout section rather than on
+tree nodes, and feed `LayoutSnapshot::from_wire`. When the host computes layout
+(WP7), it produces the snapshot itself and that section is deleted — with no
+change to the tree format, which is the reason for the separation.
+
+Leaving them would make the guest authoritative over geometry and undermine the
+retained host presentation model.
+
 ## Toolchain [artifact]
 
 Wasmtime 47.0.3, wit-bindgen 0.60.0, Rust 1.97.1 stable, `wasm32-wasip2`,
@@ -135,8 +188,17 @@ Remaining sequence [directive]:
   active-task count returns to baseline
 
 **WP5** — `instar-ui` plus minimal button interaction, together (done)
-**WP6** — `instar-window`
-**WP7** — `instar-host`
+
+**WP5.5** — extract `instar-ui-protocol`; remove the recursive build-script
+dependency; keep every attack and round-trip test; verify the guest graph
+contains no `instar-ui` (done)
+
+**WP6** — `instar-window`: winit translation only. No hit-testing, no
+`NodeKey` knowledge, `ControlFlow::Wait`.
+
+**WP7** — `instar-host`: compose window + ui + kernel; replace the test rects
+with host layout; UI owns hit-testing and interaction; host turns a `UiAction`
+into a guest event.
 **WP8** — counter guest and fixtures
 **WP9** — CI rewrite; compare against the WP0.3 baseline
 

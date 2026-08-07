@@ -17,7 +17,8 @@
 use std::time::Duration;
 
 use instar_kernel::runtime::{GenerationHandle, Runtime, RuntimeGeneration};
-use instar_ui::{DecodeError, NodeId, NodeKind, Tree, UiEvent};
+use instar_ui::protocol::decode_batch;
+use instar_ui::{LayoutSnapshot, NodeKey, NodeKind, ProtocolError, Tree, TreeError, UiAction};
 
 macro_rules! run_for {
     ($fut:expr, $window:expr) => {
@@ -40,11 +41,17 @@ async fn started() -> (Runtime, RuntimeGeneration, GenerationHandle) {
     (runtime, generation, handle)
 }
 
-/// The tree the guest most recently committed, decoded.
-fn latest_tree(kernel: &instar_kernel::runtime::SharedKernel) -> Tree {
+/// The tree and layout the guest most recently committed.
+///
+/// The host does the assembly and the layout separately, which is the shape
+/// WP7 keeps: only `LayoutSnapshot::from_wire` gets replaced, by real layout.
+fn latest(kernel: &instar_kernel::runtime::SharedKernel) -> (Tree, LayoutSnapshot) {
     let commits = kernel.commits();
     let (_, bytes) = commits.last().expect("guest has committed at least once");
-    Tree::decode(bytes).expect("guest commits a decodable tree")
+    let batch = decode_batch(bytes).expect("guest commits a decodable batch");
+    let tree = Tree::from_wire(&batch).expect("guest commits a meaningful tree");
+    let layout = LayoutSnapshot::from_wire(&batch, &tree).expect("layout names known nodes");
+    (tree, layout)
 }
 
 /// The whole point of WP5: click a button, watch the guest's state change.
@@ -58,9 +65,9 @@ async fn clicking_a_button_updates_the_committed_tree() {
         run_for!(run, Duration::from_millis(300));
 
         // The guest's first commit describes its initial interface.
-        let tree = latest_tree(&kernel);
+        let (tree, layout) = latest(&kernel);
         assert_eq!(
-            tree.find(NodeId(1)).map(|n| &n.kind),
+            tree.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 0 times".to_string()
             })
@@ -68,18 +75,20 @@ async fn clicking_a_button_updates_the_committed_tree() {
 
         // Hit-test a point over the button, exactly as a windowed host would
         // with a real cursor position.
-        let hit = tree.hit_test(20, 50).expect("the button is at (20, 50)");
-        assert_eq!(hit.id, NodeId(2));
+        let hit = tree
+            .hit_test(&layout, 20, 50)
+            .expect("the button is at (20, 50)");
+        assert_eq!(hit.key, NodeKey(2));
 
         // Deliver the click. The host addresses the node it hit -- it does not
         // know or care what the guest will do about it.
         handle
-            .send(UiEvent::Click { node: hit.id }.encode())
+            .send(UiAction::ButtonActivated(hit.key).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
 
         assert_eq!(
-            latest_tree(&kernel).find(NodeId(1)).map(|n| &n.kind),
+            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 1 times".to_string()
             }),
@@ -88,16 +97,16 @@ async fn clicking_a_button_updates_the_committed_tree() {
 
         // Again, to show it accumulates rather than toggling.
         for _ in 0..3 {
-            let tree = latest_tree(&kernel);
-            let hit = tree.hit_test(20, 50).expect("button still there");
+            let (tree, layout) = latest(&kernel);
+            let hit = tree.hit_test(&layout, 20, 50).expect("button still there");
             handle
-                .send(UiEvent::Click { node: hit.id }.encode())
+                .send(UiAction::ButtonActivated(hit.key).encode())
                 .expect("guest accepts events");
             run_for!(run, Duration::from_millis(200));
         }
 
         assert_eq!(
-            latest_tree(&kernel).find(NodeId(1)).map(|n| &n.kind),
+            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 4 times".to_string()
             })
@@ -119,41 +128,41 @@ async fn a_disabled_button_cannot_be_clicked() {
         run_for!(run, Duration::from_millis(300));
 
         // Reset starts disabled, because the count is zero.
-        let tree = latest_tree(&kernel);
+        let (tree, layout) = latest(&kernel);
         assert_eq!(
-            tree.find(NodeId(3)).map(|n| &n.kind),
+            tree.find(NodeKey(3)).map(|n| &n.kind),
             Some(&NodeKind::Button {
                 label: "Reset".to_string(),
                 enabled: false
             })
         );
         assert_eq!(
-            tree.hit_test(150, 50),
+            tree.hit_test(&layout, 150, 50),
             None,
             "a disabled button must not be hit-testable"
         );
 
         // Click the counter once; Reset becomes enabled and now hit-tests.
         handle
-            .send(UiEvent::Click { node: NodeId(2) }.encode())
+            .send(UiAction::ButtonActivated(NodeKey(2)).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
 
-        let tree = latest_tree(&kernel);
+        let (tree, layout) = latest(&kernel);
         assert_eq!(
-            tree.hit_test(150, 50).map(|n| n.id),
-            Some(NodeId(3)),
+            tree.hit_test(&layout, 150, 50).map(|n| n.key),
+            Some(NodeKey(3)),
             "Reset should be live once there is something to reset"
         );
 
         // And it works.
         handle
-            .send(UiEvent::Click { node: NodeId(3) }.encode())
+            .send(UiAction::ButtonActivated(NodeKey(3)).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
 
         assert_eq!(
-            latest_tree(&kernel).find(NodeId(1)).map(|n| &n.kind),
+            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 0 times".to_string()
             })
@@ -174,11 +183,11 @@ async fn a_new_generation_starts_from_a_clean_interface() {
         let mut run = std::pin::pin!(generation.run());
         run_for!(run, Duration::from_millis(300));
         handle
-            .send(UiEvent::Click { node: NodeId(2) }.encode())
+            .send(UiAction::ButtonActivated(NodeKey(2)).encode())
             .expect("guest accepts events");
         run_for!(run, Duration::from_millis(300));
         assert_eq!(
-            latest_tree(&kernel).find(NodeId(1)).map(|n| &n.kind),
+            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 1 times".to_string()
             })
@@ -193,7 +202,7 @@ async fn a_new_generation_starts_from_a_clean_interface() {
         let mut run = std::pin::pin!(generation.run());
         run_for!(run, Duration::from_millis(300));
         assert_eq!(
-            latest_tree(&kernel).find(NodeId(1)).map(|n| &n.kind),
+            latest(&kernel).0.find(NodeKey(1)).map(|n| &n.kind),
             Some(&NodeKind::Label {
                 text: "Clicked 0 times".to_string()
             }),
@@ -204,7 +213,7 @@ async fn a_new_generation_starts_from_a_clean_interface() {
     // Every commit across both generations decoded cleanly.
     for (generation_id, bytes) in kernel.commits() {
         assert!(
-            Tree::decode(&bytes).is_ok(),
+            decode_batch(&bytes).is_ok(),
             "{generation_id} committed an undecodable tree"
         );
     }
@@ -249,6 +258,10 @@ async fn malformed_host_events_are_rejected_by_the_guest() {
 /// so a future refactor cannot quietly make decode failures unrepresentable.
 #[test]
 fn decode_errors_are_public() {
-    let error = Tree::decode(b"nope").unwrap_err();
-    assert_eq!(error, DecodeError::BadMagic);
+    // Wire failures and semantic failures stay distinguishable from the
+    // integration surface, which is the whole reason they are separate types.
+    assert!(matches!(
+        Tree::decode(b"nope"),
+        Err(TreeError::Protocol(ProtocolError::BadMagic))
+    ));
 }

@@ -10,6 +10,7 @@ members = [
     "crates/instar-render-vello-cpu",
     "crates/instar-kernel",
     "crates/instar-ui",
+    "crates/instar-ui-protocol",
 ]
 
 # youth-runtime and youth-desktop are temporarily out of the workspace: both

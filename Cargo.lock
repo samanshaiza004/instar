@@ -1052,9 +1052,14 @@ name = "instar-ui"
 version = "0.0.2"
 dependencies = [
  "instar-kernel",
+ "instar-ui-protocol",
  "thiserror 2.0.19",
  "tokio",
 ]
+
+[[package]]
+name = "instar-ui-protocol"
+version = "0.0.2"
 
 [[package]]
 name = "io-extras"
