@@ -7,6 +7,12 @@ Decided 2026-08-07 on the WP1 toolchain (Wasmtime 47.0.3, wit-bindgen 0.60.0,
 Rust 1.97.1 stable, `wasm32-wasip2`; see [TOOLCHAIN.md](TOOLCHAIN.md)).
 Re-verify before trusting this if any of those pins move.
 
+**Confirmed on all three target platforms** — Linux, macOS, and Windows — in
+CI (`.github/workflows/gate0.yml`, run 31182995718), not on one developer
+machine. This matters more than it might look: the idle gate is a claim about
+timer and scheduler behaviour, and a runtime that parks cleanly on one
+platform's event loop could plausibly spin on another's. It does not.
+
 ## The question
 
 Instar's architecture assumes a guest can sit idle at zero cost and be woken by

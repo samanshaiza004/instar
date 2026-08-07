@@ -1,6 +1,7 @@
-name: Gate 0
+name: Kernel
 
-# The Instar Phase 1 headless-kernel gates (WP3). Deliberately a separate,
+# The Instar Phase 1 kernel gates: Gate 0 (WP3) and the guest lifecycle
+# rules that Gate 0's findings forced (WP4). Deliberately a separate,
 # narrow workflow rather than an addition to ci.yml: ci.yml is still the
 # Youth-era pipeline and is scheduled for a full rewrite in WP9. Keeping Gate 0
 # standalone means the one thing Phase 1 actually hinges on stays readable and
@@ -52,6 +53,17 @@ jobs:
 
       - name: Run Gate 0
         run: cargo test -p instar-kernel --test gate0 -- --nocapture
+
+      - name: Run guest lifecycle tests (WP4)
+        run: cargo test -p instar-kernel --test lifecycle -- --nocapture
+
+      # Linux only: ~35s of generation churn, and the RSS trend it asserts on
+      # is most stable on the runner with the least noisy memory accounting.
+      # The properties it proves are platform-independent; running it three
+      # times would cost minutes to re-verify the same claim.
+      - name: Soak -- 1000 generation teardowns stay bounded
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p instar-kernel --test soak -- --ignored --nocapture
 
       # Validates on each OS that the fixture the gates just ran against is a
       # well-formed component with the async export intact -- catches a

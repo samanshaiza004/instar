@@ -24,4 +24,5 @@
 //! "protocol" is a test fixture, not a draft of it.
 
 pub mod engine;
+pub mod runtime;
 pub mod spike;

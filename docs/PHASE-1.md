@@ -121,7 +121,7 @@ WP0–WP3 are complete. [artifact — task history and commits]
 
 Remaining sequence [directive]:
 
-**WP4 — runtime lifecycle**
+**WP4 — runtime lifecycle** (in progress)
 - `RuntimeGeneration`
 - one `Store` per generation
 - operation registry
@@ -140,11 +140,14 @@ Remaining sequence [directive]:
 **WP8** — counter guest and fixtures
 **WP9** — CI rewrite; compare against the WP0.3 baseline
 
-## Gate contingency [directive]
+## Gate contingency [directive] — CLOSED
 
-Gate 0 is not globally closed on a single-platform result. The product claim is
-Linux + Windows + macOS; the Gate 0 contingency stays open until
-`.github/workflows/gate0.yml` passes on all three.
+Gate 0 was not to be considered globally closed on a single-platform result:
+the product claim is Linux + Windows + macOS, so the contingency stayed open
+until `.github/workflows/gate0.yml` passed on all three.
+
+**It has.** All three platforms passed on 2026-08-07 (run 31182995718). The
+Gate 0 contingency is closed and the GO verdict is global.
 
 ## Out of scope for Phase 1 [artifact]
 
