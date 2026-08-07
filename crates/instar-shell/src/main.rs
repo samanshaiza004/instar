@@ -1,4 +1,8 @@
-//! `instar` — the desktop shell (WP7B2).
+//! `instar` — the desktop shell.
+//!
+//! ```text
+//! instar run path/to/app.component.wasm [--debug]
+//! ```
 //!
 //! ```text
 //! MAIN THREAD                                   RUNTIME THREAD
@@ -14,10 +18,25 @@
 //! ```
 //!
 //! Everything the loop does with a message is `instar-host`'s; everything it
-//! does with a pixel is this crate's. The file is mostly wiring, and the two
-//! places it is not are marked.
+//! does with a pixel is this crate's.
+//!
+//! # Why there is exactly one command
+//!
+//! `run` has one useful job: prove the host can load an *arbitrary* component
+//! implementing the current experimental world. Before this, the counter was
+//! compiled into the binary, and "Instar runs a guest" was true only of the
+//! guest Instar was built with.
+//!
+//! Everything else a CLI usually has — `new`, `build`, `dev`, `package`,
+//! `inspect`, `validate`, `doctor` — is deliberately absent. Each of those
+//! freezes assumptions about manifests, service discovery, build systems,
+//! package layout, SDKs, compatibility, and distribution, and none of those
+//! things have been learned yet. A command added now would be a guess
+//! preserved as an interface.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use instar_host::HostEffect;
 use instar_host::bridge::{HostBridge, Wake};
@@ -28,28 +47,150 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes};
 
-/// The component the shell runs, built from source by `build.rs`.
-const COUNTER: &[u8] = include_bytes!(env!("COUNTER_WASM"));
+const USAGE: &str = "\
+instar — a native host for WebAssembly application components
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+USAGE:
+    instar run <component.wasm> [--debug]
+
+ARGS:
+    <component.wasm>    A component implementing instar:kernel/kernel
+
+OPTIONS:
+    --debug             Report lifecycle, commits, and frame timings on stderr
+    -h, --help          Print this message
+
+`run` is the only command. new/build/dev/package/inspect/validate/doctor do
+not exist yet, deliberately: each would freeze assumptions about manifests,
+build systems, package layout, SDKs, and distribution that this project has
+not learned yet.
+";
+
+fn main() -> std::process::ExitCode {
+    match Args::parse(std::env::args().skip(1)) {
+        Ok(Some(args)) => match run(args) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("instar: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        // --help: asked for, so it is not an error.
+        Ok(None) => {
+            print!("{USAGE}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("instar: {error}\n");
+            eprint!("{USAGE}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Args {
+    component: PathBuf,
+    debug: bool,
+}
+
+impl Args {
+    /// Hand-parsed. One command and one flag does not justify an argument
+    /// parser, and a CLI framework's conventions are themselves assumptions
+    /// about a surface that does not exist yet.
+    fn parse(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut component: Option<PathBuf> = None;
+        let mut debug = false;
+        let mut command: Option<String> = None;
+
+        for arg in args {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(None),
+                "--debug" => debug = true,
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown option {other:?}"));
+                }
+                other if command.is_none() => command = Some(other.to_string()),
+                other if component.is_none() => component = Some(PathBuf::from(other)),
+                other => return Err(format!("unexpected argument {other:?}")),
+            }
+        }
+
+        match command.as_deref() {
+            None => Err("no command given".to_string()),
+            Some("run") => match component {
+                Some(component) => Ok(Some(Self { component, debug })),
+                None => Err("run needs the path to a component".to_string()),
+            },
+            // Named rather than lumped in with a typo: someone typing
+            // `instar build` has a reasonable expectation, and the useful
+            // answer is why it is missing rather than "unknown command".
+            Some(
+                other @ ("new" | "build" | "dev" | "package" | "inspect" | "validate" | "doctor"),
+            ) => Err(format!(
+                "`{other}` does not exist yet, deliberately -- it would freeze \
+                 assumptions this project has not learned. `run` is the only command"
+            )),
+            Some(other) => Err(format!("unknown command {other:?}")),
+        }
+    }
+}
+
+fn run(args: Args) -> Result<(), String> {
+    let component = load(&args.component)?;
+    if args.debug {
+        eprintln!(
+            "instar: loaded {} ({} bytes)",
+            args.component.display(),
+            component.len()
+        );
+    }
+
     // `with_user_event` is what makes the proxy able to wake a loop parked in
     // `Wait`. Without it the runtime thread could queue a commit and the
     // window would sit there until the user happened to move the mouse.
-    let event_loop = EventLoop::<()>::with_user_event().build()?;
+    let event_loop = EventLoop::<()>::with_user_event()
+        .build()
+        .map_err(|error| format!("could not start an event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut shell = Shell::new(event_loop.create_proxy());
-    event_loop.run_app(&mut shell)?;
+    let mut shell = Shell::new(event_loop.create_proxy(), component, args.debug);
+    let result = event_loop
+        .run_app(&mut shell)
+        .map_err(|error| format!("the event loop failed: {error}"));
 
     // Joins the runtime thread. Dropping would do it too — `RuntimeThread`'s
     // `Drop` shuts the guest down — but doing it explicitly means a guest that
     // refuses to leave is a visible hang here rather than a mystery at exit.
     shell.shutdown();
-    Ok(())
+    result?;
+    shell.startup_error.map_or(Ok(()), Err)
+}
+
+/// Reads the component, distinguishing the failures a user can act on.
+fn load(path: &Path) -> Result<Vec<u8>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Err(format!("{} is empty", path.display())),
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("no such file: {}", path.display()))
+        }
+        Err(_) if path.is_dir() => Err(format!(
+            "{} is a directory; pass the .wasm component itself",
+            path.display()
+        )),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
 }
 
 struct Shell {
     proxy: EventLoopProxy<()>,
+    component: Vec<u8>,
+    debug: bool,
+    /// Set when startup fails inside `resumed`, where there is nothing to
+    /// return an error *to*. Reported after the loop ends, so a shell that
+    /// could not start exits non-zero rather than looking like a clean run.
+    startup_error: Option<String>,
     /// `Arc` because softbuffer's surface holds the window too, and winit's
     /// `Window` is not `Clone`.
     window: Option<Arc<Window>>,
@@ -60,9 +201,12 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(proxy: EventLoopProxy<()>) -> Self {
+    fn new(proxy: EventLoopProxy<()>, component: Vec<u8>, debug: bool) -> Self {
         Self {
             proxy,
+            component,
+            debug,
+            startup_error: None,
             window: None,
             surface: None,
             state: None,
@@ -75,6 +219,12 @@ impl Shell {
         if let Some(bridge) = self.bridge.as_mut() {
             bridge.shutdown();
         }
+    }
+
+    /// Records a fatal startup problem and ends the loop.
+    fn fail(&mut self, error: String, event_loop: &ActiveEventLoop) {
+        self.startup_error.get_or_insert(error);
+        event_loop.exit();
     }
 
     /// Applies what the host decided. The only interesting case is `Render`;
@@ -93,11 +243,16 @@ impl Shell {
                     }
                 }
                 HostEffect::GuestGone { generation, error } => match error {
+                    // Not fatal to the shell: the host owns the window now and
+                    // is showing the crash surface. Exiting here would replace
+                    // a visible explanation with a vanished window.
                     Some(error) => eprintln!("instar: {generation} trapped: {error}"),
                     // A guest that returned from `run` is done, and so is the
                     // application: there is nothing left to drive the window.
                     None => {
-                        eprintln!("instar: {generation} exited");
+                        if self.debug {
+                            eprintln!("instar: {generation} exited");
+                        }
                         event_loop.exit();
                     }
                 },
@@ -116,6 +271,7 @@ impl Shell {
     /// whatever it was showing rather than being cleared to something
     /// arbitrary.
     fn redraw(&mut self) {
+        let debug = self.debug;
         let (Some(bridge), Some(surface), Some(presenter)) = (
             self.bridge.as_ref(),
             self.surface.as_mut(),
@@ -151,10 +307,19 @@ impl Shell {
         // The one rule this function exists to keep: on any error the buffer
         // may hold a torn mix of two frames, so it is dropped unpresented.
         // A stale frame is a far smaller problem than a half-drawn one.
+        let started = Instant::now();
         match presenter.render_into_window(scene, &mut buffer) {
             Ok(()) => {
                 if let Err(error) = buffer.present() {
                     eprintln!("instar: could not present: {error}");
+                } else if debug {
+                    eprintln!(
+                        "instar: frame {}x{} in {:.2}ms (revision {})",
+                        scene.size.width,
+                        scene.size.height,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        bridge.revision(),
+                    );
                 }
             }
             Err(error) => eprintln!("instar: frame dropped: {error}"),
@@ -167,6 +332,18 @@ impl Shell {
             return;
         };
         let effects = bridge.pump();
+        if self.debug {
+            let stats = bridge.stats();
+            if stats.rejected_commits > 0 || stats.stale_commits > 0 || stats.dropped_commands > 0 {
+                eprintln!(
+                    "instar: applied {} rejected {} stale {} dropped {}",
+                    stats.applied_commits,
+                    stats.rejected_commits,
+                    stats.stale_commits,
+                    stats.dropped_commands,
+                );
+            }
+        }
         self.apply(effects, event_loop);
     }
 }
@@ -183,9 +360,7 @@ impl ApplicationHandler<()> for Shell {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
             Err(error) => {
-                eprintln!("instar: could not create a window: {error}");
-                event_loop.exit();
-                return;
+                return self.fail(format!("could not create a window: {error}"), event_loop);
             }
         };
 
@@ -202,29 +377,35 @@ impl ApplicationHandler<()> for Shell {
             let _ = proxy.send_event(());
         });
 
+        let component = self.component.clone();
         let started = match default_font() {
-            Ok(font) => HostBridge::spawn_with_glyphs(
-                COUNTER.to_vec(),
-                state.window_id(),
-                wake,
-                Arc::new(font),
-            ),
+            Ok(font) => {
+                HostBridge::spawn_with_glyphs(component, state.window_id(), wake, Arc::new(font))
+            }
             Err(error) => {
                 // Survivable, and worth surviving: every rectangle still
                 // renders, so a broken font gives a usable window with no
                 // labels rather than no window at all.
                 eprintln!("instar: no text this session ({error})");
-                HostBridge::spawn(COUNTER.to_vec(), state.window_id(), wake)
+                HostBridge::spawn(component, state.window_id(), wake)
             }
         };
         let mut bridge = match started {
             Ok(bridge) => bridge,
             Err(error) => {
-                eprintln!("instar: the guest did not start: {error}");
-                event_loop.exit();
-                return;
+                return self.fail(
+                    format!(
+                        "the guest did not start: {error}\n       \
+                         the component must implement instar:kernel/kernel \
+                         (see docs/PROTOCOL-0.md)"
+                    ),
+                    event_loop,
+                );
             }
         };
+        if self.debug {
+            eprintln!("instar: {} started", bridge.generation());
+        }
 
         let window = Arc::new(window);
         match softbuffer::Context::new(Arc::clone(&window))
@@ -232,9 +413,10 @@ impl ApplicationHandler<()> for Shell {
         {
             Ok(surface) => self.surface = Some(surface),
             Err(error) => {
-                eprintln!("instar: could not attach a surface to the window: {error}");
-                event_loop.exit();
-                return;
+                return self.fail(
+                    format!("could not attach a surface to the window: {error}"),
+                    event_loop,
+                );
             }
         }
 
@@ -244,9 +426,7 @@ impl ApplicationHandler<()> for Shell {
         }) {
             Ok(presenter) => Some(presenter),
             Err(error) => {
-                eprintln!("instar: could not start the renderer: {error}");
-                event_loop.exit();
-                return;
+                return self.fail(format!("could not start the renderer: {error}"), event_loop);
             }
         };
 
@@ -283,6 +463,18 @@ impl ApplicationHandler<()> for Shell {
         let Some(output) = winit_adapter::translate(state, id.into(), &event) else {
             return;
         };
+        if self.debug
+            && let WindowOutput::MetricsChanged(metrics) = &output
+        {
+            eprintln!(
+                "instar: metrics {}x{} logical, {}x{} physical, scale {}",
+                metrics.logical_size.width,
+                metrics.logical_size.height,
+                metrics.physical_size.width,
+                metrics.physical_size.height,
+                metrics.scale_factor,
+            );
+        }
         let effects = bridge.on_window_event(output);
         self.apply(effects, event_loop);
     }
@@ -310,5 +502,84 @@ impl ApplicationHandler<()> for Shell {
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Args>, String> {
+        Args::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn run_takes_a_component_path() {
+        let args = parse(&["run", "app.wasm"])
+            .expect("valid")
+            .expect("not --help");
+        assert_eq!(args.component, PathBuf::from("app.wasm"));
+        assert!(!args.debug);
+    }
+
+    #[test]
+    fn debug_is_accepted_on_either_side_of_the_path() {
+        for form in [
+            vec!["run", "app.wasm", "--debug"],
+            vec!["run", "--debug", "app.wasm"],
+            vec!["--debug", "run", "app.wasm"],
+        ] {
+            let args = parse(&form)
+                .unwrap_or_else(|error| panic!("{form:?} should parse: {error}"))
+                .expect("not --help");
+            assert!(args.debug, "{form:?} should set debug");
+            assert_eq!(args.component, PathBuf::from("app.wasm"));
+        }
+    }
+
+    #[test]
+    fn help_is_not_an_error() {
+        assert!(parse(&["--help"]).expect("valid").is_none());
+        assert!(parse(&["-h"]).expect("valid").is_none());
+    }
+
+    #[test]
+    fn run_without_a_path_says_so() {
+        let error = parse(&["run"]).unwrap_err();
+        assert!(error.contains("needs the path"), "unhelpful: {error}");
+    }
+
+    /// Someone typing `instar build` has a reasonable expectation. The useful
+    /// answer is why it is missing, not "unknown command".
+    #[test]
+    fn the_commands_that_do_not_exist_yet_explain_themselves() {
+        for command in [
+            "new", "build", "dev", "package", "inspect", "validate", "doctor",
+        ] {
+            let error = parse(&[command]).unwrap_err();
+            assert!(
+                error.contains("deliberately"),
+                "{command} should explain itself, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_command_is_refused() {
+        assert!(parse(&["frobnicate"]).unwrap_err().contains("unknown"));
+        assert!(parse(&["--nope"]).unwrap_err().contains("unknown option"));
+    }
+
+    #[test]
+    fn no_arguments_is_an_error_rather_than_a_default() {
+        // A bare `instar` used to run a compiled-in counter. It must not
+        // silently do anything now: there is no default component.
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn a_missing_component_is_reported_as_such() {
+        let error = load(Path::new("definitely/not/here.wasm")).unwrap_err();
+        assert!(error.contains("no such file"), "unhelpful: {error}");
     }
 }

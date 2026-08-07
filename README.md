@@ -63,13 +63,27 @@ The architecture, and why each boundary is where it is:
 
 ## Running it
 
+`instar` takes a component and runs it. Build the example counter, then run it:
+
 ```bash
-cargo run --release
+cargo build --release --manifest-path guests/counter/Cargo.toml --target wasm32-wasip2
+```
+
+```bash
+cargo run --release -- run guests/counter/target/wasm32-wasip2/release/counter.wasm
 ```
 
 A window with a counter, a reset, and a button that crashes the guest on
-purpose — which is worth clicking, because a crash surface nobody has seen is a
-crash surface that does not work.
+purpose — worth clicking, because a crash surface nobody has seen is a crash
+surface that does not work.
+
+`--debug` reports lifecycle, commits, and frame timings on stderr.
+
+**`run` is the only command.** `new`, `build`, `dev`, `package`, `inspect`,
+`validate`, and `doctor` do not exist, deliberately: each would freeze
+assumptions about manifests, build systems, package layout, SDKs, and
+distribution that this project has not learned yet. A command added now would
+be a guess preserved as an interface.
 
 ## Running the gates
 
