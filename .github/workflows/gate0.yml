@@ -1,11 +1,11 @@
 name: Kernel
 
 # The Instar Phase 1 kernel gates: Gate 0 (WP3) and the guest lifecycle
-# rules that Gate 0's findings forced (WP4). Deliberately a separate,
-# narrow workflow rather than an addition to ci.yml: ci.yml is still the
-# Youth-era pipeline and is scheduled for a full rewrite in WP9. Keeping Gate 0
-# standalone means the one thing Phase 1 actually hinges on stays readable and
-# doesn't get edited twice.
+# rules that Gate 0's findings forced (WP4).
+#
+# Currently the entire pipeline: the inherited Youth-era ci.yml and release.yml
+# were deleted rather than repaired, since they built workspace members that no
+# longer exist. WP9 writes Instar-native CI to replace them.
 #
 # The point of running on three OSes is that Gate 0's claims are about a
 # *runtime*, not about this machine: "suspends without polling" has to hold on

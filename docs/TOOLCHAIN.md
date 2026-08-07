@@ -121,12 +121,13 @@ finding above.
 
 Latest release as of this research (`gh api
 repos/bytecodealliance/wasm-tools/releases/latest`): `v1.255.0`,
-2026-07-30. CI currently installs `wasm-tools` unpinned via
-`taiki-e/install-action@wasm-tools` (`.github/workflows/ci.yml`). Target
-version to pin: `1.255.0`. **Not yet wired into CI** — deferred to WP9's
-larger CI rewrite (WP1.4) to avoid editing `ci.yml` twice; the minimal 3-OS
-headless-kernel-fixture job added in WP3.6 is a separate, narrower workflow
-and should pin the same version when it's created.
+2026-07-30. **Pinned and in use**: `.github/workflows/gate0.yml` installs
+`wasm-tools@1.255.0` explicitly.
+
+The Youth-era `ci.yml`, which installed it unpinned, has been deleted rather
+than repaired — it built workspace members that no longer exist, so it could
+not pass in any form. `gate0.yml` is the whole pipeline until WP9 writes
+Instar-native CI.
 
 ## Summary of the pinned tuple
 
@@ -136,4 +137,4 @@ and should pin the same version when it's created.
 | Target | `wasm32-wasip2` | unchanged |
 | `wasmtime` / `wasmtime-wasi` | `47.0.3` | **changed from 46.0.1** — applied when `instar-kernel` is scaffolded (WP2) |
 | `wit-bindgen` | `0.60.0` | **changed from 0.51.0** — applied to `instar-sdk`/`instar-kernel` in WP2/WP8 |
-| `wasm-tools` (CI) | `1.255.0` | new pin, not yet wired into CI (deferred to WP9) |
+| `wasm-tools` (CI) | `1.255.0` | pinned in `gate0.yml` |
