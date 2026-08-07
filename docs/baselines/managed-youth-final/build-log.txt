@@ -1,0 +1,373 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling bitflags v2.13.1
+   Compiling serde v1.0.228
+   Compiling foldhash v0.2.0
+   Compiling hashbrown v0.17.1
+   Compiling log v0.4.33
+   Compiling heck v0.5.0
+   Compiling zmij v1.0.23
+   Compiling anyhow v1.0.103
+   Compiling equivalent v1.0.2
+   Compiling semver v1.0.28
+   Compiling serde_json v1.0.150
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling unicode-xid v0.2.6
+   Compiling id-arena v2.3.0
+   Compiling cfg-if v1.0.4
+   Compiling syn v2.0.119
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling version_check v0.9.5
+   Compiling prettyplease v0.2.37
+   Compiling libm v0.2.16
+   Compiling leb128fmt v0.1.0
+   Compiling syn v3.0.0
+   Compiling jobserver v0.1.35
+   Compiling find-msvc-tools v0.1.9
+   Compiling wit-bindgen-rust v0.51.0
+   Compiling shlex v2.0.1
+   Compiling wit-bindgen-rust-macro v0.51.0
+   Compiling cc v1.3.0
+   Compiling generic-array v0.14.7
+   Compiling wit-bindgen v0.51.0
+   Compiling objc2-encode v4.1.0
+   Compiling thiserror v2.0.19
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling indexmap v2.14.0
+   Compiling wasmtime-internal-core v46.0.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling wasmparser v0.244.0
+   Compiling errno v0.3.14
+   Compiling typenum v1.20.1
+   Compiling objc2 v0.6.4
+   Compiling target-lexicon v0.13.5
+   Compiling pkg-config v0.3.33
+   Compiling rustix v1.1.4
+   Compiling synstructure v0.13.2
+   Compiling hashbrown v0.16.1
+   Compiling thiserror-impl v2.0.19
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling uuid v1.24.0
+   Compiling writeable v0.6.3
+   Compiling cranelift-srcgen v0.133.1
+   Compiling cranelift-assembler-x64-meta v0.133.1
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.6
+   Compiling bytemuck_derive v1.11.0
+   Compiling pin-project-lite v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling zerofrom v0.1.8
+   Compiling pulley-macros v46.0.1
+   Compiling yoke v0.8.3
+   Compiling objc2-core-foundation v0.3.2
+   Compiling zerovec v0.11.6
+   Compiling litemap v0.8.2
+   Compiling fnv v1.0.7
+   Compiling allocator-api2 v0.2.21
+   Compiling gimli v0.33.0
+   Compiling bytemuck v1.25.2
+   Compiling bumpalo v3.20.3
+   Compiling zerotrie v0.2.4
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling cobs v0.3.0
+   Compiling wasmtime-internal-versioned-export-macros v46.0.1
+   Compiling block2 v0.6.2
+   Compiling icu_locale_core v2.2.0
+   Compiling smallvec v1.15.2
+   Compiling wasmparser v0.251.0
+   Compiling wit-parser v0.244.0
+   Compiling wasm-encoder v0.244.0
+   Compiling cranelift-bitset v0.133.1
+   Compiling io-lifetimes v2.0.4
+   Compiling utf8_iter v1.0.4
+   Compiling cranelift-entity v0.133.1
+   Compiling cranelift-isle v0.133.1
+   Compiling crc32fast v1.5.0
+   Compiling cranelift-bforest v0.133.1
+   Compiling icu_provider v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling wasm-metadata v0.244.0
+   Compiling pulley-interpreter v46.0.1
+   Compiling postcard v1.1.3
+   Compiling tracing-core v0.1.36
+   Compiling cranelift-codegen-shared v0.133.1
+   Compiling object v0.39.1
+   Compiling wit-component v0.244.0
+   Compiling wit-bindgen-core v0.51.0
+   Compiling objc2-foundation v0.3.2
+   Compiling cranelift-assembler-x64 v0.133.1
+   Compiling tracing-attributes v0.1.31
+   Compiling rustc-hash v2.1.3
+   Compiling cpp_demangle v0.4.5
+   Compiling cranelift-codegen-meta v0.133.1
+   Compiling icu_properties_data v2.2.0
+   Compiling tracing v0.1.44
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling arbitrary v1.4.2
+   Compiling termcolor v1.4.1
+   Compiling crossbeam-utils v0.8.22
+   Compiling icu_normalizer_data v2.2.0
+   Compiling cranelift-codegen v0.133.1
+   Compiling wasm-encoder v0.251.0
+   Compiling wasmprinter v0.251.0
+   Compiling cranelift-control v0.133.1
+   Compiling regalloc2 v0.15.1
+   Compiling fs-set-times v0.20.3
+   Compiling maybe-owned v0.3.4
+   Compiling rustc-demangle v0.1.28
+   Compiling ipnet v2.12.0
+   Compiling ambient-authority v0.0.2
+   Compiling wasmtime-internal-component-util v46.0.1
+   Compiling winnow v1.0.4
+   Compiling crossbeam-epoch v0.9.20
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling wasmtime-environ v46.0.1
+   Compiling icu_properties v2.2.0
+   Compiling font-types v0.12.2
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling zstd-safe v7.2.4
+   Compiling core-foundation-sys v0.8.7
+   Compiling linebender_resource_handle v0.1.1
+   Compiling io-extras v0.18.4
+   Compiling winnow v0.7.15
+   Compiling crossbeam-deque v0.8.7
+   Compiling read-fonts v0.40.2
+   Compiling icu_normalizer v2.2.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling wasm-encoder v0.253.0
+   Compiling vcpkg v0.2.15
+   Compiling thiserror v1.0.69
+   Compiling cap-primitives v3.4.5
+   Compiling icu_locale_data v2.2.0
+   Compiling objc-sys v0.3.5
+   Compiling futures-sink v0.3.33
+   Compiling rayon-core v1.13.0
+   Compiling unicode-width v0.2.2
+   Compiling futures-core v0.3.33
+   Compiling either v1.16.0
+   Compiling wasmtime-internal-unwinder v46.0.1
+   Compiling futures-channel v0.3.33
+   Compiling wast v253.0.0
+   Compiling libsqlite3-sys v0.38.1
+   Compiling wit-parser v0.251.0
+   Compiling wasmtime-internal-fiber v46.0.1
+   Compiling wasmtime-internal-jit-debug v46.0.1
+   Compiling thiserror-impl v1.0.69
+   Compiling accesskit v0.24.1
+   Compiling dirs-sys-next v0.1.2
+   Compiling fixedbitset v0.4.2
+   Compiling futures-io v0.3.33
+   Compiling wasmtime-internal-cache v46.0.1
+   Compiling wasmtime-internal-component-macro v46.0.1
+   Compiling icu_segmenter_data v2.2.0
+   Compiling futures-task v0.3.33
+   Compiling wasmtime-internal-cranelift v46.0.1
+   Compiling io-lifetimes v3.0.1
+   Compiling slab v0.4.12
+   Compiling autocfg v1.5.1
+   Compiling leb128 v0.2.7
+   Compiling wast v35.0.2
+   Compiling futures-util v0.3.33
+   Compiling num-traits v0.2.19
+   Compiling zstd v0.13.3
+   Compiling wasmtime-internal-wit-bindgen v46.0.1
+   Compiling petgraph v0.6.5
+   Compiling directories-next v2.0.0
+   Compiling wat v1.253.0
+   Compiling itertools v0.14.0
+   Compiling wasmtime v46.0.1
+   Compiling debugid v0.8.0
+   Compiling fastrand v2.4.1
+   Compiling base64 v0.22.1
+   Compiling arrayvec v0.7.8
+   Compiling io-extras v0.19.0
+   Compiling cap-std v3.4.5
+   Compiling wasm-compose v0.251.0
+   Compiling tempfile v3.27.0
+   Compiling fxprof-processed-profile v0.8.1
+   Compiling objc2 v0.5.2
+   Compiling icu_locale v2.2.0
+   Compiling rayon v1.12.0
+   Compiling futures v0.3.33
+   Compiling witx v0.9.1
+   Compiling skrifa v0.43.2
+   Compiling youth-sdk v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-sdk)
+   Compiling addr2line v0.26.1
+   Compiling wasmtime-internal-jit-icache-coherence v46.0.1
+   Compiling objc2-core-text v0.3.2
+   Compiling objc2-core-graphics v0.3.2
+   Compiling async-trait v0.1.91
+   Compiling encoding_rs v0.8.35
+   Compiling memmap2 v0.9.11
+   Compiling parlance v0.1.0
+   Compiling fallible-iterator v0.3.0
+   Compiling mach2 v0.6.0
+   Compiling wiggle-macro v46.0.1
+   Compiling cap-primitives v4.0.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fontique v0.11.0
+   Compiling wiggle-generate v46.0.1
+   Compiling icu_segmenter v2.2.0
+   Compiling block2 v0.5.1
+   Compiling polycool v0.4.0
+   Compiling harfrust v0.10.0
+   Compiling idna_adapter v1.2.2
+   Compiling parley_data v0.11.0
+   Compiling mac-notification-sys v0.6.15
+   Compiling bytes v1.12.1
+   Compiling cap-std v4.0.2
+   Compiling percent-encoding v2.3.2
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling deranged v0.5.8
+   Compiling cap-fs-ext v3.4.5
+   Compiling dispatch v0.2.0
+   Compiling objc2-foundation v0.2.2
+   Compiling form_urlencoded v1.2.2
+   Compiling time v0.3.54
+   Compiling idna v1.1.0
+   Compiling parley v0.11.0
+   Compiling kurbo v0.13.1
+   Compiling euclid v0.22.14
+   Compiling objc2-app-kit v0.3.2
+   Compiling core-foundation v0.9.4
+   Compiling iana-time-zone v0.1.65
+   Compiling color v0.3.3
+   Compiling tokio-macros v2.7.1
+   Compiling foreign-types-macros v0.2.3
+   Compiling signal-hook-registry v1.4.8
+   Compiling chacha20 v0.10.1
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling bitflags v1.3.2
+   Compiling foreign-types-shared v0.3.1
+   Compiling cfg_aliases v0.2.2
+   Compiling raw-window-handle v0.6.2
+   Compiling winit v0.30.12
+   Compiling tokio v1.53.0
+   Compiling foreign-types v0.5.0
+   Compiling core-graphics-types v0.1.3
+   Compiling rand v0.10.2
+   Compiling peniko v0.6.1
+   Compiling guillotiere v0.7.0
+   Compiling cap-time-ext v3.4.5
+   Compiling youth-editor-engine v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-editor-engine)
+   Compiling objc2-app-kit v0.2.2
+   Compiling url v2.5.8
+   Compiling cap-net-ext v3.4.5
+   Compiling youth-tree v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-tree)
+   Compiling slotmap v1.1.1
+   Compiling fearless_simd v0.4.1
+   Compiling cranelift-native v0.133.1
+   Compiling cranelift-frontend v0.133.1
+   Compiling arboard v3.6.1
+   Compiling notify-rust v4.18.0
+   Compiling cap-tempfile v4.0.2
+   Compiling core-graphics v0.23.2
+   Compiling accesskit_consumer v0.38.0
+   Compiling utf8parse v0.2.2
+   Compiling dpi v0.1.2
+   Compiling zeno v0.3.3
+   Compiling rfd v0.17.2
+   Compiling vello_common v0.1.0
+   Compiling smol_str v0.2.2
+   Compiling cursor-icon v1.2.0
+   Compiling yazi v0.2.1
+   Compiling vello_cpu v0.1.0
+   Compiling swash v0.2.10
+   Compiling accesskit_macos v0.26.3
+   Compiling rusqlite v0.40.1
+   Compiling anstyle-parse v1.0.0
+   Compiling youth-interaction v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-interaction)
+   Compiling objc2-quartz-core v0.3.2
+   Compiling dispatch2 v0.3.1
+   Compiling youth-state v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-state)
+   Compiling youth-paint v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-paint)
+   Compiling anstyle-query v1.1.5
+   Compiling grid v1.0.1
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling taffy v0.12.2
+   Compiling youth-text-render-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-text-render-cpu)
+   Compiling youth-render-vello-cpu v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-render-vello-cpu)
+   Compiling softbuffer v0.4.8
+   Compiling accesskit_winit v0.33.2
+   Compiling strsim v0.11.1
+   Compiling regex-syntax v0.8.11
+   Compiling option-ext v0.2.0
+   Compiling clap_lex v1.1.0
+   Compiling clap_builder v4.6.2
+   Compiling dirs-sys v0.5.0
+   Compiling clap_derive v4.6.1
+   Compiling same-file v1.0.6
+   Compiling lazy_static v1.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling regex-automata v0.4.16
+   Compiling clap v4.6.2
+   Compiling matchers v0.2.0
+   Compiling walkdir v2.5.0
+   Compiling directories v6.0.0
+   Compiling youth-capsule v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule)
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling unicode-segmentation v1.13.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling youth-project v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-project)
+   Compiling youth-sdk-text-document v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-text-document)
+   Compiling youth-sdk-time v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-time)
+   Compiling youth-sdk-elapsed v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-elapsed)
+   Compiling youth-sdk-todo v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-todo)
+   Compiling youth-sdk-editor v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-editor)
+   Compiling youth-instant-now v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/instant-now)
+   Compiling youth-countdown-presentation v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/countdown-presentation)
+   Compiling youth-sdk-tally v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/sdk-tally)
+   Compiling youth-shortcut-primary-v007 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/shortcut-primary-v007)
+   Compiling youth-trap-on-mount v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-on-mount)
+   Compiling youth-oversized-snapshot v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/oversized-snapshot)
+   Compiling youth-invalid-sequence v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-sequence)
+   Compiling youth-memory-bomb v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/memory-bomb)
+   Compiling youth-invalid-snapshot v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-snapshot)
+   Compiling wiggle v46.0.1
+   Compiling wasmtime-wasi-io v46.0.1
+   Compiling youth-counter v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/guests/counter)
+   Compiling youth-infinite-loop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/infinite-loop)
+   Compiling wasmtime-wasi v46.0.1
+   Compiling youth-trap-on-handle v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-on-handle)
+   Compiling youth-app-error-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/app-error-after-state-write)
+   Compiling youth-bad-revision-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/bad-revision-after-state-write)
+   Compiling youth-legacy-v003 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/legacy-v003)
+   Compiling youth-elapsed-invalid-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/elapsed-invalid-patch)
+   Compiling youth-invalid-patch-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-patch-after-state-write)
+   Compiling youth-oversized-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/oversized-patch)
+   Compiling youth-invalid-patch v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-patch)
+   Compiling youth-trap-after-state-write v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/trap-after-state-write)
+   Compiling youth-editor-v006 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/editor-v006)
+   Compiling youth-editor-capability-v006 v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/editor-capability-v006)
+   Compiling youth-elapsed-trap v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/elapsed-trap)
+   Compiling youth-invalid-revision v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/invalid-revision)
+   Compiling youth-time-stub v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/test-components/time-stub)
+   Compiling youth-runtime v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-runtime)
+   Compiling youth-desktop v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-desktop)
+   Compiling youth-test v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-test)
+   Compiling youth-capsule-launcher v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-capsule-launcher)
+   Compiling youth-cli v0.0.2 (/private/tmp/claude-501/-Users-keina-dev-instar/9104b01b-e06e-417c-b8cd-a48683a1ce9c/scratchpad/managed-youth-final-worktree/crates/youth-cli)
