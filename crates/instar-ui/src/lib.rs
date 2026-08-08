@@ -25,8 +25,10 @@
 //! constructor goes away. Nothing else has to change, which is exactly why the
 //! two are separate types.
 
+pub mod diff;
 pub mod layout;
 
+pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{NodeKey, ProtocolError, WireDimension, WireLayout, limits};
 pub use layout::{LayoutSnapshot, Rect, TEXT_METRICS, TextMetrics, Viewport};
@@ -54,6 +56,20 @@ impl NodeKind {
     /// to re-check.
     pub fn is_interactive(&self) -> bool {
         matches!(self, NodeKind::Button { enabled: true, .. })
+    }
+
+    /// A stable name for this kind, for errors and diagnostics.
+    ///
+    /// Not `Debug`: this is used in messages a guest author reads, and it must
+    /// not start reporting a node's *contents* because a variant gained a
+    /// field.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Column => "column",
+            Self::Text { .. } => "text",
+            Self::Button { .. } => "button",
+        }
     }
 }
 
@@ -146,6 +162,20 @@ pub enum TreeError {
     NestedRoot(NodeKey),
     #[error("{0} sets height to Fill, which Phase 1 does not support")]
     FillHeight(NodeKey),
+    /// A key that named one kind of node in the retained tree names another in
+    /// the new snapshot.
+    ///
+    /// Refused rather than treated as a replacement. The host holds transient
+    /// state against keys — focus, scroll offset, an in-flight press — and
+    /// silently swapping the node behind a key would move that state onto an
+    /// unrelated control. A guest that wants a different node should use a
+    /// different key.
+    #[error("{key} was a {was} and is now a {now}; reuse of a key for a different kind of node")]
+    KindChanged {
+        key: NodeKey,
+        was: &'static str,
+        now: &'static str,
+    },
 }
 
 /// A committed UI tree.

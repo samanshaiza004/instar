@@ -169,6 +169,8 @@ pub struct HostWindow {
     /// The most recent tree the guest committed. Survives invalidation — it is
     /// the *geometry* that goes stale, not the interface description.
     tree: Option<Tree>,
+    /// The version of the retained UI state.
+    tree_revision: u64,
     layout: Option<LayoutSnapshot>,
     /// Paint intent for the current frame, lowered when the interface or the
     /// geometry changes rather than when a frame is asked for. See
@@ -197,6 +199,17 @@ impl HostWindow {
 
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
+    }
+
+    /// The version of the retained UI state.
+    ///
+    /// Incremented only when an accepted snapshot actually changed the tree;
+    /// an identical re-commit is a guest event, not a new tree. Layout, paint,
+    /// and accessibility caches key off this value, which is why it is kept
+    /// apart from the guest-visible commit sequence that advances on every
+    /// accepted commit.
+    pub fn tree_revision(&self) -> u64 {
+        self.tree_revision
     }
 
     /// The paint intent to present, if there is any that may be shown.
@@ -380,19 +393,57 @@ impl Host {
         window_id: WindowId,
         batch: &[u8],
     ) -> Result<Vec<HostEffect>, TreeError> {
-        Ok(self.apply_tree(window_id, Tree::decode(batch)?))
+        self.apply_tree(window_id, Tree::decode(batch)?)
     }
 
-    /// Installs an already-decoded, already-validated tree.
+    /// Installs an already-decoded, already-validated snapshot.
     ///
     /// Split from [`Host::on_guest_commit`] because the two-thread bridge must
     /// decode at a specific point in a normative sequence — after the
     /// generation check, before anything is mutated — and so cannot use a
-    /// function that does both at once. The swap below is the "apply
-    /// atomically" step: one assignment, after all validation, so a rejected
-    /// commit can never leave the tree half-updated.
-    pub fn apply_tree(&mut self, window_id: WindowId, tree: Tree) -> Vec<HostEffect> {
+    /// function that does both at once.
+    ///
+    /// # The snapshot is diffed, not swapped
+    ///
+    /// The guest sends a whole interface every time; the host keeps the one it
+    /// already has and works out what differs (see [`instar_ui::diff`]). Nodes
+    /// are not destroyed and recreated because another snapshot arrived — the
+    /// retained tree is the interaction and layout object, and the snapshot is
+    /// only a description of what it should now look like.
+    ///
+    /// # Atomicity
+    ///
+    /// The diff runs **before** anything is mutated, and can refuse
+    /// ([`TreeError::KindChanged`]). A refused diff therefore leaves the
+    /// previous interface standing exactly as a refused decode does, which is
+    /// the property the whole commit path is built around. The promotion below
+    /// is still one assignment after all validation.
+    pub fn apply_tree(
+        &mut self,
+        window_id: WindowId,
+        tree: Tree,
+    ) -> Result<Vec<HostEffect>, TreeError> {
         let window = self.windows.entry(window_id).or_default();
+
+        // Before the mutation, so a refusal costs the previous interface
+        // nothing.
+        let changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
+
+        // A guest re-committing an identical interface is an ordinary shape —
+        // it is what an event the guest decided to ignore looks like from
+        // here. It should cost the decode and nothing else: no layout, no
+        // scene, no frame.
+        // (An opening commit always reports its nodes as created, so this
+        // cannot swallow a guest's first interface.)
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A snapshot that survived the diff is a new version of the retained
+        // tree. The guest-visible commit sequence advances on every accepted
+        // commit; this is the host's separate value for whether the state
+        // actually changed, and the one caches key off.
+        window.tree_revision += 1;
         window.tree = Some(tree);
         window.recompute_layout();
         // Lowered here rather than on the next frame callback: the caller is
@@ -402,12 +453,12 @@ impl Host {
 
         let window = self.windows.entry(window_id).or_default();
         if window.metrics.is_ready() {
-            vec![HostEffect::Render { window: window_id }]
+            Ok(vec![HostEffect::Render { window: window_id }])
         } else {
             // Nothing to draw against yet; remember that something wants
             // drawing once there is.
             window.redraw_pending = true;
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -507,8 +558,11 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::{HostBridge, HostUserEvent, Wake};
+    use instar_kernel::bridge::commit_request;
     use instar_ui::protocol::{BatchEncoder, NodeKey, WireDimension, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, PhysicalSize, PointerButton};
+    use std::time::{Duration, Instant};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
 
@@ -872,6 +926,199 @@ mod tests {
         assert!(
             window.tree().is_some() && window.layout().is_some(),
             "a rejected commit should leave the last good interface in place"
+        );
+    }
+
+    // --- Snapshot diffing (Stage 0) ---
+
+    /// A batch whose key 2 is a *button* where [`counter_batch`] makes it text.
+    fn kind_swapped_batch() -> Vec<u8> {
+        let fill = WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 1)
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey(2),
+                flags::ENABLED,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    // --- Commit sequence vs tree revision ---
+    //
+    // The bridge carries two counters now. `commit_sequence` is the guest's:
+    // it advances on every accepted commit, no-op or not. `tree_revision` is
+    // the host's: it advances only when the diff found something. These three
+    // tests drive a real bridge directly, so the divergence is observable at
+    // the same place a consumer would read it.
+
+    fn component() -> Vec<u8> {
+        std::fs::read(env!("HOSTILE_WASM")).expect("the hostile guest is built by build.rs")
+    }
+
+    /// A bridge whose guest has finished its opening commit, so the manual
+    /// commits below start from a known retained tree.
+    fn ready_bridge() -> HostBridge {
+        let wake: Wake = Arc::new(|| {});
+        let mut bridge = HostBridge::spawn(component(), WINDOW, wake).expect("the guest starts");
+        wait_for_commit(&mut bridge);
+        bridge
+    }
+
+    /// Waits for one more accepted guest commit.
+    fn wait_for_commit(bridge: &mut HostBridge) {
+        let target = bridge.commit_sequence() + 1;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            bridge.wait(Duration::from_millis(50));
+            if bridge.commit_sequence() >= target {
+                return;
+            }
+        }
+        panic!("the guest never committed");
+    }
+
+    /// Delivers a batch as if the guest had just committed it.
+    fn deliver(bridge: &mut HostBridge, batch: Vec<u8>) {
+        let (request, _reply) = commit_request(bridge.generation(), batch);
+        bridge.on_user_event(HostUserEvent::UiCommit {
+            generation: bridge.generation(),
+            request,
+        });
+    }
+
+    #[test]
+    fn an_accepted_change_bumps_both_counters() {
+        let mut bridge = ready_bridge();
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, counter_batch());
+
+        assert_eq!(
+            bridge.commit_sequence(),
+            sequence + 1,
+            "an accepted commit is a new event for the guest"
+        );
+        assert_eq!(
+            bridge.tree_revision(),
+            tree + 1,
+            "and a changed snapshot is a new version of the retained tree"
+        );
+        bridge.shutdown();
+    }
+
+    #[test]
+    fn an_identical_recommit_bumps_the_commit_sequence_but_not_the_tree_revision() {
+        let mut bridge = ready_bridge();
+        deliver(&mut bridge, counter_batch());
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, counter_batch());
+
+        assert_eq!(
+            bridge.commit_sequence(),
+            sequence + 1,
+            "the guest still gets a new sequence number for its accepted commit"
+        );
+        assert_eq!(
+            bridge.tree_revision(),
+            tree,
+            "an identical re-commit must not claim a new tree exists"
+        );
+        bridge.shutdown();
+    }
+
+    #[test]
+    fn a_refused_commit_bumps_neither_counter() {
+        let mut bridge = ready_bridge();
+        deliver(&mut bridge, counter_batch());
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, kind_swapped_batch());
+
+        assert_eq!(
+            bridge.stats().rejected_commits,
+            1,
+            "the kind swap should actually be refused"
+        );
+        assert_eq!(bridge.commit_sequence(), sequence);
+        assert_eq!(bridge.tree_revision(), tree);
+        bridge.shutdown();
+    }
+
+    /// A guest re-committing an interface it did not change is an ordinary
+    /// shape — it is what an event the guest chose to ignore looks like from
+    /// here. It should cost the decode and nothing else.
+    #[test]
+    fn recommitting_an_identical_snapshot_asks_for_no_frame() {
+        let mut host = ready_host();
+        let before = host.window(WINDOW).unwrap().scene().cloned();
+
+        let effects = host
+            .on_guest_commit(WINDOW, &counter_batch())
+            .expect("valid batch");
+
+        assert!(
+            effects.is_empty(),
+            "an unchanged interface should not ask for a frame, got {effects:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().scene().cloned(),
+            before,
+            "and the scene it was already showing should be untouched"
+        );
+    }
+
+    /// The host holds transient state against keys — focus, scroll offset, an
+    /// in-flight press. Silently swapping the node behind a key would move that
+    /// state onto an unrelated control, so a guest that reuses a key for a
+    /// different kind of node is refused rather than accommodated.
+    #[test]
+    fn reusing_a_key_for_a_different_kind_of_node_is_refused() {
+        let mut host = ready_host();
+        let before = host.window(WINDOW).unwrap().tree().cloned();
+
+        let refused = host.on_guest_commit(WINDOW, &kind_swapped_batch());
+
+        assert!(
+            matches!(refused, Err(TreeError::KindChanged { .. })),
+            "expected a KindChanged refusal, got {refused:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().tree().cloned(),
+            before,
+            "a refused diff must leave the previous interface standing, exactly \
+             as a refused decode does"
+        );
+    }
+
+    /// The diff runs before anything is mutated, so a refusal cannot leave the
+    /// host half-updated — and the interface it was already showing keeps
+    /// working afterwards.
+    #[test]
+    fn a_refused_snapshot_leaves_a_working_interface_behind() {
+        let mut host = ready_host();
+        assert!(host.on_guest_commit(WINDOW, &kind_swapped_batch()).is_err());
+
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+        assert_eq!(
+            to_guest(&host.handle(pointer(PointerState::Released, x, y))).len(),
+            1,
+            "the surviving interface should still be clickable"
         );
     }
 

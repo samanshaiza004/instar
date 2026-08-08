@@ -163,12 +163,15 @@ fn main() {
     for n in 1..=CYCLES {
         let cycle = Instant::now();
         click(&mut bridge);
-        let target = bridge.revision() + 1;
+        let target = bridge.commit_sequence() + 1;
         let waited = Instant::now();
-        while bridge.revision() < target && waited.elapsed() < Duration::from_secs(5) {
+        while bridge.commit_sequence() < target && waited.elapsed() < Duration::from_secs(5) {
             bridge.wait(Duration::from_millis(10));
         }
-        assert!(bridge.revision() >= target, "cycle {n} never committed");
+        assert!(
+            bridge.commit_sequence() >= target,
+            "cycle {n} never committed"
+        );
         slowest_frame = slowest_frame.max(render(&bridge, &mut presenter));
         slowest_cycle = slowest_cycle.max(cycle.elapsed());
     }
@@ -384,11 +387,11 @@ fn spawn(glyphs: bool) -> (HostBridge, Arc<Wakes>) {
 }
 
 fn settle(bridge: &mut HostBridge) {
-    let target = bridge.revision() + 1;
+    let target = bridge.commit_sequence() + 1;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
         bridge.wait(Duration::from_millis(25));
-        if bridge.revision() >= target {
+        if bridge.commit_sequence() >= target {
             return;
         }
     }

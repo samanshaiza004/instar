@@ -318,7 +318,7 @@ impl Shell {
                         scene.size.width,
                         scene.size.height,
                         started.elapsed().as_secs_f64() * 1000.0,
-                        bridge.revision(),
+                        bridge.tree_revision(),
                     );
                 }
             }

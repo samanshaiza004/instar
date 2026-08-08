@@ -178,7 +178,7 @@ fn ready() -> (HostBridge, Arc<Wakes>) {
 
 /// Waits for the host to refuse one more commit, returning how long it took.
 ///
-/// A rejection is not a revision, so [`await_commit`] would sit here until it
+/// A rejection is not a commit sequence, so [`await_commit`] would sit here until it
 /// timed out — which is itself the shape of the bug this distinguishes: a host
 /// that quietly *applied* a bad batch would satisfy `await_commit` and fail
 /// this.
@@ -212,11 +212,11 @@ fn await_guest_gone(bridge: &mut HostBridge) -> Option<String> {
 /// Returns `None` on timeout rather than panicking, so callers can say what
 /// they were waiting for.
 fn await_commit(bridge: &mut HostBridge) -> Option<Duration> {
-    let target = bridge.revision() + 1;
+    let target = bridge.commit_sequence() + 1;
     let started = Instant::now();
     while started.elapsed() < PATIENCE {
         bridge.wait(Duration::from_millis(50));
-        if bridge.revision() >= target {
+        if bridge.commit_sequence() >= target {
             return Some(started.elapsed());
         }
     }
@@ -332,7 +332,7 @@ fn a_click_round_trips_and_the_guest_re_suspends() {
 fn an_invalid_commit_changes_nothing() {
     let (mut bridge, _wakes) = ready();
     let before = label(&bridge);
-    let revision = bridge.revision();
+    let commit_sequence = bridge.commit_sequence();
 
     let (request, reply) = commit_request(bridge.generation(), b"not a batch at all".to_vec());
     let effects = bridge.on_user_event(HostUserEvent::UiCommit {
@@ -346,7 +346,11 @@ fn an_invalid_commit_changes_nothing() {
         before,
         "the previous interface still stands"
     );
-    assert_eq!(bridge.revision(), revision, "no revision was spent on it");
+    assert_eq!(
+        bridge.commit_sequence(),
+        commit_sequence,
+        "no commit sequence was spent on it"
+    );
     assert_eq!(bridge.stats().rejected_commits, 1);
     assert!(
         matches!(reply.blocking_recv(), Ok(Err(CommitRejection::Invalid(_)))),
@@ -376,9 +380,9 @@ fn a_hundred_rapid_activations_arrive_in_order() {
     let mut seen = Vec::new();
     let started = Instant::now();
     while seen.len() < CLICKS as usize && started.elapsed() < PATIENCE {
-        let revision = bridge.revision();
+        let commit_sequence = bridge.commit_sequence();
         bridge.wait(Duration::from_millis(50));
-        if bridge.revision() > revision {
+        if bridge.commit_sequence() > commit_sequence {
             seen.push(label(&bridge));
         }
     }
@@ -704,16 +708,16 @@ fn a_thousand_click_cycles_return_to_baseline() {
 fn a_guest_committing_garbage_is_refused_and_keeps_working() {
     let (mut bridge, _wakes) = ready();
     let before = label(&bridge);
-    let revision = bridge.revision();
+    let commit_sequence = bridge.commit_sequence();
 
     click(&mut bridge, GARBAGE);
     await_rejection(&mut bridge).expect("the host should refuse undecodable bytes");
 
     assert_eq!(bridge.stats().rejected_commits, 1);
     assert_eq!(
-        bridge.revision(),
-        revision,
-        "a refused batch is not a revision"
+        bridge.commit_sequence(),
+        commit_sequence,
+        "a refused batch is not a commit sequence"
     );
     assert_eq!(
         label(&bridge),
@@ -779,7 +783,7 @@ fn an_oversized_batch_is_refused_on_size() {
 fn a_guest_that_goes_silent_is_not_mistaken_for_one_that_died() {
     let (mut bridge, _wakes) = ready();
     let before = label(&bridge);
-    let revision = bridge.revision();
+    let commit_sequence = bridge.commit_sequence();
 
     click(&mut bridge, SILENT);
 
@@ -793,7 +797,11 @@ fn a_guest_that_goes_silent_is_not_mistaken_for_one_that_died() {
         }
     }
 
-    assert_eq!(bridge.revision(), revision, "nothing was committed");
+    assert_eq!(
+        bridge.commit_sequence(),
+        commit_sequence,
+        "nothing was committed"
+    );
     assert_eq!(
         label(&bridge),
         before,

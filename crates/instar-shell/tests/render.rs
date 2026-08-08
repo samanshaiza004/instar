@@ -73,11 +73,11 @@ fn ready() -> HostBridge {
 
 /// Waits for one more applied commit.
 fn await_commit(bridge: &mut HostBridge) -> Option<()> {
-    let target = bridge.revision() + 1;
+    let target = bridge.commit_sequence() + 1;
     let started = Instant::now();
     while started.elapsed() < PATIENCE {
         bridge.wait(Duration::from_millis(50));
-        if bridge.revision() >= target {
+        if bridge.commit_sequence() >= target {
             return Some(());
         }
     }
