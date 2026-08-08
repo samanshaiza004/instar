@@ -337,13 +337,37 @@ it sits three orders of magnitude above p50.
 
 ### `measure()` is observational
 
-> **`measure()` must perform no extraction, no line-breaking, no cache
-> invalidation, and no other mutation whose result depends on a speculative
-> constraint.**
+> **`measure()` may perform temporary work needed to answer the current sizing
+> query, including line-breaking for `Definite(width)`, but it must not mutate
+> finalized presentation state or invalidate reusable artifacts based on
+> speculative constraints.**
 
-The original seam forbade extraction as a measurement side effect and was
-right — but said nothing about line-breaking, which had the identical hazard
-and cost 9× the latency.
+```text
+MinContent / MaxContent
+→ intrinsic query only
+→ cached ContentWidths
+→ no line-break mutation
+
+Definite(width)
+→ may line-break temporarily to compute height
+→ must not update finalized_width
+→ must not invalidate shaped artifact
+
+finalize(actual_width)
+→ owns finalized_width
+→ owns persistent line-break state
+→ owns ShapedText extraction
+```
+
+The invariant that matters is not "measure never mutates" — a real height needs
+a real break — but that **speculative Taffy probes cannot poison the finalized
+cache**.
+
+An earlier wording forbade line-breaking outright. That was stricter than the
+code could be and stricter than correctness requires: the first seam forbade
+*extraction* as a measurement side effect and was right, but said nothing about
+line-breaking, which had the identical hazard and cost 9× the latency. The
+answer is not to ban the operation but to name what it may not touch.
 
 When a rule names one operation as forbidden, the next question is which
 sibling operations share its hazard.

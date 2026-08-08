@@ -58,6 +58,26 @@
 //! from the last speculative one. It can never cost a second shape, and it
 //! means render output is never coupled to whichever constraint Taffy happened
 //! to ask about last.
+//!
+//! # What `measure` may and may not do
+//!
+//! > `measure` may perform temporary work needed to answer the current sizing
+//! > query, including line-breaking for `Definite(width)`, but it must not
+//! > mutate finalized presentation state or invalidate reusable artifacts
+//! > based on speculative constraints.
+//!
+//! ```text
+//! MinContent / MaxContent  intrinsic query only; cached ContentWidths;
+//!                          no line-break mutation
+//! Definite(width)          may line-break temporarily to compute height;
+//!                          must not update finalized_width;
+//!                          must not invalidate the shaped artifact
+//! finalize(actual_width)   owns finalized_width, persistent line-break
+//!                          state, and ShapedText extraction
+//! ```
+//!
+//! The invariant is not "measure never mutates" — a real height needs a real
+//! break — but that **speculative probes cannot poison the finalized cache**.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
