@@ -176,7 +176,7 @@ rebuilds in ~370 µs.
 
 ## Stage 2 — protocol v2
 
-### Generational `NodeKey` is the first change, before anything else
+### Generational `NodeKey` is the first change, before anything else [done]
 
 ```rust
 struct NodeKey { id: u32, generation: u32 }
@@ -254,6 +254,50 @@ generational keys a Stage 4 correctness input, not only a Stage 2 tidy-up —
 and the reason to land them before focus, hover, scrolling, and AccessKit each
 add another stale-reference surface.
 
+### What landing it actually cost
+
+`PROTOCOL_VERSION` is 2 and a key is eight wire bytes. Two consequences were
+not obvious from the design:
+
+**Duplicate detection had to move from the key to the id.** `(7, 0)` and
+`(7, 1)` are distinct `NodeKey`s, so the existing check would have admitted
+both into one snapshot — one id as two live nodes, which is exactly the
+ambiguity the check exists to prevent. Identity for *uniqueness within a
+snapshot* is the id; identity for *sameness across snapshots* is the pair.
+
+**The ledger and the retained tree are one invariant, not two.** The rule is
+that the ledger dies with the `RuntimeGeneration`, and clearing it at guest
+death is the obvious reading. But `window.tree` outlives the guest — a cleanly
+exited guest's interface stays on screen — and a cleared ledger beside a
+retained tree is a desync: an identical re-commit takes the no-op path and
+never reaches `ledger.apply`, so those ids stay unknown while remaining live,
+and the first removal-then-reuse of one is accepted at generation 0. The hole
+the ledger exists to close, reopened by the ledger's own reset.
+
+> What dies with the generation is the *history* — retired ids, and the
+> observed-id count. What is reseeded is the tree still on screen.
+
+Stated as an invariant to sit beside the retirement one:
+
+> **Retained UI surviving a guest generation change keeps its exact
+> `NodeKey`s and repopulates the new generation's ledger before that tree can
+> become interactive.**
+
+Not reachable today, because nothing restarts a guest generation. Recorded and
+tested anyway, on the same reasoning as the retirement invariant: a rule that
+holds only because the code that would break it has not been written yet is
+worth an assertion, not a comment. The assertion is
+`a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen`, and it
+exists so that reset cannot be quietly "simplified" back to a bare
+`ledger.clear()`.
+
+### Open
+
+The `MAX_NODE_IDS` scan is O(observed ids) per commit — negligible for a guest
+holding tens of ids, ~65k entries for one that has burned the whole budget.
+Not measured, and not worth measuring until a guest exists that churns ids at
+all.
+
 ### Rest of Stage 2
 
 Node kinds `Row`, `Stack`, `Scroll`. Layout: `min`/`max`, alignment, flex grow,
@@ -301,8 +345,11 @@ Focus, hover, pointer capture, and scroll offsets join it as they arrive —
 `Interaction::retire` is deliberately the single site that answers "the node is
 gone, forget everything about it".
 
-Note what it *cannot* reach, and why Stage 2's generational keys are required:
-anything already encoded and queued for the guest.
+Note what it *cannot* reach, and why Stage 2's generational keys were required:
+anything already encoded and queued for the guest. That is now closed from the
+other end — the queued bytes carry the generation, so the guest rejects an
+activation naming a node it has since replaced. The host still cannot recall
+the event; it no longer has to.
 
 
 ---

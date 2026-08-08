@@ -61,15 +61,15 @@ const WINDOW: WindowId = WindowId::from_raw(1);
 
 /// The node keys the fixture uses. Duplicated here rather than shared, because
 /// a host learns them from the wire and nothing else.
-const LABEL: NodeKey = NodeKey(2);
-const COUNT: NodeKey = NodeKey(3);
-const BULK: NodeKey = NodeKey(5);
-const CRASH: NodeKey = NodeKey(6);
-const GARBAGE: NodeKey = NodeKey(7);
-const NONSENSE: NodeKey = NodeKey(8);
-const GIANT: NodeKey = NodeKey(9);
-const SILENT: NodeKey = NodeKey(10);
-const FLOOD: NodeKey = NodeKey(11);
+const LABEL: NodeKey = NodeKey::first(2);
+const COUNT: NodeKey = NodeKey::first(3);
+const BULK: NodeKey = NodeKey::first(5);
+const CRASH: NodeKey = NodeKey::first(6);
+const GARBAGE: NodeKey = NodeKey::first(7);
+const NONSENSE: NodeKey = NodeKey::first(8);
+const GIANT: NodeKey = NodeKey::first(9);
+const SILENT: NodeKey = NodeKey::first(10);
+const FLOOD: NodeKey = NodeKey::first(11);
 
 /// The bound a click-to-committed-tree round-trip must stay inside.
 ///
@@ -333,8 +333,8 @@ fn foreign_batch(text: &str) -> Vec<u8> {
     };
     let mut encoder = BatchEncoder::new();
     encoder
-        .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-        .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 1)
+        .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+        .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
         .node(
             opcode::NODE_TEXT,
             LABEL,

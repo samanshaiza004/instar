@@ -578,7 +578,7 @@ pub const BIDI_CONTENT_WIDTH_IS_APPROXIMATE: bool = true;
 mod tests {
     use super::*;
 
-    const KEY: NodeKey = NodeKey(7);
+    const KEY: NodeKey = NodeKey::first(7);
 
     fn style() -> ShapingStyle {
         ShapingStyle::default()
@@ -698,7 +698,7 @@ mod tests {
             wrap: false,
             ..style()
         };
-        let no_wrap_key = NodeKey(8);
+        let no_wrap_key = NodeKey::first(8);
         text.measure(no_wrap_key, sentence, no_wrap, Available::Definite(60.0));
         assert_eq!(
             text.line_count(no_wrap_key),

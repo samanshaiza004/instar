@@ -39,9 +39,10 @@
 
 use core::fmt;
 
-/// Wire format version. Bump only for an incompatible change, and only
-/// together with the decoder's handling of older versions.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Wire format version. Bump only for an incompatible change. The magic
+/// identifies the format; the version byte identifies the revision, so
+/// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -102,12 +103,49 @@ pub mod flags {
 
 /// A node's identity on the wire. Assigned by the guest and stable across
 /// commits, so the host can address a node it saw in an earlier revision.
+///
+/// The generation is the guest's answer to "is this still the same logical
+/// node?": an id that is removed and reused comes back at a higher
+/// generation, and an event carrying an old `(id, generation)` names a node
+/// that no longer exists.
+///
+/// Derive order matters. `Ord` sorts by `id` and then `generation`, which is
+/// the ordering snapshots and diffs want. AccessKit's packed id is the
+/// opposite ordering — generation in the high half — so do not "fix" one to
+/// match the other; [`NodeKey::to_accesskit_id`] is where that packing lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeKey(pub u32);
+pub struct NodeKey {
+    pub id: u32,
+    pub generation: u32,
+}
+
+impl NodeKey {
+    pub const fn new(id: u32, generation: u32) -> Self {
+        Self { id, generation }
+    }
+
+    /// Generation 0: the first lifetime of an id.
+    pub const fn first(id: u32) -> Self {
+        Self { id, generation: 0 }
+    }
+
+    /// The packing AccessKit uses for stable ids: generation in the high
+    /// half, id in the low, both halves losslessly represented.
+    pub const fn to_accesskit_id(self) -> u64 {
+        ((self.generation as u64) << 32) | self.id as u64
+    }
+
+    pub const fn from_accesskit_id(packed: u64) -> Self {
+        Self {
+            id: packed as u32,
+            generation: (packed >> 32) as u32,
+        }
+    }
+}
 
 impl fmt::Display for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "node{}", self.0)
+        write!(f, "node{}#{}", self.id, self.generation)
     }
 }
 
@@ -336,6 +374,14 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// A node key on the wire: id then generation, each little-endian, 8
+    /// bytes total. Both decode sites read it through this one path.
+    pub fn node_key(&mut self, while_reading: &'static str) -> Result<NodeKey, ProtocolError> {
+        let id = self.u32(while_reading)?;
+        let generation = self.u32(while_reading)?;
+        Ok(NodeKey { id, generation })
+    }
+
     pub fn i32(&mut self, while_reading: &'static str) -> Result<i32, ProtocolError> {
         Ok(self.u32(while_reading)? as i32)
     }
@@ -424,7 +470,8 @@ impl BatchEncoder {
         child_count: u16,
     ) -> &mut Self {
         self.nodes.push(kind);
-        self.nodes.extend_from_slice(&key.0.to_le_bytes());
+        self.nodes.extend_from_slice(&key.id.to_le_bytes());
+        self.nodes.extend_from_slice(&key.generation.to_le_bytes());
         self.nodes.push(flags);
         if let Some(text) = text {
             write_text(&mut self.nodes, text);
@@ -525,7 +572,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
         }
 
         let kind = reader.u8("node kind")?;
-        let key = NodeKey(reader.u32("node key")?);
+        let key = reader.node_key("node key")?;
         let node_flags = reader.u8("node flags")?;
         let text = match kind {
             opcode::NODE_ROOT | opcode::NODE_COLUMN => None,
@@ -599,13 +646,14 @@ pub enum WireEvent {
 
 impl WireEvent {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(10);
+        let mut out = Vec::with_capacity(14);
         out.extend_from_slice(&EVENT_MAGIC);
         out.push(PROTOCOL_VERSION);
         match self {
             WireEvent::Click { node } => {
                 out.push(opcode::EVENT_CLICK);
-                out.extend_from_slice(&node.0.to_le_bytes());
+                out.extend_from_slice(&node.id.to_le_bytes());
+                out.extend_from_slice(&node.generation.to_le_bytes());
             }
         }
         out
@@ -625,7 +673,7 @@ impl WireEvent {
 
         let event = match reader.u8("event kind")? {
             opcode::EVENT_CLICK => WireEvent::Click {
-                node: NodeKey(reader.u32("node key")?),
+                node: reader.node_key("node key")?,
             },
             value => {
                 return Err(ProtocolError::UnknownOpcode {
@@ -657,11 +705,25 @@ mod tests {
     fn sample() -> Vec<u8> {
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill_width(), 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill_width(), 2)
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                fill_width(),
+                1,
+            )
+            .node(
+                opcode::NODE_COLUMN,
+                NodeKey::first(1),
+                0,
+                None,
+                fill_width(),
+                2,
+            )
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(2),
+                NodeKey::first(2),
                 0,
                 Some("Clicked 0 times"),
                 WireLayout::default(),
@@ -669,7 +731,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(3),
+                NodeKey::first(3),
                 flags::ENABLED,
                 Some("Press me"),
                 WireLayout {
@@ -711,15 +773,51 @@ mod tests {
 
     #[test]
     fn events_round_trip() {
-        let event = WireEvent::Click { node: NodeKey(7) };
+        let event = WireEvent::Click {
+            node: NodeKey::new(7, 1),
+        };
         assert_eq!(WireEvent::decode(&event.encode()).unwrap(), event);
+    }
+
+    #[test]
+    fn accesskit_ids_round_trip() {
+        let keys = [
+            NodeKey::first(0),
+            NodeKey::first(7),
+            NodeKey::new(7, 1),
+            NodeKey::new(u32::MAX, u32::MAX),
+        ];
+        for key in keys {
+            assert_eq!(NodeKey::from_accesskit_id(key.to_accesskit_id()), key);
+        }
+        assert_eq!(
+            NodeKey::new(7, 1).to_accesskit_id(),
+            (1u64 << 32) | 7,
+            "the generation occupies the high half and the id the low half"
+        );
+    }
+
+    #[test]
+    fn a_batch_round_trips_a_non_zero_generation() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::new(7, 3),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+
+        let batch = decode_batch(&encoder.finish()).unwrap();
+        assert_eq!(batch.nodes[0].key, NodeKey::new(7, 3));
     }
 
     // --- Everything below is about surviving a hostile guest. ---
 
     #[test]
     fn rejects_bad_magic() {
-        assert_eq!(decode_batch(b"XXXX\x01\x00"), Err(ProtocolError::BadMagic));
+        assert_eq!(decode_batch(b"XXXX\x02\x00"), Err(ProtocolError::BadMagic));
     }
 
     #[test]
@@ -771,16 +869,17 @@ mod tests {
         let mut encoder = BatchEncoder::new();
         encoder.node(
             opcode::NODE_ROOT,
-            NodeKey(0),
+            NodeKey::first(0),
             0,
             None,
             WireLayout::default(),
             0,
         );
         let mut bytes = encoder.finish();
-        // The width tag sits just past kind(1) + key(4) + flags(1) in the node,
-        // which itself starts after magic(4) + version(1) + section(1) + count(2).
-        bytes[8 + 6] = 99;
+        // The width tag sits just past kind(1) + key(8) + flags(1) in the
+        // node, which itself starts after magic(4) + version(1) + section(1)
+        // + count(2).
+        bytes[8 + 10] = 99;
         assert!(matches!(
             decode_batch(&bytes),
             Err(ProtocolError::UnknownOpcode {
@@ -800,6 +899,7 @@ mod tests {
         bytes.push(opcode::SECTION_TREE);
         bytes.extend_from_slice(&1u16.to_le_bytes());
         bytes.push(opcode::NODE_ROOT);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.push(0);
         bytes.push(opcode::DIM_FIXED);
@@ -825,7 +925,7 @@ mod tests {
         for id in 0..(limits::MAX_DEPTH + 50) {
             encoder.node(
                 opcode::NODE_COLUMN,
-                NodeKey(id as u32),
+                NodeKey::first(id as u32),
                 0,
                 None,
                 WireLayout::default(),
@@ -840,7 +940,7 @@ mod tests {
         let mut encoder = BatchEncoder::new();
         encoder.node(
             opcode::NODE_ROOT,
-            NodeKey(0),
+            NodeKey::first(0),
             0,
             None,
             WireLayout::default(),
@@ -858,7 +958,7 @@ mod tests {
         encoder
             .node(
                 opcode::NODE_ROOT,
-                NodeKey(0),
+                NodeKey::first(0),
                 0,
                 None,
                 WireLayout::default(),
@@ -866,7 +966,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_ROOT,
-                NodeKey(1),
+                NodeKey::first(1),
                 0,
                 None,
                 WireLayout::default(),
@@ -884,6 +984,7 @@ mod tests {
         bytes.extend_from_slice(&1u16.to_le_bytes());
         bytes.push(opcode::NODE_TEXT);
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&2u16.to_le_bytes());
         bytes.extend_from_slice(&[0xff, 0xfe]);
@@ -895,7 +996,7 @@ mod tests {
         assert!(WireEvent::decode(b"").is_err());
         assert!(WireEvent::decode(b"IUE1").is_err());
         assert!(matches!(
-            WireEvent::decode(b"IUE1\x01\x09"),
+            WireEvent::decode(b"IUE1\x02\x09"),
             Err(ProtocolError::UnknownOpcode {
                 context: "event",
                 ..

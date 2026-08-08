@@ -34,20 +34,25 @@ fn where_the_shaping_time_goes() {
     let style = ShapingStyle::default();
 
     // 2. The very first shape, which is where any lazy font discovery lands.
-    let first = shape(&mut text, NodeKey(1), "Clicked 0 times", style);
+    let first = shape(&mut text, NodeKey::first(1), "Clicked 0 times", style);
 
     // 3. A different string each time, so every one is a genuine rebuild and
     //    the cache cannot flatter the result.
     let mut rebuilds = Vec::new();
     for n in 1..=100 {
         let string = format!("Clicked {n} times");
-        rebuilds.push(shape(&mut text, NodeKey(2), &string, style));
+        rebuilds.push(shape(&mut text, NodeKey::first(2), &string, style));
     }
 
     // 4. The same string repeatedly, which should hit the cache.
     let mut reuses = Vec::new();
     for _ in 0..100 {
-        reuses.push(shape(&mut text, NodeKey(3), "Clicked 0 times", style));
+        reuses.push(shape(
+            &mut text,
+            NodeKey::first(3),
+            "Clicked 0 times",
+            style,
+        ));
     }
 
     // 5. Monospace, to see whether an explicitly-named face differs from the
@@ -56,11 +61,11 @@ fn where_the_shaping_time_goes() {
         role: FontRole::Monospace,
         ..style
     };
-    let mono_first = shape(&mut text, NodeKey(4), "Clicked 0 times", mono);
+    let mono_first = shape(&mut text, NodeKey::first(4), "Clicked 0 times", mono);
     let mut mono_rebuilds = Vec::new();
     for n in 1..=100 {
         let string = format!("Clicked {n} times");
-        mono_rebuilds.push(shape(&mut text, NodeKey(5), &string, mono));
+        mono_rebuilds.push(shape(&mut text, NodeKey::first(5), &string, mono));
     }
 
     println!("\n--- shaping cost ---");

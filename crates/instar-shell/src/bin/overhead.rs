@@ -64,7 +64,7 @@ use instar_window::{
 const COUNTER: &[u8] = include_bytes!(env!("COUNTER_WASM"));
 
 const WINDOW: WindowId = WindowId::from_raw(1);
-const INCREMENT: NodeKey = NodeKey(4);
+const INCREMENT: NodeKey = NodeKey::first(4);
 
 const WIDTH: u32 = 480;
 const HEIGHT: u32 = 320;

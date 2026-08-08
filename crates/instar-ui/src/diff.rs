@@ -56,8 +56,8 @@ pub struct ChangeSet {
     /// Keys present in the old tree and absent from the new snapshot.
     ///
     /// Whoever holds per-node transient state — scroll offsets, hover, focus —
-    /// must drop it for these. A node that comes back later is a *new* node
-    /// that happens to reuse a key.
+    /// must drop it for these. An id that comes back later is a *new* node at
+    /// a new generation, not the same node with a history.
     pub removed: Vec<NodeKey>,
     /// Nodes whose child sequence changed: insertion, removal, or reorder.
     ///
@@ -159,7 +159,7 @@ impl ChangeSet {
             .chain(&self.enabled_changed)
             .copied()
             .collect();
-        keys.sort_unstable_by_key(|key| key.0);
+        keys.sort_unstable();
         keys.dedup();
         keys
     }
@@ -348,7 +348,13 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                created: vec![NodeKey(0), NodeKey(1), NodeKey(2), NodeKey(3), NodeKey(4)],
+                created: vec![
+                    NodeKey::first(0),
+                    NodeKey::first(1),
+                    NodeKey::first(2),
+                    NodeKey::first(3),
+                    NodeKey::first(4)
+                ],
                 ..ChangeSet::default()
             },
             "the first snapshot must be reported as all-new so the host does not mistake it for a no-op"
@@ -452,8 +458,8 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                text_changed: vec![NodeKey(2)],
-                layout_changed: vec![NodeKey(2)],
+                text_changed: vec![NodeKey::first(2)],
+                layout_changed: vec![NodeKey::first(2)],
                 ..ChangeSet::default()
             },
             "a new string re-shapes the node and may resize it; its sibling must be untouched"
@@ -470,8 +476,8 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                text_changed: vec![NodeKey(2)],
-                layout_changed: vec![NodeKey(2)],
+                text_changed: vec![NodeKey::first(2)],
+                layout_changed: vec![NodeKey::first(2)],
                 ..ChangeSet::default()
             },
             "a new label must be re-shaped and may resize the button"
@@ -488,7 +494,7 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                enabled_changed: vec![NodeKey(2)],
+                enabled_changed: vec![NodeKey::first(2)],
                 ..ChangeSet::default()
             },
             "interactivity flips without re-shaping the label or changing geometry"
@@ -530,7 +536,7 @@ mod tests {
             assert_eq!(
                 changes,
                 ChangeSet {
-                    layout_changed: vec![NodeKey(2)],
+                    layout_changed: vec![NodeKey::first(2)],
                     ..ChangeSet::default()
                 },
                 "layout delta {index} is geometry intent and needs no re-shaping"
@@ -552,9 +558,9 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                created: vec![NodeKey(4)],
-                structure_changed: vec![NodeKey(1)],
-                layout_changed: vec![NodeKey(1)],
+                created: vec![NodeKey::first(4)],
+                structure_changed: vec![NodeKey::first(1)],
+                layout_changed: vec![NodeKey::first(1)],
                 ..ChangeSet::default()
             },
             "the new child is created and the column must re-run its children sequence and geometry"
@@ -571,9 +577,9 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                removed: vec![NodeKey(3)],
-                structure_changed: vec![NodeKey(1)],
-                layout_changed: vec![NodeKey(1)],
+                removed: vec![NodeKey::first(3)],
+                structure_changed: vec![NodeKey::first(1)],
+                layout_changed: vec![NodeKey::first(1)],
                 ..ChangeSet::default()
             },
             "the removed child's transient state must be dropped, and the column must relayout without it"
@@ -590,8 +596,8 @@ mod tests {
         assert_eq!(
             changes,
             ChangeSet {
-                structure_changed: vec![NodeKey(1)],
-                layout_changed: vec![NodeKey(1)],
+                structure_changed: vec![NodeKey::first(1)],
+                layout_changed: vec![NodeKey::first(1)],
                 ..ChangeSet::default()
             },
             "reordering is a parent-level change; no node identity is gained or lost"
@@ -609,7 +615,7 @@ mod tests {
         assert_eq!(
             diff(Some(&previous), &next),
             Err(TreeError::KindChanged {
-                key: NodeKey(5),
+                key: NodeKey::first(5),
                 was: "text",
                 now: "button",
             }),
@@ -636,8 +642,14 @@ mod tests {
 
         let changes = diff(Some(&previous), &next).unwrap();
 
-        assert_same_keys(changes.structure_changed, &[NodeKey(1), NodeKey(2)]);
-        assert_same_keys(changes.layout_changed, &[NodeKey(1), NodeKey(2)]);
+        assert_same_keys(
+            changes.structure_changed,
+            &[NodeKey::first(1), NodeKey::first(2)],
+        );
+        assert_same_keys(
+            changes.layout_changed,
+            &[NodeKey::first(1), NodeKey::first(2)],
+        );
         assert!(changes.created.is_empty(), "a move is not a creation");
         assert!(changes.removed.is_empty(), "a move is not a removal");
         assert!(
@@ -669,9 +681,12 @@ mod tests {
 
         let changes = diff(Some(&previous), &next).unwrap();
 
-        assert_same_keys(changes.removed, &[NodeKey(2), NodeKey(3), NodeKey(4)]);
-        assert_same_keys(changes.structure_changed, &[NodeKey(1)]);
-        assert_same_keys(changes.layout_changed, &[NodeKey(1)]);
+        assert_same_keys(
+            changes.removed,
+            &[NodeKey::first(2), NodeKey::first(3), NodeKey::first(4)],
+        );
+        assert_same_keys(changes.structure_changed, &[NodeKey::first(1)]);
+        assert_same_keys(changes.layout_changed, &[NodeKey::first(1)]);
         assert!(changes.created.is_empty(), "only removals happened");
     }
 
@@ -687,12 +702,12 @@ mod tests {
 
         assert_eq!(
             changes.text_changed,
-            vec![NodeKey(COLUMNS + 1)],
+            vec![NodeKey::first(COLUMNS + 1)],
             "exactly the changed leaf may need re-shaping"
         );
         assert_eq!(
             changes.touched(),
-            vec![NodeKey(COLUMNS + 1)],
+            vec![NodeKey::first(COLUMNS + 1)],
             "a deep edit must touch exactly one key, not its ancestors"
         );
     }
@@ -742,7 +757,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_only.needs_reshape().collect::<Vec<_>>(),
-            vec![NodeKey(2)],
+            vec![NodeKey::first(2)],
             "changed text must be re-shaped"
         );
         assert!(
@@ -798,7 +813,13 @@ mod tests {
 
         assert_eq!(
             changes.touched(),
-            vec![NodeKey(1), NodeKey(2), NodeKey(3), NodeKey(4), NodeKey(5)],
+            vec![
+                NodeKey::first(1),
+                NodeKey::first(2),
+                NodeKey::first(3),
+                NodeKey::first(4),
+                NodeKey::first(5)
+            ],
             "the parent appears once despite structure+layout, the text once despite text+layout, all sorted"
         );
 
@@ -806,7 +827,7 @@ mod tests {
         reshaped.sort_unstable();
         assert_eq!(
             reshaped,
-            vec![NodeKey(2), NodeKey(5)],
+            vec![NodeKey::first(2), NodeKey::first(5)],
             "reshape work is changed text plus newly created nodes"
         );
     }

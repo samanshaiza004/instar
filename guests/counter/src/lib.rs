@@ -22,13 +22,13 @@ use crate::instar::kernel::kernel_runtime;
 use crate::instar::kernel::kernel_types::RuntimeError;
 use crate::instar::kernel::kernel_ui;
 
-const ROOT: NodeKey = NodeKey(0);
-const COLUMN: NodeKey = NodeKey(1);
-const TITLE: NodeKey = NodeKey(2);
-const READOUT: NodeKey = NodeKey(3);
-const INCREMENT: NodeKey = NodeKey(4);
-const RESET: NodeKey = NodeKey(5);
-const CRASH: NodeKey = NodeKey(6);
+const ROOT: NodeKey = NodeKey::first(0);
+const COLUMN: NodeKey = NodeKey::first(1);
+const TITLE: NodeKey = NodeKey::first(2);
+const READOUT: NodeKey = NodeKey::first(3);
+const INCREMENT: NodeKey = NodeKey::first(4);
+const RESET: NodeKey = NodeKey::first(5);
+const CRASH: NodeKey = NodeKey::first(6);
 
 fn container(padding: u16, gap: u16) -> WireLayout {
     WireLayout {

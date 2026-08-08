@@ -50,18 +50,18 @@ use crate::instar::kernel::kernel_types::RuntimeError;
 use crate::instar::kernel::kernel_ui;
 use crate::instar::kernel::ops;
 
-const ROOT: NodeKey = NodeKey(0);
-const COLUMN: NodeKey = NodeKey(1);
-const LABEL: NodeKey = NodeKey(2);
-const COUNT: NodeKey = NodeKey(3);
-const RESET: NodeKey = NodeKey(4);
-const BULK: NodeKey = NodeKey(5);
-const CRASH: NodeKey = NodeKey(6);
-const GARBAGE: NodeKey = NodeKey(7);
-const NONSENSE: NodeKey = NodeKey(8);
-const GIANT: NodeKey = NodeKey(9);
-const SILENT: NodeKey = NodeKey(10);
-const FLOOD: NodeKey = NodeKey(11);
+const ROOT: NodeKey = NodeKey::first(0);
+const COLUMN: NodeKey = NodeKey::first(1);
+const LABEL: NodeKey = NodeKey::first(2);
+const COUNT: NodeKey = NodeKey::first(3);
+const RESET: NodeKey = NodeKey::first(4);
+const BULK: NodeKey = NodeKey::first(5);
+const CRASH: NodeKey = NodeKey::first(6);
+const GARBAGE: NodeKey = NodeKey::first(7);
+const NONSENSE: NodeKey = NodeKey::first(8);
+const GIANT: NodeKey = NodeKey::first(9);
+const SILENT: NodeKey = NodeKey::first(10);
+const FLOOD: NodeKey = NodeKey::first(11);
 
 /// How long the bulk operation runs. Long enough that it is unambiguously
 /// still in flight while the gate measures a click round-trip against it.

@@ -34,9 +34,9 @@ use instar_window::{
 const WINDOW: WindowId = WindowId::from_raw(1);
 
 /// The counter guest's node keys, as a host learns them: off the wire.
-const READOUT: NodeKey = NodeKey(3);
-const INCREMENT: NodeKey = NodeKey(4);
-const CRASH: NodeKey = NodeKey(6);
+const READOUT: NodeKey = NodeKey::first(3);
+const INCREMENT: NodeKey = NodeKey::first(4);
+const CRASH: NodeKey = NodeKey::first(6);
 
 const PATIENCE: Duration = Duration::from_secs(5);
 

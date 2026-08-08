@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, TextContext, TreeError, UiAction, Viewport};
+use instar_ui::{Interaction, KeyLedger, TextContext, TreeError, UiAction, Viewport};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
 };
@@ -177,6 +177,8 @@ pub struct HostWindow {
     /// [`present`]: a redraw callback is the worst place to discover work.
     scene: Option<PaintScene>,
     interaction: Interaction,
+    /// The id lifecycle for the guest currently owning this window.
+    ledger: KeyLedger,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -373,6 +375,34 @@ impl Host {
         generation: GenerationId,
         error: Option<String>,
     ) -> Vec<HostEffect> {
+        // The id *history* dies with the Wasm runtime generation: retired ids
+        // are forgotten and the observed-id count resets, so a fresh
+        // generation is not billed for its predecessor's churn. This sits
+        // above the clean-exit early return, because a guest whose `run`
+        // returned has ended just as surely as one that trapped.
+        //
+        // What is reseeded rather than forgotten is the tree still on screen:
+        //
+        // > Retained UI surviving a guest generation change keeps its exact
+        // > `NodeKey`s and repopulates the new generation's ledger before that
+        // > tree can become interactive.
+        //
+        // A cleared ledger beside a retained `window.tree` is a desync: an
+        // identical re-commit takes the no-op path in `apply_tree` and never
+        // reaches `ledger.apply`, so those ids would stay unknown to the
+        // ledger while remaining live, and the first removal-then-reuse of one
+        // would be accepted at generation 0 — the hole the ledger exists to
+        // close, reopened by the ledger's own reset. Only the dead
+        // generation's *history* is discarded. This is not a bare
+        // `ledger.clear()` on purpose; see
+        // `a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen`.
+        for window in self.windows.values_mut() {
+            window.ledger.clear();
+            if let Some(tree) = window.tree.as_ref() {
+                window.ledger.apply(tree);
+            }
+        }
+
         let Some(message) = error else {
             return Vec::new();
         };
@@ -451,8 +481,11 @@ impl Host {
         let window = self.windows.entry(window_id).or_default();
 
         // Before the mutation, so a refusal costs the previous interface
-        // nothing.
+        // nothing. The ledger check sits beside the diff for the same reason:
+        // a snapshot that reuses a retired id must leave the previous
+        // interface standing exactly as a refused diff does.
         let changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
+        window.ledger.validate(&tree)?;
 
         // A guest re-committing an identical interface is an ordinary shape —
         // it is what an event the guest decided to ignore looks like from
@@ -463,6 +496,13 @@ impl Host {
         if changes.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Validation ran above the early return, so a no-op commit cannot
+        // dodge the lifecycle rules. `apply` sits after it: an identical
+        // snapshot has identical live keys, so applying would only redo a
+        // no-op, and the no-op commit keeps costing the decode and nothing
+        // else.
+        window.ledger.apply(&tree);
 
         // A snapshot that survived the diff is a new version of the retained
         // tree. The guest-visible commit sequence advances on every accepted
@@ -624,11 +664,11 @@ mod tests {
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 2)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(2),
+                NodeKey::first(2),
                 0,
                 Some("Clicked 0 times"),
                 WireLayout::default(),
@@ -636,7 +676,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(3),
+                NodeKey::first(3),
                 flags::ENABLED,
                 Some("Press me"),
                 WireLayout::default(),
@@ -683,7 +723,7 @@ mod tests {
         let rect = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|layout| layout.get(NodeKey(3)))
+            .and_then(|layout| layout.get(NodeKey::first(3)))
             .expect("the button should be laid out");
         (
             f64::from(rect.x + rect.width / 2),
@@ -878,7 +918,7 @@ mod tests {
         let release = host.handle(pointer(PointerState::Released, x, y));
         assert_eq!(
             to_guest(&release),
-            vec![&UiAction::ButtonActivated(NodeKey(3)).encode()],
+            vec![&UiAction::ButtonActivated(NodeKey::first(3)).encode()],
             "a completed click should be routed to the guest as an encoded event"
         );
     }
@@ -974,11 +1014,11 @@ mod tests {
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 1)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(2),
+                NodeKey::first(2),
                 flags::ENABLED,
                 Some("Clicked 0 times"),
                 WireLayout::default(),
@@ -1165,11 +1205,11 @@ mod tests {
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 1)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(2),
+                NodeKey::first(2),
                 0,
                 Some("Clicked 0 times"),
                 WireLayout::default(),
@@ -1178,28 +1218,155 @@ mod tests {
         encoder.finish()
     }
 
-    /// press -> the guest removes the node -> the guest reuses the key ->
-    /// release. Nothing else catches this: the kind is unchanged, so
-    /// `KindChanged` does not fire, and the scale never moved, so the geometry
-    /// barrier does not either.
+    /// A batch with the counter's shape plus a button under id 7 at
+    /// `generation`.
+    fn batch_with_button_7(generation: u32) -> Vec<u8> {
+        let fill = WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::new(7, generation),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// The counter batch with button 3 at `generation`.
+    fn counter_batch_with_button_generation(generation: u32) -> Vec<u8> {
+        let fill = WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::new(3, generation),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// press -> the guest removes the node -> the guest reuses the id at a
+    /// new generation -> release. Nothing else catches this: the kind is
+    /// unchanged, so `KindChanged` does not fire, and the scale never moved,
+    /// so the geometry barrier does not either.
     #[test]
     fn a_press_cannot_be_completed_against_a_node_that_reused_its_key() {
         let mut host = ready_host();
         let (x, y) = button_centre(&host);
         host.handle(pointer(PointerState::Pressed, x, y));
 
-        // The guest drops the button, then brings it back under the same key.
+        // The guest drops the button, then brings it back under the same id
+        // at generation 1.
         host.on_guest_commit(WINDOW, &batch_without_the_button())
             .expect("valid batch");
-        host.on_guest_commit(WINDOW, &counter_batch())
+        host.on_guest_commit(WINDOW, &counter_batch_with_button_generation(1))
             .expect("valid batch");
 
         let release = host.handle(pointer(PointerState::Released, x, y));
         assert!(
             to_guest(&release).is_empty(),
             "the press belonged to a node that no longer exists; completing it \
-             against whatever reused the key would activate a control the user \
+             against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    /// The ledger closes the queued-event hole end to end: an id that was
+    /// live, then removed, cannot come back at the same generation even when
+    /// the snapshot itself is otherwise valid.
+    #[test]
+    fn a_removed_id_cannot_come_back_at_the_same_generation() {
+        let mut host = Host::new();
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("the first lifetime of id 7 is accepted");
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("removing id 7 is accepted");
+
+        let before = host.window(WINDOW).unwrap().tree().cloned();
+        assert_eq!(
+            host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
+            Err(TreeError::GenerationNotAdvanced {
+                key: NodeKey::first(7),
+                retired: 0,
+            }),
+            "a stale event for id 7 names a node the ledger has retired"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().tree().cloned(),
+            before,
+            "the refusal must leave the previous interface standing"
+        );
+
+        host.on_guest_commit(WINDOW, &batch_with_button_7(1))
+            .expect("the same id at a higher generation is a new node");
+    }
+
+    /// A cleared ledger must not desync from the tree still on screen.
+    ///
+    /// The window keeps showing the last interface after a guest exits, so the
+    /// ids in it are still live as far as everything else is concerned. If
+    /// `on_guest_gone` merely emptied the ledger, an identical re-commit would
+    /// take the no-op path in `apply_tree` and never reach `ledger.apply` —
+    /// leaving those ids unknown, and the first removal-then-reuse accepted at
+    /// generation 0, which is the exact hole the ledger exists to close.
+    #[test]
+    fn a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen() {
+        let mut host = Host::new();
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("the first lifetime of id 7 is accepted");
+
+        host.on_guest_gone(WINDOW, GenerationId(1), None);
+
+        // The identical snapshot: a no-op commit that never reaches `apply`.
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("re-committing the interface on screen is a no-op, not a violation");
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("removing id 7 is accepted");
+
+        assert_eq!(
+            host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
+            Err(TreeError::GenerationNotAdvanced {
+                key: NodeKey::first(7),
+                retired: 0,
+            }),
+            "id 7 was live in the tree the dead generation left on screen, so \
+             reusing it must still require a higher generation"
         );
     }
 
@@ -1218,7 +1385,7 @@ mod tests {
 
         assert_eq!(
             host.window(WINDOW).unwrap().interaction.pressed(),
-            Some(NodeKey(3)),
+            Some(NodeKey::first(3)),
             "an unrelated commit must not cancel a press in progress"
         );
     }
@@ -1234,11 +1401,11 @@ mod tests {
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 2)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(2),
+                NodeKey::first(2),
                 0,
                 Some(text),
                 WireLayout::default(),
@@ -1246,7 +1413,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(3),
+                NodeKey::first(3),
                 flags::ENABLED,
                 Some("Press me"),
                 WireLayout::default(),
@@ -1444,7 +1611,7 @@ mod tests {
         let wide = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|l| l.get(NodeKey(1)))
+            .and_then(|l| l.get(NodeKey::first(1)))
             .unwrap();
 
         // Same logical size, double the physical size: layout must not move.
@@ -1452,7 +1619,7 @@ mod tests {
         let after = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|l| l.get(NodeKey(1)))
+            .and_then(|l| l.get(NodeKey::first(1)))
             .unwrap();
 
         assert_eq!(

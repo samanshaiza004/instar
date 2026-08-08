@@ -400,7 +400,7 @@ impl SceneBuilder {
 
 /// The reserved cache key for the host-owned crash text. Protocol nodes are
 /// bounded far below `u32::MAX`, so this cannot collide with a guest key.
-const CRASH_KEY: NodeKey = NodeKey(u32::MAX);
+const CRASH_KEY: NodeKey = NodeKey::first(u32::MAX);
 
 fn scene(
     metrics: &WindowMetricsChanged,
@@ -482,9 +482,9 @@ mod tests {
     use instar_window::{LogicalSize, WindowId};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
-    const LABEL: NodeKey = NodeKey(2);
-    const BUTTON: NodeKey = NodeKey(3);
-    const DISABLED: NodeKey = NodeKey(4);
+    const LABEL: NodeKey = NodeKey::first(2);
+    const BUTTON: NodeKey = NodeKey::first(3);
+    const DISABLED: NodeKey = NodeKey::first(4);
 
     fn metrics(scale: f64) -> WindowMetricsChanged {
         WindowMetricsChanged {
@@ -510,8 +510,8 @@ mod tests {
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 3)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 3)
             .node(
                 opcode::NODE_TEXT,
                 LABEL,

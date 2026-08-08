@@ -36,9 +36,9 @@ macro_rules! run_for {
 /// The counter guest's node keys, as a host learns them: off the wire, with
 /// no shared header. Named here so a change to the guest's structure fails
 /// with a name rather than silently retargeting a click at a different button.
-const READOUT: NodeKey = NodeKey(3);
-const INCREMENT: NodeKey = NodeKey(4);
-const RESET: NodeKey = NodeKey(5);
+const READOUT: NodeKey = NodeKey::first(3);
+const INCREMENT: NodeKey = NodeKey::first(4);
+const RESET: NodeKey = NodeKey::first(5);
 
 /// The guest the shell actually ships (WP8).
 ///

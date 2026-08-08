@@ -27,12 +27,14 @@
 
 pub mod diff;
 pub mod layout;
+pub mod ledger;
 pub mod text;
 
 pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{NodeKey, ProtocolError, WireDimension, WireLayout, limits};
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
+pub use ledger::{KeyLedger, MAX_NODE_IDS};
 pub use text::{
     Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
     TextStats,
@@ -92,7 +94,7 @@ pub struct Node {
 impl Node {
     pub fn root(key: u32, children: Vec<Node>) -> Self {
         Self {
-            key: NodeKey(key),
+            key: NodeKey::first(key),
             kind: NodeKind::Root,
             layout: WireLayout {
                 width: WireDimension::Fill,
@@ -104,7 +106,7 @@ impl Node {
 
     pub fn column(key: u32, children: Vec<Node>) -> Self {
         Self {
-            key: NodeKey(key),
+            key: NodeKey::first(key),
             kind: NodeKind::Column,
             layout: WireLayout {
                 width: WireDimension::Fill,
@@ -116,7 +118,7 @@ impl Node {
 
     pub fn text(key: u32, text: impl Into<String>) -> Self {
         Self {
-            key: NodeKey(key),
+            key: NodeKey::first(key),
             kind: NodeKind::Text { text: text.into() },
             layout: WireLayout::default(),
             children: Vec::new(),
@@ -125,7 +127,7 @@ impl Node {
 
     pub fn button(key: u32, label: impl Into<String>) -> Self {
         Self {
-            key: NodeKey(key),
+            key: NodeKey::first(key),
             kind: NodeKind::Button {
                 label: label.into(),
                 enabled: true,
@@ -159,8 +161,26 @@ pub enum TreeError {
     Protocol(#[from] ProtocolError),
     #[error("batch contained no nodes")]
     Empty,
+    /// A snapshot named the same node id twice. The check is on the id, not
+    /// the whole `NodeKey`: `(7, 0)` and `(7, 1)` are distinct keys but still
+    /// two live nodes under one id.
     #[error("duplicate node key {0}")]
     DuplicateKey(NodeKey),
+    #[error("{key} is a fresh id, but a never-seen id must start at generation 0")]
+    BadFirstGeneration { key: NodeKey },
+    #[error(
+        "{key} is live at generation {live}; a live id must be resent at exactly that generation"
+    )]
+    GenerationChanged { key: NodeKey, live: u32 },
+    #[error(
+        "{key} was retired at generation {retired}; a retired id may only return at a higher generation"
+    )]
+    GenerationNotAdvanced { key: NodeKey, retired: u32 },
+    #[error(
+        "this snapshot would bring the count of distinct ids ever observed to {observed}, over the {} id limit",
+        crate::ledger::MAX_NODE_IDS
+    )]
+    TooManyNodeIds { observed: usize },
     #[error("the root node is a {0}, but a tree's root must be a root node")]
     BadRoot(&'static str),
     #[error("{0} is a root node, but only the outermost node may be one")]
@@ -203,9 +223,10 @@ impl Tree {
 
         let mut seen = std::collections::HashSet::with_capacity(batch.nodes.len());
         for node in &batch.nodes {
-            if !seen.insert(node.key) {
-                // Duplicate keys would make hit-test results ambiguous and
-                // make a targeted update land on the wrong node.
+            if !seen.insert(node.key.id) {
+                // Duplicate ids would make hit-test results ambiguous and
+                // make a targeted update land on the wrong node. Generations
+                // do not make two live nodes of one id sensible.
                 return Err(TreeError::DuplicateKey(node.key));
             }
         }
@@ -439,12 +460,12 @@ mod tests {
 
         for key in [0, 1, 2, 3, 4] {
             assert!(
-                layout.get(NodeKey(key)).is_some(),
+                layout.get(NodeKey::first(key)).is_some(),
                 "every node should have geometry, {key} did not"
             );
         }
 
-        let root = layout.get(NodeKey(0)).unwrap();
+        let root = layout.get(NodeKey::first(0)).unwrap();
         assert_eq!(
             (root.width, root.height),
             (400, 300),
@@ -464,9 +485,9 @@ mod tests {
     #[test]
     fn a_column_stacks_its_children_without_overlap() {
         let layout = layout(&sample());
-        let text = layout.get(NodeKey(2)).unwrap();
-        let press = layout.get(NodeKey(3)).unwrap();
-        let reset = layout.get(NodeKey(4)).unwrap();
+        let text = layout.get(NodeKey::first(2)).unwrap();
+        let press = layout.get(NodeKey::first(3)).unwrap();
+        let reset = layout.get(NodeKey::first(4)).unwrap();
 
         assert!(
             text.y < press.y && press.y < reset.y,
@@ -485,9 +506,9 @@ mod tests {
     #[test]
     fn children_are_contained_by_their_parent() {
         let layout = layout(&sample());
-        let root = layout.get(NodeKey(0)).unwrap();
+        let root = layout.get(NodeKey::first(0)).unwrap();
         for key in [1, 2, 3, 4] {
-            let child = layout.get(NodeKey(key)).unwrap();
+            let child = layout.get(NodeKey::first(key)).unwrap();
             assert!(
                 child.x >= root.x
                     && child.y >= root.y
@@ -509,7 +530,7 @@ mod tests {
             }),
         );
         let layout = layout(&padded);
-        let child = layout.get(NodeKey(1)).unwrap();
+        let child = layout.get(NodeKey::first(1)).unwrap();
         assert_eq!(
             (child.x, child.y),
             (20, 20),
@@ -537,8 +558,8 @@ mod tests {
         let tight = layout(&build(0));
         let loose = layout(&build(10));
 
-        let tight_second = tight.get(NodeKey(3)).unwrap();
-        let loose_second = loose.get(NodeKey(3)).unwrap();
+        let tight_second = tight.get(NodeKey::first(3)).unwrap();
+        let loose_second = loose.get(NodeKey::first(3)).unwrap();
         assert_eq!(
             loose_second.y - tight_second.y,
             10,
@@ -557,7 +578,7 @@ mod tests {
                 gap: 0,
             })],
         ));
-        let button = layout(&tree).get(NodeKey(1)).unwrap();
+        let button = layout(&tree).get(NodeKey::first(1)).unwrap();
         assert_eq!((button.width, button.height), (120, 40));
     }
 
@@ -575,9 +596,11 @@ mod tests {
             ))
         };
         let content = layout(&build(WireDimension::Content))
-            .get(NodeKey(1))
+            .get(NodeKey::first(1))
             .unwrap();
-        let fill = layout(&build(WireDimension::Fill)).get(NodeKey(1)).unwrap();
+        let fill = layout(&build(WireDimension::Fill))
+            .get(NodeKey::first(1))
+            .unwrap();
         assert!(
             fill.width > content.width,
             "fill ({}) should exceed content ({}) for a one-character label",
@@ -589,9 +612,9 @@ mod tests {
     #[test]
     fn longer_text_measures_wider() {
         let build = |text: &str| Tree::new(Node::root(0, vec![Node::text(1, text)]));
-        let short = layout(&build("hi")).get(NodeKey(1)).unwrap();
+        let short = layout(&build("hi")).get(NodeKey::first(1)).unwrap();
         let long = layout(&build("a much longer line of text"))
-            .get(NodeKey(1))
+            .get(NodeKey::first(1))
             .unwrap();
         assert!(
             long.width > short.width,
@@ -606,7 +629,8 @@ mod tests {
         let wide = tree.layout(&mut text, Viewport::new(800.0, 300.0));
         let narrow = tree.layout(&mut text, Viewport::new(200.0, 300.0));
         assert!(
-            narrow.get(NodeKey(1)).unwrap().width < wide.get(NodeKey(1)).unwrap().width,
+            narrow.get(NodeKey::first(1)).unwrap().width
+                < wide.get(NodeKey::first(1)).unwrap().width,
             "a filled column should follow the viewport"
         );
     }
@@ -617,12 +641,12 @@ mod tests {
     fn hit_test_finds_the_button_the_host_placed() {
         let tree = sample();
         let layout = layout(&tree);
-        let button = layout.get(NodeKey(3)).unwrap();
+        let button = layout.get(NodeKey::first(3)).unwrap();
 
         let hit = tree.hit_test(&layout, button.x + 1, button.y + 1);
         assert_eq!(
             hit.map(|n| n.key),
-            Some(NodeKey(3)),
+            Some(NodeKey::first(3)),
             "a point inside the button's computed rect should hit it"
         );
     }
@@ -631,7 +655,7 @@ mod tests {
     fn a_disabled_button_is_not_hit() {
         let tree = sample();
         let layout = layout(&tree);
-        let reset = layout.get(NodeKey(4)).unwrap();
+        let reset = layout.get(NodeKey::first(4)).unwrap();
         assert_eq!(
             tree.hit_test(&layout, reset.x + 1, reset.y + 1),
             None,
@@ -643,7 +667,7 @@ mod tests {
     fn text_is_not_interactive() {
         let tree = sample();
         let layout = layout(&tree);
-        let text = layout.get(NodeKey(2)).unwrap();
+        let text = layout.get(NodeKey::first(2)).unwrap();
         assert_eq!(tree.hit_test(&layout, text.x + 1, text.y + 1), None);
     }
 
@@ -658,7 +682,7 @@ mod tests {
     fn a_node_without_layout_cannot_be_hit() {
         let tree = sample();
         // A snapshot missing the button entirely: nothing to hit.
-        let layout = LayoutSnapshot::from_rects([(NodeKey(0), Rect::new(0, 0, 400, 300))]);
+        let layout = LayoutSnapshot::from_rects([(NodeKey::first(0), Rect::new(0, 0, 400, 300))]);
         assert_eq!(tree.hit_test(&layout, 10, 10), None);
     }
 
@@ -678,8 +702,10 @@ mod tests {
     #[test]
     fn actions_become_guest_events() {
         assert_eq!(
-            UiAction::ButtonActivated(NodeKey(2)).to_event(),
-            WireEvent::Click { node: NodeKey(2) }
+            UiAction::ButtonActivated(NodeKey::first(2)).to_event(),
+            WireEvent::Click {
+                node: NodeKey::first(2)
+            }
         );
     }
 
@@ -691,7 +717,7 @@ mod tests {
         encoder
             .node(
                 opcode::NODE_ROOT,
-                NodeKey(1),
+                NodeKey::first(1),
                 0,
                 None,
                 WireLayout::default(),
@@ -699,7 +725,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(1),
+                NodeKey::first(1),
                 0,
                 Some("same key"),
                 WireLayout::default(),
@@ -707,7 +733,35 @@ mod tests {
             );
         assert_eq!(
             Tree::decode(&encoder.finish()),
-            Err(TreeError::DuplicateKey(NodeKey(1)))
+            Err(TreeError::DuplicateKey(NodeKey::first(1)))
+        );
+    }
+
+    /// Generations do not make one id two nodes: `(7, 0)` and `(7, 1)` in
+    /// one snapshot are still the same id twice.
+    #[test]
+    fn rejects_duplicate_ids_even_at_different_generations() {
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey::first(1),
+                0,
+                None,
+                WireLayout::default(),
+                1,
+            )
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::new(1, 1),
+                0,
+                Some("same id"),
+                WireLayout::default(),
+                0,
+            );
+        assert_eq!(
+            Tree::decode(&encoder.finish()),
+            Err(TreeError::DuplicateKey(NodeKey::new(1, 1)))
         );
     }
 
@@ -716,7 +770,7 @@ mod tests {
         let mut encoder = BatchEncoder::new();
         encoder.node(
             opcode::NODE_COLUMN,
-            NodeKey(0),
+            NodeKey::first(0),
             0,
             None,
             WireLayout::default(),
@@ -734,7 +788,7 @@ mod tests {
         encoder
             .node(
                 opcode::NODE_ROOT,
-                NodeKey(0),
+                NodeKey::first(0),
                 0,
                 None,
                 WireLayout::default(),
@@ -742,7 +796,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_ROOT,
-                NodeKey(1),
+                NodeKey::first(1),
                 0,
                 None,
                 WireLayout::default(),
@@ -750,7 +804,7 @@ mod tests {
             );
         assert_eq!(
             Tree::decode(&encoder.finish()),
-            Err(TreeError::NestedRoot(NodeKey(1)))
+            Err(TreeError::NestedRoot(NodeKey::first(1)))
         );
     }
 
@@ -762,7 +816,7 @@ mod tests {
         let mut encoder = BatchEncoder::new();
         encoder.node(
             opcode::NODE_ROOT,
-            NodeKey(0),
+            NodeKey::first(0),
             0,
             None,
             WireLayout {
@@ -775,7 +829,7 @@ mod tests {
         );
         assert_eq!(
             Tree::decode(&encoder.finish()),
-            Err(TreeError::FillHeight(NodeKey(0)))
+            Err(TreeError::FillHeight(NodeKey::first(0)))
         );
     }
 
@@ -870,11 +924,9 @@ impl Interaction {
     /// # What this cannot reach
     ///
     /// A [`UiAction`] that has already been encoded and queued for the guest.
-    /// By then it is opaque bytes in a bounded channel with no node key the
-    /// host can match against, so a queued activation for a removed key is
-    /// still delivered and still names that key. Closing that needs identity
-    /// the guest can check — a generation alongside the id — and that is a
-    /// wire-format change.
+    /// By then it is opaque bytes, but the event carries the node's generation
+    /// alongside its id. A guest comparing the delivered key against its own
+    /// live keys rejects an activation for a node it has since replaced.
     pub fn retire(&mut self, removed: &[NodeKey]) {
         if self
             .pressed
