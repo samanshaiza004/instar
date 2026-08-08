@@ -61,14 +61,13 @@
 //! the limit is not raised, and the rows say `over-limit` so nobody mistakes
 //! an absent wire pass for an omission.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use instar_host::SceneBuilder;
 use instar_paint::PhysicalSize as PaintSize;
 use instar_shell::{Presenter, default_font};
 use instar_ui::protocol::decode_batch;
-use instar_ui::{ChangeSet, Node, NodeKind, Tree, Viewport, diff};
+use instar_ui::{ChangeSet, Node, NodeKind, TextContext, Tree, Viewport, diff};
 use instar_window::{LogicalSize, PhysicalSize as WindowSize, WindowId, WindowMetricsChanged};
 
 const WINDOW: WindowId = WindowId::from_raw(1);
@@ -95,8 +94,8 @@ fn main() {
     );
 
     let metrics = metrics();
-    let builder =
-        SceneBuilder::with_glyphs(Arc::new(default_font().expect("the shipped face parses")));
+    let builder = SceneBuilder::new();
+    let mut text = TextContext::with_monospace_face(default_font());
     let mut presenter = Presenter::new(PaintSize {
         width: WIDTH,
         height: HEIGHT,
@@ -104,11 +103,25 @@ fn main() {
     .expect("the renderer starts");
 
     for shape in SHAPES {
-        measure(shape, &builder, &mut presenter, &metrics, &mut run);
+        measure(
+            shape,
+            &builder,
+            &mut text,
+            &mut presenter,
+            &metrics,
+            &mut run,
+        );
     }
     // The 4,000-node wire shape: the matrix fixes the tree size and varies
     // the shape of the change instead.
-    measure_shape_matrix(&SHAPES[2], &builder, &mut presenter, &metrics, &mut run);
+    measure_shape_matrix(
+        &SHAPES[2],
+        &builder,
+        &mut text,
+        &mut presenter,
+        &metrics,
+        &mut run,
+    );
 
     run.report();
 }
@@ -367,9 +380,14 @@ struct PassTimes {
 /// a checksum so an optimizing build cannot throw the work away. The scene is
 /// kept alive while the rasterizer runs because that is how the real shell
 /// presents: lower once, rasterize that scene.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "benchmark harness threads a text cache through the measured host layers"
+)]
 fn host_pass(
     tree: &Tree,
     previous: Option<&Tree>,
+    text: &mut TextContext,
     viewport: Viewport,
     builder: &SceneBuilder,
     presenter: &mut Presenter,
@@ -382,7 +400,7 @@ fn host_pass(
     *checksum += changes.touched().len();
 
     let started = Instant::now();
-    let snapshot = tree.layout(viewport);
+    let snapshot = tree.layout(text, viewport);
     let layout = started.elapsed();
     *checksum += snapshot.len();
 
@@ -409,6 +427,7 @@ fn host_pass(
 fn measure(
     shape: &Shape,
     builder: &SceneBuilder,
+    text: &mut TextContext,
     presenter: &mut Presenter,
     metrics: &WindowMetricsChanged,
     run: &mut Run,
@@ -440,6 +459,7 @@ fn measure(
             let times = host_pass(
                 &tree,
                 None,
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -468,6 +488,7 @@ fn measure(
             let times = host_pass(
                 &changed_tree,
                 Some(&tree),
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -484,6 +505,7 @@ fn measure(
             let times = host_pass(
                 &base,
                 None,
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -498,6 +520,7 @@ fn measure(
             let times = host_pass(
                 &changed,
                 Some(&base),
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -586,7 +609,7 @@ fn measure(
         over_limit,
         "layout",
         &layers.layout,
-        &format!("tree.layout(viewport), microseconds{host_note}"),
+        &format!("tree.layout(&mut text, viewport), microseconds{host_note}"),
     );
     timed_row(
         run,
@@ -614,6 +637,7 @@ fn measure(
 fn measure_shape_matrix(
     shape: &Shape,
     builder: &SceneBuilder,
+    text: &mut TextContext,
     presenter: &mut Presenter,
     metrics: &WindowMetricsChanged,
     run: &mut Run,
@@ -673,6 +697,7 @@ fn measure_shape_matrix(
             let times = host_pass(
                 &tree,
                 None,
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -698,6 +723,7 @@ fn measure_shape_matrix(
             let times = host_pass(
                 &changed_tree,
                 Some(&tree),
+                text,
                 viewport,
                 builder,
                 presenter,
@@ -735,7 +761,7 @@ fn measure_shape_matrix(
             (
                 "layout",
                 &layers.layout,
-                "tree.layout(viewport), microseconds",
+                "tree.layout(&mut text, viewport), microseconds",
             ),
             (
                 "lower",

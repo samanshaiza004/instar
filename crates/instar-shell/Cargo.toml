@@ -29,10 +29,5 @@ instar-render-vello-cpu = { path = "../instar-render-vello-cpu", features = ["gl
 softbuffer = "0.4.8"
 winit = "=0.30.13"
 
-# Character-to-glyph mapping, and the font's advance so the shell can pick the
-# size at which it matches the layout's. The same version the renderer
-# validates fonts with, so a face this crate accepts is one that crate can draw.
-skrifa = "=0.44.0"
-
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }

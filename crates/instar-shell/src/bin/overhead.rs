@@ -126,9 +126,9 @@ fn main() {
     // file, and one RenderTarget at the window's size. Everything the windowed
     // shell holds except the window itself.
     //
-    // The bridge is replaced rather than adapted: a glyph source is a
-    // constructor argument, because a font arriving after the guest's opening
-    // commit would mean the first frame silently had no labels.
+    // The bridge is replaced rather than adapted: the monospace face is a
+    // constructor argument, because a face arriving after the guest's opening
+    // commit would mean the first frame silently had no monospace text.
     bridge.shutdown();
     let started = Instant::now();
     let (mut bridge, wakes) = spawn(true);
@@ -368,16 +368,15 @@ fn metrics() -> WindowMetricsChanged {
 #[derive(Default)]
 struct Wakes(AtomicU64);
 
-fn spawn(glyphs: bool) -> (HostBridge, Arc<Wakes>) {
+fn spawn(with_monospace_face: bool) -> (HostBridge, Arc<Wakes>) {
     let wakes = Arc::new(Wakes::default());
     let counter = Arc::clone(&wakes);
     let wake: Wake = Arc::new(move || {
         counter.0.fetch_add(1, Ordering::SeqCst);
     });
 
-    let bridge = if glyphs {
-        let font = default_font().expect("the shipped face parses");
-        HostBridge::spawn_with_glyphs(COUNTER.to_vec(), WINDOW, wake, Arc::new(font))
+    let bridge = if with_monospace_face {
+        HostBridge::spawn_with_monospace_face(COUNTER.to_vec(), WINDOW, wake, default_font())
     } else {
         HostBridge::spawn(COUNTER.to_vec(), WINDOW, wake)
     }

@@ -63,9 +63,9 @@ fn metrics(scale: f64) -> WindowMetricsChanged {
 /// interface applied.
 fn ready() -> HostBridge {
     let wake: Wake = Arc::new(|| {});
-    let font = default_font().expect("the shipped face parses");
-    let mut bridge = HostBridge::spawn_with_glyphs(component(), WINDOW, wake, Arc::new(font))
-        .expect("the counter guest starts");
+    let mut bridge =
+        HostBridge::spawn_with_monospace_face(component(), WINDOW, wake, default_font())
+            .expect("the counter guest starts");
     bridge.on_window_event(WindowOutput::MetricsChanged(metrics(1.0)));
     await_commit(&mut bridge).expect("the guest commits its opening interface");
     bridge

@@ -28,13 +28,13 @@
 
 #![forbid(unsafe_code)]
 
-pub mod glyphs;
+pub mod fonts;
 pub mod surface;
 
 use instar_paint::{PaintBackend, PaintError, PaintScene, PhysicalSize, RenderTarget};
 use instar_render_vello_cpu::VelloCpuBackend;
 
-pub use glyphs::{FontError, MonoFont, default_font};
+pub use fonts::default_font;
 pub use surface::SurfaceError;
 
 /// Why a frame did not reach the screen.

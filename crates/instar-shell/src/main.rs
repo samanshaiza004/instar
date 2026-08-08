@@ -378,18 +378,12 @@ impl ApplicationHandler<()> for Shell {
         });
 
         let component = self.component.clone();
-        let started = match default_font() {
-            Ok(font) => {
-                HostBridge::spawn_with_glyphs(component, state.window_id(), wake, Arc::new(font))
-            }
-            Err(error) => {
-                // Survivable, and worth surviving: every rectangle still
-                // renders, so a broken font gives a usable window with no
-                // labels rather than no window at all.
-                eprintln!("instar: no text this session ({error})");
-                HostBridge::spawn(component, state.window_id(), wake)
-            }
-        };
+        let started = HostBridge::spawn_with_monospace_face(
+            component,
+            state.window_id(),
+            wake,
+            default_font(),
+        );
         let mut bridge = match started {
             Ok(bridge) => bridge,
             Err(error) => {

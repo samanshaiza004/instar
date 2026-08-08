@@ -27,11 +27,16 @@
 
 pub mod diff;
 pub mod layout;
+pub mod text;
 
 pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{NodeKey, ProtocolError, WireDimension, WireLayout, limits};
-pub use layout::{LayoutSnapshot, Rect, TEXT_METRICS, TextMetrics, Viewport};
+pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
+pub use text::{
+    Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
+    TextStats,
+};
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};
 
@@ -263,8 +268,8 @@ impl Tree {
     ///
     /// The host owns geometry entirely: this is the only source of a
     /// [`LayoutSnapshot`], and a guest cannot supply one.
-    pub fn layout(&self, viewport: Viewport) -> LayoutSnapshot {
-        layout::compute(self, viewport)
+    pub fn layout(&self, text: &mut TextContext, viewport: Viewport) -> LayoutSnapshot {
+        layout::compute(text, self, viewport)
     }
 
     /// Finds the innermost interactive node containing `(x, y)`.
@@ -414,6 +419,11 @@ mod tests {
 
     const VIEWPORT: Viewport = Viewport::new(400.0, 300.0);
 
+    fn layout(tree: &Tree) -> LayoutSnapshot {
+        let mut text = TextContext::new();
+        tree.layout(&mut text, VIEWPORT)
+    }
+
     #[test]
     fn round_trips_through_the_wire() {
         let tree = sample();
@@ -425,7 +435,7 @@ mod tests {
     #[test]
     fn the_host_computes_geometry_the_guest_never_supplied() {
         let tree = sample();
-        let layout = tree.layout(VIEWPORT);
+        let layout = layout(&tree);
 
         for key in [0, 1, 2, 3, 4] {
             assert!(
@@ -446,15 +456,14 @@ mod tests {
     #[test]
     fn layout_is_deterministic() {
         let tree = sample();
-        assert_eq!(tree.layout(VIEWPORT), tree.layout(VIEWPORT));
+        assert_eq!(layout(&tree), layout(&tree));
     }
 
-    /// Assertions are relative rather than exact: the text measurement is a
-    /// placeholder that a real font stack will replace, and these should
-    /// survive that.
+    /// Assertions are relative rather than exact, so they survive font stack
+    /// changes.
     #[test]
     fn a_column_stacks_its_children_without_overlap() {
-        let layout = sample().layout(VIEWPORT);
+        let layout = layout(&sample());
         let text = layout.get(NodeKey(2)).unwrap();
         let press = layout.get(NodeKey(3)).unwrap();
         let reset = layout.get(NodeKey(4)).unwrap();
@@ -475,7 +484,7 @@ mod tests {
 
     #[test]
     fn children_are_contained_by_their_parent() {
-        let layout = sample().layout(VIEWPORT);
+        let layout = layout(&sample());
         let root = layout.get(NodeKey(0)).unwrap();
         for key in [1, 2, 3, 4] {
             let child = layout.get(NodeKey(key)).unwrap();
@@ -499,7 +508,7 @@ mod tests {
                 gap: 0,
             }),
         );
-        let layout = padded.layout(VIEWPORT);
+        let layout = layout(&padded);
         let child = layout.get(NodeKey(1)).unwrap();
         assert_eq!(
             (child.x, child.y),
@@ -525,8 +534,8 @@ mod tests {
                 ],
             ))
         };
-        let tight = build(0).layout(VIEWPORT);
-        let loose = build(10).layout(VIEWPORT);
+        let tight = layout(&build(0));
+        let loose = layout(&build(10));
 
         let tight_second = tight.get(NodeKey(3)).unwrap();
         let loose_second = loose.get(NodeKey(3)).unwrap();
@@ -548,7 +557,7 @@ mod tests {
                 gap: 0,
             })],
         ));
-        let button = tree.layout(VIEWPORT).get(NodeKey(1)).unwrap();
+        let button = layout(&tree).get(NodeKey(1)).unwrap();
         assert_eq!((button.width, button.height), (120, 40));
     }
 
@@ -565,14 +574,10 @@ mod tests {
                 })],
             ))
         };
-        let content = build(WireDimension::Content)
-            .layout(VIEWPORT)
+        let content = layout(&build(WireDimension::Content))
             .get(NodeKey(1))
             .unwrap();
-        let fill = build(WireDimension::Fill)
-            .layout(VIEWPORT)
-            .get(NodeKey(1))
-            .unwrap();
+        let fill = layout(&build(WireDimension::Fill)).get(NodeKey(1)).unwrap();
         assert!(
             fill.width > content.width,
             "fill ({}) should exceed content ({}) for a one-character label",
@@ -584,9 +589,8 @@ mod tests {
     #[test]
     fn longer_text_measures_wider() {
         let build = |text: &str| Tree::new(Node::root(0, vec![Node::text(1, text)]));
-        let short = build("hi").layout(VIEWPORT).get(NodeKey(1)).unwrap();
-        let long = build("a much longer line of text")
-            .layout(VIEWPORT)
+        let short = layout(&build("hi")).get(NodeKey(1)).unwrap();
+        let long = layout(&build("a much longer line of text"))
             .get(NodeKey(1))
             .unwrap();
         assert!(
@@ -598,8 +602,9 @@ mod tests {
     #[test]
     fn a_narrower_viewport_narrows_filled_nodes() {
         let tree = sample();
-        let wide = tree.layout(Viewport::new(800.0, 300.0));
-        let narrow = tree.layout(Viewport::new(200.0, 300.0));
+        let mut text = TextContext::new();
+        let wide = tree.layout(&mut text, Viewport::new(800.0, 300.0));
+        let narrow = tree.layout(&mut text, Viewport::new(200.0, 300.0));
         assert!(
             narrow.get(NodeKey(1)).unwrap().width < wide.get(NodeKey(1)).unwrap().width,
             "a filled column should follow the viewport"
@@ -611,7 +616,7 @@ mod tests {
     #[test]
     fn hit_test_finds_the_button_the_host_placed() {
         let tree = sample();
-        let layout = tree.layout(VIEWPORT);
+        let layout = layout(&tree);
         let button = layout.get(NodeKey(3)).unwrap();
 
         let hit = tree.hit_test(&layout, button.x + 1, button.y + 1);
@@ -625,7 +630,7 @@ mod tests {
     #[test]
     fn a_disabled_button_is_not_hit() {
         let tree = sample();
-        let layout = tree.layout(VIEWPORT);
+        let layout = layout(&tree);
         let reset = layout.get(NodeKey(4)).unwrap();
         assert_eq!(
             tree.hit_test(&layout, reset.x + 1, reset.y + 1),
@@ -637,7 +642,7 @@ mod tests {
     #[test]
     fn text_is_not_interactive() {
         let tree = sample();
-        let layout = tree.layout(VIEWPORT);
+        let layout = layout(&tree);
         let text = layout.get(NodeKey(2)).unwrap();
         assert_eq!(tree.hit_test(&layout, text.x + 1, text.y + 1), None);
     }
@@ -645,7 +650,7 @@ mod tests {
     #[test]
     fn a_point_outside_everything_hits_nothing() {
         let tree = sample();
-        let layout = tree.layout(VIEWPORT);
+        let layout = layout(&tree);
         assert_eq!(tree.hit_test(&layout, 5_000, 5_000), None);
     }
 
@@ -836,5 +841,46 @@ impl Interaction {
     /// activate a node that has since moved elsewhere.
     pub fn cancel(&mut self) {
         self.pressed = None;
+    }
+
+    /// Drops any state referring to a node the guest removed.
+    ///
+    /// # The invariant
+    ///
+    /// > Any host transient state referencing a removed [`NodeKey`] is retired
+    /// > before the new snapshot becomes interactive.
+    ///
+    /// Without this, a press survives the disappearance of the node it landed
+    /// on, and a guest that later reuses the same key gets the press completed
+    /// against a control the user never touched:
+    ///
+    /// ```text
+    /// press node 7  ->  guest removes node 7  ->  guest re-adds node 7
+    ///               ->  release  ->  the NEW node 7 activates
+    /// ```
+    ///
+    /// Nothing else catches that. `KindChanged` does not fire, because a
+    /// button replaced by a button is the same kind; the geometry barrier does
+    /// not fire, because the scale never changed.
+    ///
+    /// As focus, hover, pointer capture, and scroll offsets arrive they retire
+    /// here too — this is deliberately the one place that answers "the node is
+    /// gone, forget everything about it".
+    ///
+    /// # What this cannot reach
+    ///
+    /// A [`UiAction`] that has already been encoded and queued for the guest.
+    /// By then it is opaque bytes in a bounded channel with no node key the
+    /// host can match against, so a queued activation for a removed key is
+    /// still delivered and still names that key. Closing that needs identity
+    /// the guest can check — a generation alongside the id — and that is a
+    /// wire-format change.
+    pub fn retire(&mut self, removed: &[NodeKey]) {
+        if self
+            .pressed
+            .is_some_and(|pressed| removed.contains(&pressed))
+        {
+            self.pressed = None;
+        }
     }
 }

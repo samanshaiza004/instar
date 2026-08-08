@@ -593,18 +593,15 @@ impl HostBridge {
         Self::start(Host::new(), component, window, wake)
     }
 
-    /// As [`HostBridge::spawn`], with a host that can draw text.
-    ///
-    /// A constructor rather than a setter: the glyph source is an input to
-    /// every scene the host lowers, and one arriving after the guest's opening
-    /// commit would mean the first frame silently had no labels.
-    pub fn spawn_with_glyphs(
+    /// As [`HostBridge::spawn`], with the shipped monospace face registered
+    /// with Parley's font context before the guest can commit anything.
+    pub fn spawn_with_monospace_face(
         component: Vec<u8>,
         window: WindowId,
         wake: Wake,
-        glyphs: Arc<dyn crate::GlyphSource>,
+        face: Arc<[u8]>,
     ) -> Result<Self, String> {
-        Self::start(Host::with_glyphs(glyphs), component, window, wake)
+        Self::start(Host::with_monospace_face(face), component, window, wake)
     }
 
     fn start(host: Host, component: Vec<u8>, window: WindowId, wake: Wake) -> Result<Self, String> {

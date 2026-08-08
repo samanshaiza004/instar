@@ -19,7 +19,8 @@ use std::time::Duration;
 use instar_kernel::runtime::{GenerationHandle, Runtime, RuntimeGeneration};
 use instar_ui::protocol::decode_batch;
 use instar_ui::{
-    LayoutSnapshot, NodeKey, NodeKind, ProtocolError, Tree, TreeError, UiAction, Viewport,
+    LayoutSnapshot, NodeKey, NodeKind, ProtocolError, TextContext, Tree, TreeError, UiAction,
+    Viewport,
 };
 
 macro_rules! run_for {
@@ -69,7 +70,8 @@ fn latest(kernel: &instar_kernel::runtime::SharedKernel) -> (Tree, LayoutSnapsho
     let (_, bytes) = commits.last().expect("guest has committed at least once");
     let batch = decode_batch(bytes).expect("guest commits a decodable batch");
     let tree = Tree::from_wire(&batch).expect("guest commits a meaningful tree");
-    let layout = tree.layout(VIEWPORT);
+    let mut text = TextContext::new();
+    let layout = tree.layout(&mut text, VIEWPORT);
     (tree, layout)
 }
 

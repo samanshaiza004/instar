@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use instar_ui_protocol::{NodeKey, WireDimension};
 use taffy::prelude::*;
 
+use crate::text::{self, ShapedText, TextContext};
 use crate::{Node, NodeKind, Tree};
 
 /// The logical-pixel viewport layout is computed against.
@@ -69,9 +70,12 @@ impl Rect {
 ///
 /// Produced by [`compute`], consumed by hit-testing and (later) painting. Not
 /// protocol state: a guest never sends one and never receives one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutSnapshot {
     rects: HashMap<NodeKey, Rect>,
+    /// The final render artifact for every text/button node, extracted after
+    /// Taffy has produced the final geometry.
+    pub text: HashMap<NodeKey, ShapedText>,
 }
 
 impl LayoutSnapshot {
@@ -91,11 +95,16 @@ impl LayoutSnapshot {
         self.rects.keys().copied()
     }
 
+    pub fn text(&self, key: NodeKey) -> Option<&ShapedText> {
+        self.text.get(&key)
+    }
+
     /// Builds a snapshot directly. For tests that need specific geometry
     /// without going through a full layout pass.
     pub fn from_rects(rects: impl IntoIterator<Item = (NodeKey, Rect)>) -> Self {
         Self {
             rects: rects.into_iter().collect(),
+            text: HashMap::new(),
         }
     }
 }
@@ -108,68 +117,15 @@ struct MeasureContext {
     is_button: bool,
 }
 
-/// Placeholder text metrics.
-///
-/// Real shaping belongs to the text renderer, which does not exist yet. These
-/// exist so layout is *deterministic and testable* now, and are the one thing
-/// in this module expected to be replaced rather than extended: when a real
-/// font stack lands, `measure` takes a font context and these go away.
-/// Assertions in tests are written against relative geometry (ordering,
-/// containment, stacking) rather than exact pixel values, so that replacement
-/// does not invalidate them.
-///
-/// Public because painting has to agree with them. A painter that places
-/// glyphs at its font's own advances, against boxes measured at these, gets
-/// text that drifts out of the rectangles the host computed for it — and the
-/// host's geometry is the authority, not the font's. Whoever draws the text
-/// reads its advance from here, so the two cannot disagree, and both are
-/// replaced together.
-///
-/// # This is scaffolding, not architecture
-///
-/// Recorded as Phase 2 debt in `docs/PHASE-1.md`. Making a real face fit these
-/// columns — inverting its advance until one glyph is one fake column — is a
-/// Phase 1 expedient and must not outlive it. The end state is one shaped
-/// result feeding both sides:
-///
-/// ```text
-/// text + style -> shape/layout -> intrinsic size    -> Taffy
-///                              -> positioned glyphs -> the renderer
-/// ```
-///
-/// Do not build on `TEXT_METRICS`. Anything that needs more from text than a
-/// fixed-pitch rectangle is the signal to do the replacement instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TextMetrics {
-    /// Advance per character. Fixed pitch, which is the whole reason these are
-    /// a placeholder.
-    pub char_width: f32,
-    pub line_height: f32,
-    /// Extra space a button reserves around its label, per side.
-    pub button_padding: f32,
-}
+/// Extra space a button reserves around its label, per side. Kept from the
+/// placeholder metrics so buttons stay bigger than their labels.
+pub const BUTTON_PADDING: f32 = 8.0;
 
-pub const TEXT_METRICS: TextMetrics = TextMetrics {
-    char_width: 8.0,
-    line_height: 16.0,
-    button_padding: 8.0,
-};
-
-fn measure(context: &MeasureContext) -> Size<f32> {
-    let Some(text) = context.text.as_deref() else {
-        return Size::ZERO;
-    };
-    // `chars()` rather than `len()`: a byte count would make non-ASCII labels
-    // measure absurdly wide. Still not correct shaping -- see above.
-    let width = text.chars().count() as f32 * TEXT_METRICS.char_width;
-    let padding = if context.is_button {
-        TEXT_METRICS.button_padding * 2.0
-    } else {
-        0.0
-    };
-    Size {
-        width: width + padding,
-        height: TEXT_METRICS.line_height + padding,
+fn text_available(value: AvailableSpace) -> text::Available {
+    match value {
+        AvailableSpace::Definite(width) => text::Available::Definite(width),
+        AvailableSpace::MinContent => text::Available::MinContent,
+        AvailableSpace::MaxContent => text::Available::MaxContent,
     }
 }
 
@@ -210,11 +166,14 @@ fn style(node: &Node) -> Style {
 ///
 /// Deterministic: the same tree and viewport always produce the same snapshot,
 /// which is what makes hit-testing reproducible and these tests meaningful.
-pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
+pub fn compute(text: &mut TextContext, tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     let mut taffy: TaffyTree<MeasureContext> = TaffyTree::new();
     let mut keys: Vec<(taffy::NodeId, NodeKey)> = Vec::new();
 
     let root = build(&mut taffy, &tree.root, &mut keys);
+    let key_by_id: HashMap<taffy::NodeId, NodeKey> = keys.iter().copied().collect();
+    let id_by_key: HashMap<NodeKey, taffy::NodeId> =
+        keys.iter().map(|(id, key)| (*key, *id)).collect();
 
     // The root is given the viewport exactly; a guest cannot size the window.
     let _ = taffy.set_style(
@@ -241,21 +200,46 @@ pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     };
 
     if taffy
-        .compute_layout_with_measure(
-            root,
-            available,
-            |known, _available, _id, context, _style| {
-                // A node with both dimensions already known needs no measuring.
-                if let (Some(width), Some(height)) = (known.width, known.height) {
-                    return Size { width, height };
+        .compute_layout_with_measure(root, available, |known, available, id, context, _style| {
+            let measured = match context.as_deref() {
+                Some(context) => {
+                    let key = key_by_id
+                        .get(&id)
+                        .copied()
+                        .expect("every taffy node has a wire key");
+                    let padding = if context.is_button {
+                        BUTTON_PADDING * 2.0
+                    } else {
+                        0.0
+                    };
+                    let label_available = if context.is_button {
+                        match available.width {
+                            AvailableSpace::Definite(width) => {
+                                text::Available::Definite((width - padding).max(0.0))
+                            }
+                            other => text_available(other),
+                        }
+                    } else {
+                        text_available(available.width)
+                    };
+                    let (width, height) = text.measure(
+                        key,
+                        context.text.as_deref().unwrap_or(""),
+                        text::ShapingStyle::default(),
+                        label_available,
+                    );
+                    Size {
+                        width: width + padding,
+                        height: height + padding,
+                    }
                 }
-                let measured = context.as_deref().map(measure).unwrap_or(Size::ZERO);
-                Size {
-                    width: known.width.unwrap_or(measured.width),
-                    height: known.height.unwrap_or(measured.height),
-                }
-            },
-        )
+                None => Size::ZERO,
+            };
+            Size {
+                width: known.width.unwrap_or(measured.width),
+                height: known.height.unwrap_or(measured.height),
+            }
+        })
         .is_err()
     {
         // Taffy fails only on a malformed tree, which `Tree` construction
@@ -268,7 +252,40 @@ pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     // relative to its parent, and every consumer here wants absolute.
     let mut rects = HashMap::with_capacity(keys.len());
     accumulate(&taffy, root, 0.0, 0.0, &keys, &mut rects);
-    LayoutSnapshot { rects }
+    let mut shaped = HashMap::new();
+    finalize_text(text, tree, &taffy, &id_by_key, &mut shaped);
+    LayoutSnapshot {
+        rects,
+        text: shaped,
+    }
+}
+
+fn finalize_text(
+    text: &mut TextContext,
+    tree: &Tree,
+    taffy: &TaffyTree<MeasureContext>,
+    id_by_key: &HashMap<NodeKey, taffy::NodeId>,
+    out: &mut HashMap<NodeKey, ShapedText>,
+) {
+    for node in tree.iter() {
+        let is_text = matches!(node.kind, NodeKind::Text { .. } | NodeKind::Button { .. });
+        if !is_text {
+            continue;
+        }
+        let Some(id) = id_by_key.get(&node.key).copied() else {
+            continue;
+        };
+        let Ok(geometry) = taffy.layout(id) else {
+            continue;
+        };
+        let padding = if matches!(node.kind, NodeKind::Button { .. }) {
+            BUTTON_PADDING * 2.0
+        } else {
+            0.0
+        };
+        let final_width = (geometry.size.width - padding).max(0.0);
+        out.insert(node.key, text.finalize(node.key, final_width).clone());
+    }
 }
 
 fn build(

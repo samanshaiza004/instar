@@ -52,12 +52,12 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, TreeError, UiAction, Viewport};
+use instar_ui::{Interaction, TextContext, TreeError, UiAction, Viewport};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
 };
 
-pub use present::{GlyphSource, PresentationState, SceneBuilder, Theme};
+pub use present::{PresentationState, SceneBuilder, Theme};
 
 /// The `instar-ui` vocabulary this crate's own API already speaks.
 ///
@@ -238,7 +238,7 @@ impl HostWindow {
     ///
     /// Does nothing while blocked, which is the barrier's "no layout" rule
     /// enforced at the only place layout is produced.
-    fn recompute_layout(&mut self) {
+    fn recompute_layout(&mut self, text: &mut TextContext) {
         let (Some(metrics), Some(tree)) = (self.metrics.usable(), self.tree.as_ref()) else {
             return;
         };
@@ -246,12 +246,12 @@ impl HostWindow {
             metrics.logical_size.width as f32,
             metrics.logical_size.height as f32,
         );
-        self.layout = Some(tree.layout(viewport));
+        self.layout = Some(tree.layout(text, viewport));
     }
 }
 
 /// Orchestrates windows, the UI layer, and the guest runtime.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
     /// What the window is showing — the guest's interface, or the host's own
@@ -260,27 +260,50 @@ pub struct Host {
     /// than about a surface.
     presentation: PresentationState,
     scenes: SceneBuilder,
+    /// The long-lived Parley shaping cache. Created once and reused for every
+    /// layout pass; see `instar_ui::TextContext`.
+    text: TextContext,
+}
+
+impl Default for Host {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Host {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            windows: HashMap::new(),
+            presentation: PresentationState::default(),
+            scenes: SceneBuilder::new(),
+            text: TextContext::new(),
+        }
     }
 
-    /// A host that can draw text.
-    ///
-    /// Without one, scenes come out with every rectangle in place and no
-    /// glyphs — which is what the headless tests want, and is why the font is
-    /// injected rather than reached for.
-    pub fn with_glyphs(glyphs: Arc<dyn GlyphSource>) -> Self {
+    /// A host whose Parley font context has the shipped monospace face.
+    pub fn with_monospace_face(face: Arc<[u8]>) -> Self {
         Self {
-            scenes: SceneBuilder::with_glyphs(glyphs),
-            ..Self::default()
+            text: TextContext::with_monospace_face(face),
+            ..Self::new()
         }
     }
 
     pub fn window(&self, id: WindowId) -> Option<&HostWindow> {
         self.windows.get(&id)
+    }
+
+    /// Shaping work done since [`Host::reset_text_stats`].
+    ///
+    /// Exposed so a warm click can be traced: the question "did one changed
+    /// label rebuild one layout, or all of them?" is not answerable from a
+    /// duration.
+    pub fn text_stats(&self) -> instar_ui::text::TextStats {
+        self.text.stats()
+    }
+
+    pub fn reset_text_stats(&mut self) {
+        self.text.reset_stats();
     }
 
     pub fn presentation(&self) -> &PresentationState {
@@ -315,7 +338,9 @@ impl Host {
             PresentationState::Crashed {
                 generation,
                 message,
-            } => self.scenes.crash_scene(*generation, message, metrics),
+            } => self
+                .scenes
+                .crash_scene(&mut self.text, *generation, message, metrics),
             PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
                 (Some(tree), Some(layout)) => {
                     self.scenes
@@ -444,8 +469,16 @@ impl Host {
         // commit; this is the host's separate value for whether the state
         // actually changed, and the one caches key off.
         window.tree_revision += 1;
+
+        // Before the new snapshot becomes interactive: any transient state
+        // referring to a node the guest removed is retired. A press that
+        // outlived its node would otherwise be completable against whatever
+        // reused its key. See `Interaction::retire`.
+        window.interaction.retire(&changes.removed);
+        self.text.retire(&changes.removed);
+
         window.tree = Some(tree);
-        window.recompute_layout();
+        window.recompute_layout(&mut self.text);
         // Lowered here rather than on the next frame callback: the caller is
         // about to tell a guest its interface was accepted, and "accepted"
         // should mean the host has everything it needs to show it.
@@ -470,7 +503,7 @@ impl Host {
         // Order matters and is the barrier's exit rule: layout first, then the
         // snapshot is replaced, then the scene is lowered against it, and only
         // then may anything be rendered.
-        window.recompute_layout();
+        window.recompute_layout(&mut self.text);
         let wanted = window.redraw_pending || window.layout.is_some();
         self.rebuild_scene(window_id);
 
@@ -1120,6 +1153,106 @@ mod tests {
             1,
             "the surviving interface should still be clickable"
         );
+    }
+
+    /// A batch with the counter's button removed, keeping every other key.
+    fn batch_without_the_button() -> Vec<u8> {
+        let fill = WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 1)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// press -> the guest removes the node -> the guest reuses the key ->
+    /// release. Nothing else catches this: the kind is unchanged, so
+    /// `KindChanged` does not fire, and the scale never moved, so the geometry
+    /// barrier does not either.
+    #[test]
+    fn a_press_cannot_be_completed_against_a_node_that_reused_its_key() {
+        let mut host = ready_host();
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+
+        // The guest drops the button, then brings it back under the same key.
+        host.on_guest_commit(WINDOW, &batch_without_the_button())
+            .expect("valid batch");
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("valid batch");
+
+        let release = host.handle(pointer(PointerState::Released, x, y));
+        assert!(
+            to_guest(&release).is_empty(),
+            "the press belonged to a node that no longer exists; completing it \
+             against whatever reused the key would activate a control the user \
+             never touched"
+        );
+    }
+
+    /// The same shape, but the node never leaves. Retirement must not become a
+    /// blanket "any commit cancels the press" — that would break click-through
+    /// on any interface that updates while the button is held.
+    #[test]
+    fn a_press_survives_a_commit_that_leaves_its_node_alone() {
+        let mut host = ready_host();
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+
+        // A commit that changes the label text but keeps the button.
+        host.on_guest_commit(WINDOW, &foreign_text_batch("Clicked 1 times"))
+            .expect("valid batch");
+
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey(3)),
+            "an unrelated commit must not cancel a press in progress"
+        );
+    }
+
+    /// The counter batch with different label text, so a commit can change
+    /// something without touching the button.
+    fn foreign_text_batch(text: &str) -> Vec<u8> {
+        let fill = WireLayout {
+            width: WireDimension::Fill,
+            height: WireDimension::Content,
+            padding: 0,
+            gap: 0,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey(2),
+                0,
+                Some(text),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey(3),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
     }
 
     // --- Presentation (WP7B2) ---
