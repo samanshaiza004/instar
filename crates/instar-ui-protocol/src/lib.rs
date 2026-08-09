@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -131,6 +131,15 @@ pub mod opcode {
     /// Clipping tags. See [`super::WireOverflow`].
     pub const OVERFLOW_VISIBLE: u8 = 0;
     pub const OVERFLOW_CLIP: u8 = 1;
+
+    /// Font family tags. See [`super::WireFontRole`].
+    pub const FONT_SYSTEM_UI: u8 = 0;
+    pub const FONT_MONOSPACE: u8 = 1;
+
+    /// Cursor tags. See [`super::WireCursor`].
+    pub const CURSOR_DEFAULT: u8 = 0;
+    pub const CURSOR_POINTER: u8 = 1;
+    pub const CURSOR_TEXT: u8 = 2;
 }
 
 /// Node flag bits.
@@ -370,6 +379,125 @@ impl WireOverflow {
     }
 }
 
+/// Straight sRGB with an 8-bit alpha channel, as the guest states it.
+///
+/// Node-local alpha, and deliberately the only alpha there is: see
+/// `docs/PHASE-2.md` on why there is no `opacity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl WireColor {
+    pub const fn opaque(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 255 }
+    }
+}
+
+/// Which family text is shaped with. Shaping-affecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireFontRole {
+    #[default]
+    SystemUi,
+    Monospace,
+}
+
+impl WireFontRole {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::SystemUi => opcode::FONT_SYSTEM_UI,
+            Self::Monospace => opcode::FONT_MONOSPACE,
+        }
+    }
+}
+
+/// What the pointer looks like over this node. Interaction-only: changing it
+/// invalidates no layout, no shaping, and no pixel of the node itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireCursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+}
+
+impl WireCursor {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Default => opcode::CURSOR_DEFAULT,
+            Self::Pointer => opcode::CURSOR_POINTER,
+            Self::Text => opcode::CURSOR_TEXT,
+        }
+    }
+}
+
+/// A border, painted **inside** the node's laid-out rect.
+///
+/// Inside, and bounded at half the shorter side, which is
+/// `instar_paint::effective_stroke_width`'s contract rather than something
+/// this layer decides. Width is a length, so it is an integer like every other
+/// length here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireBorder {
+    pub width: u16,
+    pub color: WireColor,
+}
+
+/// The properties that change how text is **shaped**, and therefore measured.
+///
+/// Separated from [`WirePaintStyle`] because the separation is the design: a
+/// change here invalidates the text cache and the layout, and a change there
+/// must not. See `docs/PHASE-2.md`, "C: style, sorted by what it can
+/// invalidate".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireTextStyle {
+    pub role: WireFontRole,
+    /// Logical pixels per em. An integer, like every other length on this
+    /// wire — fractional sizes are a deliberate later change if something
+    /// needs them, not complexity paid for in advance.
+    pub size: u16,
+    /// CSS-style, 1–1000.
+    pub weight: u16,
+}
+
+impl Default for WireTextStyle {
+    fn default() -> Self {
+        Self {
+            role: WireFontRole::SystemUi,
+            size: 14,
+            weight: 400,
+        }
+    }
+}
+
+/// The properties that change only what is drawn.
+///
+/// Every colour is optional, and `None` means "the host decides". That is not
+/// a placeholder: a guest that states no colours gets the host's theme, which
+/// is how every guest behaved before this vocabulary existed and how a guest
+/// that wants to respect a system appearance should keep behaving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WirePaintStyle {
+    pub foreground: Option<WireColor>,
+    pub background: Option<WireColor>,
+    pub border: Option<WireBorder>,
+    /// Applied to all four corners. Clamped against the node's real rect at
+    /// paint time by `instar_paint::CornerRadii::clamped_to`.
+    pub corner_radius: u16,
+}
+
+/// Everything a guest can say about a node's appearance, grouped by what a
+/// change to it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WireStyle {
+    pub text: WireTextStyle,
+    pub paint: WirePaintStyle,
+    pub cursor: WireCursor,
+}
+
 /// A node's layout intent.
 ///
 /// **Intent, not geometry.** A guest says "grow into the spare space, pad by
@@ -467,6 +595,7 @@ pub struct WireNode {
     /// Present for text and button nodes.
     pub text: Option<String>,
     pub layout: WireLayout,
+    pub style: WireStyle,
     pub child_count: u16,
 }
 
@@ -521,6 +650,8 @@ pub enum ProtocolError {
         min: u16,
         max: u16,
     },
+    /// A font weight outside CSS's 1–1000.
+    InvalidFontWeight(u16),
     /// The pre-order child counts do not describe one well-formed tree.
     MalformedTree(&'static str),
     TrailingBytes(usize),
@@ -561,6 +692,9 @@ impl fmt::Display for ProtocolError {
             ),
             Self::InvalidBounds { min, max } => {
                 write!(f, "minimum {min} exceeds maximum {max}")
+            }
+            Self::InvalidFontWeight(weight) => {
+                write!(f, "font weight {weight} is outside 1..=1000")
             }
             Self::LengthTooLarge(n) => write!(
                 f,
@@ -782,6 +916,93 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn color(&mut self, while_reading: &'static str) -> Result<WireColor, ProtocolError> {
+        let bytes = self.take(4, while_reading)?;
+        Ok(WireColor {
+            r: bytes[0],
+            g: bytes[1],
+            b: bytes[2],
+            a: bytes[3],
+        })
+    }
+
+    pub fn optional_color(
+        &mut self,
+        while_reading: &'static str,
+    ) -> Result<Option<WireColor>, ProtocolError> {
+        match self.u8(while_reading)? {
+            0 => Ok(None),
+            _ => Ok(Some(self.color(while_reading)?)),
+        }
+    }
+
+    /// A font weight, bounded so nothing downstream is handed a nonsense one.
+    ///
+    /// CSS's range, and rejected rather than clamped: unlike a border width,
+    /// where clamping produces a sensible picture, a weight of 40,000 is not
+    /// an approximation of anything and a guest asking for one has a bug worth
+    /// hearing about.
+    pub fn font_weight(&mut self, while_reading: &'static str) -> Result<u16, ProtocolError> {
+        let weight = self.u16(while_reading)?;
+        if !(1..=1000).contains(&weight) {
+            return Err(ProtocolError::InvalidFontWeight(weight));
+        }
+        Ok(weight)
+    }
+
+    pub fn font_role(
+        &mut self,
+        while_reading: &'static str,
+    ) -> Result<WireFontRole, ProtocolError> {
+        match self.u8(while_reading)? {
+            opcode::FONT_SYSTEM_UI => Ok(WireFontRole::SystemUi),
+            opcode::FONT_MONOSPACE => Ok(WireFontRole::Monospace),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "font role",
+                value,
+            }),
+        }
+    }
+
+    pub fn cursor(&mut self, while_reading: &'static str) -> Result<WireCursor, ProtocolError> {
+        match self.u8(while_reading)? {
+            opcode::CURSOR_DEFAULT => Ok(WireCursor::Default),
+            opcode::CURSOR_POINTER => Ok(WireCursor::Pointer),
+            opcode::CURSOR_TEXT => Ok(WireCursor::Text),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "cursor",
+                value,
+            }),
+        }
+    }
+
+    /// A whole style block, in the three groups the diff keys off.
+    pub fn style(&mut self, _while_reading: &'static str) -> Result<WireStyle, ProtocolError> {
+        let text = WireTextStyle {
+            role: self.font_role("font role")?,
+            size: self.length("font size")?,
+            weight: self.font_weight("font weight")?,
+        };
+        let border = match self.u8("border")? {
+            0 => None,
+            _ => Some(WireBorder {
+                width: self.length("border width")?,
+                color: self.color("border color")?,
+            }),
+        };
+        let paint = WirePaintStyle {
+            foreground: self.optional_color("foreground")?,
+            background: self.optional_color("background")?,
+            border,
+            corner_radius: self.length("corner radius")?,
+        };
+        Ok(WireStyle {
+            text,
+            paint,
+            cursor: self.cursor("cursor")?,
+        })
+    }
+
     /// A whole layout block, including the relationships between its fields.
     ///
     /// The bounds check lives here rather than in `instar-ui` because it is a
@@ -872,6 +1093,38 @@ fn write_flex_factor(out: &mut Vec<u8>, value: f32) {
     out.extend_from_slice(&value.to_bits().to_le_bytes());
 }
 
+fn write_color(out: &mut Vec<u8>, color: WireColor) {
+    out.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+}
+
+fn write_optional_color(out: &mut Vec<u8>, color: Option<WireColor>) {
+    match color {
+        Some(color) => {
+            out.push(1);
+            write_color(out, color);
+        }
+        None => out.push(0),
+    }
+}
+
+fn write_style(out: &mut Vec<u8>, style: WireStyle) {
+    out.push(style.text.role.tag());
+    out.extend_from_slice(&style.text.size.to_le_bytes());
+    out.extend_from_slice(&style.text.weight.to_le_bytes());
+    match style.paint.border {
+        Some(border) => {
+            out.push(1);
+            out.extend_from_slice(&border.width.to_le_bytes());
+            write_color(out, border.color);
+        }
+        None => out.push(0),
+    }
+    write_optional_color(out, style.paint.foreground);
+    write_optional_color(out, style.paint.background);
+    out.extend_from_slice(&style.paint.corner_radius.to_le_bytes());
+    out.push(style.cursor.tag());
+}
+
 fn write_layout(out: &mut Vec<u8>, layout: WireLayout) {
     write_size(out, layout.width);
     write_size(out, layout.height);
@@ -919,6 +1172,35 @@ impl BatchEncoder {
         layout: WireLayout,
         child_count: u16,
     ) -> &mut Self {
+        self.node_styled(
+            kind,
+            key,
+            flags,
+            text,
+            layout,
+            WireStyle::default(),
+            child_count,
+        )
+    }
+
+    /// Appends one node with an explicit style block.
+    ///
+    /// [`BatchEncoder::node`] is the same thing with
+    /// `WireStyle::default()`, which is what a guest that states no appearance
+    /// sends and what the great majority of callers want. The style block is
+    /// written to the wire either way — the default is a default *value*, not
+    /// an absent field, so the encoding stays fixed-shape and readable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn node_styled(
+        &mut self,
+        kind: u8,
+        key: NodeKey,
+        flags: u8,
+        text: Option<&str>,
+        layout: WireLayout,
+        style: WireStyle,
+        child_count: u16,
+    ) -> &mut Self {
         self.nodes.push(kind);
         self.nodes.extend_from_slice(&key.id.to_le_bytes());
         self.nodes.extend_from_slice(&key.generation.to_le_bytes());
@@ -927,6 +1209,7 @@ impl BatchEncoder {
             write_text(&mut self.nodes, text);
         }
         write_layout(&mut self.nodes, layout);
+        write_style(&mut self.nodes, style);
         self.nodes.extend_from_slice(&child_count.to_le_bytes());
         self.node_count += 1;
         self
@@ -1033,6 +1316,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             }
         };
         let layout = reader.layout("layout")?;
+        let style = reader.style("style")?;
         let child_count = reader.u16("child count")?;
 
         // Bound the count against what is actually left before trusting it: a
@@ -1050,6 +1334,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             flags: node_flags,
             text,
             layout,
+            style,
             child_count,
         });
 
@@ -1581,12 +1866,17 @@ mod tests {
     /// 37  align_items(1)
     /// 38  justify_content(1)
     /// 39  display(1) visibility(1) overflow(1)
-    /// 42  padding(2) gap(2)
-    /// 46  child_count(2)
-    /// 48  SECTION_END(1)
+    /// 42  padding(2) gap(2)                            layout ends
+    /// 46  font role(1) size(2) weight(2)               style begins
+    /// 51  border(1)                                    absent: presence only
+    /// 52  foreground(1) background(1)                  absent: presence only
+    /// 54  corner_radius(2)
+    /// 56  cursor(1)
+    /// 57  child_count(2)
+    /// 59  SECTION_END(1)
     /// ```
     const DEFAULT_ALIGN_ITEMS_OFFSET: usize = 37;
-    const DEFAULT_BATCH_LEN: usize = 49;
+    const DEFAULT_BATCH_LEN: usize = 60;
 
     #[test]
     fn rejects_unknown_align_and_justify_tags() {
@@ -1718,5 +2008,201 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // --- C3: the style vocabulary. ---
+
+    #[test]
+    fn the_whole_style_vocabulary_round_trips() {
+        let style = WireStyle {
+            text: WireTextStyle {
+                role: WireFontRole::Monospace,
+                size: 18,
+                weight: 700,
+            },
+            paint: WirePaintStyle {
+                foreground: Some(WireColor::opaque(1, 2, 3)),
+                background: Some(WireColor {
+                    r: 4,
+                    g: 5,
+                    b: 6,
+                    a: 128,
+                }),
+                border: Some(WireBorder {
+                    width: 3,
+                    color: WireColor::opaque(7, 8, 9),
+                }),
+                corner_radius: 6,
+            },
+            cursor: WireCursor::Pointer,
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder.node_styled(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            style,
+            0,
+        );
+        assert_eq!(
+            decode_batch(&encoder.finish()).unwrap().nodes[0].style,
+            style
+        );
+    }
+
+    /// A guest that states no appearance still sends a full style block, and
+    /// every colour in it is absent rather than black.
+    #[test]
+    fn an_unstyled_node_defers_every_colour_to_the_host() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        let style = decode_batch(&encoder.finish()).unwrap().nodes[0].style;
+
+        assert_eq!(style.paint.foreground, None);
+        assert_eq!(style.paint.background, None);
+        assert_eq!(style.paint.border, None);
+        assert_eq!(style, WireStyle::default());
+    }
+
+    /// Rejected rather than clamped, unlike a border width: a weight of 40,000
+    /// approximates nothing, so a guest sending one has a bug worth hearing
+    /// about rather than a picture worth salvaging.
+    #[test]
+    fn rejects_a_font_weight_outside_the_css_range() {
+        for weight in [0u16, 1001, 40_000] {
+            let mut encoder = BatchEncoder::new();
+            encoder.node_styled(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                WireStyle {
+                    text: WireTextStyle {
+                        weight,
+                        ..WireTextStyle::default()
+                    },
+                    ..WireStyle::default()
+                },
+                0,
+            );
+            assert_eq!(
+                decode_batch(&encoder.finish()),
+                Err(ProtocolError::InvalidFontWeight(weight)),
+                "weight {weight} is outside 1..=1000"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_ends_of_the_weight_range() {
+        for weight in [1u16, 400, 1000] {
+            let mut encoder = BatchEncoder::new();
+            encoder.node_styled(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                WireStyle {
+                    text: WireTextStyle {
+                        weight,
+                        ..WireTextStyle::default()
+                    },
+                    ..WireStyle::default()
+                },
+                0,
+            );
+            assert!(decode_batch(&encoder.finish()).is_ok(), "weight {weight}");
+        }
+    }
+
+    /// Font size, border width and corner radius are lengths, so they obey the
+    /// same bound every other length on this wire does.
+    #[test]
+    fn style_lengths_are_bounded_like_every_other_length() {
+        let over = limits::MAX_LENGTH + 1;
+        let cases = [
+            WireStyle {
+                text: WireTextStyle {
+                    size: over,
+                    ..WireTextStyle::default()
+                },
+                ..WireStyle::default()
+            },
+            WireStyle {
+                paint: WirePaintStyle {
+                    corner_radius: over,
+                    ..WirePaintStyle::default()
+                },
+                ..WireStyle::default()
+            },
+            WireStyle {
+                paint: WirePaintStyle {
+                    border: Some(WireBorder {
+                        width: over,
+                        color: WireColor::opaque(0, 0, 0),
+                    }),
+                    ..WirePaintStyle::default()
+                },
+                ..WireStyle::default()
+            },
+        ];
+        for (index, style) in cases.into_iter().enumerate() {
+            let mut encoder = BatchEncoder::new();
+            encoder.node_styled(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                style,
+                0,
+            );
+            assert!(
+                matches!(
+                    decode_batch(&encoder.finish()),
+                    Err(ProtocolError::LengthTooLarge(_))
+                ),
+                "case {index} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_font_role_and_cursor_tags() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        let good = encoder.finish();
+        assert_eq!(good.len(), DEFAULT_BATCH_LEN, "the offsets below assume it");
+
+        // Font role opens the style block; cursor closes it.
+        for (offset, context) in [(46usize, "font role"), (56, "cursor")] {
+            let mut bytes = good.clone();
+            bytes[offset] = 99;
+            assert!(
+                matches!(
+                    decode_batch(&bytes),
+                    Err(ProtocolError::UnknownOpcode { context: c, value: 99 }) if c == context
+                ),
+                "byte {offset} is the {context} tag"
+            );
+        }
     }
 }
