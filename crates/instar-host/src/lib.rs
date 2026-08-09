@@ -518,6 +518,16 @@ impl Host {
         self.text.retire(&changes.removed);
 
         window.tree = Some(tree);
+        // And any state referring to a node the guest *hid*, which the diff
+        // does not report as removed because it is still in the tree. Runs
+        // after the promotion rather than before it, because the question is
+        // about the new snapshot -- what can still be reached now -- whereas
+        // `retire` above asks about keys the new snapshot no longer contains.
+        // Both are before the interface becomes interactive, which is the
+        // property that matters. See `Interaction::retire_hidden`.
+        if let Some(tree) = window.tree.as_ref() {
+            window.interaction.retire_hidden(tree);
+        }
         window.recompute_layout(&mut self.text);
         // Lowered here rather than on the next frame callback: the caller is
         // about to tell a guest its interface was accepted, and "accepted"

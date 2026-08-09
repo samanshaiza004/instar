@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use instar_ui_protocol::{NodeKey, WireAlign, WireJustify, WireSize};
+use instar_ui_protocol::{NodeKey, WireAlign, WireDisplay, WireJustify, WireSize};
 use taffy::prelude::*;
 
 use crate::text::{self, ShapedText, TextContext};
@@ -431,7 +431,20 @@ fn build_with(
     };
 
     let children_are_stacked = matches!(node.kind, NodeKind::Stack);
-    let id = if node.children.is_empty() {
+    // `Display::None` is absent from layout, and so is everything under it.
+    // Nothing is built rather than building it and hiding it: a node Taffy
+    // never sees produces no rect, and a key with no rect is already
+    // unhittable and unpaintable everywhere downstream. The alternative --
+    // Taffy's own `Display::None` -- would leave the subtree in the tree with
+    // zero-sized rects, which is a different and much easier thing to
+    // accidentally hit.
+    let children: Vec<&Node> = node
+        .children
+        .iter()
+        .filter(|child| child.layout.display != WireDisplay::None)
+        .collect();
+
+    let id = if children.is_empty() {
         match context {
             Some(context) => taffy
                 .new_leaf_with_context(style(node, parent_is_stack), context)
@@ -441,13 +454,12 @@ fn build_with(
                 .expect("taffy leaf"),
         }
     } else {
-        let children: Vec<taffy::NodeId> = node
-            .children
+        let ids: Vec<taffy::NodeId> = children
             .iter()
             .map(|child| build_with(taffy, child, keys, children_are_stacked))
             .collect();
         taffy
-            .new_with_children(style(node, parent_is_stack), &children)
+            .new_with_children(style(node, parent_is_stack), &ids)
             .expect("taffy branch")
     };
 

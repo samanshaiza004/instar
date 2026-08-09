@@ -116,6 +116,18 @@ pub mod opcode {
     pub const JUSTIFY_SPACE_BETWEEN: u8 = 3;
     pub const JUSTIFY_SPACE_AROUND: u8 = 4;
     pub const JUSTIFY_SPACE_EVENLY: u8 = 5;
+
+    /// Participation tags. See [`super::WireDisplay`].
+    pub const DISPLAY_NORMAL: u8 = 0;
+    pub const DISPLAY_NONE: u8 = 1;
+
+    /// Presentation tags. See [`super::WireVisibility`].
+    pub const VISIBILITY_VISIBLE: u8 = 0;
+    pub const VISIBILITY_HIDDEN: u8 = 1;
+
+    /// Clipping tags. See [`super::WireOverflow`].
+    pub const OVERFLOW_VISIBLE: u8 = 0;
+    pub const OVERFLOW_CLIP: u8 = 1;
 }
 
 /// Node flag bits.
@@ -281,6 +293,80 @@ impl WireJustify {
     }
 }
 
+/// Whether a node takes part in layout at all.
+///
+/// The one line separating this from [`WireVisibility`]: `None` leaves layout,
+/// `Hidden` stays in it and keeps its space. Everything else the two suppress
+/// — paint, hit-testing, accessibility, and the whole subtree — is identical,
+/// which is exactly why they are two properties rather than one with a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireDisplay {
+    #[default]
+    Normal,
+    /// Retained in the tree, absent from layout, paint, hit-testing, and
+    /// accessibility. Descendants are absent with it.
+    None,
+}
+
+impl WireDisplay {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Normal => opcode::DISPLAY_NORMAL,
+            Self::None => opcode::DISPLAY_NONE,
+        }
+    }
+}
+
+/// Whether a node is presented.
+///
+/// `Hidden` suppresses the **whole subtree**, deliberately unlike CSS, where a
+/// descendant may set `visibility: visible` and reappear inside an invisible
+/// ancestor. That rule makes "is this node visible?" a walk to the root rather
+/// than a lookup, and nothing Instar is trying to support needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireVisibility {
+    #[default]
+    Visible,
+    /// Occupies its space and shows nothing. Not painted, not hit-testable,
+    /// not exposed to accessibility, for itself and everything under it.
+    Hidden,
+}
+
+impl WireVisibility {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Visible => opcode::VISIBILITY_VISIBLE,
+            Self::Hidden => opcode::VISIBILITY_HIDDEN,
+        }
+    }
+}
+
+/// What happens to descendants that fall outside a node's rectangle.
+///
+/// **There is no `Scroll` variant, on purpose.** CSS makes scrolling a value
+/// of the overflow property; copying that would make CSS's overflow model
+/// Instar's architecture by accident. `Clip` is a rectangle intersection and
+/// holds no state. Scrolling is a *node kind* — a retained viewport with a
+/// host-owned offset and a retirement obligation — and a property value cannot
+/// carry that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireOverflow {
+    #[default]
+    Visible,
+    /// Paint and hit-testing for descendants are intersected with this node's
+    /// rectangle. Layout is unaffected, nothing scrolls, and no offset exists.
+    Clip,
+}
+
+impl WireOverflow {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Visible => opcode::OVERFLOW_VISIBLE,
+            Self::Clip => opcode::OVERFLOW_CLIP,
+        }
+    }
+}
+
 /// A node's layout intent.
 ///
 /// **Intent, not geometry.** A guest says "grow into the spare space, pad by
@@ -327,6 +413,12 @@ pub struct WireLayout {
     pub align_items: WireAlign,
     /// How this node distributes its children along the main axis.
     pub justify_content: WireJustify,
+    /// Whether this node takes part in layout at all.
+    pub display: WireDisplay,
+    /// Whether this node and its subtree are presented.
+    pub visibility: WireVisibility,
+    /// Whether descendants are clipped to this node's rectangle.
+    pub overflow: WireOverflow,
     /// Inset applied on all four sides, in logical pixels.
     pub padding: u16,
     /// Space between children, in logical pixels. Ignored by leaf nodes.
@@ -347,6 +439,9 @@ impl Default for WireLayout {
             align_self: None,
             align_items: WireAlign::Start,
             justify_content: WireJustify::Start,
+            display: WireDisplay::Normal,
+            visibility: WireVisibility::Visible,
+            overflow: WireOverflow::Visible,
             padding: 0,
             gap: 0,
         }
@@ -648,6 +743,42 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn display(&mut self, while_reading: &'static str) -> Result<WireDisplay, ProtocolError> {
+        match self.u8(while_reading)? {
+            opcode::DISPLAY_NORMAL => Ok(WireDisplay::Normal),
+            opcode::DISPLAY_NONE => Ok(WireDisplay::None),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "display",
+                value,
+            }),
+        }
+    }
+
+    pub fn visibility(
+        &mut self,
+        while_reading: &'static str,
+    ) -> Result<WireVisibility, ProtocolError> {
+        match self.u8(while_reading)? {
+            opcode::VISIBILITY_VISIBLE => Ok(WireVisibility::Visible),
+            opcode::VISIBILITY_HIDDEN => Ok(WireVisibility::Hidden),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "visibility",
+                value,
+            }),
+        }
+    }
+
+    pub fn overflow(&mut self, while_reading: &'static str) -> Result<WireOverflow, ProtocolError> {
+        match self.u8(while_reading)? {
+            opcode::OVERFLOW_VISIBLE => Ok(WireOverflow::Visible),
+            opcode::OVERFLOW_CLIP => Ok(WireOverflow::Clip),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: "overflow",
+                value,
+            }),
+        }
+    }
+
     /// A whole layout block, including the relationships between its fields.
     ///
     /// The bounds check lives here rather than in `instar-ui` because it is a
@@ -667,6 +798,9 @@ impl<'a> Reader<'a> {
             align_self: self.optional_align("align self")?,
             align_items: self.align("align items")?,
             justify_content: self.justify("justify content")?,
+            display: self.display("display")?,
+            visibility: self.visibility("visibility")?,
+            overflow: self.overflow("overflow")?,
             padding: self.length("padding")?,
             gap: self.length("gap")?,
         };
@@ -753,6 +887,9 @@ fn write_layout(out: &mut Vec<u8>, layout: WireLayout) {
     }
     out.push(layout.align_items.tag());
     out.push(layout.justify_content.tag());
+    out.push(layout.display.tag());
+    out.push(layout.visibility.tag());
+    out.push(layout.overflow.tag());
     out.extend_from_slice(&layout.padding.to_le_bytes());
     out.extend_from_slice(&layout.gap.to_le_bytes());
 }
@@ -1403,6 +1540,9 @@ mod tests {
             align_self: Some(WireAlign::Center),
             align_items: WireAlign::Stretch,
             justify_content: WireJustify::SpaceBetween,
+            display: WireDisplay::None,
+            visibility: WireVisibility::Hidden,
+            overflow: WireOverflow::Clip,
             padding: 7,
             gap: 3,
         };
@@ -1433,12 +1573,13 @@ mod tests {
     /// 36  align_self(1)                                absent: presence only
     /// 37  align_items(1)
     /// 38  justify_content(1)
-    /// 39  padding(2) gap(2)
-    /// 43  child_count(2)
-    /// 45  SECTION_END(1)
+    /// 39  display(1) visibility(1) overflow(1)
+    /// 42  padding(2) gap(2)
+    /// 46  child_count(2)
+    /// 48  SECTION_END(1)
     /// ```
     const DEFAULT_ALIGN_ITEMS_OFFSET: usize = 37;
-    const DEFAULT_BATCH_LEN: usize = 46;
+    const DEFAULT_BATCH_LEN: usize = 49;
 
     #[test]
     fn rejects_unknown_align_and_justify_tags() {
@@ -1462,6 +1603,9 @@ mod tests {
         for (offset, context) in [
             (DEFAULT_ALIGN_ITEMS_OFFSET, "align"),
             (DEFAULT_ALIGN_ITEMS_OFFSET + 1, "justify"),
+            (DEFAULT_ALIGN_ITEMS_OFFSET + 2, "display"),
+            (DEFAULT_ALIGN_ITEMS_OFFSET + 3, "visibility"),
+            (DEFAULT_ALIGN_ITEMS_OFFSET + 4, "overflow"),
         ] {
             let mut bytes = good.clone();
             bytes[offset] = 99;

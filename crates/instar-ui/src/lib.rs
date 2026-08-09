@@ -33,7 +33,8 @@ pub mod text;
 pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
-    NodeKey, ProtocolError, WireAlign, WireJustify, WireLayout, WireSize, limits,
+    NodeKey, ProtocolError, WireAlign, WireDisplay, WireJustify, WireLayout, WireOverflow,
+    WireSize, WireVisibility, limits,
 };
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
@@ -179,6 +180,25 @@ impl Node {
     /// `align_items`.
     pub fn with_align_self(mut self, align: WireAlign) -> Self {
         self.layout.align_self = Some(align);
+        self
+    }
+
+    /// Absent from layout, paint, hit-testing and accessibility, along with
+    /// everything under it.
+    pub fn display_none(mut self) -> Self {
+        self.layout.display = WireDisplay::None;
+        self
+    }
+
+    /// Keeps its space and shows nothing, for itself and its whole subtree.
+    pub fn hidden(mut self) -> Self {
+        self.layout.visibility = WireVisibility::Hidden;
+        self
+    }
+
+    /// Clips descendants to this node's rectangle. Does not scroll.
+    pub fn clipped(mut self) -> Self {
+        self.layout.overflow = WireOverflow::Clip;
         self
     }
 
@@ -331,7 +351,7 @@ impl Tree {
     /// are still descended into, so a button inside a container is reachable.
     /// Nodes absent from the snapshot have no geometry and cannot be hit.
     pub fn hit_test(&self, layout: &LayoutSnapshot, x: i32, y: i32) -> Option<&Node> {
-        hit_test_node(&self.root, layout, x, y)
+        hit_test_node(&self.root, layout, x, y, None)
     }
 }
 
@@ -414,21 +434,80 @@ pub fn rect_contains(rect: Rect, px: i32, py: i32) -> bool {
         && py < rect.y.saturating_add(rect.height)
 }
 
-fn hit_test_node<'a>(node: &'a Node, layout: &LayoutSnapshot, x: i32, y: i32) -> Option<&'a Node> {
+/// The overlap of two rectangles, or an empty rect if they do not meet.
+///
+/// Empty rather than `None`, because [`rect_contains`] already answers "no" for
+/// a non-positive extent — so an empty intersection needs no special case at
+/// the call site, and nested clips compose by intersecting all the way down.
+pub fn rect_intersection(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x.saturating_add(a.width)).min(b.x.saturating_add(b.width));
+    let bottom = (a.y.saturating_add(a.height)).min(b.y.saturating_add(b.height));
+    Rect::new(x, y, (right - x).max(0), (bottom - y).max(0))
+}
+
+/// Whether a node and its subtree take part in presentation at all.
+///
+/// `Display::None` and `Visibility::Hidden` differ only in whether space is
+/// reserved, and that difference is layout's business. To paint, hit-testing,
+/// and accessibility they are the same answer, and both cover the whole
+/// subtree.
+pub fn is_presented(node: &Node) -> bool {
+    node.layout.display != WireDisplay::None && node.layout.visibility != WireVisibility::Hidden
+}
+
+/// Hit-tests one node, carrying the clip its ancestors imposed.
+///
+/// `clip` is `None` when nothing above has clipped, which is not the same as
+/// clipping to the root: with `Overflow::Visible` a child that overflows its
+/// parent is genuinely reachable outside it, and that is what makes `Clip`
+/// mean something.
+///
+/// This is a behaviour change A3 had to make deliberately. The previous
+/// version returned early unless the point was inside the *parent's* rect
+/// before descending, which quietly clipped every node in the tree — so
+/// `Overflow::Visible` would have been a property that did nothing, and
+/// `Clip` a property that changed nothing.
+fn hit_test_node<'a>(
+    node: &'a Node,
+    layout: &LayoutSnapshot,
+    x: i32,
+    y: i32,
+    clip: Option<Rect>,
+) -> Option<&'a Node> {
+    if !is_presented(node) {
+        return None;
+    }
     let Some(rect) = layout.get(node.key) else {
         // No geometry means nothing to hit, and nothing beneath it either --
         // an unlaid-out subtree is not on screen.
         return None;
     };
-    if !rect_contains(rect, x, y) {
+
+    // Clip first, then descend. Reversing these reports hits on content the
+    // clip is there to exclude: inside a child's rect, outside the viewport
+    // that owns it. Scroll (B3) inherits the same ordering, with a translation
+    // between the two steps.
+    let clip = match node.layout.overflow {
+        WireOverflow::Clip => Some(match clip {
+            Some(outer) => rect_intersection(outer, rect),
+            None => rect,
+        }),
+        WireOverflow::Visible => clip,
+    };
+    if let Some(clip) = clip
+        && !rect_contains(clip, x, y)
+    {
         return None;
     }
+
     for child in node.children.iter().rev() {
-        if let Some(hit) = hit_test_node(child, layout, x, y) {
+        if let Some(hit) = hit_test_node(child, layout, x, y, clip) {
             return Some(hit);
         }
     }
-    node.kind.is_interactive().then_some(node)
+    (rect_contains(rect, x, y) && node.kind.is_interactive()).then_some(node)
 }
 
 /// A semantic outcome of interaction, for the host to act on.
@@ -1049,6 +1128,231 @@ mod tests {
         );
     }
 
+    // --- A3: Display, Visibility, Overflow. ---
+
+    /// Root > column > [button 2, button 3], where the column may be
+    /// suppressed and button 3 is what we aim at.
+    fn suppressible(suppress: fn(Node) -> Node) -> Tree {
+        Tree::new(Node::root(
+            0,
+            vec![suppress(Node::column(
+                1,
+                vec![Node::button(2, "first"), Node::button(3, "second")],
+            ))],
+        ))
+    }
+
+    #[test]
+    fn display_none_leaves_layout_entirely() {
+        let visible = layout(&suppressible(|node| node));
+        let hidden = layout(&suppressible(Node::display_none));
+
+        assert!(
+            visible.get(NodeKey::first(3)).is_some(),
+            "the fixture's button is laid out when nothing suppresses it"
+        );
+        for key in [1, 2, 3] {
+            assert_eq!(
+                hidden.get(NodeKey::first(key)),
+                None,
+                "node {key} is under Display::None and must have no geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn visibility_hidden_keeps_its_space() {
+        let visible = layout(&suppressible(|node| node));
+        let hidden = layout(&suppressible(Node::hidden));
+
+        assert_eq!(
+            hidden.get(NodeKey::first(3)),
+            visible.get(NodeKey::first(3)),
+            "Hidden still participates in layout -- that is the whole \
+             difference from Display::None"
+        );
+    }
+
+    #[test]
+    fn neither_display_none_nor_hidden_can_be_hit() {
+        let reference = suppressible(|node| node);
+        let snapshot = layout(&reference);
+        let target = snapshot.get(NodeKey::first(3)).unwrap();
+        let (x, y) = (target.x + 1, target.y + 1);
+        assert_eq!(
+            reference.hit_test(&snapshot, x, y).map(|node| node.key),
+            Some(NodeKey::first(3)),
+            "the fixture is hittable before anything suppresses it"
+        );
+
+        for (what, tree) in [
+            ("Display::None", suppressible(Node::display_none)),
+            ("Visibility::Hidden", suppressible(Node::hidden)),
+        ] {
+            // Hidden keeps its geometry, so this deliberately hit-tests
+            // against the *visible* snapshot: the point is that suppression
+            // refuses the hit even where the rectangle still exists.
+            assert_eq!(
+                tree.hit_test(&snapshot, x, y),
+                None,
+                "a descendant of {what} must not be hittable"
+            );
+        }
+    }
+
+    /// The rule CSS has and Instar deliberately does not.
+    #[test]
+    fn a_visible_child_of_a_hidden_parent_stays_hidden() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::column(
+                    1,
+                    vec![Node::button(2, "press").with_layout(WireLayout {
+                        visibility: WireVisibility::Visible,
+                        ..WireLayout::default()
+                    })],
+                )
+                .hidden(),
+            ],
+        ));
+        let snapshot = layout(&suppressible(|node| node));
+        let target = snapshot.get(NodeKey::first(2)).unwrap();
+        assert_eq!(
+            tree.hit_test(&snapshot, target.x + 1, target.y + 1),
+            None,
+            "suppression is subtree-wide; a descendant cannot opt back in"
+        );
+    }
+
+    /// A child placed outside its parent, so clipping has something to clip.
+    fn overflowing(clip: bool) -> Tree {
+        let inner = Node::button(2, "out").with_layout(WireLayout {
+            width: WireSize::Fixed(80),
+            height: WireSize::Fixed(20),
+            ..WireLayout::default()
+        });
+        let mut parent = Node::column(1, vec![inner]).with_layout(WireLayout {
+            width: WireSize::Fixed(40),
+            height: WireSize::Fixed(10),
+            ..WireLayout::default()
+        });
+        if clip {
+            parent = parent.clipped();
+        }
+        Tree::new(Node::root(0, vec![parent]))
+    }
+
+    #[test]
+    fn overflow_clip_restricts_hit_testing_and_visible_does_not() {
+        let open = overflowing(false);
+        let snapshot = layout(&open);
+        let child = snapshot.get(NodeKey::first(2)).unwrap();
+        let parent = snapshot.get(NodeKey::first(1)).unwrap();
+
+        // A point inside the child but past the parent's bottom edge.
+        let (x, y) = (child.x + 1, parent.y + parent.height + 1);
+        assert!(
+            y < child.y + child.height,
+            "the fixture must actually overflow for this to test anything"
+        );
+
+        assert_eq!(
+            open.hit_test(&snapshot, x, y).map(|node| node.key),
+            Some(NodeKey::first(2)),
+            "Overflow::Visible means an overflowing child is genuinely reachable"
+        );
+        assert_eq!(
+            overflowing(true).hit_test(&snapshot, x, y),
+            None,
+            "Overflow::Clip refuses the same point"
+        );
+    }
+
+    #[test]
+    fn overflow_clip_does_not_change_layout() {
+        assert_eq!(
+            layout(&overflowing(true)).get(NodeKey::first(2)),
+            layout(&overflowing(false)).get(NodeKey::first(2)),
+            "clipping is a paint and hit-test rule, never a layout one"
+        );
+    }
+
+    #[test]
+    fn nested_clips_intersect() {
+        let inner_rect = Rect::new(0, 0, 100, 100);
+        let outer_rect = Rect::new(0, 0, 50, 50);
+        assert_eq!(
+            rect_intersection(outer_rect, inner_rect),
+            Rect::new(0, 0, 50, 50),
+            "the intersection is the tighter of the two"
+        );
+        assert_eq!(
+            rect_intersection(Rect::new(0, 0, 10, 10), Rect::new(20, 20, 10, 10)),
+            Rect::new(20, 20, 0, 0),
+            "disjoint rectangles intersect to something empty, which \
+             rect_contains already answers no for"
+        );
+    }
+
+    /// The A3 half of the retirement invariant.
+    #[test]
+    fn hiding_a_pressed_node_retires_the_press() {
+        let reference = suppressible(|node| node);
+        let snapshot = layout(&reference);
+        let target = snapshot.get(NodeKey::first(3)).unwrap();
+
+        for (what, tree) in [
+            ("Display::None", suppressible(Node::display_none)),
+            ("Visibility::Hidden", suppressible(Node::hidden)),
+        ] {
+            let mut interaction = Interaction::new();
+            interaction.on_press(&reference, &snapshot, target.x + 1, target.y + 1);
+            assert_eq!(
+                interaction.pressed(),
+                Some(NodeKey::first(3)),
+                "the press lands before anything is suppressed"
+            );
+
+            interaction.retire_hidden(&tree);
+            assert_eq!(
+                interaction.pressed(),
+                None,
+                "{what} must retire a press against its subtree"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unaffected_press_survives_a_commit_that_hides_something_else() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::button(2, "kept"),
+                Node::column(3, vec![Node::button(4, "gone")]).hidden(),
+            ],
+        ));
+        let snapshot = layout(&Tree::new(Node::root(
+            0,
+            vec![
+                Node::button(2, "kept"),
+                Node::column(3, vec![Node::button(4, "gone")]),
+            ],
+        )));
+        let target = snapshot.get(NodeKey::first(2)).unwrap();
+
+        let mut interaction = Interaction::new();
+        interaction.on_press(&tree, &snapshot, target.x + 1, target.y + 1);
+        assert_eq!(interaction.pressed(), Some(NodeKey::first(2)));
+
+        interaction.retire_hidden(&tree);
+        assert_eq!(
+            interaction.pressed(),
+            Some(NodeKey::first(2)),
+            "retirement must not become a blanket cancel"
+        );
+    }
+
     #[test]
     fn a_disabled_button_is_not_hit() {
         let tree = sample();
@@ -1362,4 +1666,55 @@ impl Interaction {
             self.pressed = None;
         }
     }
+
+    /// Drops any state referring to a node the guest made non-interactive.
+    ///
+    /// # The invariant
+    ///
+    /// > When a subtree becomes non-interactive through `Display::None` or
+    /// > `Visibility::Hidden`, any host transient state referencing that
+    /// > subtree is retired before the new state becomes interactive.
+    ///
+    /// The same class of rule as [`Interaction::retire`], for a different
+    /// event. Deletion and hiding are genuinely different — a hidden node is
+    /// still in the tree and still live at its generation, so the ledger has
+    /// no opinion about it and `removed` never mentions it — but they share
+    /// the only thing that matters here:
+    ///
+    /// ```text
+    /// press a button  ->  guest hides it  ->  release
+    ///                 ->  a press completes against something the user can
+    ///                     neither see nor reach
+    /// ```
+    ///
+    /// This lands in A3 rather than Stage 3 because the alternative is
+    /// shipping the hole and waiting for focus, hover, and pointer capture to
+    /// each fall into it. They retire here too as they arrive.
+    pub fn retire_hidden(&mut self, tree: &Tree) {
+        let Some(pressed) = self.pressed else {
+            return;
+        };
+        // Walking from the root, because suppression is inherited: a node may
+        // be perfectly visible itself and sit under a hidden ancestor. Looking
+        // the key up directly would miss exactly that case.
+        if !reachable_for_interaction(&tree.root, pressed) {
+            self.pressed = None;
+        }
+    }
+}
+
+/// Whether `key` names a node that interaction can still reach.
+///
+/// False when the node is gone, and false when anything on the path to it is
+/// `Display::None` or `Visibility::Hidden` — which is what makes suppression
+/// subtree-wide rather than per-node.
+fn reachable_for_interaction(node: &Node, key: NodeKey) -> bool {
+    if !is_presented(node) {
+        return false;
+    }
+    node.key == key
+        || node
+            .children
+            .iter()
+            .any(|child| reachable_for_interaction(child, key))
 }

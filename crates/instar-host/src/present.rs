@@ -208,15 +208,6 @@ fn physical(rect: instar_ui::Rect, scale: f32) -> Rect {
     }
 }
 
-/// One text node's render artifact, with the logical origin of its laid-out
-/// box. Glyph positions in [`ShapedText`] are relative to that box, so the
-/// origin is added during physicalization.
-struct TextToPaint<'a> {
-    origin: (f32, f32),
-    shaped: &'a ShapedText,
-    color: Color,
-}
-
 /// Builds the paint intent for one frame.
 ///
 /// Fonts are not owned here: the shaped text carries every face it used, and
@@ -258,76 +249,126 @@ impl SceneBuilder {
         let mut commands = vec![PaintCommand::Clear {
             color: self.theme.background,
         }];
-        let mut text = Vec::new();
+        let mut fonts = Vec::new();
+        let mut font_ids = HashMap::new();
+        self.paint_node(
+            &tree.root,
+            layout,
+            pressed,
+            scale,
+            &mut commands,
+            &mut fonts,
+            &mut font_ids,
+        );
+        scene(metrics, commands, fonts)
+    }
 
-        // Tree order is paint order: the wire format is a depth-first
-        // preorder, so a parent is drawn before its children and the result
-        // is the containment the layout describes.
-        for node in tree.iter() {
-            let Some(rect) = layout.get(node.key) else {
-                continue;
-            };
-            match &node.kind {
-                // Structure only. Drawing a background for these would mean the
-                // host inventing appearance for a node whose whole meaning is
-                // "these things are stacked".
-                NodeKind::Root | NodeKind::Column | NodeKind::Row | NodeKind::Stack => {}
-                NodeKind::Text { .. } => {
-                    if let Some(shaped) = layout.text(node.key) {
-                        text.push(TextToPaint {
-                            origin: (rect.x as f32, rect.y as f32),
-                            shaped,
-                            color: self.theme.text,
-                        });
-                    }
+    /// Emits one node and its subtree, in paint order.
+    ///
+    /// # Why this recurses instead of walking `tree.iter()`
+    ///
+    /// `PushClip`/`PopClip` bracket the commands they apply to, so emitting
+    /// them needs the shape of the tree, which a flat preorder iterator has
+    /// thrown away.
+    ///
+    /// Text moved inline as part of the same change. It used to be collected
+    /// into a list and flushed after every rectangle — which no clip could
+    /// have contained, and which was already wrong for [`NodeKind::Stack`]:
+    /// with every face drawn before every glyph, a lower stacked child's text
+    /// painted over a higher child's face. Tree order is paint order for both
+    /// now.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_node(
+        &self,
+        node: &instar_ui::Node,
+        layout: &LayoutSnapshot,
+        pressed: Option<instar_ui::NodeKey>,
+        scale: f32,
+        commands: &mut Vec<PaintCommand>,
+        fonts: &mut Vec<FontResource>,
+        font_ids: &mut HashMap<u64, FontId>,
+    ) {
+        // `Display::None` and `Visibility::Hidden` are the same answer here,
+        // and both cover the subtree. A `Display::None` node has no rect
+        // either, so this is belt and braces for the first and the only guard
+        // for the second.
+        if !instar_ui::is_presented(node) {
+            return;
+        }
+        let Some(rect) = layout.get(node.key) else {
+            return;
+        };
+
+        let clipped = node.layout.overflow == instar_ui::WireOverflow::Clip;
+        if clipped {
+            commands.push(PaintCommand::PushClip {
+                rect: physical(rect, scale),
+            });
+        }
+
+        match &node.kind {
+            // Structure only. Drawing a background for these would mean the
+            // host inventing appearance for a node whose whole meaning is
+            // "these things are stacked".
+            NodeKind::Root | NodeKind::Column | NodeKind::Row | NodeKind::Stack => {}
+            NodeKind::Text { .. } => {
+                if let Some(shaped) = layout.text(node.key) {
+                    push_shaped(
+                        commands,
+                        fonts,
+                        font_ids,
+                        shaped,
+                        (rect.x as f32, rect.y as f32),
+                        scale,
+                        self.theme.text,
+                    );
                 }
-                NodeKind::Button { enabled, .. } => {
-                    let (face, ink) = match (enabled, pressed == Some(node.key)) {
-                        (false, _) => (self.theme.disabled_face, self.theme.disabled_label),
-                        (true, true) => (self.theme.pressed_face, self.theme.button_label),
-                        (true, false) => (self.theme.button_face, self.theme.button_label),
-                    };
-                    let logical_rect = rect;
-                    let rect = physical(logical_rect, scale);
-                    commands.push(PaintCommand::FillRect { rect, color: face });
-                    if *enabled {
-                        commands.push(PaintCommand::StrokeRect {
-                            rect,
-                            width: 1.0,
-                            color: self.theme.button_border,
-                        });
-                    }
-                    // Layout reserved `BUTTON_PADDING` on every side; the label
-                    // sits inside it. Same constant layout measured with, so the
-                    // text lands where the box was sized for it.
-                    if let Some(shaped) = layout.text(node.key) {
-                        text.push(TextToPaint {
-                            origin: (
-                                logical_rect.x as f32 + BUTTON_PADDING,
-                                logical_rect.y as f32 + BUTTON_PADDING,
-                            ),
-                            shaped,
-                            color: ink,
-                        });
-                    }
+            }
+            NodeKind::Button { enabled, .. } => {
+                let (face, ink) = match (enabled, pressed == Some(node.key)) {
+                    (false, _) => (self.theme.disabled_face, self.theme.disabled_label),
+                    (true, true) => (self.theme.pressed_face, self.theme.button_label),
+                    (true, false) => (self.theme.button_face, self.theme.button_label),
+                };
+                let physical_rect = physical(rect, scale);
+                commands.push(PaintCommand::FillRect {
+                    rect: physical_rect,
+                    color: face,
+                });
+                if *enabled {
+                    commands.push(PaintCommand::StrokeRect {
+                        rect: physical_rect,
+                        width: 1.0,
+                        color: self.theme.button_border,
+                    });
+                }
+                // Layout reserved `BUTTON_PADDING` on every side; the label
+                // sits inside it. Same constant layout measured with, so the
+                // text lands where the box was sized for it.
+                if let Some(shaped) = layout.text(node.key) {
+                    push_shaped(
+                        commands,
+                        fonts,
+                        font_ids,
+                        shaped,
+                        (
+                            rect.x as f32 + BUTTON_PADDING,
+                            rect.y as f32 + BUTTON_PADDING,
+                        ),
+                        scale,
+                        ink,
+                    );
                 }
             }
         }
 
-        let mut fonts = Vec::new();
-        let mut font_ids = HashMap::new();
-        for paint in text {
-            push_shaped(
-                &mut commands,
-                &mut fonts,
-                &mut font_ids,
-                paint.shaped,
-                paint.origin,
-                scale,
-                paint.color,
-            );
+        for child in &node.children {
+            self.paint_node(child, layout, pressed, scale, commands, fonts, font_ids);
         }
-        scene(metrics, commands, fonts)
+
+        if clipped {
+            commands.push(PaintCommand::PopClip);
+        }
     }
 
     /// The window before there is anything in it.
@@ -763,19 +804,93 @@ mod tests {
     #[test]
     fn text_is_painted_after_the_surfaces_it_sits_on() {
         let scene = scene(1.0, None);
-        let first_glyphs = scene
-            .commands
-            .iter()
-            .position(|command| matches!(command, PaintCommand::GlyphRun { .. }))
-            .expect("the fixture has text");
-        let last_fill = scene
-            .commands
-            .iter()
-            .rposition(|command| matches!(command, PaintCommand::FillRect { .. }))
-            .expect("the fixture has buttons");
+
+        // Per button, not globally. This used to assert that every glyph came
+        // after every fill, which held only because text was collected and
+        // flushed at the end of the scene — and that deferral was itself a bug
+        // for `Stack`, where a lower child's text painted over a higher
+        // child's face. A3 made tree order paint order for both, so the real
+        // property is the one the old assertion was standing in for: nothing
+        // is filled between a button's face and its label.
+        let mut fills = 0;
+        let mut glyphs_since_fill = 0;
+        for command in &scene.commands {
+            match command {
+                PaintCommand::FillRect { .. } => {
+                    if fills > 0 {
+                        assert!(
+                            glyphs_since_fill > 0,
+                            "a button's face was drawn before the previous \
+                             button's label, which would erase it"
+                        );
+                    }
+                    fills += 1;
+                    glyphs_since_fill = 0;
+                }
+                PaintCommand::GlyphRun { .. } => glyphs_since_fill += 1,
+                _ => {}
+            }
+        }
+        assert!(fills > 0, "the fixture has buttons");
         assert!(
-            first_glyphs > last_fill,
-            "a button drawn after its label would erase it"
+            glyphs_since_fill > 0,
+            "the last button's label must follow its face"
+        );
+    }
+
+    /// The bug the deferred-text list was hiding.
+    ///
+    /// A `Stack` overlaps its children and later ones paint over earlier ones.
+    /// With every face emitted before every glyph, the *first* child's text
+    /// was drawn after the *second* child's face — so the thing underneath
+    /// showed through the thing on top.
+    #[test]
+    fn a_stacked_child_does_not_paint_its_text_over_a_later_sibling() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![instar_ui::Node::stack(
+                1,
+                vec![
+                    instar_ui::Node::button(2, "under"),
+                    instar_ui::Node::button(3, "over"),
+                ],
+            )],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        let scene = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+
+        let kinds: Vec<&'static str> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                PaintCommand::FillRect { .. } => Some("fill"),
+                PaintCommand::GlyphRun { .. } => Some("glyphs"),
+                _ => None,
+            })
+            .collect();
+        let second_fill = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == "fill")
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("both stacked buttons are filled");
+        let first_glyphs = kinds
+            .iter()
+            .position(|kind| *kind == "glyphs")
+            .expect("both stacked buttons have labels");
+        assert!(
+            first_glyphs < second_fill,
+            "the lower child's label must be painted before the upper \
+             child's face covers it: {kinds:?}"
         );
     }
 
