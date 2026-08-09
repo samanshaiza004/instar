@@ -28,6 +28,7 @@
 pub mod diff;
 pub mod layout;
 pub mod ledger;
+pub mod scroll;
 pub mod text;
 
 pub use diff::{ChangeSet, diff};
@@ -38,6 +39,7 @@ pub use instar_ui_protocol::{
 };
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
+pub use scroll::{ScrollOffset, ScrollState};
 pub use text::{
     Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
     TextStats,
@@ -57,6 +59,12 @@ pub enum NodeKind {
     /// Lays children on top of one another at the content-box origin. Later
     /// children paint over earlier ones. Not interactive.
     Stack,
+    /// A retained viewport over exactly one content child.
+    ///
+    /// The scroll offset is host-owned and appears nowhere on the wire: a
+    /// guest describes what is scrollable, never where it is scrolled to.
+    /// Not interactive itself — the content inside it is.
+    Scroll,
     /// Displays text. Not interactive. Measured by the host.
     Text { text: String },
     /// Interactive. Hit-testing resolves to these.
@@ -84,6 +92,7 @@ impl NodeKind {
             Self::Column => "column",
             Self::Row => "row",
             Self::Stack => "stack",
+            Self::Scroll => "scroll",
             Self::Text { .. } => "text",
             Self::Button { .. } => "button",
         }
@@ -142,6 +151,14 @@ impl Node {
     /// common `Stack` is an overlay over whatever it covers.
     pub fn stack(key: u32, children: Vec<Node>) -> Self {
         Self::container(key, NodeKind::Stack, children)
+    }
+
+    /// A retained viewport over one content child.
+    ///
+    /// One child, not a list: see [`TreeError::ScrollArity`]. Clips by
+    /// definition, so `Overflow` is not a separate decision here.
+    pub fn scroll(key: u32, content: Node) -> Self {
+        Self::container(key, NodeKind::Scroll, vec![content])
     }
 
     pub fn text(key: u32, text: impl Into<String>) -> Self {
@@ -253,6 +270,14 @@ pub enum TreeError {
     /// silently swapping the node behind a key would move that state onto an
     /// unrelated control. A guest that wants a different node should use a
     /// different key.
+    /// A `Scroll` had other than exactly one child.
+    ///
+    /// One child gives one unambiguous content extent — a union of several
+    /// overlapping boxes has more than one defensible answer — and it stops
+    /// `Scroll` quietly becoming a layout container as well as a viewport. An
+    /// app that wants several things puts a `Stack` or a `Column` there.
+    #[error("{key} is a scroll with {children} children; a scroll takes exactly one")]
+    ScrollArity { key: NodeKey, children: usize },
     #[error("{key} was a {was} and is now a {now}; reuse of a key for a different kind of node")]
     KindChanged {
         key: NodeKey,
@@ -297,12 +322,24 @@ impl Tree {
             opcode::NODE_COLUMN => return Err(TreeError::BadRoot("column")),
             opcode::NODE_ROW => return Err(TreeError::BadRoot("row")),
             opcode::NODE_STACK => return Err(TreeError::BadRoot("stack")),
+            opcode::NODE_SCROLL => return Err(TreeError::BadRoot("scroll")),
             opcode::NODE_TEXT => return Err(TreeError::BadRoot("text")),
             _ => return Err(TreeError::BadRoot("button")),
         }
         for node in &batch.nodes[1..] {
             if node.kind == opcode::NODE_ROOT {
                 return Err(TreeError::NestedRoot(node.key));
+            }
+        }
+        // Checked on the flat wire nodes rather than after assembly, because
+        // `child_count` is what the guest actually said and is available
+        // before anything is built.
+        for node in &batch.nodes {
+            if node.kind == opcode::NODE_SCROLL && node.child_count != 1 {
+                return Err(TreeError::ScrollArity {
+                    key: node.key,
+                    children: node.child_count as usize,
+                });
             }
         }
         let mut cursor = 0usize;
@@ -350,8 +387,29 @@ impl Tree {
     /// an earlier sibling it overlaps. Non-interactive nodes never match but
     /// are still descended into, so a button inside a container is reachable.
     /// Nodes absent from the snapshot have no geometry and cannot be hit.
+    /// Hit-tests a tree with no viewport scrolled anywhere.
+    ///
+    /// Equivalent to [`Tree::hit_test_scrolled`] with an empty
+    /// [`ScrollState`], which is what an unscrolled interface has. Kept as the
+    /// simple spelling because most callers and most tests have nothing to
+    /// scroll.
     pub fn hit_test(&self, layout: &LayoutSnapshot, x: i32, y: i32) -> Option<&Node> {
-        hit_test_node(&self.root, layout, x, y, None)
+        self.hit_test_scrolled(layout, &ScrollState::new(), x, y)
+    }
+
+    /// Hit-tests against the host's current scroll offsets.
+    ///
+    /// The offsets are a separate argument for the same reason the
+    /// [`LayoutSnapshot`] is: they are host presentation state, not something
+    /// the tree carries or the guest can influence.
+    pub fn hit_test_scrolled(
+        &self,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        x: i32,
+        y: i32,
+    ) -> Option<&Node> {
+        hit_test_node(&self.root, layout, scroll, x, y, None)
     }
 }
 
@@ -364,6 +422,7 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
         opcode::NODE_COLUMN => NodeKind::Column,
         opcode::NODE_ROW => NodeKind::Row,
         opcode::NODE_STACK => NodeKind::Stack,
+        opcode::NODE_SCROLL => NodeKind::Scroll,
         opcode::NODE_TEXT => NodeKind::Text {
             text: wire.text.clone().unwrap_or_default(),
         },
@@ -401,6 +460,7 @@ fn encode_node(encoder: &mut BatchEncoder, node: &Node) {
         NodeKind::Column => (opcode::NODE_COLUMN, None, 0),
         NodeKind::Row => (opcode::NODE_ROW, None, 0),
         NodeKind::Stack => (opcode::NODE_STACK, None, 0),
+        NodeKind::Scroll => (opcode::NODE_SCROLL, None, 0),
         NodeKind::Text { text } => (opcode::NODE_TEXT, Some(text.as_str()), 0),
         NodeKind::Button { label, enabled } => (
             opcode::NODE_BUTTON,
@@ -472,6 +532,7 @@ pub fn is_presented(node: &Node) -> bool {
 fn hit_test_node<'a>(
     node: &'a Node,
     layout: &LayoutSnapshot,
+    scroll: &ScrollState,
     x: i32,
     y: i32,
     clip: Option<Rect>,
@@ -485,16 +546,24 @@ fn hit_test_node<'a>(
         return None;
     };
 
-    // Clip first, then descend. Reversing these reports hits on content the
-    // clip is there to exclude: inside a child's rect, outside the viewport
-    // that owns it. Scroll (B3) inherits the same ordering, with a translation
-    // between the two steps.
-    let clip = match node.layout.overflow {
-        WireOverflow::Clip => Some(match clip {
+    // One ordering, extended rather than duplicated:
+    //
+    //     ancestor clip  ->  this node's clip  ->  translate  ->  descend
+    //
+    // A `Scroll` clips because it is a viewport, so it joins `Overflow::Clip`
+    // at the same step instead of introducing a second clipping path. Only the
+    // translation is new, and it sits between the clip and the descent for the
+    // reason the clip came first: reversed, the pointer lands inside a child's
+    // translated rect while being outside the viewport that owns it, and
+    // content scrolled out of view answers hits.
+    let clips = node.layout.overflow == WireOverflow::Clip || matches!(node.kind, NodeKind::Scroll);
+    let clip = if clips {
+        Some(match clip {
             Some(outer) => rect_intersection(outer, rect),
             None => rect,
-        }),
-        WireOverflow::Visible => clip,
+        })
+    } else {
+        clip
     };
     if let Some(clip) = clip
         && !rect_contains(clip, x, y)
@@ -502,12 +571,43 @@ fn hit_test_node<'a>(
         return None;
     }
 
+    // Whether the pointer is on *this* node, decided before any translation,
+    // because this node's own rect lives in the space the pointer is still in.
+    // A `Scroll` is not interactive today so this cannot currently be observed
+    // — which is exactly why it is worth getting right now rather than leaving
+    // a latent coordinate mismatch for whatever becomes interactive next.
+    let hit_self = rect_contains(rect, x, y) && node.kind.is_interactive();
+
+    // Into content coordinates. The offset is how far the content has moved
+    // *up and left*, so a pointer at a given viewport position corresponds to
+    // a content position further down and right by the same amount.
+    //
+    // The clip travels with it. It was measured in the untranslated space, and
+    // leaving it behind would compare translated points against untranslated
+    // bounds — which looks correct until something *above* the scroll also
+    // clips, the nested case that is easiest to leave untested.
+    let (x, y, clip) = match node.kind {
+        NodeKind::Scroll => {
+            let offset = scroll.get(node.key);
+            let moved = clip.map(|clip| {
+                Rect::new(
+                    clip.x + offset.x,
+                    clip.y + offset.y,
+                    clip.width,
+                    clip.height,
+                )
+            });
+            (x + offset.x, y + offset.y, moved)
+        }
+        _ => (x, y, clip),
+    };
+
     for child in node.children.iter().rev() {
-        if let Some(hit) = hit_test_node(child, layout, x, y, clip) {
+        if let Some(hit) = hit_test_node(child, layout, scroll, x, y, clip) {
             return Some(hit);
         }
     }
-    (rect_contains(rect, x, y) && node.kind.is_interactive()).then_some(node)
+    hit_self.then_some(node)
 }
 
 /// A semantic outcome of interaction, for the host to act on.
@@ -1295,6 +1395,176 @@ mod tests {
         );
     }
 
+    // --- B1: the retained viewport. ---
+
+    /// A 100-tall viewport over 400-tall content, with a button at content
+    /// y = 200 — well outside the viewport until something scrolls.
+    ///
+    /// The numbers are concrete on purpose. A property test over arbitrary
+    /// offsets would pass against a sign error as readily as against the right
+    /// answer; "200 minus 150 is 50" does not.
+    fn scrolled_fixture() -> Tree {
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    1,
+                    Node::column(
+                        2,
+                        vec![
+                            Node::text(3, "spacer").with_layout(WireLayout {
+                                height: WireSize::Fixed(200),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(4, "target").with_layout(WireLayout {
+                                height: WireSize::Fixed(40),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(5, "tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(160),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    #[test]
+    fn the_fixture_puts_its_target_outside_the_viewport() {
+        let snapshot = layout(&scrolled_fixture());
+        assert_eq!(
+            snapshot.get(NodeKey::first(1)).unwrap().height,
+            100,
+            "the viewport is 100 tall"
+        );
+        assert_eq!(
+            snapshot.get(NodeKey::first(4)).unwrap().y,
+            200,
+            "and the target sits at content y = 200, outside it"
+        );
+    }
+
+    #[test]
+    fn scrolling_brings_content_into_the_viewport_and_hit_testing_follows() {
+        let tree = scrolled_fixture();
+        let snapshot = layout(&tree);
+        let mut scroll = ScrollState::new();
+        scroll.set(NodeKey::first(1), ScrollOffset::new(0, 150));
+
+        // 200 in content space, minus an offset of 150, is 50 in the viewport.
+        assert_eq!(
+            tree.hit_test_scrolled(&snapshot, &scroll, 5, 50)
+                .map(|node| node.key),
+            Some(NodeKey::first(4)),
+            "a click at viewport y = 50 must reach the button at content y = 200"
+        );
+        assert_eq!(
+            tree.hit_test_scrolled(&snapshot, &scroll, 5, 200),
+            None,
+            "and the button's unscrolled position is now outside the viewport, \
+             so nothing is there"
+        );
+    }
+
+    #[test]
+    fn nothing_outside_the_viewport_can_be_hit_however_far_it_scrolls() {
+        let tree = scrolled_fixture();
+        let snapshot = layout(&tree);
+        let mut scroll = ScrollState::new();
+        scroll.set(NodeKey::first(1), ScrollOffset::new(0, 150));
+
+        for y in [101, 150, 260, 399] {
+            assert_eq!(
+                tree.hit_test_scrolled(&snapshot, &scroll, 5, y),
+                None,
+                "y = {y} is past the viewport's bottom edge and must not hit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscrolled_viewport_behaves_as_though_scroll_did_not_exist() {
+        let tree = scrolled_fixture();
+        let snapshot = layout(&tree);
+        assert_eq!(
+            tree.hit_test(&snapshot, 5, 50),
+            None,
+            "at offset zero the target is still at 200 and the viewport ends at 100"
+        );
+    }
+
+    /// The composition A3's ordering promised: ancestor clip, viewport clip,
+    /// translation, descent. A parallel clipping path inside `Scroll` would
+    /// pass every test above and fail this one.
+    #[test]
+    fn an_ancestor_clip_still_binds_inside_a_scrolled_viewport() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                // Clips to 40 tall, around a viewport that is 100 tall.
+                Node::column(
+                    1,
+                    vec![
+                        Node::scroll(
+                            2,
+                            Node::column(
+                                3,
+                                vec![
+                                    Node::text(4, "spacer").with_layout(WireLayout {
+                                        height: WireSize::Fixed(200),
+                                        ..WireLayout::default()
+                                    }),
+                                    Node::button(5, "target").with_layout(WireLayout {
+                                        height: WireSize::Fixed(40),
+                                        ..WireLayout::default()
+                                    }),
+                                ],
+                            ),
+                        )
+                        .with_layout(WireLayout {
+                            height: WireSize::Fixed(100),
+                            align_self: Some(WireAlign::Stretch),
+                            ..WireLayout::default()
+                        }),
+                    ],
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(40),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                })
+                .clipped(),
+            ],
+        ));
+        let snapshot = layout(&tree);
+        let mut scroll = ScrollState::new();
+        // 200 - 180 = 20, so the 40-tall button spans viewport y 20..60 --
+        // straddling the ancestor's 40px clip, which is what makes the two
+        // assertions below disagree.
+        scroll.set(NodeKey::first(2), ScrollOffset::new(0, 180));
+
+        assert_eq!(
+            tree.hit_test_scrolled(&snapshot, &scroll, 5, 30)
+                .map(|node| node.key),
+            Some(NodeKey::first(5)),
+            "inside both the ancestor clip and the viewport, the scrolled \
+             button is reachable"
+        );
+        assert_eq!(
+            tree.hit_test_scrolled(&snapshot, &scroll, 5, 50),
+            None,
+            "the same button, past the ancestor's 40px clip: the viewport \
+             alone would have allowed this, so only a composed clip refuses it"
+        );
+    }
+
     /// The A3 half of the retirement invariant.
     #[test]
     fn hiding_a_pressed_node_retires_the_press() {
@@ -1307,7 +1577,13 @@ mod tests {
             ("Visibility::Hidden", suppressible(Node::hidden)),
         ] {
             let mut interaction = Interaction::new();
-            interaction.on_press(&reference, &snapshot, target.x + 1, target.y + 1);
+            interaction.on_press(
+                &reference,
+                &snapshot,
+                &ScrollState::new(),
+                target.x + 1,
+                target.y + 1,
+            );
             assert_eq!(
                 interaction.pressed(),
                 Some(NodeKey::first(3)),
@@ -1342,7 +1618,13 @@ mod tests {
         let target = snapshot.get(NodeKey::first(2)).unwrap();
 
         let mut interaction = Interaction::new();
-        interaction.on_press(&tree, &snapshot, target.x + 1, target.y + 1);
+        interaction.on_press(
+            &tree,
+            &snapshot,
+            &ScrollState::new(),
+            target.x + 1,
+            target.y + 1,
+        );
         assert_eq!(interaction.pressed(), Some(NodeKey::first(2)));
 
         interaction.retire_hidden(&tree);
@@ -1598,8 +1880,17 @@ impl Interaction {
     ///
     /// Activation deliberately waits for the release, matching every desktop
     /// convention: pressing a button and dragging away must not activate it.
-    pub fn on_press(&mut self, tree: &Tree, layout: &LayoutSnapshot, x: i32, y: i32) {
-        self.pressed = tree.hit_test(layout, x, y).map(|node| node.key);
+    pub fn on_press(
+        &mut self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        x: i32,
+        y: i32,
+    ) {
+        self.pressed = tree
+            .hit_test_scrolled(layout, scroll, x, y)
+            .map(|node| node.key);
     }
 
     /// A release landed at `(x, y)`.
@@ -1611,11 +1902,12 @@ impl Interaction {
         &mut self,
         tree: &Tree,
         layout: &LayoutSnapshot,
+        scroll: &ScrollState,
         x: i32,
         y: i32,
     ) -> Option<UiAction> {
         let pressed = self.pressed.take()?;
-        let released_on = tree.hit_test(layout, x, y)?.key;
+        let released_on = tree.hit_test_scrolled(layout, scroll, x, y)?.key;
         (released_on == pressed).then_some(UiAction::ButtonActivated(pressed))
     }
 

@@ -165,24 +165,43 @@ fn justify(value: WireJustify) -> JustifyContent {
     }
 }
 
-/// A2 collapsed this from three variants to one question.
+/// What a parent imposes on its children beyond ordinary flex layout.
 ///
-/// It began as `ParentAxis { Column, Row, Stack }`, because `Fill` meant
-/// cross-axis stretch and a child therefore had to know which way its parent
-/// laid out before it could know which axis `Fill` referred to. Deleting
-/// `Fill` deleted that: a child now states `align_self` directly, and
-/// `Row` versus `Column` is read off the *parent's own* kind when styling the
-/// parent, never handed down.
+/// A2 deleted the previous `ParentAxis { Column, Row, Stack }`, which existed
+/// only because `Fill` meant cross-axis stretch and a child had to know its
+/// parent's direction to know which axis that was. Direction is no longer
+/// handed down, and `Row` versus `Column` is read off the parent's own kind
+/// when styling the parent.
 ///
-/// What survives is placement inside a [`NodeKind::Stack`], which is a grid
-/// and needs its children pinned to the single cell. That is a yes-or-no
-/// question, so it is a bool.
-fn style(node: &Node, parent_is_stack: bool) -> Style {
+/// What is left is genuinely about the parent: a `Stack` is a grid and pins
+/// its children to one cell, and a `Scroll` is a viewport whose content must
+/// keep its natural size. Both are things a child cannot work out for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildOf {
+    Normal,
+    /// A [`NodeKind::Stack`]: one grid cell, natural size, no stretch.
+    StackCell,
+    /// A [`NodeKind::Scroll`]: the content of a viewport.
+    ScrollContent,
+}
+
+fn style(node: &Node, parent: ChildOf) -> Style {
     let layout = node.layout;
     let (display, flex_direction, gap) = match &node.kind {
         NodeKind::Stack => (
             Display::Grid,
             FlexDirection::Row,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        // A viewport lays its one content child out as a column, so the child
+        // takes its natural height rather than being squeezed to the
+        // viewport's -- the overflow is the whole point.
+        NodeKind::Scroll => (
+            Display::Flex,
+            FlexDirection::Column,
             Size {
                 width: LengthPercentage::length(0.0),
                 height: LengthPercentage::length(0.0),
@@ -212,10 +231,19 @@ fn style(node: &Node, parent_is_stack: bool) -> Style {
     // rather than resolved here. The one exception is a stack child, which
     // overlaps at its natural size unless it asked for something else;
     // inheriting a stretch there would defeat the point of the stack.
-    let align_self = match (layout.align_self, parent_is_stack) {
+    let align_self = match (layout.align_self, parent) {
         (Some(value), _) => Some(align(value)),
-        (None, true) => Some(AlignItems::START),
-        (None, false) => None,
+        (None, ChildOf::StackCell) => Some(AlignItems::START),
+        (None, _) => None,
+    };
+
+    // A viewport's content keeps the size it asked for. The default shrink of
+    // 1.0 would let Taffy compress it to the viewport, and content that has
+    // been squeezed to fit is content that never overflows -- which would make
+    // the scrollable extent permanently zero and the whole node pointless.
+    let flex_shrink = match parent {
+        ChildOf::ScrollContent => 0.0,
+        _ => layout.shrink,
     };
 
     Style {
@@ -236,11 +264,11 @@ fn style(node: &Node, parent_is_stack: bool) -> Style {
         // Finite and in range because `Reader::flex_factor` is the only way
         // one reaches this crate.
         flex_grow: layout.grow,
-        flex_shrink: layout.shrink,
+        flex_shrink,
         align_self,
         align_items: Some(align(layout.align_items)),
         justify_content: Some(justify(layout.justify_content)),
-        justify_self: parent_is_stack.then_some(AlignItems::START),
+        justify_self: (parent == ChildOf::StackCell).then_some(AlignItems::START),
         padding: taffy::Rect::length(f32::from(layout.padding)),
         gap,
         grid_template_rows: if matches!(node.kind, NodeKind::Stack) {
@@ -253,12 +281,12 @@ fn style(node: &Node, parent_is_stack: bool) -> Style {
         } else {
             Vec::new()
         },
-        grid_row: if parent_is_stack {
+        grid_row: if parent == ChildOf::StackCell {
             line(1)
         } else {
             Default::default()
         },
-        grid_column: if parent_is_stack {
+        grid_column: if parent == ChildOf::StackCell {
             line(1)
         } else {
             Default::default()
@@ -408,15 +436,15 @@ fn build(
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
 ) -> taffy::NodeId {
     // The root's style is replaced wholesale in `compute`, and the root is
-    // never a stack child.
-    build_with(taffy, node, keys, false)
+    // never anyone's special child.
+    build_with(taffy, node, keys, ChildOf::Normal)
 }
 
 fn build_with(
     taffy: &mut TaffyTree<MeasureContext>,
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
-    parent_is_stack: bool,
+    parent: ChildOf,
 ) -> taffy::NodeId {
     let context = match &node.kind {
         NodeKind::Text { text } => Some(MeasureContext {
@@ -430,7 +458,11 @@ fn build_with(
         _ => None,
     };
 
-    let children_are_stacked = matches!(node.kind, NodeKind::Stack);
+    let child_context = match node.kind {
+        NodeKind::Stack => ChildOf::StackCell,
+        NodeKind::Scroll => ChildOf::ScrollContent,
+        _ => ChildOf::Normal,
+    };
     // `Display::None` is absent from layout, and so is everything under it.
     // Nothing is built rather than building it and hiding it: a node Taffy
     // never sees produces no rect, and a key with no rect is already
@@ -447,19 +479,17 @@ fn build_with(
     let id = if children.is_empty() {
         match context {
             Some(context) => taffy
-                .new_leaf_with_context(style(node, parent_is_stack), context)
+                .new_leaf_with_context(style(node, parent), context)
                 .expect("taffy leaf"),
-            None => taffy
-                .new_leaf(style(node, parent_is_stack))
-                .expect("taffy leaf"),
+            None => taffy.new_leaf(style(node, parent)).expect("taffy leaf"),
         }
     } else {
         let ids: Vec<taffy::NodeId> = children
             .iter()
-            .map(|child| build_with(taffy, child, keys, children_are_stacked))
+            .map(|child| build_with(taffy, child, keys, child_context))
             .collect();
         taffy
-            .new_with_children(style(node, parent_is_stack), &ids)
+            .new_with_children(style(node, parent), &ids)
             .expect("taffy branch")
     };
 

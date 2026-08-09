@@ -48,8 +48,8 @@ use instar_paint::{
     PaintScene, PhysicalSize, Rect,
 };
 use instar_ui::{
-    Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ShapedText, ShapingStyle,
-    TextContext, Tree,
+    Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ScrollOffset, ScrollState,
+    ShapedText, ShapingStyle, TextContext, Tree,
 };
 use instar_window::WindowMetricsChanged;
 
@@ -242,6 +242,7 @@ impl SceneBuilder {
         &self,
         tree: &Tree,
         layout: &LayoutSnapshot,
+        scroll: &ScrollState,
         metrics: &WindowMetricsChanged,
         pressed: Option<instar_ui::NodeKey>,
     ) -> PaintScene {
@@ -254,6 +255,8 @@ impl SceneBuilder {
         self.paint_node(
             &tree.root,
             layout,
+            scroll,
+            ScrollOffset::ZERO,
             pressed,
             scale,
             &mut commands,
@@ -282,6 +285,8 @@ impl SceneBuilder {
         &self,
         node: &instar_ui::Node,
         layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        translation: ScrollOffset,
         pressed: Option<instar_ui::NodeKey>,
         scale: f32,
         commands: &mut Vec<PaintCommand>,
@@ -298,19 +303,47 @@ impl SceneBuilder {
         let Some(rect) = layout.get(node.key) else {
             return;
         };
+        // Every rect out of the snapshot is in absolute layout coordinates.
+        // Painting inside a scrolled viewport moves it by the accumulated
+        // translation of the viewports above it.
+        let rect = instar_ui::Rect::new(
+            rect.x - translation.x,
+            rect.y - translation.y,
+            rect.width,
+            rect.height,
+        );
 
-        let clipped = node.layout.overflow == instar_ui::WireOverflow::Clip;
+        // A `Scroll` clips because it is a viewport, joining `Overflow::Clip`
+        // at the step A3 established rather than opening a second path. Only
+        // the translation below is new.
+        let clipped = node.layout.overflow == instar_ui::WireOverflow::Clip
+            || matches!(node.kind, NodeKind::Scroll);
         if clipped {
             commands.push(PaintCommand::PushClip {
                 rect: physical(rect, scale),
             });
         }
 
+        // Descendants of a viewport move up and left by its offset, which is
+        // what "scrolled down" means. Accumulated rather than replaced, so a
+        // viewport inside a viewport composes.
+        let child_translation = match node.kind {
+            NodeKind::Scroll => {
+                let offset = scroll.get(node.key);
+                ScrollOffset::new(translation.x + offset.x, translation.y + offset.y)
+            }
+            _ => translation,
+        };
+
         match &node.kind {
             // Structure only. Drawing a background for these would mean the
             // host inventing appearance for a node whose whole meaning is
             // "these things are stacked".
-            NodeKind::Root | NodeKind::Column | NodeKind::Row | NodeKind::Stack => {}
+            NodeKind::Root
+            | NodeKind::Column
+            | NodeKind::Row
+            | NodeKind::Stack
+            | NodeKind::Scroll => {}
             NodeKind::Text { .. } => {
                 if let Some(shaped) = layout.text(node.key) {
                     push_shaped(
@@ -363,7 +396,17 @@ impl SceneBuilder {
         }
 
         for child in &node.children {
-            self.paint_node(child, layout, pressed, scale, commands, fonts, font_ids);
+            self.paint_node(
+                child,
+                layout,
+                scroll,
+                child_translation,
+                pressed,
+                scale,
+                commands,
+                fonts,
+                font_ids,
+            );
         }
 
         if clipped {
@@ -589,7 +632,7 @@ mod tests {
                 metrics.logical_size.height as f32,
             ),
         );
-        SceneBuilder::new().app_scene(&tree, &layout, &metrics, pressed)
+        SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, pressed)
     }
 
     fn fills(scene: &PaintScene) -> Vec<Rect> {
@@ -737,7 +780,8 @@ mod tests {
                 metrics.logical_size.height as f32,
             ),
         );
-        let scene = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
         let keys = [LABEL, BUTTON, DISABLED];
 
         for run in glyph_runs(&scene) {
@@ -838,6 +882,109 @@ mod tests {
         );
     }
 
+    /// Painting is the other half of the same transform hit-testing does.
+    ///
+    /// Concrete numbers rather than a property: a button at content y = 200
+    /// under an offset of 150 must be filled at viewport y = 50, and a sign
+    /// error would put it at 350 while still passing any "it moved" check.
+    #[test]
+    fn a_scrolled_viewport_paints_its_content_translated() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![
+                instar_ui::Node::scroll(
+                    1,
+                    instar_ui::Node::column(
+                        2,
+                        vec![
+                            instar_ui::Node::text(3, "spacer").with_layout(instar_ui::WireLayout {
+                                height: instar_ui::WireSize::Fixed(200),
+                                ..instar_ui::WireLayout::default()
+                            }),
+                            instar_ui::Node::button(4, "target").with_layout(
+                                instar_ui::WireLayout {
+                                    height: instar_ui::WireSize::Fixed(40),
+                                    ..instar_ui::WireLayout::default()
+                                },
+                            ),
+                        ],
+                    ),
+                )
+                .with_layout(instar_ui::WireLayout {
+                    height: instar_ui::WireSize::Fixed(100),
+                    align_self: Some(instar_ui::WireAlign::Stretch),
+                    ..instar_ui::WireLayout::default()
+                }),
+            ],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        assert_eq!(
+            layout.get(NodeKey::first(4)).unwrap().y,
+            200,
+            "the fixture puts its target at content y = 200"
+        );
+
+        let mut scroll = ScrollState::new();
+        scroll.set(NodeKey::first(1), ScrollOffset::new(0, 150));
+        let scene = SceneBuilder::new().app_scene(&tree, &layout, &scroll, &metrics, None);
+
+        let filled: Vec<i32> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![50],
+            "200 minus an offset of 150 is 50, and nothing else is filled"
+        );
+    }
+
+    /// A viewport is a clip, and it uses the one A3 established.
+    #[test]
+    fn a_scroll_pushes_a_clip_and_balances_it() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![instar_ui::Node::scroll(
+                1,
+                instar_ui::Node::button(2, "inside"),
+            )],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
+
+        assert!(
+            scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, PaintCommand::PushClip { .. })),
+            "a viewport clips without being told to"
+        );
+        scene
+            .validate()
+            .expect("every PushClip a scroll emits must be matched");
+    }
+
     /// The bug the deferred-text list was hiding.
     ///
     /// A `Stack` overlaps its children and later ones paint over earlier ones.
@@ -865,7 +1012,8 @@ mod tests {
                 metrics.logical_size.height as f32,
             ),
         );
-        let scene = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
 
         let kinds: Vec<&'static str> = scene
             .commands
@@ -907,9 +1055,11 @@ mod tests {
             ),
         );
 
-        let with = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+        let with =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
         layout.text.clear();
-        let without = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+        let without =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
 
         assert_eq!(
             fills(&with),

@@ -66,6 +66,7 @@ use std::time::{Duration, Instant};
 use instar_host::SceneBuilder;
 use instar_paint::PhysicalSize as PaintSize;
 use instar_shell::{Presenter, default_font};
+use instar_ui::ScrollState;
 use instar_ui::protocol::decode_batch;
 use instar_ui::{ChangeSet, Node, NodeKind, TextContext, Tree, Viewport, diff};
 use instar_window::{LogicalSize, PhysicalSize as WindowSize, WindowId, WindowMetricsChanged};
@@ -405,7 +406,7 @@ fn host_pass(
     *checksum += snapshot.len();
 
     let started = Instant::now();
-    let scene = builder.app_scene(tree, &snapshot, metrics, None);
+    let scene = builder.app_scene(tree, &snapshot, &ScrollState::new(), metrics, None);
     let lower = started.elapsed();
     *checksum += scene.commands.len();
 

@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -76,7 +76,7 @@ pub mod limits {
 
 /// Node kind opcodes.
 ///
-/// Deliberately six. The layout vocabulary is meant to stay small enough to
+/// Deliberately seven. The layout vocabulary is meant to stay small enough to
 /// reason about completely; a general CSS surface is not a goal, and every
 /// kind added here is one the host must lay out, hit-test, and paint forever.
 pub mod opcode {
@@ -93,6 +93,9 @@ pub mod opcode {
     /// Overlaps its children at the content-box origin; later children paint
     /// over earlier ones.
     pub const NODE_STACK: u8 = 5;
+    /// A retained viewport over exactly one content child, with a host-owned
+    /// scroll offset the guest cannot see or set.
+    pub const NODE_SCROLL: u8 = 6;
 
     pub const SECTION_END: u8 = 0;
     pub const SECTION_TREE: u8 = 1;
@@ -1015,7 +1018,11 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
         let key = reader.node_key("node key")?;
         let node_flags = reader.u8("node flags")?;
         let text = match kind {
-            opcode::NODE_ROOT | opcode::NODE_COLUMN | opcode::NODE_ROW | opcode::NODE_STACK => None,
+            opcode::NODE_ROOT
+            | opcode::NODE_COLUMN
+            | opcode::NODE_ROW
+            | opcode::NODE_STACK
+            | opcode::NODE_SCROLL => None,
             opcode::NODE_TEXT => Some(reader.text("text content")?),
             opcode::NODE_BUTTON => Some(reader.text("button label")?),
             value => {

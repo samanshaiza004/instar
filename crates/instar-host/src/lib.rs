@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, KeyLedger, TextContext, TreeError, UiAction, Viewport};
+use instar_ui::{Interaction, KeyLedger, ScrollState, TextContext, TreeError, UiAction, Viewport};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
 };
@@ -179,6 +179,9 @@ pub struct HostWindow {
     interaction: Interaction,
     /// The id lifecycle for the guest currently owning this window.
     ledger: KeyLedger,
+    /// Where each retained viewport is scrolled to. Host-owned: no guest sets
+    /// one, and none can read one.
+    scroll: ScrollState,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -249,6 +252,35 @@ impl HostWindow {
             metrics.logical_size.height as f32,
         );
         self.layout = Some(tree.layout(text, viewport));
+    }
+
+    /// Confines every retained offset to what the current layout leaves
+    /// scrollable.
+    ///
+    /// Called after layout and before the snapshot becomes interactive.
+    /// Content that shrank must not leave a viewport showing a region that no
+    /// longer exists, and a hit-test against a stale offset resolves to the
+    /// wrong node rather than to nothing — which is worse, because it looks
+    /// like it worked.
+    ///
+    /// The scrollable extent is the content's size less the viewport's, floored
+    /// at zero: content that fits has nothing to scroll. A viewport that is not
+    /// laid out right now — hidden, or under a `Display::None` ancestor — has
+    /// no extent to clamp against, and its offset is left alone rather than
+    /// zeroed, because hiding retains.
+    fn clamp_scroll(&mut self) {
+        let (Some(tree), Some(layout)) = (self.tree.as_ref(), self.layout.as_ref()) else {
+            return;
+        };
+        self.scroll.clamp_to(tree, &|key| {
+            let viewport = layout.get(key)?;
+            let content = instar_ui::scroll::content_of(tree.find(key)?)?;
+            let content_rect = layout.get(content.key)?;
+            Some(instar_ui::ScrollOffset::new(
+                (content_rect.width - viewport.width).max(0),
+                (content_rect.height - viewport.height).max(0),
+            ))
+        });
     }
 }
 
@@ -344,10 +376,13 @@ impl Host {
                 .scenes
                 .crash_scene(&mut self.text, *generation, message, metrics),
             PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
-                (Some(tree), Some(layout)) => {
-                    self.scenes
-                        .app_scene(tree, layout, metrics, window.interaction.pressed())
-                }
+                (Some(tree), Some(layout)) => self.scenes.app_scene(
+                    tree,
+                    layout,
+                    &window.scroll,
+                    metrics,
+                    window.interaction.pressed(),
+                ),
                 // Ready, but the guest has not committed anything yet. An
                 // empty background beats an unpainted buffer, which on most
                 // platforms is whatever was in memory.
@@ -516,6 +551,11 @@ impl Host {
         // reused its key. See `Interaction::retire`.
         window.interaction.retire(&changes.removed);
         self.text.retire(&changes.removed);
+        // Deletion destroys a viewport's offset; hiding does not. This is the
+        // deletion half, and it sits with the other retirements for the same
+        // reason -- state that outlives the node it describes eventually
+        // lands on something else.
+        window.scroll.retire(&changes.removed);
 
         window.tree = Some(tree);
         // And any state referring to a node the guest *hid*, which the diff
@@ -529,6 +569,12 @@ impl Host {
             window.interaction.retire_hidden(tree);
         }
         window.recompute_layout(&mut self.text);
+        // After layout, because the scrollable extent is a layout answer, and
+        // before the scene is lowered and the commit is acknowledged, because
+        // both of those are the interface becoming interactive. Content that
+        // shrank must not leave a viewport showing a region that is no longer
+        // there.
+        window.clamp_scroll();
         // Lowered here rather than on the next frame callback: the caller is
         // about to tell a guest its interface was accepted, and "accepted"
         // should mean the host has everything it needs to show it.
@@ -600,14 +646,15 @@ impl Host {
 
         let (x, y) = event.logical_pos.round();
         let held = window.interaction.pressed();
+        let scroll = &window.scroll;
         let mut effects = match event.state {
             PointerState::Pressed => {
-                window.interaction.on_press(tree, layout, x, y);
+                window.interaction.on_press(tree, layout, scroll, x, y);
                 Vec::new()
             }
             PointerState::Released => window
                 .interaction
-                .on_release(tree, layout, x, y)
+                .on_release(tree, layout, scroll, x, y)
                 .map(|action: UiAction| vec![HostEffect::SendToGuest(action.encode())])
                 .unwrap_or_default(),
         };
@@ -1304,6 +1351,131 @@ mod tests {
             "the press belonged to a node that no longer exists; completing it \
              against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    /// A viewport whose content shrank must not keep pointing past the end.
+    ///
+    /// Driven through `apply_tree` rather than by calling the clamp directly,
+    /// because the property is about *ordering* — the offset is confined
+    /// before the new snapshot is lowered and acknowledged, not at some later
+    /// convenient moment.
+    #[test]
+    fn shrinking_content_clamps_a_retained_offset() {
+        use instar_ui::{Node, ScrollOffset, WireLayout, WireSize};
+
+        let build = |content_height: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        10,
+                        Node::text(11, "content").with_layout(WireLayout {
+                            height: WireSize::Fixed(content_height),
+                            ..WireLayout::default()
+                        }),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        ..WireLayout::default()
+                    }),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(500)).expect("valid tree");
+
+        let window = host.windows.get_mut(&WINDOW).unwrap();
+        window
+            .scroll
+            .set(NodeKey::first(10), ScrollOffset::new(0, 300));
+        assert_eq!(
+            window.scroll.get(NodeKey::first(10)).y,
+            300,
+            "400 of scrollable extent leaves 300 reachable"
+        );
+
+        // The same viewport over content that now barely overflows it.
+        host.apply_tree(WINDOW, build(150)).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            50,
+            "150 of content in a 100 viewport leaves 50, and the offset is \
+             pulled back to it"
+        );
+
+        host.apply_tree(WINDOW, build(80)).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            0,
+            "content that fits leaves nothing to scroll"
+        );
+    }
+
+    /// Deletion destroys the offset; a commit that keeps the viewport does not.
+    #[test]
+    fn a_deleted_viewport_loses_its_offset_and_a_surviving_one_keeps_it() {
+        use instar_ui::{Node, ScrollOffset, WireLayout, WireSize};
+
+        let with_scroll = || {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        10,
+                        Node::text(11, "content").with_layout(WireLayout {
+                            height: WireSize::Fixed(500),
+                            ..WireLayout::default()
+                        }),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        ..WireLayout::default()
+                    }),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, with_scroll()).expect("valid tree");
+        host.windows
+            .get_mut(&WINDOW)
+            .unwrap()
+            .scroll
+            .set(NodeKey::first(10), ScrollOffset::new(0, 200));
+
+        // A commit that changes something else entirely leaves the offset be.
+        let mut kept = with_scroll();
+        kept.root.children.push(Node::text(12, "sibling"));
+        host.apply_tree(WINDOW, kept).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            200,
+            "a commit that leaves the viewport alive preserves its offset"
+        );
+
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(12, "gone")])),
+        )
+        .expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.len(),
+            0,
+            "deleting the viewport destroys the offset rather than orphaning it"
         );
     }
 
