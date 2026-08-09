@@ -298,17 +298,77 @@ holding tens of ids, ~65k entries for one that has burned the whole budget.
 Not measured, and not worth measuring until a guest exists that churns ids at
 all.
 
-### Rest of Stage 2
+### Rest of Stage 2, in order
 
-Node kinds `Row`, `Stack`, `Scroll`. Layout: `min`/`max`, alignment, flex grow,
-display, visibility, overflow. Style: foreground, background, border, corner
-radius, font role/size/weight, padding, gap, cursor. **No opacity** — a property
-by that name will be assumed to composite a subtree, and per-node paint alpha
-is not that. `StrokeRoundedRect` is needed in `instar-paint` and the Vello
-backend: `StrokeRect` currently rejects any width but 1.0 and there is no
-rounded stroke.
+Layout first, paint second, and each package lands on a green baseline so a
+failure can be attributed to the package that caused it.
 
-Grid is not exposed, even though Taffy supports it.
+```text
+A1  Row, Stack
+A2  sizing: Fill / Content / Fixed, min/max, grow/shrink, alignment
+A3  Display, Visibility, Overflow
+B1  Scroll viewport semantics
+B2  host-owned scroll offset and clamping
+B3  clipping and transformed hit-test
+C   style: foreground, background, border, corner radius,
+    font role/size/weight, padding, gap, cursor
+```
+
+Styling is last and separate. Mixing paint vocabulary into the first serious
+layout expansion makes failures harder to classify — a wrong rectangle and a
+wrong colour on the same commit are two searches, not one.
+
+**No opacity**, whenever C lands — a property by that name will be assumed to
+composite a subtree, and per-node paint alpha is not that. C also needs
+`StrokeRoundedRect` in `instar-paint` and the Vello backend: `StrokeRect`
+currently rejects any width but 1.0 and there is no rounded stroke.
+
+Grid is not exposed as a node kind, even though Taffy supports it. `Stack` is
+implemented over a single grid cell internally, which is the ordinary way to
+overlap children and stays an implementation detail of `instar-ui::layout` —
+the module already owns the rule that no Taffy type reaches its public API.
+
+**No floats on the wire.** The vocabulary A2 adds — flex factors especially —
+is float-shaped in CSS and stays integral here. A `f32` crossing a trust
+boundary carries NaN and infinity, which propagate silently through layout
+arithmetic into geometry, and bounding them costs more than the expressiveness
+is worth.
+
+### Scroll: the invariants, frozen before the node exists
+
+Stage 3's scroll semantics were written down before there was a `Scroll` node
+to argue about. They are the contract for B1–B3 and are restated here as
+obligations rather than description:
+
+```text
+offset is host-owned            a guest cannot set, read, or veto it
+wheel response needs no guest round-trip
+content shrinks                 offset clamps to the new extent
+Display::None                   offset is retained, interaction is not
+deleted Scroll                  offset is destroyed with the node
+hit test                        clip to the viewport, then translate into
+                                content space -- in that order
+```
+
+Two of those are the ones a plausible implementation gets wrong.
+
+**`Display::None` retains, deletion destroys.** They look alike and are
+opposites. A node the guest hid is still a node the guest has; scrolling back
+to where you were when it reappears is the behaviour a user expects, so the
+offset survives. A node the guest removed is gone, and its offset joins focus,
+hover, and pointer capture in `Interaction::retire` — the single site that
+answers "the node is gone, forget everything about it". A generational
+`NodeKey` is what makes that unambiguous: an id that comes back comes back at a
+new generation and therefore starts at offset zero, with no rule needed to say
+so.
+
+**Clip before transform.** Hit-testing a scrolled subtree that translates first
+and clips second will report hits on content scrolled out of view — the pointer
+is inside the child's translated rect but outside the viewport that owns it.
+The order is not an optimization.
+
+The stage acceptance is unchanged: a test proving **zero `SendToGuest`** for
+hover, focus movement, and wheel events, while each still produces a `Render`.
 
 ---
 
