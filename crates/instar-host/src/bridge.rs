@@ -571,7 +571,14 @@ pub struct HostBridge {
     window: WindowId,
     runtime: RuntimeThread,
     events: std::sync::mpsc::Receiver<HostUserEvent>,
-    revision: u64,
+    /// Accepted guest commits, in order.
+    ///
+    /// The counter the guest sees: `screened.accept(...)` is handed this value,
+    /// so it advances on every accepted commit even when the snapshot was
+    /// identical to the retained one. That monotonicity is the guest's sync
+    /// contract, and it must not be tied to whether the host found the tree
+    /// interesting.
+    commit_sequence: u64,
     stats: BridgeStats,
 }
 
@@ -586,18 +593,15 @@ impl HostBridge {
         Self::start(Host::new(), component, window, wake)
     }
 
-    /// As [`HostBridge::spawn`], with a host that can draw text.
-    ///
-    /// A constructor rather than a setter: the glyph source is an input to
-    /// every scene the host lowers, and one arriving after the guest's opening
-    /// commit would mean the first frame silently had no labels.
-    pub fn spawn_with_glyphs(
+    /// As [`HostBridge::spawn`], with the shipped monospace face registered
+    /// with Parley's font context before the guest can commit anything.
+    pub fn spawn_with_monospace_face(
         component: Vec<u8>,
         window: WindowId,
         wake: Wake,
-        glyphs: Arc<dyn crate::GlyphSource>,
+        face: Arc<[u8]>,
     ) -> Result<Self, String> {
-        Self::start(Host::with_glyphs(glyphs), component, window, wake)
+        Self::start(Host::with_monospace_face(face), component, window, wake)
     }
 
     fn start(host: Host, component: Vec<u8>, window: WindowId, wake: Wake) -> Result<Self, String> {
@@ -609,7 +613,7 @@ impl HostBridge {
             window,
             runtime,
             events: events_rx,
-            revision: 0,
+            commit_sequence: 0,
             stats: BridgeStats::default(),
         })
     }
@@ -635,9 +639,27 @@ impl HostBridge {
         }
     }
 
-    /// The revision of the interface currently applied.
-    pub fn revision(&self) -> u64 {
-        self.revision
+    /// The sequence number of the last accepted guest commit.
+    ///
+    /// The guest sees this counter: every accepted commit advances it, no-op or
+    /// not, so guest synchronization is unaffected by whether the host found
+    /// the snapshot interesting. [`Self::tree_revision`] is the separate host
+    /// value that layout, paint, and accessibility caches key off.
+    pub fn commit_sequence(&self) -> u64 {
+        self.commit_sequence
+    }
+
+    /// The version of the retained UI state this bridge's window is showing.
+    ///
+    /// Forwards to the host's tree revision for this window. It advances only
+    /// when the diff found something, so an identical re-commit does not claim
+    /// a new tree exists. This is the value layout, paint, and accessibility
+    /// caches key off; [`Self::commit_sequence`] is the guest-visible one.
+    pub fn tree_revision(&self) -> u64 {
+        self.host
+            .window(self.window)
+            .map(|window| window.tree_revision())
+            .unwrap_or(0)
     }
 
     /// Host operations still in flight for the guest.
@@ -776,15 +798,32 @@ impl HostBridge {
             }
         };
 
-        // 4. Apply atomically, 5. lay out, 6. ask for a frame. All three live
-        //    inside `apply_tree`, in that order.
-        self.revision += 1;
-        self.stats.applied_commits += 1;
-        let effects = self.host.apply_tree(self.window, tree);
+        // 4. Diff against the retained tree, 5. apply atomically, 6. lay out,
+        //    7. lower, 8. ask for a frame. All of it lives inside `apply_tree`,
+        //    in that order.
+        //
+        //    The diff can refuse — a key that named one kind of node and now
+        //    names another. That is a semantic rejection like any other and
+        //    lands here rather than inside the apply, because it happens
+        //    before a single byte of state is touched.
+        let effects = match self.host.apply_tree(self.window, tree) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.stats.rejected_commits += 1;
+                screened.reject(CommitRejection::Invalid(error.to_string()));
+                return Vec::new();
+            }
+        };
 
-        // 7. Reply last. The guest resumes knowing the interface it described
+        // Every accepted commit is a new sequence number for the guest, even
+        // when the snapshot was a no-op for the host; the tree revision is the
+        // host's answer to "did anything actually change".
+        self.commit_sequence += 1;
+        self.stats.applied_commits += 1;
+
+        // 9. Reply last. The guest resumes knowing the interface it described
         //    is the one the host is now showing.
-        screened.accept(self.revision);
+        screened.accept(self.commit_sequence);
         effects
     }
 
@@ -799,7 +838,7 @@ impl std::fmt::Debug for HostBridge {
         f.debug_struct("HostBridge")
             .field("generation", &self.generation)
             .field("window", &self.window)
-            .field("revision", &self.revision)
+            .field("commit_sequence", &self.commit_sequence)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }

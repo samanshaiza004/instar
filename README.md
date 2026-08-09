@@ -5,13 +5,26 @@ application components. Applications describe semantic retained UI through a
 typed WIT contract; the host owns rendering, input, and the boundary around
 every guest turn.
 
-> **Status: early. Not usable yet.**
+> **Status: early. Phase 1 complete; not stable.**
 >
-> Instar is a ground-up rewrite, currently in Phase 1. What exists today is a
-> validated runtime premise and a kernel spike — not an application host you
-> can build against. The public API, the WIT protocol, and the crate layout are
-> all still expected to change. Much of the tree is still salvage material from
-> the previous codebase (see [Inheritance](#inheritance)).
+> Instar runs a real WebAssembly component in a real window: a guest that sits
+> idle at zero cost, is woken by a click, describes an interface it owns no
+> geometry in, and gets it rendered — and when it dies, the host says so on a
+> surface the guest cannot influence.
+>
+> That is a validated foundation, not a product. The public API, the WIT
+> protocol, and the crate layout are all still expected to change, and there is
+> no compatibility promise of any kind.
+>
+> What Phase 1 proved, cost, and left as scaffolding:
+> [docs/PHASE-1-RESULTS.md](docs/PHASE-1-RESULTS.md).
+>
+> Phase 2 has since built the retained UI foundation on top of it: full
+> snapshots diffed against a retained tree, generational node identity, an
+> explicit layout vocabulary with rows, stacks and overlap, visibility and
+> clipping, and a scroll viewport whose offset the host owns — so a wheel
+> moves the view with no Wasm round trip. Styling and scrollbar chrome are
+> not built yet.
 
 ## Why the rewrite
 
@@ -38,9 +51,52 @@ subtask.
 
 | Crate | What it is |
 |---|---|
+| `instar-ui-protocol` | The wire format, and the only Instar crate a guest links. Zero dependencies. |
 | `instar-kernel` | Wasmtime Component Model async runtime: engine config, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind. |
-| `instar-paint` | Paint/display-list types. |
+| `instar-ui` | The retained tree, Taffy layout, hit-testing. Never sees DPI. |
+| `instar-window` | winit translation and DPI conversion. Never sees a `NodeKey`. |
+| `instar-paint` | Paint intent: scene and command types. |
 | `instar-render-vello-cpu` | CPU rendering backend. |
+| `instar-host` | Orchestration: routing, the metrics barrier, the two-thread bridge, scene lowering. |
+| `instar-shell` | The event loop, presentation, the font, the binary. |
+| `instar-guest-build` | Build-script support for compiling guests. |
+
+`guests/` holds every WebAssembly component, each built from source rather than
+committed as an artifact. See [guests/README.md](guests/README.md).
+
+How Instar works and why each boundary is where it is:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The wire format:
+[docs/PROTOCOL-0.md](docs/PROTOCOL-0.md). What it costs, and what CI does and
+does not enforce: [docs/baselines/PERFORMANCE.md](docs/baselines/PERFORMANCE.md).
+
+`docs/PHASE-1.md` and `docs/PHASE-2.md` are the record of *how* the decisions
+were reached, including the ones that turned out wrong. They are logs, not
+references — when they disagree with `ARCHITECTURE.md`, that file is the one to
+trust.
+
+## Running it
+
+`instar` takes a component and runs it. Build the example counter, then run it:
+
+```bash
+cargo build --release --manifest-path guests/counter/Cargo.toml --target wasm32-wasip2
+```
+
+```bash
+cargo run --release -- run guests/counter/target/wasm32-wasip2/release/counter.wasm
+```
+
+A window with a counter, a reset, and a button that crashes the guest on
+purpose — worth clicking, because a crash surface nobody has seen is a crash
+surface that does not work.
+
+`--debug` reports lifecycle, commits, and frame timings on stderr.
+
+**`run` is the only command.** `new`, `build`, `dev`, `package`, `inspect`,
+`validate`, and `doctor` do not exist, deliberately: each would freeze
+assumptions about manifests, build systems, package layout, SDKs, and
+distribution that this project has not learned yet. A command added now would
+be a guess preserved as an interface.
 
 ## Running the gates
 
@@ -51,8 +107,25 @@ drives it through suspend/wake, concurrency, cancellation, and shutdown:
 cargo test -p instar-kernel --test gate0
 ```
 
-It runs on Linux, macOS, and Windows in CI — the claims are about a runtime,
+The whole suite, including the bridge acceptance gate and the pixel-level
+render tests:
+
+```bash
+cargo test --workspace
+```
+
+Both run on Linux, macOS, and Windows in CI — the claims are about a runtime,
 not about one machine.
+
+## Overhead
+
+What each layer costs, measured rather than estimated:
+
+```bash
+cargo run --release --bin overhead
+```
+
+Numbers and method in [docs/OVERHEAD.md](docs/OVERHEAD.md).
 
 ## Toolchain
 
@@ -63,13 +136,15 @@ in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
 
 ## Inheritance
 
-Instar began from a codebase called Youth and keeps its git history. Several
-`youth-*` crates are still present as salvage material — source that later work
-packages extract from and then delete, not code that gets fixed in place. They
-are not part of Instar's design and should not be treated as current.
+Instar began from a codebase called Youth and keeps its git history. The
+`youth-*` crates were salvage material — source that later work packages
+extracted from and then deleted — and as of Phase 1 they are gone. Every one was
+either lifted (the kernel's engine config, the windowing and host layers, the
+paint and render crates) or superseded.
 
+The source is not lost: it is all at the `managed-youth-final` tag, and
 `docs/baselines/managed-youth-final/` records the pre-rewrite baseline so the
-rewrite can be measured against it later. It is deliberately kept.
+rewrite can be measured against it. Both are deliberately kept.
 
 ## License
 

@@ -1,0 +1,18 @@
+[package]
+name = "hostile"
+version = "0.0.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+description = "Instars hostile guest: every way a guest is permitted to misbehave, reachable by clicking. Not part of the Instar workspace; targets wasm32-wasip2 and is built on demand."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60.0"
+# The wire format only. A guest speaks the encoding; it never links the host's
+# UI implementation, its layout engine, or its hit-testing.
+instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }
+
+[workspace]

@@ -13,17 +13,20 @@
 //!
 //! # The vocabulary is deliberately tiny
 //!
-//! Four node kinds and four layout properties (see
-//! [`instar_ui_protocol::WireLayout`]). No grid, no general CSS surface, no
-//! arbitrary positioning. Everything here is a flex column, because that is
-//! the entire Phase 1 commitment — Taffy can express far more, and exposing
-//! that would turn an internal choice into a compatibility obligation.
+//! Six node kinds and four layout properties (see
+//! [`instar_ui_protocol::WireLayout`]). No general CSS surface, no arbitrary
+//! positioning. Containers are a flex column, a flex row, or one grid cell:
+//! `Row` mirrors `Column` on the other axis, and `Stack` overlaps its children
+//! in that cell. Grid stays an implementation detail of this module — Taffy
+//! can express far more than Instar promises, and exposing that would turn an
+//! internal choice into a compatibility obligation.
 
 use std::collections::HashMap;
 
-use instar_ui_protocol::{NodeKey, WireDimension};
+use instar_ui_protocol::{NodeKey, WireAlign, WireDisplay, WireJustify, WireSize};
 use taffy::prelude::*;
 
+use crate::text::{self, ShapedText, TextContext};
 use crate::{Node, NodeKind, Tree};
 
 /// The logical-pixel viewport layout is computed against.
@@ -69,9 +72,12 @@ impl Rect {
 ///
 /// Produced by [`compute`], consumed by hit-testing and (later) painting. Not
 /// protocol state: a guest never sends one and never receives one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutSnapshot {
     rects: HashMap<NodeKey, Rect>,
+    /// The final render artifact for every text/button node, extracted after
+    /// Taffy has produced the final geometry.
+    pub text: HashMap<NodeKey, ShapedText>,
 }
 
 impl LayoutSnapshot {
@@ -91,11 +97,16 @@ impl LayoutSnapshot {
         self.rects.keys().copied()
     }
 
+    pub fn text(&self, key: NodeKey) -> Option<&ShapedText> {
+        self.text.get(&key)
+    }
+
     /// Builds a snapshot directly. For tests that need specific geometry
     /// without going through a full layout pass.
     pub fn from_rects(rects: impl IntoIterator<Item = (NodeKey, Rect)>) -> Self {
         Self {
             rects: rects.into_iter().collect(),
+            text: HashMap::new(),
         }
     }
 }
@@ -108,99 +119,177 @@ struct MeasureContext {
     is_button: bool,
 }
 
-/// Placeholder text metrics.
-///
-/// Real shaping belongs to the text renderer, which does not exist yet. These
-/// exist so layout is *deterministic and testable* now, and are the one thing
-/// in this module expected to be replaced rather than extended: when a real
-/// font stack lands, `measure` takes a font context and these go away.
-/// Assertions in tests are written against relative geometry (ordering,
-/// containment, stacking) rather than exact pixel values, so that replacement
-/// does not invalidate them.
-///
-/// Public because painting has to agree with them. A painter that places
-/// glyphs at its font's own advances, against boxes measured at these, gets
-/// text that drifts out of the rectangles the host computed for it — and the
-/// host's geometry is the authority, not the font's. Whoever draws the text
-/// reads its advance from here, so the two cannot disagree, and both are
-/// replaced together.
-///
-/// # This is scaffolding, not architecture
-///
-/// Recorded as Phase 2 debt in `docs/PHASE-1.md`. Making a real face fit these
-/// columns — inverting its advance until one glyph is one fake column — is a
-/// Phase 1 expedient and must not outlive it. The end state is one shaped
-/// result feeding both sides:
-///
-/// ```text
-/// text + style -> shape/layout -> intrinsic size    -> Taffy
-///                              -> positioned glyphs -> the renderer
-/// ```
-///
-/// Do not build on `TEXT_METRICS`. Anything that needs more from text than a
-/// fixed-pitch rectangle is the signal to do the replacement instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TextMetrics {
-    /// Advance per character. Fixed pitch, which is the whole reason these are
-    /// a placeholder.
-    pub char_width: f32,
-    pub line_height: f32,
-    /// Extra space a button reserves around its label, per side.
-    pub button_padding: f32,
-}
+/// Extra space a button reserves around its label, per side. Kept from the
+/// placeholder metrics so buttons stay bigger than their labels.
+pub const BUTTON_PADDING: f32 = 8.0;
 
-pub const TEXT_METRICS: TextMetrics = TextMetrics {
-    char_width: 8.0,
-    line_height: 16.0,
-    button_padding: 8.0,
-};
-
-fn measure(context: &MeasureContext) -> Size<f32> {
-    let Some(text) = context.text.as_deref() else {
-        return Size::ZERO;
-    };
-    // `chars()` rather than `len()`: a byte count would make non-ASCII labels
-    // measure absurdly wide. Still not correct shaping -- see above.
-    let width = text.chars().count() as f32 * TEXT_METRICS.char_width;
-    let padding = if context.is_button {
-        TEXT_METRICS.button_padding * 2.0
-    } else {
-        0.0
-    };
-    Size {
-        width: width + padding,
-        height: TEXT_METRICS.line_height + padding,
-    }
-}
-
-fn dimension(value: WireDimension) -> Dimension {
+fn text_available(value: AvailableSpace) -> text::Available {
     match value {
-        // Fill is expressed as stretch on the cross axis (see `style`), not as
-        // a dimension, so it stays `auto` here.
-        WireDimension::Fill | WireDimension::Content => Dimension::auto(),
-        WireDimension::Fixed(px) => Dimension::length(f32::from(px)),
+        AvailableSpace::Definite(width) => text::Available::Definite(width),
+        AvailableSpace::MinContent => text::Available::MinContent,
+        AvailableSpace::MaxContent => text::Available::MaxContent,
     }
 }
 
-fn style(node: &Node) -> Style {
+fn dimension(value: WireSize) -> Dimension {
+    match value {
+        WireSize::Content => Dimension::auto(),
+        WireSize::Fixed(px) => Dimension::length(f32::from(px)),
+    }
+}
+
+fn bound(value: Option<u16>) -> Dimension {
+    match value {
+        Some(px) => Dimension::length(f32::from(px)),
+        None => Dimension::auto(),
+    }
+}
+
+fn align(value: WireAlign) -> AlignItems {
+    match value {
+        WireAlign::Start => AlignItems::START,
+        WireAlign::Center => AlignItems::CENTER,
+        WireAlign::End => AlignItems::END,
+        WireAlign::Stretch => AlignItems::STRETCH,
+    }
+}
+
+fn justify(value: WireJustify) -> JustifyContent {
+    match value {
+        WireJustify::Start => JustifyContent::START,
+        WireJustify::Center => JustifyContent::CENTER,
+        WireJustify::End => JustifyContent::END,
+        WireJustify::SpaceBetween => JustifyContent::SPACE_BETWEEN,
+        WireJustify::SpaceAround => JustifyContent::SPACE_AROUND,
+        WireJustify::SpaceEvenly => JustifyContent::SPACE_EVENLY,
+    }
+}
+
+/// What a parent imposes on its children beyond ordinary flex layout.
+///
+/// A2 deleted the previous `ParentAxis { Column, Row, Stack }`, which existed
+/// only because `Fill` meant cross-axis stretch and a child had to know its
+/// parent's direction to know which axis that was. Direction is no longer
+/// handed down, and `Row` versus `Column` is read off the parent's own kind
+/// when styling the parent.
+///
+/// What is left is genuinely about the parent: a `Stack` is a grid and pins
+/// its children to one cell, and a `Scroll` is a viewport whose content must
+/// keep its natural size. Both are things a child cannot work out for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildOf {
+    Normal,
+    /// A [`NodeKind::Stack`]: one grid cell, natural size, no stretch.
+    StackCell,
+    /// A [`NodeKind::Scroll`]: the content of a viewport.
+    ScrollContent,
+}
+
+fn style(node: &Node, parent: ChildOf) -> Style {
     let layout = node.layout;
+    let (display, flex_direction, gap) = match &node.kind {
+        NodeKind::Stack => (
+            Display::Grid,
+            FlexDirection::Row,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        // A viewport lays its one content child out as a column, so the child
+        // takes its natural height rather than being squeezed to the
+        // viewport's -- the overflow is the whole point.
+        NodeKind::Scroll => (
+            Display::Flex,
+            FlexDirection::Column,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        NodeKind::Row => (
+            Display::Flex,
+            FlexDirection::Row,
+            // Gap is main-axis space: width for a row, height for a column.
+            Size {
+                width: LengthPercentage::length(f32::from(layout.gap)),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        _ => (
+            Display::Flex,
+            FlexDirection::Column,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(f32::from(layout.gap)),
+            },
+        ),
+    };
+
+    // `None` means "inherit the parent's align_items", which is exactly what
+    // Taffy does with an absent `align_self` — so absence is passed through
+    // rather than resolved here. The one exception is a stack child, which
+    // overlaps at its natural size unless it asked for something else;
+    // inheriting a stretch there would defeat the point of the stack.
+    let align_self = match (layout.align_self, parent) {
+        (Some(value), _) => Some(align(value)),
+        (None, ChildOf::StackCell) => Some(AlignItems::START),
+        (None, _) => None,
+    };
+
+    // A viewport's content keeps the size it asked for. The default shrink of
+    // 1.0 would let Taffy compress it to the viewport, and content that has
+    // been squeezed to fit is content that never overflows -- which would make
+    // the scrollable extent permanently zero and the whole node pointless.
+    let flex_shrink = match parent {
+        ChildOf::ScrollContent => 0.0,
+        _ => layout.shrink,
+    };
+
     Style {
-        display: Display::Flex,
-        // Everything is a column. That is the whole Phase 1 layout model.
-        flex_direction: FlexDirection::Column,
+        display,
+        flex_direction,
         size: Size {
             width: dimension(layout.width),
             height: dimension(layout.height),
         },
-        // Fill takes the parent's cross-axis extent; Content shrinks to fit.
-        align_self: Some(match layout.width {
-            WireDimension::Fill => AlignSelf::STRETCH,
-            _ => AlignSelf::START,
-        }),
+        min_size: Size {
+            width: bound(layout.min_width),
+            height: bound(layout.min_height),
+        },
+        max_size: Size {
+            width: bound(layout.max_width),
+            height: bound(layout.max_height),
+        },
+        // Finite and in range because `Reader::flex_factor` is the only way
+        // one reaches this crate.
+        flex_grow: layout.grow,
+        flex_shrink,
+        align_self,
+        align_items: Some(align(layout.align_items)),
+        justify_content: Some(justify(layout.justify_content)),
+        justify_self: (parent == ChildOf::StackCell).then_some(AlignItems::START),
         padding: taffy::Rect::length(f32::from(layout.padding)),
-        gap: Size {
-            width: LengthPercentage::length(0.0),
-            height: LengthPercentage::length(f32::from(layout.gap)),
+        gap,
+        grid_template_rows: if matches!(node.kind, NodeKind::Stack) {
+            vec![auto()]
+        } else {
+            Vec::new()
+        },
+        grid_template_columns: if matches!(node.kind, NodeKind::Stack) {
+            vec![auto()]
+        } else {
+            Vec::new()
+        },
+        grid_row: if parent == ChildOf::StackCell {
+            line(1)
+        } else {
+            Default::default()
+        },
+        grid_column: if parent == ChildOf::StackCell {
+            line(1)
+        } else {
+            Default::default()
         },
         ..Default::default()
     }
@@ -210,11 +299,14 @@ fn style(node: &Node) -> Style {
 ///
 /// Deterministic: the same tree and viewport always produce the same snapshot,
 /// which is what makes hit-testing reproducible and these tests meaningful.
-pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
+pub fn compute(text: &mut TextContext, tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     let mut taffy: TaffyTree<MeasureContext> = TaffyTree::new();
     let mut keys: Vec<(taffy::NodeId, NodeKey)> = Vec::new();
 
     let root = build(&mut taffy, &tree.root, &mut keys);
+    let key_by_id: HashMap<taffy::NodeId, NodeKey> = keys.iter().copied().collect();
+    let id_by_key: HashMap<NodeKey, taffy::NodeId> =
+        keys.iter().map(|(id, key)| (*key, *id)).collect();
 
     // The root is given the viewport exactly; a guest cannot size the window.
     let _ = taffy.set_style(
@@ -231,6 +323,15 @@ pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
                 width: LengthPercentage::length(0.0),
                 height: LengthPercentage::length(f32::from(tree.root.layout.gap)),
             },
+            // Carried across explicitly, because this style *replaces* the one
+            // `style()` built rather than amending it, and an absent
+            // `align_items` is not neutral: Taffy follows CSS and treats it as
+            // stretch. Every child used to set `align_self` outright, so the
+            // omission was invisible; now that a child may say `None` to mean
+            // "inherit", inheriting the wrong default silently stretches the
+            // entire interface.
+            align_items: Some(align(tree.root.layout.align_items)),
+            justify_content: Some(justify(tree.root.layout.justify_content)),
             ..Default::default()
         },
     );
@@ -241,21 +342,46 @@ pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     };
 
     if taffy
-        .compute_layout_with_measure(
-            root,
-            available,
-            |known, _available, _id, context, _style| {
-                // A node with both dimensions already known needs no measuring.
-                if let (Some(width), Some(height)) = (known.width, known.height) {
-                    return Size { width, height };
+        .compute_layout_with_measure(root, available, |known, available, id, context, _style| {
+            let measured = match context.as_deref() {
+                Some(context) => {
+                    let key = key_by_id
+                        .get(&id)
+                        .copied()
+                        .expect("every taffy node has a wire key");
+                    let padding = if context.is_button {
+                        BUTTON_PADDING * 2.0
+                    } else {
+                        0.0
+                    };
+                    let label_available = if context.is_button {
+                        match available.width {
+                            AvailableSpace::Definite(width) => {
+                                text::Available::Definite((width - padding).max(0.0))
+                            }
+                            other => text_available(other),
+                        }
+                    } else {
+                        text_available(available.width)
+                    };
+                    let (width, height) = text.measure(
+                        key,
+                        context.text.as_deref().unwrap_or(""),
+                        text::ShapingStyle::default(),
+                        label_available,
+                    );
+                    Size {
+                        width: width + padding,
+                        height: height + padding,
+                    }
                 }
-                let measured = context.as_deref().map(measure).unwrap_or(Size::ZERO);
-                Size {
-                    width: known.width.unwrap_or(measured.width),
-                    height: known.height.unwrap_or(measured.height),
-                }
-            },
-        )
+                None => Size::ZERO,
+            };
+            Size {
+                width: known.width.unwrap_or(measured.width),
+                height: known.height.unwrap_or(measured.height),
+            }
+        })
         .is_err()
     {
         // Taffy fails only on a malformed tree, which `Tree` construction
@@ -268,13 +394,57 @@ pub fn compute(tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
     // relative to its parent, and every consumer here wants absolute.
     let mut rects = HashMap::with_capacity(keys.len());
     accumulate(&taffy, root, 0.0, 0.0, &keys, &mut rects);
-    LayoutSnapshot { rects }
+    let mut shaped = HashMap::new();
+    finalize_text(text, tree, &taffy, &id_by_key, &mut shaped);
+    LayoutSnapshot {
+        rects,
+        text: shaped,
+    }
+}
+
+fn finalize_text(
+    text: &mut TextContext,
+    tree: &Tree,
+    taffy: &TaffyTree<MeasureContext>,
+    id_by_key: &HashMap<NodeKey, taffy::NodeId>,
+    out: &mut HashMap<NodeKey, ShapedText>,
+) {
+    for node in tree.iter() {
+        let is_text = matches!(node.kind, NodeKind::Text { .. } | NodeKind::Button { .. });
+        if !is_text {
+            continue;
+        }
+        let Some(id) = id_by_key.get(&node.key).copied() else {
+            continue;
+        };
+        let Ok(geometry) = taffy.layout(id) else {
+            continue;
+        };
+        let padding = if matches!(node.kind, NodeKind::Button { .. }) {
+            BUTTON_PADDING * 2.0
+        } else {
+            0.0
+        };
+        let final_width = (geometry.size.width - padding).max(0.0);
+        out.insert(node.key, text.finalize(node.key, final_width).clone());
+    }
 }
 
 fn build(
     taffy: &mut TaffyTree<MeasureContext>,
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
+) -> taffy::NodeId {
+    // The root's style is replaced wholesale in `compute`, and the root is
+    // never anyone's special child.
+    build_with(taffy, node, keys, ChildOf::Normal)
+}
+
+fn build_with(
+    taffy: &mut TaffyTree<MeasureContext>,
+    node: &Node,
+    keys: &mut Vec<(taffy::NodeId, NodeKey)>,
+    parent: ChildOf,
 ) -> taffy::NodeId {
     let context = match &node.kind {
         NodeKind::Text { text } => Some(MeasureContext {
@@ -288,21 +458,38 @@ fn build(
         _ => None,
     };
 
-    let id = if node.children.is_empty() {
+    let child_context = match node.kind {
+        NodeKind::Stack => ChildOf::StackCell,
+        NodeKind::Scroll => ChildOf::ScrollContent,
+        _ => ChildOf::Normal,
+    };
+    // `Display::None` is absent from layout, and so is everything under it.
+    // Nothing is built rather than building it and hiding it: a node Taffy
+    // never sees produces no rect, and a key with no rect is already
+    // unhittable and unpaintable everywhere downstream. The alternative --
+    // Taffy's own `Display::None` -- would leave the subtree in the tree with
+    // zero-sized rects, which is a different and much easier thing to
+    // accidentally hit.
+    let children: Vec<&Node> = node
+        .children
+        .iter()
+        .filter(|child| child.layout.display != WireDisplay::None)
+        .collect();
+
+    let id = if children.is_empty() {
         match context {
             Some(context) => taffy
-                .new_leaf_with_context(style(node), context)
+                .new_leaf_with_context(style(node, parent), context)
                 .expect("taffy leaf"),
-            None => taffy.new_leaf(style(node)).expect("taffy leaf"),
+            None => taffy.new_leaf(style(node, parent)).expect("taffy leaf"),
         }
     } else {
-        let children: Vec<taffy::NodeId> = node
-            .children
+        let ids: Vec<taffy::NodeId> = children
             .iter()
-            .map(|child| build(taffy, child, keys))
+            .map(|child| build_with(taffy, child, keys, child_context))
             .collect();
         taffy
-            .new_with_children(style(node), &children)
+            .new_with_children(style(node, parent), &ids)
             .expect("taffy branch")
     };
 

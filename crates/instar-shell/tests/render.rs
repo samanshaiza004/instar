@@ -34,9 +34,9 @@ use instar_window::{
 const WINDOW: WindowId = WindowId::from_raw(1);
 
 /// The counter guest's node keys, as a host learns them: off the wire.
-const READOUT: NodeKey = NodeKey(3);
-const INCREMENT: NodeKey = NodeKey(4);
-const CRASH: NodeKey = NodeKey(6);
+const READOUT: NodeKey = NodeKey::first(3);
+const INCREMENT: NodeKey = NodeKey::first(4);
+const CRASH: NodeKey = NodeKey::first(6);
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -63,9 +63,9 @@ fn metrics(scale: f64) -> WindowMetricsChanged {
 /// interface applied.
 fn ready() -> HostBridge {
     let wake: Wake = Arc::new(|| {});
-    let font = default_font().expect("the shipped face parses");
-    let mut bridge = HostBridge::spawn_with_glyphs(component(), WINDOW, wake, Arc::new(font))
-        .expect("the counter guest starts");
+    let mut bridge =
+        HostBridge::spawn_with_monospace_face(component(), WINDOW, wake, default_font())
+            .expect("the counter guest starts");
     bridge.on_window_event(WindowOutput::MetricsChanged(metrics(1.0)));
     await_commit(&mut bridge).expect("the guest commits its opening interface");
     bridge
@@ -73,11 +73,11 @@ fn ready() -> HostBridge {
 
 /// Waits for one more applied commit.
 fn await_commit(bridge: &mut HostBridge) -> Option<()> {
-    let target = bridge.revision() + 1;
+    let target = bridge.commit_sequence() + 1;
     let started = Instant::now();
     while started.elapsed() < PATIENCE {
         bridge.wait(Duration::from_millis(50));
-        if bridge.revision() >= target {
+        if bridge.commit_sequence() >= target {
             return Some(());
         }
     }

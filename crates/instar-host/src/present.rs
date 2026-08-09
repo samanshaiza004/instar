@@ -16,14 +16,15 @@
 //! # The crash screen is the host's, and is not a UI tree
 //!
 //! When a guest traps there is no guest left to describe anything, so
-//! [`crash_scene`] emits paint commands directly. The tempting shortcut —
-//! synthesizing an Instar tree that says "the app crashed" and pushing it
-//! through the normal path — is rejected: it would mean the host can author
-//! interfaces in the guest's name, and every downstream consumer (hit-testing,
-//! the commit log, anything that later asks "what did the guest commit?")
-//! would be told a lie by a layer that is supposed to be transcribing. The
-//! retained tree keeps saying whatever the guest last said. What the window
-//! shows is a separate question, and this module is where it is answered.
+//! [`crash_scene`] shapes the host's own account of the failure directly.
+//! The tempting shortcut — synthesizing an Instar tree that says "the app
+//! crashed" and pushing it through the normal path — is rejected: it would
+//! mean the host can author interfaces in the guest's name, and every
+//! downstream consumer (hit-testing, the commit log, anything that later asks
+//! "what did the guest commit?") would be told a lie by a layer that is
+//! supposed to be transcribing. The retained tree keeps saying whatever the
+//! guest last said. What the window shows is a separate question, and this
+//! module is where it is answered.
 //!
 //! # Physical here, logical above
 //!
@@ -31,15 +32,25 @@
 //! boundary `docs/PHASE-1.md` draws, where `instar-host` converts the logical
 //! geometry `instar-ui` produced into the physical target a renderer wants.
 //! `instar-ui` never sees a scale factor, and nothing here feeds back into it.
+//!
+//! Text arrives as [`instar_ui::ShapedText`], already extracted from Parley
+//! in logical space. Lowering multiplies the run's font size and every glyph
+//! position by the display scale, and keeps `AffineTransform::identity()`:
+//! Vello treats `font_size` as pixels-per-em when selecting bitmap and colour
+//! glyph strikes, so scaling the transform instead would not be equivalent.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::{
-    AffineTransform, Color, FontId, FontResource, GlyphPosition, GlyphRun, PaintCommand,
+    AffineTransform, Color, FontId, FontKey, FontResource, GlyphPosition, GlyphRun, PaintCommand,
     PaintScene, PhysicalSize, Rect,
 };
-use instar_ui::{LayoutSnapshot, Node, NodeKind, TEXT_METRICS, Tree};
+use instar_ui::{
+    Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ScrollOffset, ScrollState,
+    ShapedText, ShapingStyle, TextContext, Tree,
+};
 use instar_window::WindowMetricsChanged;
 
 /// What the window is showing.
@@ -103,33 +114,6 @@ impl Default for Theme {
             crash_text: Color::opaque(0xff, 0xd8, 0xd8),
         }
     }
-}
-
-/// Where glyphs come from.
-///
-/// `instar-host` owns *where* text goes — layout decided that, in logical
-/// coordinates, using [`instar_ui::TEXT_METRICS`] — and deliberately owns no
-/// font machinery at all. An implementation supplies the face and the
-/// character-to-glyph mapping, and nothing else; it is not consulted about
-/// advances, because the advance is layout's and a shaper that disagreed with
-/// it would push text out of the boxes the host computed.
-///
-/// That is a placeholder arrangement and is expected to end when real shaping
-/// lands, at which point measurement and glyph positions come from one font
-/// context and this trait dissolves into it.
-pub trait GlyphSource: Send + Sync + 'static {
-    /// The face every run built from this source refers to.
-    fn font(&self) -> FontResource;
-
-    /// This face's glyph for `ch`, or `None` if it has none.
-    fn glyph(&self, ch: char) -> Option<u32>;
-
-    /// The size, in physical pixels per em, at which one advance in this face
-    /// is `char_width` physical pixels wide.
-    ///
-    /// The caller passes an already-scaled `char_width`, so a source needs to
-    /// know nothing about DPI.
-    fn em_size(&self, char_width: f32) -> f32;
 }
 
 /// The most trap text the crash surface will retain and draw.
@@ -211,16 +195,6 @@ pub fn clamp_diagnostic(message: &str) -> String {
     kept
 }
 
-/// One line of text to draw, in physical pixels.
-struct TextRun<'a> {
-    text: &'a str,
-    /// Left edge of the first glyph's advance box.
-    x: f32,
-    /// Top edge of the line box; the baseline is derived from it.
-    y: f32,
-    color: Color,
-}
-
 /// Turns absolute logical geometry into physical geometry.
 ///
 /// A single place where the scale factor is applied, so "which coordinate
@@ -236,47 +210,17 @@ fn physical(rect: instar_ui::Rect, scale: f32) -> Rect {
 
 /// Builds the paint intent for one frame.
 ///
-/// Holds the glyph source across frames because a `FontResource` carries the
-/// whole font file, and rebuilding one per commit would allocate a font's
-/// worth of bytes on every click.
+/// Fonts are not owned here: the shaped text carries every face it used, and
+/// [`Self::app_scene`] deduplicates those faces into the scene's font table.
+#[derive(Debug, Default)]
 pub struct SceneBuilder {
     theme: Theme,
-    glyphs: Option<Arc<dyn GlyphSource>>,
-}
-
-impl std::fmt::Debug for SceneBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SceneBuilder")
-            .field("theme", &self.theme)
-            .field("has_glyphs", &self.glyphs.is_some())
-            .finish()
-    }
-}
-
-impl Default for SceneBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl SceneBuilder {
-    /// A builder with no font.
-    ///
-    /// Scenes come out fully laid out and painted except for glyphs, which are
-    /// simply absent. That is the right shape for a headless test — geometry
-    /// and color are exactly what they would be with text — and it means the
-    /// only thing a missing font can break is text.
     pub fn new() -> Self {
         Self {
             theme: Theme::default(),
-            glyphs: None,
-        }
-    }
-
-    pub fn with_glyphs(glyphs: Arc<dyn GlyphSource>) -> Self {
-        Self {
-            theme: Theme::default(),
-            glyphs: Some(glyphs),
         }
     }
 
@@ -298,6 +242,7 @@ impl SceneBuilder {
         &self,
         tree: &Tree,
         layout: &LayoutSnapshot,
+        scroll: &ScrollState,
         metrics: &WindowMetricsChanged,
         pressed: Option<instar_ui::NodeKey>,
     ) -> PaintScene {
@@ -305,66 +250,167 @@ impl SceneBuilder {
         let mut commands = vec![PaintCommand::Clear {
             color: self.theme.background,
         }];
-        let mut runs = Vec::new();
-
-        // Tree order is paint order: the wire format is a depth-first
-        // preorder, so a parent is drawn before its children and the result
-        // is the containment the layout describes.
-        for node in tree.iter() {
-            let Some(rect) = layout.get(node.key).map(|rect| physical(rect, scale)) else {
-                continue;
-            };
-            self.lower_node(node, rect, scale, pressed, &mut commands, &mut runs);
-        }
-
-        self.finish(commands, runs, metrics, scale)
+        let mut fonts = Vec::new();
+        let mut font_ids = HashMap::new();
+        self.paint_node(
+            &tree.root,
+            layout,
+            scroll,
+            ScrollOffset::ZERO,
+            pressed,
+            scale,
+            &mut commands,
+            &mut fonts,
+            &mut font_ids,
+        );
+        scene(metrics, commands, fonts)
     }
 
-    fn lower_node<'a>(
+    /// Emits one node and its subtree, in paint order.
+    ///
+    /// # Why this recurses instead of walking `tree.iter()`
+    ///
+    /// `PushClip`/`PopClip` bracket the commands they apply to, so emitting
+    /// them needs the shape of the tree, which a flat preorder iterator has
+    /// thrown away.
+    ///
+    /// Text moved inline as part of the same change. It used to be collected
+    /// into a list and flushed after every rectangle — which no clip could
+    /// have contained, and which was already wrong for [`NodeKind::Stack`]:
+    /// with every face drawn before every glyph, a lower stacked child's text
+    /// painted over a higher child's face. Tree order is paint order for both
+    /// now.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_node(
         &self,
-        node: &'a Node,
-        rect: Rect,
-        scale: f32,
+        node: &instar_ui::Node,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        translation: ScrollOffset,
         pressed: Option<instar_ui::NodeKey>,
+        scale: f32,
         commands: &mut Vec<PaintCommand>,
-        runs: &mut Vec<TextRun<'a>>,
+        fonts: &mut Vec<FontResource>,
+        font_ids: &mut HashMap<u64, FontId>,
     ) {
+        // `Display::None` and `Visibility::Hidden` are the same answer here,
+        // and both cover the subtree. A `Display::None` node has no rect
+        // either, so this is belt and braces for the first and the only guard
+        // for the second.
+        if !instar_ui::is_presented(node) {
+            return;
+        }
+        let Some(rect) = layout.get(node.key) else {
+            return;
+        };
+        // Every rect out of the snapshot is in absolute layout coordinates.
+        // Painting inside a scrolled viewport moves it by the accumulated
+        // translation of the viewports above it.
+        let rect = instar_ui::Rect::new(
+            rect.x - translation.x,
+            rect.y - translation.y,
+            rect.width,
+            rect.height,
+        );
+
+        // A `Scroll` clips because it is a viewport, joining `Overflow::Clip`
+        // at the step A3 established rather than opening a second path. Only
+        // the translation below is new.
+        let clipped = node.layout.overflow == instar_ui::WireOverflow::Clip
+            || matches!(node.kind, NodeKind::Scroll);
+        if clipped {
+            commands.push(PaintCommand::PushClip {
+                rect: physical(rect, scale),
+            });
+        }
+
+        // Descendants of a viewport move up and left by its offset, which is
+        // what "scrolled down" means. Accumulated rather than replaced, so a
+        // viewport inside a viewport composes.
+        let child_translation = match node.kind {
+            NodeKind::Scroll => {
+                let offset = scroll.get(node.key);
+                ScrollOffset::new(translation.x + offset.x, translation.y + offset.y)
+            }
+            _ => translation,
+        };
+
         match &node.kind {
             // Structure only. Drawing a background for these would mean the
             // host inventing appearance for a node whose whole meaning is
             // "these things are stacked".
-            NodeKind::Root | NodeKind::Column => {}
-            NodeKind::Text { text } => runs.push(TextRun {
-                text,
-                x: rect.x as f32,
-                y: rect.y as f32,
-                color: self.theme.text,
-            }),
-            NodeKind::Button { label, enabled } => {
+            NodeKind::Root
+            | NodeKind::Column
+            | NodeKind::Row
+            | NodeKind::Stack
+            | NodeKind::Scroll => {}
+            NodeKind::Text { .. } => {
+                if let Some(shaped) = layout.text(node.key) {
+                    push_shaped(
+                        commands,
+                        fonts,
+                        font_ids,
+                        shaped,
+                        (rect.x as f32, rect.y as f32),
+                        scale,
+                        self.theme.text,
+                    );
+                }
+            }
+            NodeKind::Button { enabled, .. } => {
                 let (face, ink) = match (enabled, pressed == Some(node.key)) {
                     (false, _) => (self.theme.disabled_face, self.theme.disabled_label),
                     (true, true) => (self.theme.pressed_face, self.theme.button_label),
                     (true, false) => (self.theme.button_face, self.theme.button_label),
                 };
-                commands.push(PaintCommand::FillRect { rect, color: face });
+                let physical_rect = physical(rect, scale);
+                commands.push(PaintCommand::FillRect {
+                    rect: physical_rect,
+                    color: face,
+                });
                 if *enabled {
                     commands.push(PaintCommand::StrokeRect {
-                        rect,
+                        rect: physical_rect,
                         width: 1.0,
                         color: self.theme.button_border,
                     });
                 }
-                // Layout reserved `button_padding` on every side; the label
+                // Layout reserved `BUTTON_PADDING` on every side; the label
                 // sits inside it. Same constant layout measured with, so the
                 // text lands where the box was sized for it.
-                let padding = TEXT_METRICS.button_padding * scale;
-                runs.push(TextRun {
-                    text: label,
-                    x: rect.x as f32 + padding,
-                    y: rect.y as f32 + padding,
-                    color: ink,
-                });
+                if let Some(shaped) = layout.text(node.key) {
+                    push_shaped(
+                        commands,
+                        fonts,
+                        font_ids,
+                        shaped,
+                        (
+                            rect.x as f32 + BUTTON_PADDING,
+                            rect.y as f32 + BUTTON_PADDING,
+                        ),
+                        scale,
+                        ink,
+                    );
+                }
             }
+        }
+
+        for child in &node.children {
+            self.paint_node(
+                child,
+                layout,
+                scroll,
+                child_translation,
+                pressed,
+                scale,
+                commands,
+                fonts,
+                font_ids,
+            );
+        }
+
+        if clipped {
+            commands.push(PaintCommand::PopClip);
         }
     }
 
@@ -374,213 +420,155 @@ impl SceneBuilder {
     /// in that memory, which on most platforms is visible garbage. A window
     /// with no interface in it yet should look deliberately blank.
     pub fn blank_scene(&self, metrics: &WindowMetricsChanged) -> PaintScene {
-        let scale = metrics.scale_factor as f32;
-        self.finish(
+        scene(
+            metrics,
             vec![PaintCommand::Clear {
                 color: self.theme.background,
             }],
             Vec::new(),
-            metrics,
-            scale,
         )
     }
 
     /// The crash screen, built from nothing but the host's own account.
     ///
     /// Takes no tree and no layout, which is the point: it is reachable when
-    /// there is no guest left to ask, and it must not depend on one.
+    /// there is no guest left to ask, and it must not depend on one. Text is
+    /// shaped through the host's long-lived [`TextContext`]; the reserved key
+    /// is far outside the protocol's node range, and the entry is overwritten
+    /// whenever a new trap replaces the screen.
     pub fn crash_scene(
         &self,
+        text: &mut TextContext,
         generation: GenerationId,
         message: &str,
         metrics: &WindowMetricsChanged,
     ) -> PaintScene {
         let scale = metrics.scale_factor as f32;
-        let margin = 16.0 * scale;
-        let line = TEXT_METRICS.line_height * scale;
+        let margin = 16.0;
+        let content = format!("The application stopped responding ({generation})\n{message}");
+        let width = (metrics.logical_size.width as f32 - 2.0 * margin).max(1.0);
 
-        // Long traps are common and a wall of clipped text helps nobody, so
-        // everything here is wrapped to the window rather than run off the
-        // edge — the heading included, since a generation id makes it longer
-        // than it looks and a narrow window is not a special case.
-        let columns = (((metrics.logical_size.width as f32 - 2.0 * 16.0) / TEXT_METRICS.char_width)
-            .floor() as usize)
-            .max(1);
-        let mut lines = wrap(
-            &format!("The application stopped responding ({generation})"),
-            columns,
+        // Let Parley wrap the whole diagnostic to the content width. A wasm
+        // backtrace can be hundreds of lines; lines below the window are
+        // dropped here rather than rasterized into nothing.
+        text.measure(
+            CRASH_KEY,
+            &content,
+            ShapingStyle::default(),
+            Available::Definite(width),
         );
-        lines.extend(wrap(message, columns));
+        let mut visible = text.finalize(CRASH_KEY, width).clone();
+        let visible_bottom = metrics.logical_size.height as f32 - margin;
+        for run in &mut visible.runs {
+            run.glyphs.retain(|glyph| glyph.y <= visible_bottom);
+        }
+        visible.runs.retain(|run| !run.glyphs.is_empty());
 
-        // A wasm backtrace can be hundreds of lines. Emitting a glyph run per
-        // line for all of them would cost a rasterization pass each and put
-        // every one of them off the bottom of the window, so the ones that
-        // cannot be seen are not drawn.
-        let spacing = line * 1.5;
-        let visible = (((metrics.logical_size.height as f32 * scale - margin) / spacing).floor()
-            as usize)
-            .max(1);
-        lines.truncate(visible);
-
-        let runs = lines
-            .iter()
-            .enumerate()
-            .map(|(index, text)| TextRun {
-                text,
-                x: margin,
-                y: margin + index as f32 * spacing,
-                color: self.theme.crash_text,
-            })
-            .collect::<Vec<_>>();
-
-        self.finish(
-            vec![PaintCommand::Clear {
-                color: self.theme.crash_background,
-            }],
-            runs,
-            metrics,
+        let mut commands = vec![PaintCommand::Clear {
+            color: self.theme.crash_background,
+        }];
+        let mut fonts = Vec::new();
+        let mut font_ids = HashMap::new();
+        push_shaped(
+            &mut commands,
+            &mut fonts,
+            &mut font_ids,
+            &visible,
+            (margin, margin),
             scale,
-        )
-    }
-
-    /// Appends the text runs and assembles the scene.
-    ///
-    /// Text goes last so it draws over the surfaces it sits on, and all of it
-    /// shares one [`PaintCommand::GlyphRun`] per line against a single font
-    /// resource, so the backend converts the face once per scene.
-    fn finish(
-        &self,
-        mut commands: Vec<PaintCommand>,
-        runs: Vec<TextRun<'_>>,
-        metrics: &WindowMetricsChanged,
-        scale: f32,
-    ) -> PaintScene {
-        let size = PhysicalSize {
-            width: metrics.physical_size.width,
-            height: metrics.physical_size.height,
-        };
-
-        let fonts = match &self.glyphs {
-            Some(source) => vec![source.font()],
-            // No font: geometry and color are still exactly right, and the
-            // text is simply not there. See `SceneBuilder::new`.
-            None => Vec::new(),
-        };
-
-        if let Some(source) = &self.glyphs {
-            let advance = TEXT_METRICS.char_width * scale;
-            let em = source.em_size(advance);
-            for run in runs {
-                let glyphs: Arc<[GlyphPosition]> = run
-                    .text
-                    .chars()
-                    .enumerate()
-                    .filter_map(|(column, ch)| {
-                        source.glyph(ch).map(|id| GlyphPosition {
-                            id,
-                            x: run.x + column as f32 * advance,
-                            // Positions are baselines. Sitting the baseline at
-                            // the line box's bottom would clip descenders, so
-                            // it goes at the conventional ~80% of the box.
-                            y: run.y + TEXT_METRICS.line_height * scale * 0.8,
-                        })
-                    })
-                    .collect();
-                if glyphs.is_empty() {
-                    continue;
-                }
-                commands.push(PaintCommand::GlyphRun {
-                    run: GlyphRun {
-                        font: FontId(0),
-                        font_size: em,
-                        glyphs,
-                        transform: AffineTransform::identity(),
-                        color: run.color,
-                        hint: true,
-                    },
-                });
-            }
-        }
-
-        PaintScene {
-            size,
-            commands,
-            masks: Vec::new(),
-            fonts,
-            images: Vec::new(),
-        }
+            self.theme.crash_text,
+        );
+        scene(metrics, commands, fonts)
     }
 }
 
-/// Breaks `text` into lines of at most `columns` characters, at whitespace
-/// where it can and mid-word where a single word is longer than the window.
-fn wrap(text: &str, columns: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > columns {
-                lines.push(std::mem::take(&mut current));
-            }
-            // A word wider than the window still has to go somewhere; cutting
-            // it is better than one line running off the edge.
-            let mut word = word;
-            while word.chars().count() > columns {
-                let split = word
-                    .char_indices()
-                    .nth(columns)
-                    .map(|(index, _)| index)
-                    .unwrap_or(word.len());
-                let (head, tail) = word.split_at(split);
-                lines.push(head.to_string());
-                word = tail;
-            }
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-        lines.push(current);
+/// The reserved cache key for the host-owned crash text. Protocol nodes are
+/// bounded far below `u32::MAX`, so this cannot collide with a guest key.
+const CRASH_KEY: NodeKey = NodeKey::first(u32::MAX);
+
+fn scene(
+    metrics: &WindowMetricsChanged,
+    commands: Vec<PaintCommand>,
+    fonts: Vec<FontResource>,
+) -> PaintScene {
+    PaintScene {
+        size: PhysicalSize {
+            width: metrics.physical_size.width,
+            height: metrics.physical_size.height,
+        },
+        commands,
+        masks: Vec::new(),
+        fonts,
+        images: Vec::new(),
     }
-    lines
+}
+
+/// Appends one [`ShapedText`] as positioned glyph runs.
+///
+/// Fonts are deduplicated across the whole scene by [`instar_ui::FontFace::key`],
+/// and each run indexes the scene's table. `FontFace::data` is an `Arc<[u8]>`,
+/// so this is a refcount bump, never a copy of font bytes.
+fn push_shaped(
+    commands: &mut Vec<PaintCommand>,
+    fonts: &mut Vec<FontResource>,
+    font_ids: &mut HashMap<u64, FontId>,
+    shaped: &ShapedText,
+    origin: (f32, f32),
+    scale: f32,
+    color: Color,
+) {
+    for run in &shaped.runs {
+        let face = &shaped.fonts[run.font];
+        let font = match font_ids.get(&face.key) {
+            Some(font) => *font,
+            None => {
+                let font = FontId(fonts.len() as u32);
+                fonts.push(FontResource {
+                    key: FontKey(face.key),
+                    data: Arc::clone(&face.data),
+                    index: face.index,
+                });
+                font_ids.insert(face.key, font);
+                font
+            }
+        };
+        let glyphs: Arc<[GlyphPosition]> = run
+            .glyphs
+            .iter()
+            .map(|glyph| GlyphPosition {
+                id: glyph.id,
+                x: (origin.0 + glyph.x) * scale,
+                y: (origin.1 + glyph.y) * scale,
+            })
+            .collect();
+        if glyphs.is_empty() {
+            continue;
+        }
+        commands.push(PaintCommand::GlyphRun {
+            run: GlyphRun {
+                font,
+                font_size: run.font_size * scale,
+                glyphs,
+                transform: AffineTransform::identity(),
+                color,
+                hint: false,
+            },
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use instar_paint::PaintSceneError;
-    use instar_ui::NodeKey;
-    use instar_ui::protocol::{BatchEncoder, WireDimension, WireLayout, flags, opcode};
-    use instar_window::{LogicalSize, WindowId, WindowMetricsChanged};
+    use instar_ui::Viewport;
+    use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
+    use instar_window::{LogicalSize, WindowId};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
-    const LABEL: NodeKey = NodeKey(2);
-    const BUTTON: NodeKey = NodeKey(3);
-    const DISABLED: NodeKey = NodeKey(4);
-
-    /// Maps every character to a distinct non-zero glyph id, so a test can
-    /// count glyphs and see which ones without a font file.
-    struct FakeGlyphs;
-
-    impl GlyphSource for FakeGlyphs {
-        fn font(&self) -> FontResource {
-            FontResource {
-                key: instar_paint::FontKey(1),
-                data: Arc::from(&b"not a real font"[..]),
-                index: 0,
-            }
-        }
-
-        fn glyph(&self, ch: char) -> Option<u32> {
-            // Space maps to nothing, like a face with no space glyph, so the
-            // "missing glyphs are skipped" path is exercised by ordinary text.
-            (ch != ' ').then_some(ch as u32)
-        }
-
-        fn em_size(&self, char_width: f32) -> f32 {
-            char_width * 2.0
-        }
-    }
+    const LABEL: NodeKey = NodeKey::first(2);
+    const BUTTON: NodeKey = NodeKey::first(3);
+    const DISABLED: NodeKey = NodeKey::first(4);
 
     fn metrics(scale: f64) -> WindowMetricsChanged {
         WindowMetricsChanged {
@@ -599,15 +587,13 @@ mod tests {
 
     fn tree() -> Tree {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 3)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 3)
             .node(
                 opcode::NODE_TEXT,
                 LABEL,
@@ -638,11 +624,15 @@ mod tests {
     fn scene(scale: f64, pressed: Option<NodeKey>) -> PaintScene {
         let tree = tree();
         let metrics = metrics(scale);
-        let layout = tree.layout(instar_ui::Viewport::new(
-            metrics.logical_size.width as f32,
-            metrics.logical_size.height as f32,
-        ));
-        SceneBuilder::with_glyphs(Arc::new(FakeGlyphs)).app_scene(&tree, &layout, &metrics, pressed)
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, pressed)
     }
 
     fn fills(scene: &PaintScene) -> Vec<Rect> {
@@ -694,20 +684,41 @@ mod tests {
     }
 
     /// The DPI split, from the paint side: doubling the scale must double
-    /// every rectangle, because `instar-ui` produced the same logical numbers
-    /// both times and this module is the only thing that scales them.
+    /// every rectangle and every glyph position and font size, because
+    /// `instar-ui` produced the same logical numbers both times and this
+    /// module is the only thing that scales them.
     #[test]
     fn doubling_the_scale_doubles_the_geometry() {
-        let single = fills(&scene(1.0, None));
-        let double = fills(&scene(2.0, None));
+        let single = scene(1.0, None);
+        let double = scene(2.0, None);
 
-        assert_eq!(single.len(), double.len());
-        assert!(!single.is_empty(), "the fixture has buttons to fill");
-        for (one, two) in single.iter().zip(&double) {
+        assert_eq!(fills(&single).len(), fills(&double).len());
+        assert!(
+            !fills(&single).is_empty(),
+            "the fixture has buttons to fill"
+        );
+        for (one, two) in fills(&single).iter().zip(fills(&double)) {
             assert_eq!(
                 (two.x, two.y, two.width, two.height),
                 (one.x * 2, one.y * 2, one.width * 2, one.height * 2),
             );
+        }
+
+        let single_runs = glyph_runs(&single);
+        let double_runs = glyph_runs(&double);
+        assert_eq!(single_runs.len(), double_runs.len());
+        for (one, two) in single_runs.iter().zip(&double_runs) {
+            assert!(
+                (two.font_size - one.font_size * 2.0).abs() < 0.001,
+                "font size is physical pixels per em and must scale"
+            );
+            assert_eq!(two.glyphs.len(), one.glyphs.len());
+            for (a, b) in one.glyphs.iter().zip(two.glyphs.iter()) {
+                assert!(
+                    (b.x - a.x * 2.0).abs() < 0.001 && (b.y - a.y * 2.0).abs() < 0.001,
+                    "glyph positions must scale with the display"
+                );
+            }
         }
     }
 
@@ -753,88 +764,307 @@ mod tests {
         );
     }
 
-    /// The property that keeps painting honest about who owns geometry: the
-    /// host measured these boxes with [`TEXT_METRICS`], so the glyphs must be
-    /// placed with the same advance. A painter using its font's own advances
-    /// would pass every other test here and produce text hanging out of its
-    /// button.
+    /// The property that keeps painting honest about who owns geometry: every
+    /// glyph run must land inside the box the host laid out for the node whose
+    /// text produced it, now with real proportional advances rather than a
+    /// fixed-pitch column count.
     #[test]
     fn every_glyph_lands_inside_the_box_layout_computed_for_it() {
         let tree = tree();
         let metrics = metrics(1.0);
-        let layout = tree.layout(instar_ui::Viewport::new(400.0, 300.0));
-        let scene = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs))
-            .app_scene(&tree, &layout, &metrics, None);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
+        let keys = [LABEL, BUTTON, DISABLED];
 
-        // `FakeGlyphs` maps a character to its own code point, so a run can be
-        // matched back to the node whose text produced it — which is what makes
-        // "inside *its own* box" checkable rather than "inside some box".
-        for (key, text) in [
-            (LABEL, "Clicked 0 times"),
-            (BUTTON, "Press me"),
-            (DISABLED, "Reset"),
-        ] {
-            let expected: Vec<u32> = text
-                .chars()
-                .filter(|c| *c != ' ')
-                .map(|c| c as u32)
-                .collect();
-            let run = glyph_runs(&scene)
-                .into_iter()
-                .find(|run| run.glyphs.iter().map(|g| g.id).eq(expected.iter().copied()))
-                .unwrap_or_else(|| panic!("{text:?} should have been laid into a glyph run"));
+        for run in glyph_runs(&scene) {
+            let owner = keys.into_iter().find(|key| {
+                let rect = physical(layout.get(*key).expect("laid out"), 1.0);
+                run.glyphs.iter().all(|glyph| {
+                    glyph.x >= rect.x as f32
+                        && glyph.x < rect.x as f32 + rect.width as f32
+                        && glyph.y >= rect.y as f32
+                        && glyph.y <= rect.y as f32 + rect.height as f32
+                })
+            });
+            assert!(
+                owner.is_some(),
+                "a glyph run escaped every text box in the fixture"
+            );
+        }
 
-            let box_ = layout.get(key).expect("laid out");
-            for glyph in run.glyphs.iter() {
-                assert!(
-                    glyph.x >= box_.x as f32
-                        && glyph.x + TEXT_METRICS.char_width <= (box_.x + box_.width) as f32,
-                    "a glyph of {text:?} at x={} escapes the box layout sized for it \
-                     ({box_:?}); painting must use the advance layout measured with",
-                    glyph.x
-                );
-                assert!(
-                    glyph.y >= box_.y as f32 && glyph.y <= (box_.y + box_.height) as f32,
-                    "the baseline of {text:?} at y={} is outside its box ({box_:?})",
-                    glyph.y
-                );
-            }
+        for key in keys {
+            let shaped = layout.text(key).expect("the node should have shaped text");
+            assert!(!shaped.runs.is_empty(), "node {key} produced no runs");
+            let rect = physical(layout.get(key).expect("laid out"), 1.0);
+            assert!(
+                glyph_runs(&scene).iter().any(|run| {
+                    run.glyphs.iter().all(|glyph| {
+                        glyph.x >= rect.x as f32
+                            && glyph.x < rect.x as f32 + rect.width as f32
+                            && glyph.y >= rect.y as f32
+                            && glyph.y <= rect.y as f32 + rect.height as f32
+                    })
+                }),
+                "node {key} has no run inside its own box"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_fonts_are_deduplicated_by_face_key() {
+        let scene = scene(1.0, None);
+        assert!(
+            !scene.fonts.is_empty(),
+            "the fixture should have shaped text"
+        );
+        let mut keys = scene
+            .fonts
+            .iter()
+            .map(|font| font.key.0)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            scene.fonts.len(),
+            "the same face must not be carried twice in one scene"
+        );
+        for run in glyph_runs(&scene) {
+            assert!(
+                (run.font.0 as usize) < scene.fonts.len(),
+                "every run indexes the scene's font table"
+            );
         }
     }
 
     #[test]
     fn text_is_painted_after_the_surfaces_it_sits_on() {
         let scene = scene(1.0, None);
-        let first_glyphs = scene
-            .commands
-            .iter()
-            .position(|command| matches!(command, PaintCommand::GlyphRun { .. }))
-            .expect("the fixture has text");
-        let last_fill = scene
-            .commands
-            .iter()
-            .rposition(|command| matches!(command, PaintCommand::FillRect { .. }))
-            .expect("the fixture has buttons");
+
+        // Per button, not globally. This used to assert that every glyph came
+        // after every fill, which held only because text was collected and
+        // flushed at the end of the scene — and that deferral was itself a bug
+        // for `Stack`, where a lower child's text painted over a higher
+        // child's face. A3 made tree order paint order for both, so the real
+        // property is the one the old assertion was standing in for: nothing
+        // is filled between a button's face and its label.
+        let mut fills = 0;
+        let mut glyphs_since_fill = 0;
+        for command in &scene.commands {
+            match command {
+                PaintCommand::FillRect { .. } => {
+                    if fills > 0 {
+                        assert!(
+                            glyphs_since_fill > 0,
+                            "a button's face was drawn before the previous \
+                             button's label, which would erase it"
+                        );
+                    }
+                    fills += 1;
+                    glyphs_since_fill = 0;
+                }
+                PaintCommand::GlyphRun { .. } => glyphs_since_fill += 1,
+                _ => {}
+            }
+        }
+        assert!(fills > 0, "the fixture has buttons");
         assert!(
-            first_glyphs > last_fill,
-            "a button drawn after its label would erase it"
+            glyphs_since_fill > 0,
+            "the last button's label must follow its face"
+        );
+    }
+
+    /// Painting is the other half of the same transform hit-testing does.
+    ///
+    /// Concrete numbers rather than a property: a button at content y = 200
+    /// under an offset of 150 must be filled at viewport y = 50, and a sign
+    /// error would put it at 350 while still passing any "it moved" check.
+    #[test]
+    fn a_scrolled_viewport_paints_its_content_translated() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![
+                instar_ui::Node::scroll(
+                    1,
+                    instar_ui::Node::column(
+                        2,
+                        vec![
+                            instar_ui::Node::text(3, "spacer").with_layout(instar_ui::WireLayout {
+                                height: instar_ui::WireSize::Fixed(200),
+                                ..instar_ui::WireLayout::default()
+                            }),
+                            instar_ui::Node::button(4, "target").with_layout(
+                                instar_ui::WireLayout {
+                                    height: instar_ui::WireSize::Fixed(40),
+                                    ..instar_ui::WireLayout::default()
+                                },
+                            ),
+                        ],
+                    ),
+                )
+                .with_layout(instar_ui::WireLayout {
+                    height: instar_ui::WireSize::Fixed(100),
+                    align_self: Some(instar_ui::WireAlign::Stretch),
+                    ..instar_ui::WireLayout::default()
+                }),
+            ],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        assert_eq!(
+            layout.get(NodeKey::first(4)).unwrap().y,
+            200,
+            "the fixture puts its target at content y = 200"
+        );
+
+        let mut scroll = ScrollState::new();
+        scroll.set(NodeKey::first(1), ScrollOffset::new(0, 150));
+        let scene = SceneBuilder::new().app_scene(&tree, &layout, &scroll, &metrics, None);
+
+        let filled: Vec<i32> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![50],
+            "200 minus an offset of 150 is 50, and nothing else is filled"
+        );
+    }
+
+    /// A viewport is a clip, and it uses the one A3 established.
+    #[test]
+    fn a_scroll_pushes_a_clip_and_balances_it() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![instar_ui::Node::scroll(
+                1,
+                instar_ui::Node::button(2, "inside"),
+            )],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
+
+        assert!(
+            scene
+                .commands
+                .iter()
+                .any(|command| matches!(command, PaintCommand::PushClip { .. })),
+            "a viewport clips without being told to"
+        );
+        scene
+            .validate()
+            .expect("every PushClip a scroll emits must be matched");
+    }
+
+    /// The bug the deferred-text list was hiding.
+    ///
+    /// A `Stack` overlaps its children and later ones paint over earlier ones.
+    /// With every face emitted before every glyph, the *first* child's text
+    /// was drawn after the *second* child's face — so the thing underneath
+    /// showed through the thing on top.
+    #[test]
+    fn a_stacked_child_does_not_paint_its_text_over_a_later_sibling() {
+        let tree = Tree::new(instar_ui::Node::root(
+            0,
+            vec![instar_ui::Node::stack(
+                1,
+                vec![
+                    instar_ui::Node::button(2, "under"),
+                    instar_ui::Node::button(3, "over"),
+                ],
+            )],
+        ));
+        let metrics = metrics(1.0);
+        let mut text = TextContext::new();
+        let layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
+        let scene =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
+
+        let kinds: Vec<&'static str> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                PaintCommand::FillRect { .. } => Some("fill"),
+                PaintCommand::GlyphRun { .. } => Some("glyphs"),
+                _ => None,
+            })
+            .collect();
+        let second_fill = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == "fill")
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("both stacked buttons are filled");
+        let first_glyphs = kinds
+            .iter()
+            .position(|kind| *kind == "glyphs")
+            .expect("both stacked buttons have labels");
+        assert!(
+            first_glyphs < second_fill,
+            "the lower child's label must be painted before the upper \
+             child's face covers it: {kinds:?}"
         );
     }
 
     #[test]
-    fn without_a_font_everything_but_the_text_is_still_painted() {
+    fn without_shaped_text_everything_but_the_text_is_still_painted() {
         let tree = tree();
         let metrics = metrics(1.0);
-        let layout = tree.layout(instar_ui::Viewport::new(400.0, 300.0));
+        let mut text = TextContext::new();
+        let mut layout = tree.layout(
+            &mut text,
+            Viewport::new(
+                metrics.logical_size.width as f32,
+                metrics.logical_size.height as f32,
+            ),
+        );
 
-        let with = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs))
-            .app_scene(&tree, &layout, &metrics, None);
-        let without = SceneBuilder::new().app_scene(&tree, &layout, &metrics, None);
+        let with =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
+        layout.text.clear();
+        let without =
+            SceneBuilder::new().app_scene(&tree, &layout, &ScrollState::new(), &metrics, None);
 
         assert_eq!(
             fills(&with),
             fills(&without),
-            "a missing font should cost the text and nothing else"
+            "missing shaped text should cost the glyphs and nothing else"
         );
         assert!(without.fonts.is_empty());
         assert!(glyph_runs(&without).is_empty());
@@ -844,7 +1074,9 @@ mod tests {
 
     #[test]
     fn a_crash_scene_needs_no_tree_and_no_layout() {
-        let scene = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs)).crash_scene(
+        let mut text = TextContext::new();
+        let scene = SceneBuilder::new().crash_scene(
+            &mut text,
             GenerationId(3),
             "guest trapped: unreachable",
             &metrics(1.0),
@@ -867,23 +1099,26 @@ mod tests {
     #[test]
     fn a_long_trap_message_is_wrapped_rather_than_run_off_the_edge() {
         let message = "trap: ".to_string() + &"detail ".repeat(200);
-        let scene = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs)).crash_scene(
-            GenerationId(1),
-            &message,
-            &metrics(1.0),
-        );
+        let mut text = TextContext::new();
+        let scene =
+            SceneBuilder::new().crash_scene(&mut text, GenerationId(1), &message, &metrics(1.0));
 
-        let width = metrics(1.0).logical_size.width as f32;
+        // Glyph positions in a scene are absolute, so the bound is the content
+        // area's right EDGE, not its width. The margin is part of the
+        // coordinate, not something to subtract from the comparison — an
+        // earlier version of this test compared an absolute x against a
+        // relative width and reported perfectly well-wrapped text as escaping.
+        let margin = 16.0;
+        let right_edge = metrics(1.0).logical_size.width as f32 - margin;
         for run in glyph_runs(&scene) {
-            let right = run
-                .glyphs
-                .iter()
-                .map(|glyph| glyph.x + TEXT_METRICS.char_width)
-                .fold(0.0_f32, f32::max);
-            assert!(
-                right <= width,
-                "a run reaching {right} escapes a {width}-wide window"
-            );
+            for glyph in run.glyphs.iter() {
+                assert!(
+                    glyph.x >= margin && glyph.x <= right_edge,
+                    "a glyph at {} falls outside the content area [{margin}, {right_edge}]; \
+                     Parley should have wrapped the diagnostic to fit",
+                    glyph.x
+                );
+            }
         }
     }
 
@@ -960,7 +1195,9 @@ mod tests {
     #[test]
     fn a_clamped_diagnostic_still_produces_a_drawable_crash_screen() {
         let flood = "trap\n".repeat(MAX_CRASH_MESSAGE_LINES * 8);
-        let scene = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs)).crash_scene(
+        let mut text = TextContext::new();
+        let scene = SceneBuilder::new().crash_scene(
+            &mut text,
             GenerationId(1),
             &clamp_diagnostic(&flood),
             &metrics(1.0),
@@ -978,11 +1215,9 @@ mod tests {
             .map(|n| format!("frame {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let scene = SceneBuilder::with_glyphs(Arc::new(FakeGlyphs)).crash_scene(
-            GenerationId(1),
-            &message,
-            &metrics(1.0),
-        );
+        let mut text = TextContext::new();
+        let scene =
+            SceneBuilder::new().crash_scene(&mut text, GenerationId(1), &message, &metrics(1.0));
 
         let height = metrics(1.0).logical_size.height as f32;
         let runs = glyph_runs(&scene);
@@ -994,22 +1229,5 @@ mod tests {
                 "a baseline at {lowest} is below a {height}-tall window"
             );
         }
-    }
-
-    #[test]
-    fn wrapping_breaks_a_word_longer_than_the_window() {
-        let lines = wrap(&"x".repeat(25), 10);
-        assert!(
-            lines.iter().all(|line| line.chars().count() <= 10),
-            "an unbreakable word still has to fit: {lines:?}"
-        );
-        assert_eq!(lines.concat(), "x".repeat(25), "no characters are lost");
-    }
-
-    #[test]
-    fn wrapping_preserves_every_word() {
-        let lines = wrap("the guest trapped while handling a click", 12);
-        assert!(lines.iter().all(|line| line.chars().count() <= 12));
-        assert_eq!(lines.join(" "), "the guest trapped while handling a click");
     }
 }

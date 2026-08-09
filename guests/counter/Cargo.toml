@@ -1,0 +1,19 @@
+[package]
+name = "counter"
+version = "0.0.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+description = "Instar's counter guest: the interface the desktop shell runs. Not part of the Instar workspace; targets wasm32-wasip2 and is built on demand by instar-shell's build script."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60.0"
+# The wire format, and nothing else. A guest speaks the encoding; it never
+# links the host's UI implementation, its layout engine, or its hit-testing.
+# See docs/PHASE-1.md, "UI layering".
+instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }
+
+[workspace]

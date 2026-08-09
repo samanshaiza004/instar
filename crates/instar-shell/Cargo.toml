@@ -11,9 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 instar-host = { path = "../instar-host" }
-instar-kernel = { path = "../instar-kernel" }
 instar-paint = { path = "../instar-paint" }
 instar-window = { path = "../instar-window" }
+
+# The benchmark binary (`src/bin/uibench.rs`) drives the UI tree and the wire
+# format directly, so this workspace crate is a dependency of the shell, not
+# just of its test targets.
+instar-ui = { path = "../instar-ui" }
 
 # The renderer, and the one place its `glyph-run` feature is switched on:
 # `instar-host` emits GlyphRun commands, and this is the crate that has to be
@@ -25,10 +29,5 @@ instar-render-vello-cpu = { path = "../instar-render-vello-cpu", features = ["gl
 softbuffer = "0.4.8"
 winit = "=0.30.13"
 
-# Character-to-glyph mapping, and the font's advance so the shell can pick the
-# size at which it matches the layout's. The same version the renderer
-# validates fonts with, so a face this crate accepts is one that crate can draw.
-skrifa = "=0.44.0"
-
-[dev-dependencies]
-instar-ui = { path = "../instar-ui" }
+[build-dependencies]
+instar-guest-build = { path = "../instar-guest-build" }

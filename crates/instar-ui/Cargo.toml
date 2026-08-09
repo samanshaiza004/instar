@@ -9,6 +9,7 @@ description = "Instar's retained semantic UI tree and its wire encoding: what a 
 # The wire format, shared verbatim with guests. This crate adds meaning on
 # top; the protocol crate stays dependency-free so guests stay light.
 instar-ui-protocol = { path = "../instar-ui-protocol" }
+parley = "0.11"
 thiserror = "2"
 # Layout, and an implementation detail of src/layout.rs: no Taffy type appears
 # in this crate's public API. See docs/PHASE-1.md -- LayoutSnapshot is an
@@ -23,3 +24,6 @@ taffy = "0.12.2"
 # meaning, so the interaction tests live here rather than in the kernel.
 instar-kernel = { path = "../instar-kernel" }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[build-dependencies]
+instar-guest-build = { path = "../instar-guest-build" }

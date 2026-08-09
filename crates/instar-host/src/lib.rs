@@ -52,12 +52,22 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, LayoutSnapshot, Tree, TreeError, UiAction, Viewport};
+use instar_ui::{Interaction, KeyLedger, ScrollState, TextContext, TreeError, UiAction, Viewport};
 use instar_window::{
-    LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
+    LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
+    WindowMetricsChanged, WindowOutput,
 };
 
-pub use present::{GlyphSource, PresentationState, SceneBuilder, Theme};
+pub use present::{PresentationState, SceneBuilder, Theme};
+
+/// The `instar-ui` vocabulary this crate's own API already speaks.
+///
+/// Re-exported so a consumer can name what [`HostWindow::layout`] and
+/// [`HostWindow::tree`] hand back without taking a direct dependency on the UI
+/// layer. That edge would not be *wrong* — this crate is above it — but a
+/// caller adding a dependency purely to spell a return type is a caller being
+/// made to know something it does not need to.
+pub use instar_ui::{LayoutSnapshot, NodeKey, Rect, Tree};
 
 /// Whether a window's geometry can be used right now.
 ///
@@ -160,12 +170,19 @@ pub struct HostWindow {
     /// The most recent tree the guest committed. Survives invalidation — it is
     /// the *geometry* that goes stale, not the interface description.
     tree: Option<Tree>,
+    /// The version of the retained UI state.
+    tree_revision: u64,
     layout: Option<LayoutSnapshot>,
     /// Paint intent for the current frame, lowered when the interface or the
     /// geometry changes rather than when a frame is asked for. See
     /// [`present`]: a redraw callback is the worst place to discover work.
     scene: Option<PaintScene>,
     interaction: Interaction,
+    /// The id lifecycle for the guest currently owning this window.
+    ledger: KeyLedger,
+    /// Where each retained viewport is scrolled to. Host-owned: no guest sets
+    /// one, and none can read one.
+    scroll: ScrollState,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -188,6 +205,17 @@ impl HostWindow {
 
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
+    }
+
+    /// The version of the retained UI state.
+    ///
+    /// Incremented only when an accepted snapshot actually changed the tree;
+    /// an identical re-commit is a guest event, not a new tree. Layout, paint,
+    /// and accessibility caches key off this value, which is why it is kept
+    /// apart from the guest-visible commit sequence that advances on every
+    /// accepted commit.
+    pub fn tree_revision(&self) -> u64 {
+        self.tree_revision
     }
 
     /// The paint intent to present, if there is any that may be shown.
@@ -216,7 +244,7 @@ impl HostWindow {
     ///
     /// Does nothing while blocked, which is the barrier's "no layout" rule
     /// enforced at the only place layout is produced.
-    fn recompute_layout(&mut self) {
+    fn recompute_layout(&mut self, text: &mut TextContext) {
         let (Some(metrics), Some(tree)) = (self.metrics.usable(), self.tree.as_ref()) else {
             return;
         };
@@ -224,12 +252,70 @@ impl HostWindow {
             metrics.logical_size.width as f32,
             metrics.logical_size.height as f32,
         );
-        self.layout = Some(tree.layout(viewport));
+        self.layout = Some(tree.layout(text, viewport));
+    }
+
+    /// Confines every retained offset to what the current layout leaves
+    /// scrollable.
+    ///
+    /// Called after layout and before the snapshot becomes interactive.
+    /// Content that shrank must not leave a viewport showing a region that no
+    /// longer exists, and a hit-test against a stale offset resolves to the
+    /// wrong node rather than to nothing — which is worse, because it looks
+    /// like it worked.
+    ///
+    /// The scrollable extent is the content's size less the viewport's, floored
+    /// at zero: content that fits has nothing to scroll. A viewport that is not
+    /// laid out right now — hidden, or under a `Display::None` ancestor — has
+    /// no extent to clamp against, and its offset is left alone rather than
+    /// zeroed, because hiding retains.
+    fn clamp_scroll(&mut self) {
+        let (Some(tree), Some(layout)) = (self.tree.as_ref(), self.layout.as_ref()) else {
+            return;
+        };
+        self.scroll.clamp_to(tree, &|key| {
+            let viewport = layout.get(key)?;
+            let content = instar_ui::scroll::content_of(tree.find(key)?)?;
+            let content_rect = layout.get(content.key)?;
+            Some(instar_ui::ScrollOffset::new(
+                (content_rect.width - viewport.width).max(0),
+                (content_rect.height - viewport.height).max(0),
+            ))
+        });
     }
 }
 
+/// Every viewport's scrollable extent: content size less viewport size, floored
+/// at zero.
+///
+/// Computed once per event rather than per viewport visited, because the
+/// bubbling walk may ask about several and each answer is two lookups.
+fn scroll_extents(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+) -> HashMap<NodeKey, instar_ui::ScrollOffset> {
+    let mut extents = HashMap::new();
+    for node in tree.iter() {
+        let Some(content) = instar_ui::scroll::content_of(node) else {
+            continue;
+        };
+        let (Some(viewport), Some(content)) = (layout.get(node.key), layout.get(content.key))
+        else {
+            continue;
+        };
+        extents.insert(
+            node.key,
+            instar_ui::ScrollOffset::new(
+                (content.width - viewport.width).max(0),
+                (content.height - viewport.height).max(0),
+            ),
+        );
+    }
+    extents
+}
+
 /// Orchestrates windows, the UI layer, and the guest runtime.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
     /// What the window is showing — the guest's interface, or the host's own
@@ -238,27 +324,50 @@ pub struct Host {
     /// than about a surface.
     presentation: PresentationState,
     scenes: SceneBuilder,
+    /// The long-lived Parley shaping cache. Created once and reused for every
+    /// layout pass; see `instar_ui::TextContext`.
+    text: TextContext,
+}
+
+impl Default for Host {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Host {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            windows: HashMap::new(),
+            presentation: PresentationState::default(),
+            scenes: SceneBuilder::new(),
+            text: TextContext::new(),
+        }
     }
 
-    /// A host that can draw text.
-    ///
-    /// Without one, scenes come out with every rectangle in place and no
-    /// glyphs — which is what the headless tests want, and is why the font is
-    /// injected rather than reached for.
-    pub fn with_glyphs(glyphs: Arc<dyn GlyphSource>) -> Self {
+    /// A host whose Parley font context has the shipped monospace face.
+    pub fn with_monospace_face(face: Arc<[u8]>) -> Self {
         Self {
-            scenes: SceneBuilder::with_glyphs(glyphs),
-            ..Self::default()
+            text: TextContext::with_monospace_face(face),
+            ..Self::new()
         }
     }
 
     pub fn window(&self, id: WindowId) -> Option<&HostWindow> {
         self.windows.get(&id)
+    }
+
+    /// Shaping work done since [`Host::reset_text_stats`].
+    ///
+    /// Exposed so a warm click can be traced: the question "did one changed
+    /// label rebuild one layout, or all of them?" is not answerable from a
+    /// duration.
+    pub fn text_stats(&self) -> instar_ui::text::TextStats {
+        self.text.stats()
+    }
+
+    pub fn reset_text_stats(&mut self) {
+        self.text.reset_stats();
     }
 
     pub fn presentation(&self) -> &PresentationState {
@@ -293,12 +402,17 @@ impl Host {
             PresentationState::Crashed {
                 generation,
                 message,
-            } => self.scenes.crash_scene(*generation, message, metrics),
+            } => self
+                .scenes
+                .crash_scene(&mut self.text, *generation, message, metrics),
             PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
-                (Some(tree), Some(layout)) => {
-                    self.scenes
-                        .app_scene(tree, layout, metrics, window.interaction.pressed())
-                }
+                (Some(tree), Some(layout)) => self.scenes.app_scene(
+                    tree,
+                    layout,
+                    &window.scroll,
+                    metrics,
+                    window.interaction.pressed(),
+                ),
                 // Ready, but the guest has not committed anything yet. An
                 // empty background beats an unpainted buffer, which on most
                 // platforms is whatever was in memory.
@@ -326,6 +440,34 @@ impl Host {
         generation: GenerationId,
         error: Option<String>,
     ) -> Vec<HostEffect> {
+        // The id *history* dies with the Wasm runtime generation: retired ids
+        // are forgotten and the observed-id count resets, so a fresh
+        // generation is not billed for its predecessor's churn. This sits
+        // above the clean-exit early return, because a guest whose `run`
+        // returned has ended just as surely as one that trapped.
+        //
+        // What is reseeded rather than forgotten is the tree still on screen:
+        //
+        // > Retained UI surviving a guest generation change keeps its exact
+        // > `NodeKey`s and repopulates the new generation's ledger before that
+        // > tree can become interactive.
+        //
+        // A cleared ledger beside a retained `window.tree` is a desync: an
+        // identical re-commit takes the no-op path in `apply_tree` and never
+        // reaches `ledger.apply`, so those ids would stay unknown to the
+        // ledger while remaining live, and the first removal-then-reuse of one
+        // would be accepted at generation 0 — the hole the ledger exists to
+        // close, reopened by the ledger's own reset. Only the dead
+        // generation's *history* is discarded. This is not a bare
+        // `ledger.clear()` on purpose; see
+        // `a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen`.
+        for window in self.windows.values_mut() {
+            window.ledger.clear();
+            if let Some(tree) = window.tree.as_ref() {
+                window.ledger.apply(tree);
+            }
+        }
+
         let Some(message) = error else {
             return Vec::new();
         };
@@ -354,6 +496,7 @@ impl Host {
                 self.on_metrics_invalidated(window_id)
             }
             WindowOutput::Pointer(event) => self.on_pointer(event),
+            WindowOutput::Scroll(event) => self.on_scroll(event),
             WindowOutput::RedrawRequested { window_id } => self.on_redraw_requested(window_id),
             // Close policy lives here, not in the window layer. A host with a
             // guest to consult could ask it first; this one exits.
@@ -371,21 +514,98 @@ impl Host {
         window_id: WindowId,
         batch: &[u8],
     ) -> Result<Vec<HostEffect>, TreeError> {
-        Ok(self.apply_tree(window_id, Tree::decode(batch)?))
+        self.apply_tree(window_id, Tree::decode(batch)?)
     }
 
-    /// Installs an already-decoded, already-validated tree.
+    /// Installs an already-decoded, already-validated snapshot.
     ///
     /// Split from [`Host::on_guest_commit`] because the two-thread bridge must
     /// decode at a specific point in a normative sequence — after the
     /// generation check, before anything is mutated — and so cannot use a
-    /// function that does both at once. The swap below is the "apply
-    /// atomically" step: one assignment, after all validation, so a rejected
-    /// commit can never leave the tree half-updated.
-    pub fn apply_tree(&mut self, window_id: WindowId, tree: Tree) -> Vec<HostEffect> {
+    /// function that does both at once.
+    ///
+    /// # The snapshot is diffed, not swapped
+    ///
+    /// The guest sends a whole interface every time; the host keeps the one it
+    /// already has and works out what differs (see [`instar_ui::diff`]). Nodes
+    /// are not destroyed and recreated because another snapshot arrived — the
+    /// retained tree is the interaction and layout object, and the snapshot is
+    /// only a description of what it should now look like.
+    ///
+    /// # Atomicity
+    ///
+    /// The diff runs **before** anything is mutated, and can refuse
+    /// ([`TreeError::KindChanged`]). A refused diff therefore leaves the
+    /// previous interface standing exactly as a refused decode does, which is
+    /// the property the whole commit path is built around. The promotion below
+    /// is still one assignment after all validation.
+    pub fn apply_tree(
+        &mut self,
+        window_id: WindowId,
+        tree: Tree,
+    ) -> Result<Vec<HostEffect>, TreeError> {
         let window = self.windows.entry(window_id).or_default();
+
+        // Before the mutation, so a refusal costs the previous interface
+        // nothing. The ledger check sits beside the diff for the same reason:
+        // a snapshot that reuses a retired id must leave the previous
+        // interface standing exactly as a refused diff does.
+        let changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
+        window.ledger.validate(&tree)?;
+
+        // A guest re-committing an identical interface is an ordinary shape —
+        // it is what an event the guest decided to ignore looks like from
+        // here. It should cost the decode and nothing else: no layout, no
+        // scene, no frame.
+        // (An opening commit always reports its nodes as created, so this
+        // cannot swallow a guest's first interface.)
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Validation ran above the early return, so a no-op commit cannot
+        // dodge the lifecycle rules. `apply` sits after it: an identical
+        // snapshot has identical live keys, so applying would only redo a
+        // no-op, and the no-op commit keeps costing the decode and nothing
+        // else.
+        window.ledger.apply(&tree);
+
+        // A snapshot that survived the diff is a new version of the retained
+        // tree. The guest-visible commit sequence advances on every accepted
+        // commit; this is the host's separate value for whether the state
+        // actually changed, and the one caches key off.
+        window.tree_revision += 1;
+
+        // Before the new snapshot becomes interactive: any transient state
+        // referring to a node the guest removed is retired. A press that
+        // outlived its node would otherwise be completable against whatever
+        // reused its key. See `Interaction::retire`.
+        window.interaction.retire(&changes.removed);
+        self.text.retire(&changes.removed);
+        // Deletion destroys a viewport's offset; hiding does not. This is the
+        // deletion half, and it sits with the other retirements for the same
+        // reason -- state that outlives the node it describes eventually
+        // lands on something else.
+        window.scroll.retire(&changes.removed);
+
         window.tree = Some(tree);
-        window.recompute_layout();
+        // And any state referring to a node the guest *hid*, which the diff
+        // does not report as removed because it is still in the tree. Runs
+        // after the promotion rather than before it, because the question is
+        // about the new snapshot -- what can still be reached now -- whereas
+        // `retire` above asks about keys the new snapshot no longer contains.
+        // Both are before the interface becomes interactive, which is the
+        // property that matters. See `Interaction::retire_hidden`.
+        if let Some(tree) = window.tree.as_ref() {
+            window.interaction.retire_hidden(tree);
+        }
+        window.recompute_layout(&mut self.text);
+        // After layout, because the scrollable extent is a layout answer, and
+        // before the scene is lowered and the commit is acknowledged, because
+        // both of those are the interface becoming interactive. Content that
+        // shrank must not leave a viewport showing a region that is no longer
+        // there.
+        window.clamp_scroll();
         // Lowered here rather than on the next frame callback: the caller is
         // about to tell a guest its interface was accepted, and "accepted"
         // should mean the host has everything it needs to show it.
@@ -393,12 +613,12 @@ impl Host {
 
         let window = self.windows.entry(window_id).or_default();
         if window.metrics.is_ready() {
-            vec![HostEffect::Render { window: window_id }]
+            Ok(vec![HostEffect::Render { window: window_id }])
         } else {
             // Nothing to draw against yet; remember that something wants
             // drawing once there is.
             window.redraw_pending = true;
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -410,7 +630,7 @@ impl Host {
         // Order matters and is the barrier's exit rule: layout first, then the
         // snapshot is replaced, then the scene is lowered against it, and only
         // then may anything be rendered.
-        window.recompute_layout();
+        window.recompute_layout(&mut self.text);
         let wanted = window.redraw_pending || window.layout.is_some();
         self.rebuild_scene(window_id);
 
@@ -457,14 +677,15 @@ impl Host {
 
         let (x, y) = event.logical_pos.round();
         let held = window.interaction.pressed();
+        let scroll = &window.scroll;
         let mut effects = match event.state {
             PointerState::Pressed => {
-                window.interaction.on_press(tree, layout, x, y);
+                window.interaction.on_press(tree, layout, scroll, x, y);
                 Vec::new()
             }
             PointerState::Released => window
                 .interaction
-                .on_release(tree, layout, x, y)
+                .on_release(tree, layout, scroll, x, y)
                 .map(|action: UiAction| vec![HostEffect::SendToGuest(action.encode())])
                 .unwrap_or_default(),
         };
@@ -480,6 +701,64 @@ impl Host {
             });
         }
         effects
+    }
+
+    /// A wheel or touchpad scroll.
+    ///
+    /// The whole response is host-local: find the viewports under the pointer,
+    /// move their offsets, redraw. There is deliberately no branch here that
+    /// can reach the guest — Stage 3's acceptance is that ordinary scrolling
+    /// produces zero `SendToGuest`, and the way to make that true is for the
+    /// path not to exist rather than for a test to keep watch over one that
+    /// does.
+    fn on_scroll(&mut self, event: RawScrollEvent) -> Vec<HostEffect> {
+        let Some(window) = self.windows.get_mut(&event.window_id) else {
+            return Vec::new();
+        };
+        // The metrics barrier applies: geometry computed for a scale that has
+        // since changed is exactly what must not be scrolled against.
+        let (Some(_), Some(tree), Some(layout)) = (
+            window.metrics.usable(),
+            window.tree.as_ref(),
+            window.layout.as_ref(),
+        ) else {
+            return Vec::new();
+        };
+
+        let (x, y) = event.logical_pos.round();
+        let delta = match event.delta {
+            ScrollDelta::Logical { x, y } => instar_ui::ScrollDeltaPixels::new(x, y),
+            // A count becomes a distance here, where how far a line is is a UI
+            // policy question rather than a windowing fact.
+            ScrollDelta::Lines { x, y } => instar_ui::ScrollDeltaPixels::new(
+                x * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+                y * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+            ),
+        };
+
+        let extents = scroll_extents(tree, layout);
+        let outcome = instar_ui::scroll::apply_wheel(
+            tree,
+            layout,
+            &mut window.scroll,
+            &|key| extents.get(&key).copied(),
+            x,
+            y,
+            delta,
+        );
+
+        // Nothing moved -- a viewport already at its limit, or no viewport
+        // under the pointer at all. No frame: a redraw that changes no pixel
+        // is still a frame somebody paid for, and a wheel held at the end of a
+        // list would produce a stream of them.
+        if !outcome.consumed {
+            return Vec::new();
+        }
+
+        self.rebuild_scene(event.window_id);
+        vec![HostEffect::Render {
+            window: event.window_id,
+        }]
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -498,8 +777,11 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use instar_ui::protocol::{BatchEncoder, NodeKey, WireDimension, WireLayout, flags, opcode};
+    use crate::bridge::{HostBridge, HostUserEvent, Wake};
+    use instar_kernel::bridge::commit_request;
+    use instar_ui::protocol::{BatchEncoder, NodeKey, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, PhysicalSize, PointerButton};
+    use std::time::{Duration, Instant};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
 
@@ -521,18 +803,16 @@ mod tests {
     /// root > column > (text, button).
     fn counter_batch() -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
-            .node(opcode::NODE_ROOT, NodeKey(0), 0, None, fill, 1)
-            .node(opcode::NODE_COLUMN, NodeKey(1), 0, None, fill, 2)
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
             .node(
                 opcode::NODE_TEXT,
-                NodeKey(2),
+                NodeKey::first(2),
                 0,
                 Some("Clicked 0 times"),
                 WireLayout::default(),
@@ -540,7 +820,7 @@ mod tests {
             )
             .node(
                 opcode::NODE_BUTTON,
-                NodeKey(3),
+                NodeKey::first(3),
                 flags::ENABLED,
                 Some("Press me"),
                 WireLayout::default(),
@@ -587,7 +867,7 @@ mod tests {
         let rect = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|layout| layout.get(NodeKey(3)))
+            .and_then(|layout| layout.get(NodeKey::first(3)))
             .expect("the button should be laid out");
         (
             f64::from(rect.x + rect.width / 2),
@@ -782,7 +1062,7 @@ mod tests {
         let release = host.handle(pointer(PointerState::Released, x, y));
         assert_eq!(
             to_guest(&release),
-            vec![&UiAction::ButtonActivated(NodeKey(3)).encode()],
+            vec![&UiAction::ButtonActivated(NodeKey::first(3)).encode()],
             "a completed click should be routed to the guest as an encoded event"
         );
     }
@@ -864,6 +1144,775 @@ mod tests {
             window.tree().is_some() && window.layout().is_some(),
             "a rejected commit should leave the last good interface in place"
         );
+    }
+
+    // --- Snapshot diffing (Stage 0) ---
+
+    /// A batch whose key 2 is a *button* where [`counter_batch`] makes it text.
+    fn kind_swapped_batch() -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::first(2),
+                flags::ENABLED,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    // --- Commit sequence vs tree revision ---
+    //
+    // The bridge carries two counters now. `commit_sequence` is the guest's:
+    // it advances on every accepted commit, no-op or not. `tree_revision` is
+    // the host's: it advances only when the diff found something. These three
+    // tests drive a real bridge directly, so the divergence is observable at
+    // the same place a consumer would read it.
+
+    fn component() -> Vec<u8> {
+        std::fs::read(env!("HOSTILE_WASM")).expect("the hostile guest is built by build.rs")
+    }
+
+    /// A bridge whose guest has finished its opening commit, so the manual
+    /// commits below start from a known retained tree.
+    fn ready_bridge() -> HostBridge {
+        let wake: Wake = Arc::new(|| {});
+        let mut bridge = HostBridge::spawn(component(), WINDOW, wake).expect("the guest starts");
+        wait_for_commit(&mut bridge);
+        bridge
+    }
+
+    /// Waits for one more accepted guest commit.
+    fn wait_for_commit(bridge: &mut HostBridge) {
+        let target = bridge.commit_sequence() + 1;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            bridge.wait(Duration::from_millis(50));
+            if bridge.commit_sequence() >= target {
+                return;
+            }
+        }
+        panic!("the guest never committed");
+    }
+
+    /// Delivers a batch as if the guest had just committed it.
+    fn deliver(bridge: &mut HostBridge, batch: Vec<u8>) {
+        let (request, _reply) = commit_request(bridge.generation(), batch);
+        bridge.on_user_event(HostUserEvent::UiCommit {
+            generation: bridge.generation(),
+            request,
+        });
+    }
+
+    #[test]
+    fn an_accepted_change_bumps_both_counters() {
+        let mut bridge = ready_bridge();
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, counter_batch());
+
+        assert_eq!(
+            bridge.commit_sequence(),
+            sequence + 1,
+            "an accepted commit is a new event for the guest"
+        );
+        assert_eq!(
+            bridge.tree_revision(),
+            tree + 1,
+            "and a changed snapshot is a new version of the retained tree"
+        );
+        bridge.shutdown();
+    }
+
+    #[test]
+    fn an_identical_recommit_bumps_the_commit_sequence_but_not_the_tree_revision() {
+        let mut bridge = ready_bridge();
+        deliver(&mut bridge, counter_batch());
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, counter_batch());
+
+        assert_eq!(
+            bridge.commit_sequence(),
+            sequence + 1,
+            "the guest still gets a new sequence number for its accepted commit"
+        );
+        assert_eq!(
+            bridge.tree_revision(),
+            tree,
+            "an identical re-commit must not claim a new tree exists"
+        );
+        bridge.shutdown();
+    }
+
+    #[test]
+    fn a_refused_commit_bumps_neither_counter() {
+        let mut bridge = ready_bridge();
+        deliver(&mut bridge, counter_batch());
+        let sequence = bridge.commit_sequence();
+        let tree = bridge.tree_revision();
+
+        deliver(&mut bridge, kind_swapped_batch());
+
+        assert_eq!(
+            bridge.stats().rejected_commits,
+            1,
+            "the kind swap should actually be refused"
+        );
+        assert_eq!(bridge.commit_sequence(), sequence);
+        assert_eq!(bridge.tree_revision(), tree);
+        bridge.shutdown();
+    }
+
+    /// A guest re-committing an interface it did not change is an ordinary
+    /// shape — it is what an event the guest chose to ignore looks like from
+    /// here. It should cost the decode and nothing else.
+    #[test]
+    fn recommitting_an_identical_snapshot_asks_for_no_frame() {
+        let mut host = ready_host();
+        let before = host.window(WINDOW).unwrap().scene().cloned();
+
+        let effects = host
+            .on_guest_commit(WINDOW, &counter_batch())
+            .expect("valid batch");
+
+        assert!(
+            effects.is_empty(),
+            "an unchanged interface should not ask for a frame, got {effects:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().scene().cloned(),
+            before,
+            "and the scene it was already showing should be untouched"
+        );
+    }
+
+    /// The host holds transient state against keys — focus, scroll offset, an
+    /// in-flight press. Silently swapping the node behind a key would move that
+    /// state onto an unrelated control, so a guest that reuses a key for a
+    /// different kind of node is refused rather than accommodated.
+    #[test]
+    fn reusing_a_key_for_a_different_kind_of_node_is_refused() {
+        let mut host = ready_host();
+        let before = host.window(WINDOW).unwrap().tree().cloned();
+
+        let refused = host.on_guest_commit(WINDOW, &kind_swapped_batch());
+
+        assert!(
+            matches!(refused, Err(TreeError::KindChanged { .. })),
+            "expected a KindChanged refusal, got {refused:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().tree().cloned(),
+            before,
+            "a refused diff must leave the previous interface standing, exactly \
+             as a refused decode does"
+        );
+    }
+
+    /// The diff runs before anything is mutated, so a refusal cannot leave the
+    /// host half-updated — and the interface it was already showing keeps
+    /// working afterwards.
+    #[test]
+    fn a_refused_snapshot_leaves_a_working_interface_behind() {
+        let mut host = ready_host();
+        assert!(host.on_guest_commit(WINDOW, &kind_swapped_batch()).is_err());
+
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+        assert_eq!(
+            to_guest(&host.handle(pointer(PointerState::Released, x, y))).len(),
+            1,
+            "the surviving interface should still be clickable"
+        );
+    }
+
+    /// A batch with the counter's button removed, keeping every other key.
+    fn batch_without_the_button() -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// A batch with the counter's shape plus a button under id 7 at
+    /// `generation`.
+    fn batch_with_button_7(generation: u32) -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::new(7, generation),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// The counter batch with button 3 at `generation`.
+    fn counter_batch_with_button_generation(generation: u32) -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("Clicked 0 times"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::new(3, generation),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    /// press -> the guest removes the node -> the guest reuses the id at a
+    /// new generation -> release. Nothing else catches this: the kind is
+    /// unchanged, so `KindChanged` does not fire, and the scale never moved,
+    /// so the geometry barrier does not either.
+    #[test]
+    fn a_press_cannot_be_completed_against_a_node_that_reused_its_key() {
+        let mut host = ready_host();
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+
+        // The guest drops the button, then brings it back under the same id
+        // at generation 1.
+        host.on_guest_commit(WINDOW, &batch_without_the_button())
+            .expect("valid batch");
+        host.on_guest_commit(WINDOW, &counter_batch_with_button_generation(1))
+            .expect("valid batch");
+
+        let release = host.handle(pointer(PointerState::Released, x, y));
+        assert!(
+            to_guest(&release).is_empty(),
+            "the press belonged to a node that no longer exists; completing it \
+             against whatever reused the id would activate a control the user \
+             never touched"
+        );
+    }
+
+    // --- B2: the wheel, and the guest's absence from it. ---
+
+    fn wheel(x: f64, y: f64, dy: f64) -> WindowOutput {
+        WindowOutput::Scroll(instar_window::RawScrollEvent {
+            window_id: WINDOW,
+            logical_pos: LogicalPoint::new(x, y),
+            delta: instar_window::ScrollDelta::Logical { x: 0.0, y: dy },
+        })
+    }
+
+    /// A 100-tall viewport whose content is 500 tall, with a button at content
+    /// y = 200 — below the fold until something scrolls.
+    fn scrollable_tree() -> Tree {
+        use instar_ui::{Node, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![
+                            Node::text(12, "spacer").with_layout(WireLayout {
+                                height: WireSize::Fixed(200),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(13, "target").with_layout(WireLayout {
+                                height: WireSize::Fixed(40),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(14, "tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(260),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    /// The acceptance test for the whole stage: a wheel moves the interface,
+    /// and the guest never hears about it.
+    ///
+    /// Deliberately stronger than "the offset changed". The offset is an
+    /// implementation detail; what a user experiences is that the button is
+    /// *drawn* somewhere new and *clicks* somewhere new. Asserting only the
+    /// offset would pass against an implementation that moved the number and
+    /// forgot to re-lower the scene.
+    #[test]
+    fn a_wheel_scrolls_the_view_without_the_guest_hearing_anything() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, scrollable_tree())
+            .expect("valid tree");
+
+        let target = NodeKey::first(13);
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(target))
+                .map(|rect| rect.y),
+            Some(200),
+            "the target starts at content y = 200, below a 100-tall viewport"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .hit_test_scrolled(
+                    host.window(WINDOW).and_then(HostWindow::layout).unwrap(),
+                    &host.window(WINDOW).unwrap().scroll,
+                    5,
+                    50,
+                ),
+            None,
+            "and nothing is at viewport y = 50 before scrolling"
+        );
+
+        let effects = host.handle(wheel(5.0, 50.0, 150.0));
+
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            150,
+            "the host-owned offset moved by the delta"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "and the window was asked to redraw"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "ordinary scrolling must never reach the guest: {effects:?}"
+        );
+
+        // Painted somewhere new.
+        let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+        let filled: Vec<i32> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                instar_paint::PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![50],
+            "200 minus an offset of 150 puts the button at viewport y = 50"
+        );
+
+        // And clickable where it is drawn.
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            window
+                .tree()
+                .unwrap()
+                .hit_test_scrolled(window.layout().unwrap(), &window.scroll, 5, 50)
+                .map(|node| node.key),
+            Some(target),
+            "the same button is now reachable where it appears"
+        );
+    }
+
+    /// A viewport already at its limit costs nothing.
+    #[test]
+    fn scrolling_past_the_end_produces_neither_a_guest_event_nor_a_frame() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, scrollable_tree())
+            .expect("valid tree");
+
+        // 500 of content in a 100 viewport leaves 400 to scroll.
+        host.handle(wheel(5.0, 50.0, 400.0));
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            400,
+            "the fixture is now scrolled to its end"
+        );
+
+        let effects = host.handle(wheel(5.0, 50.0, 120.0));
+        assert!(
+            effects.is_empty(),
+            "a wheel that moves nothing must produce no effect at all -- not a \
+             guest event, and not a frame that would redraw identical pixels: \
+             {effects:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            400,
+            "and the offset is unchanged"
+        );
+    }
+
+    /// The nested-scroll trap, which "the nearest scroll owns the event" walks
+    /// straight into.
+    #[test]
+    fn an_inner_viewport_at_its_limit_hands_the_rest_to_its_ancestor() {
+        use instar_ui::{Node, WireLayout, WireSize};
+
+        // Outer viewport 100 tall over 400 of content; inner 50 tall over 100.
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    20,
+                    Node::column(
+                        21,
+                        vec![
+                            Node::scroll(
+                                22,
+                                Node::text(23, "inner").with_layout(WireLayout {
+                                    height: WireSize::Fixed(100),
+                                    ..WireLayout::default()
+                                }),
+                            )
+                            .with_layout(WireLayout {
+                                height: WireSize::Fixed(50),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(24, "outer tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(350),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, tree).expect("valid tree");
+
+        let inner = NodeKey::first(22);
+        let outer = NodeKey::first(20);
+
+        // Pointer inside the inner viewport. It can take 50; the rest is the
+        // outer one's.
+        host.handle(wheel(5.0, 10.0, 120.0));
+
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            window.scroll.get(inner).y,
+            50,
+            "the inner viewport takes what it has room for"
+        );
+        assert_eq!(
+            window.scroll.get(outer).y,
+            70,
+            "and the remaining 70 scrolls the ancestor rather than vanishing"
+        );
+    }
+
+    /// A viewport whose content shrank must not keep pointing past the end.
+    ///
+    /// Driven through `apply_tree` rather than by calling the clamp directly,
+    /// because the property is about *ordering* — the offset is confined
+    /// before the new snapshot is lowered and acknowledged, not at some later
+    /// convenient moment.
+    #[test]
+    fn shrinking_content_clamps_a_retained_offset() {
+        use instar_ui::{Node, ScrollOffset, WireLayout, WireSize};
+
+        let build = |content_height: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        10,
+                        Node::text(11, "content").with_layout(WireLayout {
+                            height: WireSize::Fixed(content_height),
+                            ..WireLayout::default()
+                        }),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        ..WireLayout::default()
+                    }),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(500)).expect("valid tree");
+
+        let window = host.windows.get_mut(&WINDOW).unwrap();
+        window
+            .scroll
+            .set(NodeKey::first(10), ScrollOffset::new(0, 300));
+        assert_eq!(
+            window.scroll.get(NodeKey::first(10)).y,
+            300,
+            "400 of scrollable extent leaves 300 reachable"
+        );
+
+        // The same viewport over content that now barely overflows it.
+        host.apply_tree(WINDOW, build(150)).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            50,
+            "150 of content in a 100 viewport leaves 50, and the offset is \
+             pulled back to it"
+        );
+
+        host.apply_tree(WINDOW, build(80)).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            0,
+            "content that fits leaves nothing to scroll"
+        );
+    }
+
+    /// Deletion destroys the offset; a commit that keeps the viewport does not.
+    #[test]
+    fn a_deleted_viewport_loses_its_offset_and_a_surviving_one_keeps_it() {
+        use instar_ui::{Node, ScrollOffset, WireLayout, WireSize};
+
+        let with_scroll = || {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        10,
+                        Node::text(11, "content").with_layout(WireLayout {
+                            height: WireSize::Fixed(500),
+                            ..WireLayout::default()
+                        }),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        ..WireLayout::default()
+                    }),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, with_scroll()).expect("valid tree");
+        host.windows
+            .get_mut(&WINDOW)
+            .unwrap()
+            .scroll
+            .set(NodeKey::first(10), ScrollOffset::new(0, 200));
+
+        // A commit that changes something else entirely leaves the offset be.
+        let mut kept = with_scroll();
+        kept.root.children.push(Node::text(12, "sibling"));
+        host.apply_tree(WINDOW, kept).expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            200,
+            "a commit that leaves the viewport alive preserves its offset"
+        );
+
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(12, "gone")])),
+        )
+        .expect("valid tree");
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.len(),
+            0,
+            "deleting the viewport destroys the offset rather than orphaning it"
+        );
+    }
+
+    /// The ledger closes the queued-event hole end to end: an id that was
+    /// live, then removed, cannot come back at the same generation even when
+    /// the snapshot itself is otherwise valid.
+    #[test]
+    fn a_removed_id_cannot_come_back_at_the_same_generation() {
+        let mut host = Host::new();
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("the first lifetime of id 7 is accepted");
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("removing id 7 is accepted");
+
+        let before = host.window(WINDOW).unwrap().tree().cloned();
+        assert_eq!(
+            host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
+            Err(TreeError::GenerationNotAdvanced {
+                key: NodeKey::first(7),
+                retired: 0,
+            }),
+            "a stale event for id 7 names a node the ledger has retired"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().tree().cloned(),
+            before,
+            "the refusal must leave the previous interface standing"
+        );
+
+        host.on_guest_commit(WINDOW, &batch_with_button_7(1))
+            .expect("the same id at a higher generation is a new node");
+    }
+
+    /// A cleared ledger must not desync from the tree still on screen.
+    ///
+    /// The window keeps showing the last interface after a guest exits, so the
+    /// ids in it are still live as far as everything else is concerned. If
+    /// `on_guest_gone` merely emptied the ledger, an identical re-commit would
+    /// take the no-op path in `apply_tree` and never reach `ledger.apply` —
+    /// leaving those ids unknown, and the first removal-then-reuse accepted at
+    /// generation 0, which is the exact hole the ledger exists to close.
+    #[test]
+    fn a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen() {
+        let mut host = Host::new();
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("the first lifetime of id 7 is accepted");
+
+        host.on_guest_gone(WINDOW, GenerationId(1), None);
+
+        // The identical snapshot: a no-op commit that never reaches `apply`.
+        host.on_guest_commit(WINDOW, &batch_with_button_7(0))
+            .expect("re-committing the interface on screen is a no-op, not a violation");
+        host.on_guest_commit(WINDOW, &counter_batch())
+            .expect("removing id 7 is accepted");
+
+        assert_eq!(
+            host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
+            Err(TreeError::GenerationNotAdvanced {
+                key: NodeKey::first(7),
+                retired: 0,
+            }),
+            "id 7 was live in the tree the dead generation left on screen, so \
+             reusing it must still require a higher generation"
+        );
+    }
+
+    /// The same shape, but the node never leaves. Retirement must not become a
+    /// blanket "any commit cancels the press" — that would break click-through
+    /// on any interface that updates while the button is held.
+    #[test]
+    fn a_press_survives_a_commit_that_leaves_its_node_alone() {
+        let mut host = ready_host();
+        let (x, y) = button_centre(&host);
+        host.handle(pointer(PointerState::Pressed, x, y));
+
+        // A commit that changes the label text but keeps the button.
+        host.on_guest_commit(WINDOW, &foreign_text_batch("Clicked 1 times"))
+            .expect("valid batch");
+
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(3)),
+            "an unrelated commit must not cancel a press in progress"
+        );
+    }
+
+    /// The counter batch with different label text, so a commit can change
+    /// something without touching the button.
+    fn foreign_text_batch(text: &str) -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 2)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some(text),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::first(3),
+                flags::ENABLED,
+                Some("Press me"),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
     }
 
     // --- Presentation (WP7B2) ---
@@ -1055,7 +2104,7 @@ mod tests {
         let wide = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|l| l.get(NodeKey(1)))
+            .and_then(|l| l.get(NodeKey::first(1)))
             .unwrap();
 
         // Same logical size, double the physical size: layout must not move.
@@ -1063,7 +2112,7 @@ mod tests {
         let after = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
-            .and_then(|l| l.get(NodeKey(1)))
+            .and_then(|l| l.get(NodeKey::first(1)))
             .unwrap();
 
         assert_eq!(
