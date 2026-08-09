@@ -150,6 +150,44 @@ pub struct RawPointerEvent {
     pub state: PointerState,
 }
 
+/// How far a wheel or touchpad asked to scroll, and in what units.
+///
+/// The two are kept apart because they are genuinely different facts. A pixel
+/// delta is a distance and can be converted at the window boundary like any
+/// other. A line delta is a *count* — how far a line is is a UI policy
+/// question, and answering it here would put typography in the windowing
+/// layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollDelta {
+    /// Logical pixels, already converted from physical at this boundary.
+    Logical { x: f64, y: f64 },
+    /// Whole lines, as a wheel notch reports them. `instar-ui` decides how
+    /// far a line is.
+    Lines { x: f64, y: f64 },
+}
+
+/// A wheel or touchpad scroll, in logical coordinates.
+///
+/// # The sign convention is settled here and nowhere else
+///
+/// > `+y` means **increase the scroll offset**, which reveals content further
+/// > down.
+///
+/// Platform wheel direction, natural-scrolling preferences, and winit's own
+/// conventions are resolved in this crate and never travel inward. Retained UI
+/// that has to ask which way `+y` points on this operating system is retained
+/// UI with a platform leak in it.
+///
+/// Like [`RawPointerEvent`], this carries no interpretation: no target node,
+/// no viewport, no offset. Which `Scroll` this reaches — if any — is
+/// `instar-ui`'s to decide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawScrollEvent {
+    pub window_id: WindowId,
+    pub logical_pos: LogicalPoint,
+    pub delta: ScrollDelta,
+}
+
 /// The window's geometry changed: resized, moved between monitors, or the
 /// user changed display scaling.
 ///
@@ -168,6 +206,7 @@ pub struct WindowMetricsChanged {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowOutput {
     Pointer(RawPointerEvent),
+    Scroll(RawScrollEvent),
     MetricsChanged(WindowMetricsChanged),
     /// The window's presentation geometry is temporarily unusable.
     ///
@@ -363,6 +402,34 @@ impl WindowState {
         })
     }
 
+    /// A wheel notch or touchpad gesture, converted and sign-corrected.
+    ///
+    /// `physical_delta` is what the platform reported, in its own direction.
+    /// A platform where wheeling away from you scrolls *up* reports a positive
+    /// value there and is negated here — the one place that question is asked.
+    ///
+    /// `None` when the cursor position is not yet known: a scroll has to
+    /// happen *somewhere* for `instar-ui` to find a viewport under it, and
+    /// inventing a position would put the event on whatever is at the origin.
+    pub fn on_wheel(&self, delta: ScrollDelta, natural: bool) -> Option<RawScrollEvent> {
+        let delta = match delta {
+            // Physical to logical, like every other distance crossing this
+            // boundary.
+            ScrollDelta::Logical { x, y } => ScrollDelta::Logical {
+                x: x / self.scale_factor,
+                y: y / self.scale_factor,
+            },
+            // A count, not a distance, so the scale factor does not apply.
+            ScrollDelta::Lines { x, y } => ScrollDelta::Lines { x, y },
+        };
+        let delta = if natural { delta } else { negate(delta) };
+        Some(RawScrollEvent {
+            window_id: self.window_id,
+            logical_pos: self.last_cursor?,
+            delta,
+        })
+    }
+
     pub fn metrics(&self) -> WindowMetricsChanged {
         WindowMetricsChanged {
             window_id: self.window_id,
@@ -370,6 +437,13 @@ impl WindowState {
             physical_size: self.physical_size,
             scale_factor: self.scale_factor,
         }
+    }
+}
+
+fn negate(delta: ScrollDelta) -> ScrollDelta {
+    match delta {
+        ScrollDelta::Logical { x, y } => ScrollDelta::Logical { x: -x, y: -y },
+        ScrollDelta::Lines { x, y } => ScrollDelta::Lines { x: -x, y: -y },
     }
 }
 

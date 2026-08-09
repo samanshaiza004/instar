@@ -54,7 +54,8 @@ use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
 use instar_ui::{Interaction, KeyLedger, ScrollState, TextContext, TreeError, UiAction, Viewport};
 use instar_window::{
-    LogicalPoint, PointerState, RawPointerEvent, WindowId, WindowMetricsChanged, WindowOutput,
+    LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
+    WindowMetricsChanged, WindowOutput,
 };
 
 pub use present::{PresentationState, SceneBuilder, Theme};
@@ -284,6 +285,35 @@ impl HostWindow {
     }
 }
 
+/// Every viewport's scrollable extent: content size less viewport size, floored
+/// at zero.
+///
+/// Computed once per event rather than per viewport visited, because the
+/// bubbling walk may ask about several and each answer is two lookups.
+fn scroll_extents(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+) -> HashMap<NodeKey, instar_ui::ScrollOffset> {
+    let mut extents = HashMap::new();
+    for node in tree.iter() {
+        let Some(content) = instar_ui::scroll::content_of(node) else {
+            continue;
+        };
+        let (Some(viewport), Some(content)) = (layout.get(node.key), layout.get(content.key))
+        else {
+            continue;
+        };
+        extents.insert(
+            node.key,
+            instar_ui::ScrollOffset::new(
+                (content.width - viewport.width).max(0),
+                (content.height - viewport.height).max(0),
+            ),
+        );
+    }
+    extents
+}
+
 /// Orchestrates windows, the UI layer, and the guest runtime.
 #[derive(Debug)]
 pub struct Host {
@@ -466,6 +496,7 @@ impl Host {
                 self.on_metrics_invalidated(window_id)
             }
             WindowOutput::Pointer(event) => self.on_pointer(event),
+            WindowOutput::Scroll(event) => self.on_scroll(event),
             WindowOutput::RedrawRequested { window_id } => self.on_redraw_requested(window_id),
             // Close policy lives here, not in the window layer. A host with a
             // guest to consult could ask it first; this one exits.
@@ -670,6 +701,64 @@ impl Host {
             });
         }
         effects
+    }
+
+    /// A wheel or touchpad scroll.
+    ///
+    /// The whole response is host-local: find the viewports under the pointer,
+    /// move their offsets, redraw. There is deliberately no branch here that
+    /// can reach the guest — Stage 3's acceptance is that ordinary scrolling
+    /// produces zero `SendToGuest`, and the way to make that true is for the
+    /// path not to exist rather than for a test to keep watch over one that
+    /// does.
+    fn on_scroll(&mut self, event: RawScrollEvent) -> Vec<HostEffect> {
+        let Some(window) = self.windows.get_mut(&event.window_id) else {
+            return Vec::new();
+        };
+        // The metrics barrier applies: geometry computed for a scale that has
+        // since changed is exactly what must not be scrolled against.
+        let (Some(_), Some(tree), Some(layout)) = (
+            window.metrics.usable(),
+            window.tree.as_ref(),
+            window.layout.as_ref(),
+        ) else {
+            return Vec::new();
+        };
+
+        let (x, y) = event.logical_pos.round();
+        let delta = match event.delta {
+            ScrollDelta::Logical { x, y } => instar_ui::ScrollDeltaPixels::new(x, y),
+            // A count becomes a distance here, where how far a line is is a UI
+            // policy question rather than a windowing fact.
+            ScrollDelta::Lines { x, y } => instar_ui::ScrollDeltaPixels::new(
+                x * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+                y * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+            ),
+        };
+
+        let extents = scroll_extents(tree, layout);
+        let outcome = instar_ui::scroll::apply_wheel(
+            tree,
+            layout,
+            &mut window.scroll,
+            &|key| extents.get(&key).copied(),
+            x,
+            y,
+            delta,
+        );
+
+        // Nothing moved -- a viewport already at its limit, or no viewport
+        // under the pointer at all. No frame: a redraw that changes no pixel
+        // is still a frame somebody paid for, and a wheel held at the end of a
+        // list would produce a stream of them.
+        if !outcome.consumed {
+            return Vec::new();
+        }
+
+        self.rebuild_scene(event.window_id);
+        vec![HostEffect::Render {
+            window: event.window_id,
+        }]
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -1351,6 +1440,240 @@ mod tests {
             "the press belonged to a node that no longer exists; completing it \
              against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    // --- B2: the wheel, and the guest's absence from it. ---
+
+    fn wheel(x: f64, y: f64, dy: f64) -> WindowOutput {
+        WindowOutput::Scroll(instar_window::RawScrollEvent {
+            window_id: WINDOW,
+            logical_pos: LogicalPoint::new(x, y),
+            delta: instar_window::ScrollDelta::Logical { x: 0.0, y: dy },
+        })
+    }
+
+    /// A 100-tall viewport whose content is 500 tall, with a button at content
+    /// y = 200 — below the fold until something scrolls.
+    fn scrollable_tree() -> Tree {
+        use instar_ui::{Node, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![
+                            Node::text(12, "spacer").with_layout(WireLayout {
+                                height: WireSize::Fixed(200),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(13, "target").with_layout(WireLayout {
+                                height: WireSize::Fixed(40),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(14, "tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(260),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    /// The acceptance test for the whole stage: a wheel moves the interface,
+    /// and the guest never hears about it.
+    ///
+    /// Deliberately stronger than "the offset changed". The offset is an
+    /// implementation detail; what a user experiences is that the button is
+    /// *drawn* somewhere new and *clicks* somewhere new. Asserting only the
+    /// offset would pass against an implementation that moved the number and
+    /// forgot to re-lower the scene.
+    #[test]
+    fn a_wheel_scrolls_the_view_without_the_guest_hearing_anything() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, scrollable_tree())
+            .expect("valid tree");
+
+        let target = NodeKey::first(13);
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(target))
+                .map(|rect| rect.y),
+            Some(200),
+            "the target starts at content y = 200, below a 100-tall viewport"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .hit_test_scrolled(
+                    host.window(WINDOW).and_then(HostWindow::layout).unwrap(),
+                    &host.window(WINDOW).unwrap().scroll,
+                    5,
+                    50,
+                ),
+            None,
+            "and nothing is at viewport y = 50 before scrolling"
+        );
+
+        let effects = host.handle(wheel(5.0, 50.0, 150.0));
+
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            150,
+            "the host-owned offset moved by the delta"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "and the window was asked to redraw"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "ordinary scrolling must never reach the guest: {effects:?}"
+        );
+
+        // Painted somewhere new.
+        let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+        let filled: Vec<i32> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                instar_paint::PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![50],
+            "200 minus an offset of 150 puts the button at viewport y = 50"
+        );
+
+        // And clickable where it is drawn.
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            window
+                .tree()
+                .unwrap()
+                .hit_test_scrolled(window.layout().unwrap(), &window.scroll, 5, 50)
+                .map(|node| node.key),
+            Some(target),
+            "the same button is now reachable where it appears"
+        );
+    }
+
+    /// A viewport already at its limit costs nothing.
+    #[test]
+    fn scrolling_past_the_end_produces_neither_a_guest_event_nor_a_frame() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, scrollable_tree())
+            .expect("valid tree");
+
+        // 500 of content in a 100 viewport leaves 400 to scroll.
+        host.handle(wheel(5.0, 50.0, 400.0));
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            400,
+            "the fixture is now scrolled to its end"
+        );
+
+        let effects = host.handle(wheel(5.0, 50.0, 120.0));
+        assert!(
+            effects.is_empty(),
+            "a wheel that moves nothing must produce no effect at all -- not a \
+             guest event, and not a frame that would redraw identical pixels: \
+             {effects:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(10))
+                .y,
+            400,
+            "and the offset is unchanged"
+        );
+    }
+
+    /// The nested-scroll trap, which "the nearest scroll owns the event" walks
+    /// straight into.
+    #[test]
+    fn an_inner_viewport_at_its_limit_hands_the_rest_to_its_ancestor() {
+        use instar_ui::{Node, WireLayout, WireSize};
+
+        // Outer viewport 100 tall over 400 of content; inner 50 tall over 100.
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    20,
+                    Node::column(
+                        21,
+                        vec![
+                            Node::scroll(
+                                22,
+                                Node::text(23, "inner").with_layout(WireLayout {
+                                    height: WireSize::Fixed(100),
+                                    ..WireLayout::default()
+                                }),
+                            )
+                            .with_layout(WireLayout {
+                                height: WireSize::Fixed(50),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(24, "outer tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(350),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, tree).expect("valid tree");
+
+        let inner = NodeKey::first(22);
+        let outer = NodeKey::first(20);
+
+        // Pointer inside the inner viewport. It can take 50; the rest is the
+        // outer one's.
+        host.handle(wheel(5.0, 10.0, 120.0));
+
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            window.scroll.get(inner).y,
+            50,
+            "the inner viewport takes what it has room for"
+        );
+        assert_eq!(
+            window.scroll.get(outer).y,
+            70,
+            "and the remaining 70 scrolls the ancestor rather than vanishing"
         );
     }
 
