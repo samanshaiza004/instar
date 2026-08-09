@@ -1602,6 +1602,182 @@ mod tests {
         );
     }
 
+    // --- C6: border composition. ---
+
+    /// A thickly bordered node, big enough that a centred stroke would be
+    /// unmistakable.
+    fn bordered_tree() -> Tree {
+        use instar_ui::{Node, WireColor, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::button(40, "bordered")
+                    .with_layout(WireLayout {
+                        width: WireSize::Fixed(80),
+                        height: WireSize::Fixed(40),
+                        ..WireLayout::default()
+                    })
+                    .with_border(6, WireColor::opaque(255, 0, 0))
+                    .with_background(WireColor::opaque(0, 0, 255))
+                    .with_corner_radius(5),
+            ],
+        ))
+    }
+
+    /// Every rectangle the host emits for a node lies within that node's
+    /// laid-out rect.
+    ///
+    /// Asserted on the scene rather than on pixels, because this is the
+    /// host's half of the contract: it must not *ask* for anything outside
+    /// the rect. `instar-render-vello-cpu` proves the primitives then honour
+    /// it. A centred stroke would fail at whichever layer invented it.
+    #[test]
+    fn nothing_a_bordered_node_paints_leaves_its_layout_rect() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, bordered_tree())
+            .expect("valid tree");
+
+        let bounds = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(40)))
+            .expect("the bordered node is laid out");
+        let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+
+        let mut checked = 0;
+        for command in &scene.commands {
+            let rect = match command {
+                instar_paint::PaintCommand::FillRect { rect, .. }
+                | instar_paint::PaintCommand::StrokeRect { rect, .. }
+                | instar_paint::PaintCommand::FillRoundedRect { rect, .. }
+                | instar_paint::PaintCommand::StrokeRoundedRect { rect, .. } => *rect,
+                _ => continue,
+            };
+            checked += 1;
+            assert!(
+                rect.x >= bounds.x
+                    && rect.y >= bounds.y
+                    && rect.x + rect.width as i32 <= bounds.x + bounds.width
+                    && rect.y + rect.height as i32 <= bounds.y + bounds.height,
+                "{rect:?} escapes the node's layout rect {bounds:?}"
+            );
+        }
+        assert!(
+            checked >= 2,
+            "the fixture should emit at least a background and a border, got {checked}"
+        );
+    }
+
+    /// Hit-testing uses the node's outer bounds, not the area inside its
+    /// border.
+    ///
+    /// Stated as a test so nobody later decides the inset geometry is the
+    /// "real" one. A 6px border on an 80x40 node would move every edge by
+    /// six pixels, and a control whose clickable area is smaller than the
+    /// control is a bug users report as "the button doesn't work near the
+    /// edge".
+    #[test]
+    fn hit_test_bounds_are_the_visible_outer_bounds() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, bordered_tree())
+            .expect("valid tree");
+
+        let window = host.window(WINDOW).unwrap();
+        let layout = window.layout().unwrap();
+        let tree = window.tree().unwrap();
+        let bounds = layout.get(NodeKey::first(40)).unwrap();
+        let target = Some(NodeKey::first(40));
+
+        // One pixel inside each outer edge, including the corners the radius
+        // rounds -- hit-testing is rectangular and does not follow the curve.
+        for (x, y, edge) in [
+            (bounds.x, bounds.y, "top-left"),
+            (bounds.x + bounds.width - 1, bounds.y, "top-right"),
+            (bounds.x, bounds.y + bounds.height - 1, "bottom-left"),
+            (
+                bounds.x + bounds.width - 1,
+                bounds.y + bounds.height - 1,
+                "bottom-right",
+            ),
+        ] {
+            assert_eq!(
+                tree.hit_test(layout, x, y).map(|node| node.key),
+                target,
+                "the {edge} pixel is inside the control and must hit it"
+            );
+        }
+
+        // And one pixel outside each edge.
+        for (x, y, edge) in [
+            (bounds.x - 1, bounds.y + 1, "left"),
+            (bounds.x + bounds.width, bounds.y + 1, "right"),
+            (bounds.x + 1, bounds.y - 1, "top"),
+            (bounds.x + 1, bounds.y + bounds.height, "bottom"),
+        ] {
+            assert_ne!(
+                tree.hit_test(layout, x, y).map(|node| node.key),
+                target,
+                "the pixel past the {edge} edge is outside the control"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_border_changes_neither_paint_nor_bounds() {
+        use instar_ui::{Node, WireColor, WireLayout, WireSize};
+
+        let build = |width: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::text(41, "x")
+                        .with_layout(WireLayout {
+                            width: WireSize::Fixed(40),
+                            height: WireSize::Fixed(20),
+                            ..WireLayout::default()
+                        })
+                        .with_border(width, WireColor::opaque(255, 0, 0)),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(0)).expect("valid tree");
+        let bounds = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(41)));
+        let strokes = |host: &Host| {
+            host.window(WINDOW)
+                .and_then(HostWindow::scene)
+                .map(|scene| {
+                    scene
+                        .commands
+                        .iter()
+                        .filter(|command| {
+                            matches!(
+                                command,
+                                instar_paint::PaintCommand::StrokeRect { .. }
+                                    | instar_paint::PaintCommand::StrokeRoundedRect { .. }
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(strokes(&host), 0, "a zero-width border emits no stroke");
+
+        host.apply_tree(WINDOW, build(4)).expect("valid tree");
+        assert_eq!(strokes(&host), 1, "a real one does");
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(NodeKey::first(41))),
+            bounds,
+            "and a border never affects layout either way"
+        );
+    }
+
     // --- B2: the wheel, and the guest's absence from it. ---
 
     fn wheel(x: f64, y: f64, dy: f64) -> WindowOutput {

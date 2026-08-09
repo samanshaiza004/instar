@@ -468,6 +468,42 @@ and a stack overflow waiting for the first release run.
 
 > A gate that hides a body from the compiler hides its bugs too.
 
+### A performance-invariant test must observe entry, not cost
+
+> When the property is "this path is not taken", assert that the forbidden
+> work was **not entered**. Do not assert that it was cheap.
+
+Instar's paint-only invariant — a colour change must not reshape text — was
+first tested by asserting the text cache reported no rebuilds, no
+re-line-breaks and no extractions. Injecting the exact regression it existed to
+catch left it green: those counters stay at zero when layout *does* re-run,
+because the cache simply hits. The test proved the expensive work was cheap,
+which is a different claim from the one it was written to make.
+
+What distinguishes them is a counter that increments on *consultation*:
+`reused` fires if and only if something asked the text system a question. The
+full expected tuple for a foreground-only commit is therefore
+
+```text
+rebuilt 0   relinebroken 0   reused 0   extracted 0
+```
+
+and the fourth is the load-bearing one.
+
+This generalizes past text. If a paint-only update ever runs Taffy and Taffy
+grows an effective cache, timings and downstream counters will look fine again
+while the architecture has regressed. The question to test is always "did
+anything enter this path", never "was entering it expensive".
+
+The corollary is a habit, not a rule:
+
+> A test that stays green under the fault it was written to catch is evidence
+> about the injection first, and about the test second.
+
+Both times that has happened here, it was the test. Deliberate fault injection
+gets an assertion that the injection actually applied — a substitution that
+silently matches nothing produces a green run that means nothing.
+
 The latency bounds are asserted **on request**, not by default:
 
 ```text

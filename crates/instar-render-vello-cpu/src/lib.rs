@@ -1174,8 +1174,160 @@ mod tests {
         );
     }
 
+    /// Renders a whole command list onto white.
+    fn painted_all(commands: Vec<PaintCommand>) -> RenderTarget {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(SIZE).unwrap();
+        let mut all = vec![PaintCommand::Clear {
+            color: Color::opaque(255, 255, 255),
+        }];
+        all.extend(commands);
+        backend
+            .render_into(SIZE, &scene(all, vec![]), &mut target)
+            .expect("the scene renders");
+        target
+    }
+
+    /// A node clipping to its own rect must not amputate its own border.
+    ///
+    /// This is the composition A3's clip and C1's inside-stroke have to make
+    /// together: the clip is exactly the rect, and an inside stroke is exactly
+    /// within it, so the complete ring survives. A centred stroke would lose
+    /// its outer half to the very clip the node asked for.
+    ///
+    /// Translucent and rounded on purpose -- it re-exercises the corner
+    /// double-composite from C1 at the same time.
+    #[test]
+    fn a_nodes_own_clip_does_not_cut_off_its_own_border() {
+        let bounds = rect(3, 2, 10, 8);
+        let border = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        let clipped = painted_all(vec![
+            PaintCommand::PushClip { rect: bounds },
+            PaintCommand::StrokeRoundedRect {
+                rect: bounds,
+                radii: CornerRadii::uniform(2.0),
+                width: 2.0,
+                color: border,
+            },
+            PaintCommand::PopClip,
+        ]);
+        let unclipped = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(2.0),
+            width: 2.0,
+            color: border,
+        }]);
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                assert_eq!(
+                    sample(&clipped, x, y),
+                    sample(&unclipped, x, y),
+                    "({x}, {y}) differs: clipping to the node's own rect \
+                     removed part of a border that is painted inside it"
+                );
+            }
+        }
+        assert!(
+            is_ink(&clipped, 8, 2),
+            "the fixture must actually have a top edge to lose"
+        );
+    }
+
+    /// Two bordered neighbours sharing an edge, with no gap between them.
+    ///
+    /// A centred stroke would put half of each border in the other's
+    /// rectangle, so the boundary would carry both colours. Inside stroking
+    /// keeps each node's ink to its own rect, which is what lets adjacent
+    /// controls be laid out flush.
+    #[test]
+    fn adjacent_bordered_siblings_do_not_bleed_into_each_other() {
+        let left = rect(0, 0, 8, 12);
+        let right = rect(8, 0, 8, 12);
+        let target = painted_all(vec![
+            PaintCommand::StrokeRect {
+                rect: left,
+                width: 3.0,
+                color: Color::opaque(255, 0, 0),
+            },
+            PaintCommand::StrokeRect {
+                rect: right,
+                width: 3.0,
+                color: Color::opaque(0, 0, 255),
+            },
+        ]);
+
+        for y in 0..SIZE.height {
+            for x in 0..8 {
+                let pixel = sample(&target, x, y);
+                assert!(
+                    pixel[2] == 0 || pixel == [255, 255, 255, 255],
+                    "({x}, {y}) is in the left sibling and carries blue: {pixel:?}"
+                );
+            }
+            for x in 8..SIZE.width {
+                let pixel = sample(&target, x, y);
+                assert!(
+                    pixel[0] == 0 || pixel == [255, 255, 255, 255],
+                    "({x}, {y}) is in the right sibling and carries red: {pixel:?}"
+                );
+            }
+        }
+        assert!(is_ink(&target, 7, 6), "the shared boundary is drawn");
+        assert!(is_ink(&target, 8, 6), "on both sides");
+    }
+
+    #[test]
+    fn a_zero_width_border_draws_nothing_at_all() {
+        let target = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: rect(2, 2, 8, 6),
+            radii: CornerRadii::uniform(2.0),
+            width: 0.0,
+            color: Color::opaque(0, 0, 0),
+        }]);
+        let any = (0..SIZE.height)
+            .flat_map(|y| (0..SIZE.width).map(move |x| (x, y)))
+            .any(|(x, y)| is_ink(&target, x, y));
+        assert!(!any, "a zero-width border is not a hairline, it is nothing");
+    }
+
+    /// A 2x1 rect asked for a 40px border and 500px corners. The clamps are
+    /// unit-tested; this proves the whole pipeline honours them rather than
+    /// panicking or emitting NaN geometry kurbo then does something arbitrary
+    /// with.
+    #[test]
+    fn an_absurd_border_on_a_tiny_rect_stays_defined() {
+        let bounds = rect(5, 5, 2, 1);
+        let target = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(500.0),
+            width: 40.0,
+            color: Color::opaque(0, 0, 0),
+        }]);
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                let inside = (x as i32) >= bounds.x
+                    && (y as i32) >= bounds.y
+                    && (x as i32) < bounds.x + bounds.width as i32
+                    && (y as i32) < bounds.y + bounds.height as i32;
+                if !inside {
+                    assert!(
+                        !is_ink(&target, x, y),
+                        "({x}, {y}) escaped a 2x1 rect that asked for a 40px border"
+                    );
+                }
+            }
+        }
+    }
+
     /// A radius larger than the rect is clamped rather than handed to kurbo to
-    /// interpret, so the result is defined instead of merely whatever happens.
+    /// interpret, so the result is defined instead of merely whatever happens."""
     #[test]
     fn an_absurd_radius_still_renders_within_bounds() {
         let bounds = rect(3, 3, 8, 6);

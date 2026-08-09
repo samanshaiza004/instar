@@ -26,9 +26,17 @@ Click → guest event → guest commit → host diff → layout → lower → ac
 | Parley, first cut | 46 ms | 82 ms | 134 ms | 301 ms |
 | **Parley, after the cache fixes** | **4.94 ms** | **5.75 ms** | **11.5 ms** | **105 ms** |
 | Stage 2 complete, idle machine | 4.86–4.98 ms | 5.15–5.34 ms | 5.31–5.55 ms | 5.5–8.8 ms |
+| Package C complete, load avg 8.5 | 4.93–4.98 ms | 5.58–5.85 ms | 5.93–6.46 ms | 6.3–6.9 ms |
 
 The Phase 1 row is not a regression target. It measured fake fixed-pitch
 metrics against no real font; the honest comparison is the second row onward.
+
+**Package C cost nothing measurable either**, which is the point of measuring
+it: style should not touch the click path, and a style vocabulary that made
+clicks slower would mean a paint-only change was reaching layout after all —
+the same regression `TextStats` guards from the other side. The row was taken
+at a load average of 8.5 rather than on an idle machine, so it is a
+conservative reading rather than a best case.
 
 **Stage 2 cost nothing measurable.** The last row was taken interleaved against
 the commit before the generational-key work, alternating runs so drift hit both

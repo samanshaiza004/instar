@@ -397,7 +397,12 @@ impl SceneBuilder {
                         });
                     }
                 }
-                if *enabled && node.style.paint.border.is_none() {
+                let stated_border = node
+                    .style
+                    .paint
+                    .border
+                    .is_some_and(|border| border.width > 0);
+                if *enabled && !stated_border {
                     commands.push(PaintCommand::StrokeRect {
                         rect: physical_rect,
                         width: 1.0,
@@ -539,7 +544,13 @@ impl SceneBuilder {
                 commands.push(PaintCommand::FillRoundedRect { rect, radii, color });
             }
         }
-        if let Some(border) = paint.border {
+        // A stated border of zero width is not a hairline, it is no border.
+        // The wire keeps whatever the guest said -- `Some(width: 0)` round
+        // trips faithfully, because normalizing it away at decode would make
+        // the encoding lossy -- but the host declines to emit a command that
+        // paints nothing. The backend would draw nothing either way; the
+        // difference is a scene that says what it means.
+        if let Some(border) = paint.border.filter(|border| border.width > 0) {
             // The width is logical like every other length, so it scales here
             // and is bounded by the paint contract, not by this layer.
             let width = f32::from(border.width) * scale;
