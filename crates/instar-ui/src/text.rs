@@ -204,15 +204,30 @@ pub enum Available {
 /// 4,000-node tree the target is `rebuilt == 1` — not 4,000 — even while the
 /// frame is still dominated by layout and raster.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Each counter names the work of *one call*, so which call does the counting
+/// matters and is stated here — an earlier reading of these drifted out of
+/// step with the code and took three tests with it.
 pub struct TextStats {
-    /// Layouts rebuilt because text or style changed. The expensive one.
+    /// Layouts rebuilt because text or style changed. The expensive one, and
+    /// the only one that reshapes.
     pub rebuilt: u64,
-    /// Layouts re-broken because the available width changed. Cheap: no
-    /// reshaping.
+    /// **Finalization** re-broke a layout because the final width moved.
+    /// Cheap: no reshaping.
+    ///
+    /// A speculative break inside [`TextContext::measure`] is deliberately not
+    /// counted. It is not finalization — it must leave `finalized_width` and
+    /// the shaped artifact alone — and counting it here would make the two
+    /// indistinguishable in a trace, which is the confusion this whole split
+    /// exists to remove.
     pub relinebroken: u64,
-    /// Layouts reused whole.
+    /// A query answered without touching the layout: an intrinsic
+    /// (`MinContent`/`MaxContent`) measure served from the per-entry cache, or
+    /// a finalize at a width the layout is already broken at.
+    ///
+    /// Counted per call, not per node, so a rebuild followed by a cached
+    /// intrinsic answer in the same `measure` records both.
     pub reused: u64,
-    /// `ShapedText` artifacts extracted from a `Layout`.
+    /// `ShapedText` artifacts extracted from a `Layout`. Finalization only.
     pub extracted: u64,
 }
 
@@ -598,19 +613,35 @@ mod tests {
 
         let (second_width, second_height) =
             text.measure(KEY, "Hello world", style(), Available::Definite(200.0));
-        assert_eq!(text.stats().rebuilt, 1);
-        assert_eq!(text.stats().reused, 1);
+        assert_eq!(
+            text.stats().rebuilt,
+            1,
+            "the same string and style must not reshape"
+        );
         assert_eq!((first_width, first_height), (second_width, second_height));
 
         let shaped = text.finalize(KEY, 200.0);
         assert!(!shaped.runs.is_empty());
-        let _ = shaped;
         assert_eq!(
-            text.stats().reused,
-            2,
-            "finalize reuses the same broken layout"
+            text.stats().relinebroken,
+            1,
+            "the first finalize owns the persistent break, whatever measure \
+             did speculatively"
         );
         assert_eq!(text.stats().extracted, 1);
+
+        text.finalize(KEY, 200.0);
+        assert_eq!(
+            (text.stats().reused, text.stats().relinebroken),
+            (1, 1),
+            "finalizing again at the same width reuses the broken layout"
+        );
+        assert_eq!(
+            text.stats().extracted,
+            1,
+            "and a reused layout must not be re-extracted -- doing so cost as \
+             much as the rebuild the cache just avoided"
+        );
     }
 
     #[test]
@@ -619,18 +650,24 @@ mod tests {
         let sentence = "a long sentence that will wrap";
         text.measure(KEY, sentence, style(), Available::Definite(200.0));
         text.measure(KEY, sentence, style(), Available::Definite(60.0));
-        assert_eq!(text.stats().rebuilt, 1);
-        assert_eq!(text.stats().relinebroken, 1);
-        assert_eq!(text.stats().reused, 0);
+        assert_eq!(
+            text.stats().rebuilt,
+            1,
+            "a width change re-breaks; it never reshapes"
+        );
+        assert_eq!(
+            (text.stats().relinebroken, text.stats().extracted),
+            (0, 0),
+            "measure's speculative breaks are not finalization: they touch \
+             neither the persistent break record nor the shaped artifact"
+        );
 
         text.finalize(KEY, 60.0);
-        assert_eq!(text.stats().rebuilt, 1);
-        assert_eq!(text.stats().relinebroken, 1);
+        assert_eq!((text.stats().rebuilt, text.stats().relinebroken), (1, 1));
 
         text.finalize(KEY, 140.0);
-        assert_eq!(text.stats().rebuilt, 1);
-        assert_eq!(text.stats().relinebroken, 2);
-        assert_eq!(text.stats().extracted, 2);
+        assert_eq!((text.stats().rebuilt, text.stats().relinebroken), (1, 2));
+        assert_eq!(text.stats().extracted, 2, "each real break re-extracts");
     }
 
     #[test]
@@ -639,7 +676,13 @@ mod tests {
         text.measure(KEY, "first", style(), Available::MaxContent);
         text.measure(KEY, "second", style(), Available::MaxContent);
         assert_eq!(text.stats().rebuilt, 2);
-        assert_eq!(text.stats().reused, 0);
+        assert_eq!(
+            text.stats().reused,
+            2,
+            "both intrinsic answers came from the per-entry cache -- `reused` \
+             counts queries served without touching the layout, so a rebuild \
+             and a cached answer for the same call are both recorded"
+        );
     }
 
     #[test]

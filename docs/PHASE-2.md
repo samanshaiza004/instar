@@ -382,6 +382,109 @@ release  latency: p50 ≤ 5 ms, p95 ≤ 8 ms, p99 ≤ 16 ms, max ≤ 250 ms
 `max` is a deadlock and outlier guard, not a performance target, which is why
 it sits three orders of magnitude above p50.
 
+**A profile split must be `cfg!`, not `#[cfg]`.** The release half of that
+table was not being asserted at all. `assert_prompt`'s release body called
+*itself* — six live call sites, no assertion, and a stack overflow waiting for
+the first release run. A `#[cfg]`-gated pair of bodies is only type-checked in
+the build it belongs to, and CI builds debug, so nothing could see it. The
+release assertions now live in one body behind `if cfg!(debug_assertions)`,
+which costs nothing at runtime and buys compilation in both profiles.
+
+> A gate that hides a body from the compiler hides its bugs too. Split on
+> `cfg!` and let both halves compile; reserve `#[cfg]` for code that genuinely
+> cannot exist in the other profile.
+
+**Nothing runs `--release`.** CI's whole matrix is debug — `cargo test
+--workspace`, and the bridge suite again with `--nocapture`. So the right-hand
+column of that table has never executed, which is the other half of why the
+recursion survived: not compiled, and not run.
+
+Turning it on for the first time failed, at p50 6.66 ms against a 5 ms target —
+and the first three readings looked like a Stage 2 regression. They were not.
+They were taken while two other builds had the machine at a load average of 23.
+
+The measurement that settles it interleaves the two commits on an idle machine,
+alternating so that drift hits both equally:
+
+```text
+             p50                    p95                    p99
+parent    4.983 / 4.954 / 4.953  5.34 / 5.18 / 5.30  5.67 / 5.31 / 5.55
+stage 2   4.959 / 4.857 / 4.981  5.27 / 5.15 /  --   5.48 / 5.32 /  --
+```
+
+Indistinguishable, and the Stage 1 ledger's 4.94 ms reproduces exactly. The
+generational key costs nothing measurable: the ledger is one hash lookup per
+node on a twelve-node fixture, against a round trip dominated by Wasmtime,
+layout, and raster.
+
+> The first number said "regression". The controlled number said "your laptop
+> was busy". Same rule as the 386 ms that turned out to be 5 ms — instrument
+> the thing, in the profile that matters, on a machine doing nothing else.
+
+What the exercise did find is that `p50 ≤ 5 ms` had no headroom. It was the
+recorded 4.94 ms rounded up to the next integer, while p95, p99 and max all
+sit near 1.4x their measurements. Six idle runs put p50 between 4.86 and
+4.98 ms — 0.4% to 2.9% under the bound, and 6.66 ms the moment anything else
+runs. It is now 7 ms, which is the 1.4x its neighbours already used. That is a
+calibration, not a concession: the interleaved runs show the margin was always
+this thin and that Stage 2 did not spend it.
+
+### So the bounds are asserted on request, not by default
+
+```text
+INSTAR_LATENCY_GATE=1 cargo test --release -p instar-host --test bridge -- --nocapture
+```
+
+The distribution prints on every run in every profile. What is opt-in is the
+*judgement*, because a judgement needs a host that is doing nothing else, and
+the machine this was written on reports p95 5.2 ms idle and 17.9 ms with a
+build running. A suite that goes red because someone opened a browser teaches
+people to ignore red suites, which costs more than the gate is worth.
+
+This is deliberately not the `#[cfg(any())]` it replaces. That assertion was
+switched off in a way nothing could see: it did not compile, it left `PROMPT`
+dead, and it let the release body rot into infinite recursion. This one
+compiles in every profile, runs on request, and *says on every run* that it is
+only reporting:
+
+```text
+click-to-committed-tree: n=1000 p50=5.15ms p95=9.87ms p99=19.9ms max=158ms
+  (reported only; set INSTAR_LATENCY_GATE=1 on an idle host to assert)
+```
+
+> An assertion you have chosen not to run must announce itself. The difference
+> between a deferred judgement and a forgotten one is whether anybody is told.
+
+Still open, and not answerable from a chair: whether CI should arm the gate,
+given that a shared runner is not a quiet host either. Today CI runs only
+debug, which is the other half of why the dead assertion survived.
+
+### Ordering is not throughput
+
+`a_hundred_rapid_activations_arrive_in_order` demanded the exact sequence
+`1..=100`, sampled one label per 50 ms `wait`. `wait` pumps the whole queue, so
+two commits landing in one window are observed as one — a correct run reports a
+gap and looks like a dropped click — and 100 debug round-trips do not reliably
+fit the deadline, so it also failed for being slow, which is the property this
+file deliberately does not assert in debug.
+
+Sampling cannot hide the defect being hunted: a reordering makes an observed
+count *decrease*, and dropping observations does not reorder them. So the
+assertion is monotonicity plus completion, and the deadline is generous,
+because it is a completion test.
+
+## The green baseline rule
+
+> Each Stage 2 architectural package starts from a green
+> `cargo test --workspace` and a green
+> `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`.
+
+Not tidiness. When the layout vocabulary lands and thirty tests go red, the
+only way to tell new breakage from old debt is that there was no old debt.
+Three of the failures cleared to establish this had been red since Stage 1 and
+were being read as background noise — one of them was hiding the release
+latency gate never running at all.
+
 ### `measure()` is observational
 
 > **`measure()` may perform temporary work needed to answer the current sizing

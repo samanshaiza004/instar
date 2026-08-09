@@ -169,8 +169,23 @@ fn the_kernel_knows_nothing_about_windows_layout_or_pixels() {
 }
 
 /// `instar-host` bridges logical presentation to physical rendering, so it may
-/// see paint *types* — and must not see a backend, a window system, or a font.
+/// see paint *types* — and must not see a rasterizer or a window system.
 /// Choosing what rasterizes a scene lives one layer up, in this crate.
+///
+/// # Why `skrifa` is not on this list
+///
+/// It was, and Stage 2 took it off deliberately rather than because it had
+/// become inconvenient. The original rule read "no backend, no window system,
+/// no font", and `skrifa` stood in for the last clause. Stage 1 then put a
+/// real text stack in `instar-ui` — Parley shapes in logical space, and the
+/// host converts shaped positions and font ppem to physical space during paint
+/// lowering. `skrifa` is font-*data parsing* that arrives with that stack:
+/// `instar-host -> instar-ui -> parley -> skrifa`.
+///
+/// So the host cannot avoid it without either the UI layer losing its text
+/// stack or the host losing the UI layer, and neither is a layering
+/// improvement. What the rule was actually protecting — that the host does not
+/// pick what draws pixels — is unchanged and still asserted below.
 #[test]
 fn the_host_takes_paint_types_but_no_renderer() {
     let root = workspace_root();
@@ -181,7 +196,7 @@ fn the_host_takes_paint_types_but_no_renderer() {
         "instar-host lowers trees to PaintScenes, so it must see the scene \
          types.\n\nFull tree:\n{tree}"
     );
-    for forbidden in ["vello_cpu", "softbuffer", "skrifa"] {
+    for forbidden in ["vello_cpu", "softbuffer"] {
         assert!(
             !depends_on(&tree, forbidden),
             "instar-host has picked up {forbidden}. Lowering a tree to paint \

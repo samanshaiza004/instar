@@ -37,7 +37,8 @@
 //! a measured bound, and [`PROMPT`] is the one that matters — the click-to-
 //! committed-tree round-trip, asserted under concurrent load.
 //!
-//! [`PROMPT`] is a ceiling on brokenness and is asserted. The *distribution* —
+//! [`PROMPT`] is a ceiling on brokenness and is asserted — in release builds
+//! only, for the reason [`assert_prompt`] gives. The *distribution* —
 //! p50/p95/p99, collected by [`Latencies`] — is reported and not asserted, and
 //! will stay that way until there are numbers from a real windowed host to
 //! calibrate against. See its docs for why.
@@ -110,10 +111,20 @@ impl Latencies {
     }
 
     /// Asserts the warm-click targets. Release only; debug asserts nothing
-    /// about time. `MAX` is an outlier and deadlock guard, not a target — it
-    /// sits far above p50 on purpose.
-    #[cfg(not(debug_assertions))]
+    /// about time. `PROMPT` bounds the max as an outlier and deadlock guard,
+    /// not a target — it sits far above p50 on purpose, and it is the max
+    /// rather than a percentile because a p99 bound would let ten clicks in a
+    /// thousand take arbitrarily long, and a UI that ignores every hundredth
+    /// click is broken in exactly the way the tail is where you would look.
+    ///
+    /// One body with `cfg!`, not a `#[cfg]`-gated pair — see [`assert_prompt`].
+    ///
+    /// Release *and* opt-in: see [`latency_gate_armed`]. The distribution is
+    /// printed either way.
     fn assert_targets(&self) {
+        if cfg!(debug_assertions) || !latency_gate_armed() {
+            return;
+        }
         let mut sorted = self.0.clone();
         sorted.sort_unstable();
         for (name, measured, target) in [
@@ -124,13 +135,11 @@ impl Latencies {
         ] {
             assert!(
                 measured <= target,
-                "{name} was {measured:?}, over the {target:?} target"
+                "{name} was {measured:?}, over the {target:?} target -- \
+                 progress that degrades over a session is not prompt progress"
             );
         }
     }
-
-    #[cfg(debug_assertions)]
-    fn assert_targets(&self) {}
 
     fn slowest(&self) -> Duration {
         self.0.iter().copied().max().unwrap_or_default()
@@ -149,6 +158,13 @@ impl Latencies {
             self.percentile(&sorted, 99.0),
             self.slowest(),
         );
+        // Said out loud, every time, so a gate that is off cannot drift into
+        // being a gate nobody remembers exists.
+        if cfg!(debug_assertions) {
+            println!("  (debug build: timings are not asserted, and not comparable)");
+        } else if !latency_gate_armed() {
+            println!("  (reported only; set INSTAR_LATENCY_GATE=1 on an idle host to assert)");
+        }
     }
 }
 
@@ -163,25 +179,82 @@ impl Latencies {
 ///
 /// ```text
 /// debug    completion, ordering, cancellation, no-hang, boundedness
-/// release  latency: p50/p95/p99, and an outlier guard
+/// release  latency: p50 <= 5ms, p95 <= 8ms, p99 <= 16ms, max <= 250ms
 /// ```
-#[cfg(debug_assertions)]
-fn assert_prompt(_elapsed: Duration, _what: &str) {}
-
-#[cfg(not(debug_assertions))]
+///
+/// The split is `cfg!` rather than `#[cfg]` on purpose: the assertion must
+/// **compile** in every build even when it does not run. A `#[cfg]`-gated pair
+/// of bodies is only type-checked in the build it belongs to, and because CI
+/// builds debug, this function's release body sat here calling *itself* —
+/// asserting nothing, and overflowing the stack on the first release run —
+/// with nothing able to notice. A gate that hides a body from the compiler
+/// hides its bugs too.
 fn assert_prompt(elapsed: Duration, what: &str) {
-    assert_prompt(elapsed, "a click round-trip");
+    if cfg!(debug_assertions) || !latency_gate_armed() {
+        return;
+    }
+    assert!(
+        elapsed < PROMPT,
+        "{what} took {elapsed:?}, over the {PROMPT:?} bound"
+    );
 }
 
-/// Warm-click latency targets. Release only, same reasoning as above.
+/// Whether the latency bounds are being *asserted* rather than merely reported.
 ///
-/// `MAX` is a deadlock and outlier guard, not a performance target — which is
-/// why it sits three orders of magnitude above p50 rather than near it.
-#[cfg(not(debug_assertions))]
-const P50: Duration = Duration::from_millis(5);
-#[cfg(not(debug_assertions))]
+/// ```text
+/// INSTAR_LATENCY_GATE=1 cargo test --release -p instar-host --test bridge -- --nocapture
+/// ```
+///
+/// # Why an opt-in and not just "release"
+///
+/// A latency distribution is a measurement, and a measurement is only worth
+/// asserting on a host that is doing nothing else. On the machine this was
+/// written on — an ordinary desktop with a browser and two editors open — the
+/// same suite reports p95 5.2ms idle and 17.9ms while a build runs. Asserting
+/// against the second number teaches everyone to ignore a red suite, which
+/// costs more than the gate is worth.
+///
+/// This is deliberately **not** the `#[cfg(any())]` it replaced. That was an
+/// assertion switched off in a way nothing could see: it did not compile, it
+/// left `PROMPT` dead, and it left the release body free to rot into an
+/// infinite recursion. This compiles in every profile, runs on request, says
+/// so when it does not, and prints the distribution unconditionally so the
+/// numbers are never hidden — only the *judgement* is deferred to a run that
+/// can support one.
+fn latency_gate_armed() -> bool {
+    std::env::var_os("INSTAR_LATENCY_GATE").is_some_and(|value| value != "0")
+}
+
+/// Warm-click latency targets. Asserted in release only, same reasoning as
+/// above; defined unconditionally so the assertion that reads them always
+/// compiles.
+///
+/// # `P50` has headroom now, and the others always did
+///
+/// Until Stage 2 none of these were asserted — [`assert_prompt`]'s release
+/// body was dead, and nothing runs `--release` anyway (CI does not). Arming
+/// them exposed one target set with no margin:
+///
+/// ```text
+///        recorded   was     now    headroom
+/// p50      4.94ms    5ms     7ms    1.01x -> 1.42x
+/// p95      5.75ms    8ms     8ms    1.39x
+/// p99     11.5 ms   16ms    16ms    1.39x
+/// max    105    ms  250ms   250ms   2.4x     (PROMPT)
+/// ```
+///
+/// 5ms was the Stage 1 measurement rounded up to the next integer, not a
+/// stricter policy for p50 — its neighbours all sit near 1.4x. Six idle
+/// release runs, interleaved between this commit and its parent, measured p50
+/// at 4.86–4.98ms: between 0.4% and 2.9% below the bound. A ceiling on
+/// brokenness that a healthy machine grazes is a flake generator, and under
+/// any background load at all this one went to 6.66ms.
+///
+/// Those same runs are why the change is a calibration rather than a
+/// concession: parent and child were indistinguishable (p50 4.95ms either
+/// way), so the margin was always this thin and nothing in Stage 2 spent it.
+const P50: Duration = Duration::from_millis(7);
 const P95: Duration = Duration::from_millis(8);
-#[cfg(not(debug_assertions))]
 const P99: Duration = Duration::from_millis(16);
 
 fn component() -> Vec<u8> {
@@ -413,13 +486,33 @@ fn an_invalid_commit_changes_nothing() {
 // --- 3. Ordering ---
 
 /// Order is the one thing a queue must not get wrong. The fixture's counter
-/// makes a reordering visible: the labels would not be monotonic.
+/// makes a reordering visible: the counts would not be monotonic.
+///
+/// # Why this samples rather than enumerates
+///
+/// It used to demand the exact sequence `1..=100`, one label per 50ms `wait`.
+/// That conflated ordering with throughput and was wrong twice over. `wait`
+/// pumps the whole queue, so two commits landing inside one window are seen as
+/// one — a *correct* run reports a gap at 10 and looks like a dropped click.
+/// And 100 debug round-trips do not reliably fit in `PATIENCE`, so the same
+/// test also failed for being slow, which is a property this file deliberately
+/// does not assert in debug.
+///
+/// What is actually being tested survives sampling intact. A reordering makes
+/// some observed count *decrease*, and under-sampling cannot hide that — it
+/// drops observations, it does not reorder them. So: every count seen is
+/// strictly greater than the last, all 100 activations land, and none is
+/// dropped.
 #[test]
 fn a_hundred_rapid_activations_arrive_in_order() {
     const CLICKS: u64 = 100;
+    /// Completion, not latency. Generous on purpose: a slow debug build is
+    /// not a queue defect, and `PATIENCE` is calibrated for single operations.
+    const BURST: Duration = Duration::from_secs(60);
 
     let (mut bridge, _wakes) = ready();
     let (x, y) = centre(&bridge, COUNT);
+    let base = bridge.commit_sequence();
 
     // Queued as fast as the winit thread can produce them, with no pumping in
     // between -- which is exactly the burst a held-down key or a fast mouse
@@ -429,24 +522,42 @@ fn a_hundred_rapid_activations_arrive_in_order() {
         bridge.on_window_event(pointer(PointerState::Released, x, y));
     }
 
-    let mut seen = Vec::new();
+    let mut counts = Vec::new();
+    let mut last_sequence = base;
     let started = Instant::now();
-    while seen.len() < CLICKS as usize && started.elapsed() < PATIENCE {
-        let commit_sequence = bridge.commit_sequence();
+    while bridge.commit_sequence() - base < CLICKS && started.elapsed() < BURST {
         bridge.wait(Duration::from_millis(50));
-        if bridge.commit_sequence() > commit_sequence {
-            seen.push(label(&bridge));
+        if bridge.commit_sequence() > last_sequence {
+            last_sequence = bridge.commit_sequence();
+            counts.push(clicked_count(&label(&bridge)));
         }
     }
 
-    let expected: Vec<String> = (1..=CLICKS)
-        .map(|n| format!("Clicked {n} times, 0 bulk"))
-        .collect();
     assert_eq!(
-        seen, expected,
-        "every activation should be delivered, applied, and observed in order"
+        bridge.commit_sequence() - base,
+        CLICKS,
+        "every activation should be delivered and applied within {BURST:?}"
+    );
+    assert!(
+        counts.windows(2).all(|pair| pair[0] < pair[1]),
+        "counts must never go backwards; a reordered queue is what would make \
+         them: {counts:?}"
+    );
+    assert_eq!(
+        counts.last().copied(),
+        Some(CLICKS),
+        "the last interface observed should be the last activation applied"
     );
     assert_eq!(bridge.stats().dropped_commands, 0, "100 fits in 256");
+}
+
+/// The count out of a fixture label like `Clicked 7 times, 0 bulk`.
+fn clicked_count(label: &str) -> u64 {
+    label
+        .strip_prefix("Clicked ")
+        .and_then(|rest| rest.split_once(' '))
+        .and_then(|(count, _)| count.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected fixture label {label:?}"))
 }
 
 // --- 4. Back-pressure ---
@@ -696,19 +807,9 @@ fn a_thousand_click_cycles_return_to_baseline() {
         format!("Clicked {CYCLES} times, 0 bulk"),
         "every cycle should have landed exactly once"
     );
-    // The max, not a percentile: a p99 bound would let ten of these thousand
-    // clicks take arbitrarily long, and a UI that ignores every hundredth
-    // click is broken in exactly the way the tail is where you would look.
-    let slowest = latencies.slowest();
+    // Bounds the tail with the max rather than a percentile; see
+    // `Latencies::assert_targets`.
     latencies.assert_targets();
-    #[allow(unused)]
-    let _ = slowest;
-    #[cfg(any())]
-    assert!(
-        slowest < PROMPT,
-        "the slowest of {CYCLES} round-trips was {slowest:?}, over the {PROMPT:?} \
-         bound -- progress that degrades over a session is not prompt progress"
-    );
 
     let stats = bridge.stats();
     assert_eq!(
@@ -918,7 +1019,6 @@ fn trace_one_warm_click() {
     await_commit(&mut bridge).expect("warm-up click commits");
 
     let before = bridge.host().text_stats();
-    let started = Instant::now();
     click(&mut bridge, COUNT);
     let elapsed = await_commit(&mut bridge).expect("the traced click commits");
     let after = bridge.host().text_stats();
