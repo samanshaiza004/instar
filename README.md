@@ -18,6 +18,13 @@ every guest turn.
 >
 > What Phase 1 proved, cost, and left as scaffolding:
 > [docs/PHASE-1-RESULTS.md](docs/PHASE-1-RESULTS.md).
+>
+> Phase 2 has since built the retained UI foundation on top of it: full
+> snapshots diffed against a retained tree, generational node identity, an
+> explicit layout vocabulary with rows, stacks and overlap, visibility and
+> clipping, and a scroll viewport whose offset the host owns — so a wheel
+> moves the view with no Wasm round trip. Styling and scrollbar chrome are
+> not built yet.
 
 ## Why the rewrite
 
@@ -57,9 +64,15 @@ subtask.
 `guests/` holds every WebAssembly component, each built from source rather than
 committed as an artifact. See [guests/README.md](guests/README.md).
 
-The architecture, and why each boundary is where it is:
+How Instar works and why each boundary is where it is:
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The wire format:
-[docs/PROTOCOL-0.md](docs/PROTOCOL-0.md).
+[docs/PROTOCOL-0.md](docs/PROTOCOL-0.md). What it costs, and what CI does and
+does not enforce: [docs/baselines/PERFORMANCE.md](docs/baselines/PERFORMANCE.md).
+
+`docs/PHASE-1.md` and `docs/PHASE-2.md` are the record of *how* the decisions
+were reached, including the ones that turned out wrong. They are logs, not
+references — when they disagree with `ARCHITECTURE.md`, that file is the one to
+trust.
 
 ## Running it
 

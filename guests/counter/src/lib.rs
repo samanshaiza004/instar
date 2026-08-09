@@ -14,9 +14,7 @@ wit_bindgen::generate!({
     world: "kernel",
 });
 
-use instar_ui_protocol::{
-    BatchEncoder, NodeKey, WireAlign, WireEvent, WireLayout, flags, opcode,
-};
+use instar_ui_protocol::{BatchEncoder, NodeKey, WireAlign, WireEvent, WireLayout, flags, opcode};
 
 use crate::instar::kernel::kernel_runtime;
 use crate::instar::kernel::kernel_types::RuntimeError;

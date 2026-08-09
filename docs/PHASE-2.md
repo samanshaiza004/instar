@@ -176,6 +176,16 @@ rebuilds in ~370 µs.
 
 ## Stage 2 — protocol v2
 
+> **Status.** A1–A3 and B1–B2 are implemented and green: generational identity,
+> `Row`/`Stack`, the orthogonal sizing vocabulary, `Display`/`Visibility`/
+> `Overflow`, the retained `Scroll` viewport, and host-local wheel scrolling.
+> Packages C (style) and the scrollbar chrome are **frozen contracts only** —
+> see the marked sections below.
+>
+> This file is the record of *how the decisions were reached*, including the
+> ones that turned out wrong. For how Instar works now, read
+> `docs/ARCHITECTURE.md`; for what it costs, `docs/baselines/PERFORMANCE.md`.
+
 ### Generational `NodeKey` is the first change, before anything else [done]
 
 ```rust
@@ -620,7 +630,11 @@ Scrollbar chrome stays later. Wheel and touchpad scrolling is the
 architectural claim worth proving — continuous interaction resolved entirely
 host-locally, with Wasm absent from the response loop.
 
-### C: style, sorted by what it can invalidate
+### C: style, sorted by what it can invalidate — **planned, not implemented**
+
+> Nothing in this section or the next exists in the code. They are frozen
+> contracts for the next two packages, written before implementation on
+> purpose. Everything above this line is built and green.
 
 The vocabulary is grouped by consequence rather than by what it looks like,
 because the grouping *is* the design:
@@ -678,7 +692,7 @@ blend, and a whole category of interaction with clipping and text rendering. A
 deceptively simple name with layer-level consequences is worse than no property
 at all.
 
-### Then scrollbar chrome, as the last Scroll package
+### Then scrollbar chrome, as the last Scroll package — **planned**
 
 ```text
 thumb and track state    host-owned

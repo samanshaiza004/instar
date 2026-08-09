@@ -1,8 +1,11 @@
 # Instar architecture
 
-The shape of the system as Phase 1 leaves it, and why each boundary is where it
-is. `PHASE-1.md` records the decisions in the order they were made;
-this describes the result.
+The shape of the system as it stands, and why each boundary is where it is.
+
+`PHASE-1.md` and `PHASE-2.md` record decisions in the order they were made,
+including the ones that turned out wrong and what replaced them. **This
+describes how Instar works now.** If the two ever disagree, this file is the
+one to trust and the phase log is the one to correct.
 
 ## The whole thing
 
@@ -62,17 +65,34 @@ covering the crate that does not exist yet.
 
 ### 2. The host owns geometry, entirely
 
-A guest sends layout *intent*: `Fill | Content | Fixed`, padding, gap. It
-cannot express a rectangle, because the protocol has no way to encode one — the
-layout section was removed outright rather than deprecated.
+A guest sends layout *intent*. It cannot express a rectangle, because the
+protocol has no way to encode one — the layout section was removed outright
+rather than deprecated.
 
 ```text
-guest: "a column of these, filling the width"
+guest: "a column of these, each stretching across it"
 host:  every number on the screen
 ```
 
 `LayoutSnapshot` is an internal `instar-ui` product, not protocol state. Taffy
 is an implementation detail of one file.
+
+The vocabulary is four orthogonal questions, and keeping them orthogonal is the
+design:
+
+```text
+preferred size         Content | Fixed(u16)   plus min/max bounds
+main-axis expansion    grow
+main-axis contraction  shrink
+cross-axis filling     align_self: Stretch
+```
+
+**There is no `Fill`.** There was, and it meant three different things once a
+second axis existed: cross-axis stretch under a column, height under a row, and
+content-size on a row's main axis. One name for three behaviours implies a rule
+nobody can hold in their head, so it was deleted while the protocol was still
+cheap to break. An SDK may offer `ui.width(Fill)` as sugar and lower it per
+context — the sugar is allowed to be clever; the wire is not.
 
 ### 3. DPI is converted low and known high
 
@@ -118,7 +138,13 @@ into a `PaintScene` belongs to it. Choosing what rasterizes that scene does
 not, and lives in `instar-shell`.
 
 Enforced by a test: `instar-host` must depend on `instar-paint` and must not
-depend on `vello_cpu`, `softbuffer`, or `skrifa`.
+depend on `vello_cpu` or `softbuffer`.
+
+`skrifa` was on that list and is not any more. Text shaping lives in
+`instar-ui` by design, so `skrifa` arrives as
+`instar-host → instar-ui → parley → skrifa`, and the host cannot avoid it
+without the UI layer losing its text stack. What the rule protects — that the
+host does not choose what draws pixels — is unchanged.
 
 ## The rules that are not about dependencies
 
@@ -191,6 +217,153 @@ exactly when cancelling is most wanted.
 Shutdown travels out of band and jumps the queue, because the state most in need
 of shutting down is exactly the state where the queue is full.
 
+### A guest commits snapshots; the host diffs them
+
+There is no mutation protocol and no patch opcode. A guest sends a whole
+interface every time, and the host diffs it against the retained tree by
+`NodeKey`.
+
+```text
+full snapshot  ->  host diff  ->  incremental host work
+```
+
+**Host nodes are not destroyed and recreated because another snapshot
+arrived.** The snapshot is authoritative as a *description*; the retained tree
+is the interaction, layout, and render object, and it persists across commits.
+
+Chosen over guest-sent deltas because a guest that mis-tracks its own dirty
+state cannot desync the host — structurally impossible rather than merely
+tested for. Recovery from any confusion is "send another snapshot".
+
+Two counters, deliberately not one:
+
+```text
+commit_sequence   every accepted submission; what the guest sees, so its
+                  synchronization does not depend on whether the host found
+                  the snapshot interesting
+tree_revision     the version of the retained state; advances only when the
+                  diff found something; what caches key off
+```
+
+An identical re-commit therefore costs the decode and nothing else: no layout,
+no scene, no frame.
+
+### Node identity is generational
+
+```rust
+struct NodeKey { id: u32, generation: u32 }
+```
+
+An id that is removed and reused comes back at a higher generation. Without
+that, this sequence mis-delivers and nothing catches it:
+
+```text
+ButtonActivated(7) queued  ->  guest removes node 7  ->  guest re-adds node 7
+                           ->  old event delivered   ->  lands on the NEW node 7
+```
+
+By the time an action is queued it is opaque bytes the host cannot recall. It
+no longer has to: the bytes carry the generation, so a guest comparing against
+its own live keys rejects an activation for a node it has since replaced.
+
+The guest chooses ids, so the host enforces monotonicity, and the ledger is
+itself bounded because `MAX_NODES` bounds live nodes and not a guest burning
+new ids forever:
+
+```text
+id never seen before   ->  generation must be 0
+id currently live      ->  generation must match exactly
+id retired             ->  generation must be > previous
+per runtime generation ->  at most 65,536 distinct ids ever observed
+```
+
+Uniqueness *within* a snapshot is keyed on the id alone: `(7,0)` and `(7,1)`
+are distinct keys but still one id claiming to be two live nodes.
+
+The pair also packs losslessly into an AccessKit id
+(`generation << 32 | id`), so remove-then-reuse becomes a new accessibility
+object rather than recycling one a screen reader may still hold.
+
+### Absent, invisible, and clipped are three different things
+
+```text
+Display::None        retained in the tree, absent from layout, paint,
+                     hit-testing and accessibility; descendants likewise
+Visibility::Hidden   keeps its space; no paint, no hit-test, no
+                     accessibility; suppresses the whole subtree
+Overflow::Clip       layout unaffected; descendant paint and hit-testing
+                     intersected with this node's rect; nested clips
+                     intersect
+```
+
+One line separates the first two: `None` leaves layout, `Hidden` stays in it.
+Everything else they suppress is identical, which is why they are two names
+rather than one property with a flag.
+
+`Hidden` is subtree-wide, deliberately unlike CSS, where a descendant can set
+`visibility: visible` and reappear inside an invisible ancestor. That makes "is
+this node visible?" a walk to the root rather than a lookup.
+
+**`Overflow` has no `Scroll` variant.** CSS makes scrolling a value of the
+overflow property; copying that would make CSS's overflow model Instar's
+architecture by accident. `Clip` is a rectangle intersection holding no state.
+Scrolling is a node kind with a host-owned offset and a retirement obligation,
+and a property value cannot carry that.
+
+### Scroll is a retained viewport the guest cannot aim
+
+```text
+guest owns    the content
+host owns     where that content is scrolled to
+```
+
+The offset appears nowhere on the wire in either direction. A guest cannot set
+one, read one, or veto a change to one — which is what lets a wheel event move
+the view with no Wasm round trip, and means a guest cannot scroll a view out
+from under someone reading it.
+
+A `Scroll` takes exactly one content child. That gives one unambiguous content
+extent, and it stops `Scroll` becoming a layout container as well as a
+viewport, which is two things wearing one name.
+
+Both traversals run the same ordering:
+
+```text
+ancestor clip  ->  this node's clip  ->  translate  ->  descend
+```
+
+The clip comes first because the other order reports hits on content scrolled
+out of view — inside a child's translated rect, outside the viewport that owns
+it. The clip travels with the pointer, which only matters once something
+*above* the scroll also clips.
+
+Retention follows the node, not the pixels:
+
+```text
+commit that keeps the Scroll alive   offset survives unchanged
+content shrinks                      clamped before the next presentation
+                                     becomes interactive
+Display::None / Visibility::Hidden   no interaction; offset retained
+the node is deleted                  offset destroyed with it
+```
+
+A wheel delta goes to the deepest viewport under the pointer, which takes what
+it has room for; **the remainder bubbles outward**. "The nearest scroll owns
+the whole event" is the classic nested-scroll trap, where an inner viewport at
+its limit swallows input that should have kept scrolling the outer one.
+
+### Continuous interaction is host-local, structurally
+
+A pressed button is drawn pressed, a wheel moves a viewport, and neither
+consults the guest. The guest hears about *completed* interactions; everything
+between the finger going down and an outcome existing belongs to the host.
+
+This is not a policy the code follows — there is no branch in the scroll path
+that can reach the guest at all. The zero-`SendToGuest` property holds because
+the path does not exist, rather than because a test watches one that does.
+Hover, focus, caret blink, selection, sliders, and drag previews inherit the
+same arrangement.
+
 ### Transient interaction state is host-owned
 
 A pressed button is drawn pressed, and that frame is requested without consulting
@@ -210,6 +383,49 @@ transcription. The retained tree keeps saying whatever the guest last said.
 The surface is itself bounded: 32 KiB / 512 lines, capped where the state is
 built rather than where it is drawn, with the complete diagnostic still going
 to the log.
+
+### Retirement: the node is gone, forget everything about it
+
+> Any host transient state referencing a removed `NodeKey` is retired before
+> the new snapshot becomes interactive.
+
+And its counterpart, because hiding is not deletion but has the same
+consequence for input:
+
+> When a subtree becomes non-interactive through `Display::None` or
+> `Visibility::Hidden`, any host transient state referencing it is retired
+> before the new state becomes interactive.
+
+Press and scroll offsets obey both today; focus, hover, and pointer capture
+join them as they arrive. Deletion destroys a scroll offset, hiding retains
+it — a node the guest hid is still a node the guest has, and returning to where
+you were when it reappears is what a user expects.
+
+One thing retirement cannot reach is an action already encoded and queued for
+the guest. That is what generational keys close, from the other end.
+
+### `measure()` is observational
+
+Taffy probes a text node many times per layout pass under different
+constraints, and its last call is not necessarily at the node's final width.
+
+> `measure()` may perform temporary work needed to answer the current sizing
+> query, including line-breaking for `Definite(width)`, but it must not mutate
+> finalized presentation state or invalidate reusable artifacts based on
+> speculative constraints.
+
+```text
+MinContent / MaxContent   intrinsic query only, from a cached ContentWidths
+Definite(width)           may line-break to compute height; must not touch
+                          finalized_width or the shaped artifact
+finalize(actual_width)    owns finalized_width, persistent line-break state,
+                          and ShapedText extraction
+```
+
+The invariant is not "measure never mutates" — a real height needs a real
+break — but that speculative probes cannot poison the finalized cache. Getting
+this wrong is not a correctness failure, it is a 9× latency failure that no
+test would have reported.
 
 ## Guest lifetime
 
@@ -231,14 +447,47 @@ This came out of Gate 0, which found that abandoning a started guest task
 retains its runtime bookkeeping. Wasmtime documents the same thing: cancelling a
 concurrent task requires dropping the `Store`.
 
+## What the tests assert, and in which profile
+
+Debug and release deliberately assert different things, permanently.
+
+```text
+debug     completion, ordering, cancellation, no-hang, boundedness
+release   latency: p50, p95, p99, and an outlier guard
+```
+
+Debug timings measure rustc's optimization level more than Instar's design: a
+single debug reading of 386 ms once sent an investigation hunting an
+architectural defect that release measured at 5 ms. The defect was real; the
+number that raised the alarm was 75× the number that mattered.
+
+The split is written with `cfg!`, never `#[cfg]`. A `#[cfg]`-gated pair of
+bodies is only type-checked in the build it belongs to, and since CI builds
+debug, the release half of this once sat calling *itself* — asserting nothing,
+and a stack overflow waiting for the first release run.
+
+> A gate that hides a body from the compiler hides its bugs too.
+
+The latency bounds are asserted **on request**, not by default:
+
+```text
+INSTAR_LATENCY_GATE=1 cargo test --release -p instar-host --test bridge -- --nocapture
+```
+
+The distribution prints on every run in every profile; what is opt-in is the
+*judgement*, because a judgement needs a host doing nothing else. Every run
+says on its own output when it is only reporting, so a deferred judgement
+cannot quietly become a forgotten one. See `docs/baselines/PERFORMANCE.md`.
+
 ## Known scaffolding
 
 Recorded so it is not mistaken for design:
 
-- **`TEXT_METRICS`** — fixed-pitch placeholder metrics shared by layout and
-  painting, with the shell inverting a real font's advance to match them. Phase
-  2 replaces both sides with one shaped result driving Taffy measurement and
-  glyph positioning. See `PHASE-1.md`.
 - **One window, one guest.** `PresentationState` is per-runtime, not per-window.
 - **No quota enforcement.** A guest that spins on CPU without yielding is out of
-  scope for Phase 1.
+  scope.
+- **No style vocabulary yet.** Colour, border, corner radius, font role/size/
+  weight, and cursor are package C; `PHASE-2.md` freezes their contract. Until
+  then the host chooses every colour from its own theme.
+- **No scrollbar chrome.** Wheel and touchpad scrolling work; there is nothing
+  drawn to drag.

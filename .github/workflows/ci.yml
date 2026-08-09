@@ -73,6 +73,7 @@ jobs:
             echo "::group::$guest"
             (cd "$guest" && cargo fmt --all --check)
             (cd "$guest" && cargo clippy --target wasm32-wasip2 --all-targets)
+            (cd "$guest" && cargo build --target wasm32-wasip2)
             echo "::endgroup::"
           done
 
@@ -112,11 +113,31 @@ jobs:
       - name: The rest of the suite
         run: cargo test --workspace
 
-      # --nocapture so the p50/p95/p99 telemetry reaches the log. Not asserted
-      # on (see docs/PHASE-1.md); recorded so a regression has a paper trail
-      # from before it happened.
-      - name: Bridge round-trip latency
+      # --nocapture so the p50/p95/p99 telemetry reaches the log. Debug, so
+      # the numbers measure rustc's optimization level more than Instar's
+      # design and are recorded rather than asserted -- the run says so on its
+      # own output. See docs/baselines/PERFORMANCE.md.
+      - name: Bridge round-trip latency (recorded, not asserted)
         run: cargo test -p instar-host --test bridge -- --nocapture
+
+      # Compiles the release-only latency assertions without running them.
+      #
+      # This exists because they once rotted. `assert_prompt`'s release body
+      # called itself -- six live call sites, no assertion, and a stack
+      # overflow waiting for the first release run -- and nothing noticed,
+      # because it was `#[cfg]`-gated out of every build CI performed. The
+      # bodies are `cfg!`-guarded now so they always type-check, and this step
+      # is what makes "always" true on every platform rather than on whichever
+      # machine last ran --release by hand.
+      #
+      # Not `cargo test --release`: the gate stays unarmed here. A
+      # GitHub-hosted runner documents resource classes, not deterministic
+      # latency, so asserting millisecond percentiles on one would be
+      # inferring more than the platform promises. Arming it belongs on a
+      # controlled performance runner, as a job whose failures mean something.
+      - name: Release assertions still compile
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release -p instar-host --tests
 
       # Linux only: ~35s of generation churn, and the RSS trend it asserts on
       # is most stable on the runner with the least noisy memory accounting.
