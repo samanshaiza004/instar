@@ -70,11 +70,25 @@ pub struct ChangeSet {
     /// Nodes whose displayed string changed. These, and only these, need
     /// re-shaping.
     pub text_changed: Vec<NodeKey>,
-    /// Nodes whose appearance changed without changing their text or geometry.
+    /// Nodes whose **shaping** style changed: font role, size, or weight.
     ///
-    /// Empty until the protocol carries style (Stage 2). It exists now so the
-    /// type does not change shape underneath the routing that reads it.
-    pub style_changed: Vec<NodeKey>,
+    /// Invalidates the text cache and the layout, exactly as changed text
+    /// does. Kept apart from [`ChangeSet::paint_changed`] because that one
+    /// must not.
+    pub text_style_changed: Vec<NodeKey>,
+    /// Nodes whose **paint-only** style changed: foreground, background,
+    /// border, corner radius.
+    ///
+    /// Lowers and rasters, and does nothing else. This field was called
+    /// `style_changed` and was chained into `needs_reshape` and `needs_layout`
+    /// while it was permanently empty — so the moment the protocol carried a
+    /// colour, every repaint would have re-shaped the tree. Nothing would have
+    /// failed; it would just have got slow, which is the failure mode
+    /// `TextStats` exists to catch. The name is now specific enough that
+    /// putting it back in either list would read as wrong.
+    pub paint_changed: Vec<NodeKey>,
+    /// Nodes whose cursor changed. Invalidates nothing measured or drawn.
+    pub cursor_changed: Vec<NodeKey>,
     /// Nodes whose interactivity changed. Affects hit-testing, accessibility,
     /// and how the node is drawn — a disabled control is drawn as unavailable
     /// rather than hidden.
@@ -94,7 +108,9 @@ impl ChangeSet {
             && self.structure_changed.is_empty()
             && self.layout_changed.is_empty()
             && self.text_changed.is_empty()
-            && self.style_changed.is_empty()
+            && self.text_style_changed.is_empty()
+            && self.paint_changed.is_empty()
+            && self.cursor_changed.is_empty()
             && self.enabled_changed.is_empty()
     }
 
@@ -106,7 +122,7 @@ impl ChangeSet {
     pub fn needs_reshape(&self) -> impl Iterator<Item = NodeKey> + '_ {
         self.text_changed
             .iter()
-            .chain(&self.style_changed)
+            .chain(&self.text_style_changed)
             .chain(&self.created)
             .copied()
     }
@@ -129,7 +145,7 @@ impl ChangeSet {
             || !self.structure_changed.is_empty()
             || !self.layout_changed.is_empty()
             || !self.text_changed.is_empty()
-            || !self.style_changed.is_empty()
+            || !self.text_style_changed.is_empty()
     }
 
     /// Whether anything on screen would look different.
@@ -140,10 +156,19 @@ impl ChangeSet {
     /// Whether the accessibility tree has to be updated.
     ///
     /// Text, structure, and enabled-ness are all things a screen reader
-    /// reports. Pure geometry changes matter too, because bounds are exposed —
-    /// which is why this is currently the same question as `needs_paint`.
+    /// reports, and geometry matters too because bounds are exposed.
+    ///
+    /// Colour and cursor are not. A screen reader does not report a
+    /// background, and republishing an unchanged accessibility tree is not
+    /// free — on some platforms it is an IPC round trip per node.
     pub fn needs_a11y(&self) -> bool {
-        !self.is_empty()
+        !self.created.is_empty()
+            || !self.removed.is_empty()
+            || !self.structure_changed.is_empty()
+            || !self.layout_changed.is_empty()
+            || !self.text_changed.is_empty()
+            || !self.text_style_changed.is_empty()
+            || !self.enabled_changed.is_empty()
     }
 
     /// Every key mentioned anywhere, deduplicated. Diagnostics and tests.
@@ -155,7 +180,9 @@ impl ChangeSet {
             .chain(&self.structure_changed)
             .chain(&self.layout_changed)
             .chain(&self.text_changed)
-            .chain(&self.style_changed)
+            .chain(&self.text_style_changed)
+            .chain(&self.paint_changed)
+            .chain(&self.cursor_changed)
             .chain(&self.enabled_changed)
             .copied()
             .collect();
@@ -260,6 +287,23 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
 
     if old.layout != new.layout {
         changes.layout_changed.push(new.key);
+    }
+
+    // Style is compared per group, never as a whole. Comparing `old.style !=
+    // new.style` and reporting one category would be the mistake this split
+    // exists to prevent -- the three groups cost completely different things,
+    // and the wire keeps them apart precisely so this can read the category
+    // rather than re-derive it field by field.
+    if old.style.text != new.style.text {
+        changes.text_style_changed.push(new.key);
+        // A different face, size or weight measures differently.
+        changes.layout_changed.push(new.key);
+    }
+    if old.style.paint != new.style.paint {
+        changes.paint_changed.push(new.key);
+    }
+    if old.style.cursor != new.style.cursor {
+        changes.cursor_changed.push(new.key);
     }
 
     match (&old.kind, &new.kind) {

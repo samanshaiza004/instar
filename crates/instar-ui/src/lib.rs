@@ -34,8 +34,9 @@ pub mod text;
 pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
-    NodeKey, ProtocolError, WireAlign, WireDisplay, WireJustify, WireLayout, WireOverflow,
-    WireSize, WireVisibility, limits,
+    NodeKey, ProtocolError, WireAlign, WireBorder, WireColor, WireCursor, WireDisplay,
+    WireFontRole, WireJustify, WireLayout, WireOverflow, WirePaintStyle, WireSize, WireStyle,
+    WireTextStyle, WireVisibility, limits,
 };
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
@@ -111,6 +112,8 @@ pub struct Node {
     /// Layout *intent*. The host turns this into geometry; the guest never
     /// states a rectangle.
     pub layout: WireLayout,
+    /// Appearance, grouped by what a change to it costs. See [`WireStyle`].
+    pub style: WireStyle,
     pub children: Vec<Node>,
 }
 
@@ -128,6 +131,7 @@ impl Node {
                 align_self: Some(WireAlign::Stretch),
                 ..WireLayout::default()
             },
+            style: WireStyle::default(),
             children,
         }
     }
@@ -166,6 +170,7 @@ impl Node {
             key: NodeKey::first(key),
             kind: NodeKind::Text { text: text.into() },
             layout: WireLayout::default(),
+            style: WireStyle::default(),
             children: Vec::new(),
         }
     }
@@ -178,6 +183,7 @@ impl Node {
                 enabled: true,
             },
             layout: WireLayout::default(),
+            style: WireStyle::default(),
             children: Vec::new(),
         }
     }
@@ -210,6 +216,54 @@ impl Node {
     /// Keeps its space and shows nothing, for itself and its whole subtree.
     pub fn hidden(mut self) -> Self {
         self.layout.visibility = WireVisibility::Hidden;
+        self
+    }
+
+    pub fn with_style(mut self, style: WireStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Paint-only. Changing this must not reshape or re-lay-out anything.
+    pub fn with_foreground(mut self, color: WireColor) -> Self {
+        self.style.paint.foreground = Some(color);
+        self
+    }
+
+    pub fn with_background(mut self, color: WireColor) -> Self {
+        self.style.paint.background = Some(color);
+        self
+    }
+
+    pub fn with_border(mut self, width: u16, color: WireColor) -> Self {
+        self.style.paint.border = Some(WireBorder { width, color });
+        self
+    }
+
+    pub fn with_corner_radius(mut self, radius: u16) -> Self {
+        self.style.paint.corner_radius = radius;
+        self
+    }
+
+    /// Shaping-affecting: this one *does* invalidate the text cache.
+    pub fn with_font_size(mut self, size: u16) -> Self {
+        self.style.text.size = size;
+        self
+    }
+
+    pub fn with_font_weight(mut self, weight: u16) -> Self {
+        self.style.text.weight = weight;
+        self
+    }
+
+    pub fn with_font_role(mut self, role: WireFontRole) -> Self {
+        self.style.text.role = role;
+        self
+    }
+
+    /// Interaction-only. Invalidates nothing that is measured or drawn.
+    pub fn with_cursor(mut self, cursor: WireCursor) -> Self {
+        self.style.cursor = cursor;
         self
     }
 
@@ -450,6 +504,7 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
         key: wire.key,
         kind,
         layout: wire.layout,
+        style: wire.style,
         children,
     })
 }
@@ -468,12 +523,13 @@ fn encode_node(encoder: &mut BatchEncoder, node: &Node) {
             if *enabled { flags::ENABLED } else { 0 },
         ),
     };
-    encoder.node(
+    encoder.node_styled(
         kind,
         node.key,
         node_flags,
         text,
         node.layout,
+        node.style,
         node.children.len().min(u16::MAX as usize) as u16,
     );
     for child in &node.children {

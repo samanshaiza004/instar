@@ -58,12 +58,113 @@ pub struct Rect {
 }
 
 /// Corner radii for a rounded rectangle, in physical pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CornerRadii {
     pub top_left: f32,
     pub top_right: f32,
     pub bottom_right: f32,
     pub bottom_left: f32,
+}
+
+impl CornerRadii {
+    pub const NONE: Self = Self::uniform(0.0);
+
+    pub const fn uniform(radius: f32) -> Self {
+        Self {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        }
+    }
+
+    /// The largest radii with this shape that actually fit inside `rect`.
+    ///
+    /// Two adjacent radii sharing a side cannot together exceed it, or the
+    /// corners overlap and the outline is not a well-defined shape. When they
+    /// do, every radius is scaled by one common factor rather than clipped
+    /// individually, so a deliberately lopsided shape stays lopsided instead
+    /// of quietly becoming symmetric. This is the rule CSS settled on, for the
+    /// same reason.
+    ///
+    /// Applied here rather than left to a backend, so a hostile or careless
+    /// value has one deterministic result instead of depending on how some
+    /// rasterizer handles degenerate geometry.
+    pub fn clamped_to(self, rect: Rect) -> Self {
+        // Negative and non-finite first: they have no meaning, and letting one
+        // reach the scale factor below would poison every corner through the
+        // shared multiplier.
+        let sane = |radius: f32| {
+            if radius.is_finite() {
+                radius.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let (top_left, top_right, bottom_right, bottom_left) = (
+            sane(self.top_left),
+            sane(self.top_right),
+            sane(self.bottom_right),
+            sane(self.bottom_left),
+        );
+
+        let width = rect.width as f32;
+        let height = rect.height as f32;
+        // `f32::INFINITY` for a side whose radii sum to zero: that side imposes
+        // no constraint, and `min` then ignores it.
+        let limit = |side: f32, sum: f32| if sum > 0.0 { side / sum } else { f32::INFINITY };
+        let scale = limit(width, top_left + top_right)
+            .min(limit(width, bottom_left + bottom_right))
+            .min(limit(height, top_left + bottom_left))
+            .min(limit(height, top_right + bottom_right))
+            .min(1.0);
+
+        Self {
+            top_left: top_left * scale,
+            top_right: top_right * scale,
+            bottom_right: bottom_right * scale,
+            bottom_left: bottom_left * scale,
+        }
+    }
+
+    pub fn is_none(self) -> bool {
+        self.top_left == 0.0
+            && self.top_right == 0.0
+            && self.bottom_right == 0.0
+            && self.bottom_left == 0.0
+    }
+}
+
+/// The stroke width that will actually be painted for `rect`.
+///
+/// # Strokes are painted *inside* the rectangle
+///
+/// Not centred on its edge, which is what a stroke ordinarily means. A centred
+/// stroke puts half its width outside the rect, so a bordered node overlaps
+/// its neighbours by half a border, a clip cuts the outer half off, and the
+/// bounds hit-testing uses stop matching the bounds a user can see. Inside
+/// stroking keeps a node's painted extent exactly the rect it was given, which
+/// is also what lets clipping compose with it.
+///
+/// # And bounded at half the shorter side
+///
+/// ```text
+/// effective = min(requested, min(width, height) / 2)
+/// ```
+///
+/// Two opposite inside-strokes of more than half the shorter side would
+/// overlap in the middle, which is not a border any more — it is a fill, drawn
+/// twice, with whatever the backend does about the double coverage. Clamping
+/// gives a 20px border on a 20x10 rect one deterministic answer (5px) rather
+/// than a rasterizer-dependent one.
+///
+/// Non-finite and negative widths paint nothing.
+pub fn effective_stroke_width(rect: Rect, requested: f32) -> f32 {
+    if !requested.is_finite() || requested <= 0.0 {
+        return 0.0;
+    }
+    let shorter = rect.width.min(rect.height) as f32;
+    requested.min(shorter / 2.0)
 }
 
 /// The physical pixel dimensions a [`PaintScene`] was built for (and a
@@ -247,20 +348,31 @@ pub enum PaintCommand {
         rect: Rect,
         color: Color,
     },
-    /// A stroke of the rectangle's border. Only `width == 1.0` is
-    /// supported in this increment: every backend implements it as four
-    /// 1-physical-pixel edge fills, matching the existing hand-rolled
-    /// border exactly. Any other width is rejected at render time
-    /// ([`PaintError::UnsupportedStrokeWidth`]).
+    /// A border painted **inside** `rect`, `width` physical pixels thick.
+    ///
+    /// Inside rather than centred on the edge, and bounded at half the
+    /// shorter side: see [`effective_stroke_width`], which every backend must
+    /// route the requested width through. A width of zero, or one that is
+    /// negative or non-finite, paints nothing.
     StrokeRect {
         rect: Rect,
         width: f32,
         color: Color,
     },
-    /// Fills `rect` with the supplied corner radii. Producer code in
-    /// this increment never emits one (no control needs rounded geometry
-    /// yet); it exists so a backend's rounded capability is part of the
-    /// contract and testable before a producer depends on it.
+    /// The rounded counterpart of [`PaintCommand::StrokeRect`].
+    ///
+    /// Same inside-stroke rule, and radii are put through
+    /// [`CornerRadii::clamped_to`] before anything is drawn, so a radius
+    /// larger than the rect has one defined result rather than a
+    /// rasterizer-dependent one.
+    StrokeRoundedRect {
+        rect: Rect,
+        radii: CornerRadii,
+        width: f32,
+        color: Color,
+    },
+    /// Fills `rect` with the supplied corner radii, clamped by
+    /// [`CornerRadii::clamped_to`].
     FillRoundedRect {
         rect: Rect,
         radii: CornerRadii,
@@ -731,5 +843,147 @@ mod tests {
         // coordinates in the run's local space.
         assert_eq!(run.glyphs[0].id, 36);
         assert_eq!(run.glyphs[1].x, 9.6);
+    }
+
+    // --- Geometry the backends are not allowed to reinterpret. ---
+
+    const BOX: Rect = Rect {
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 40,
+    };
+
+    #[test]
+    fn a_stroke_never_exceeds_half_the_shorter_side() {
+        // 40 tall, so 20 is the most an inside stroke can be before opposite
+        // edges meet in the middle.
+        assert_eq!(effective_stroke_width(BOX, 1.0), 1.0);
+        assert_eq!(effective_stroke_width(BOX, 20.0), 20.0);
+        assert_eq!(effective_stroke_width(BOX, 21.0), 20.0);
+        assert_eq!(effective_stroke_width(BOX, 1_000.0), 20.0);
+    }
+
+    /// The example the contract is written against: a 20px border on a 20x10
+    /// rect is 5px, not "whatever the rasterizer does with overlapping edges".
+    #[test]
+    fn an_absurd_border_on_a_small_rect_has_one_defined_answer() {
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        assert_eq!(effective_stroke_width(small, 20.0), 5.0);
+    }
+
+    #[test]
+    fn a_stroke_that_cannot_be_drawn_paints_nothing() {
+        for width in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                effective_stroke_width(BOX, width),
+                0.0,
+                "{width} is not a paintable width"
+            );
+        }
+        assert_eq!(
+            effective_stroke_width(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0
+                },
+                4.0
+            ),
+            0.0,
+            "an empty rect has no inside to stroke"
+        );
+    }
+
+    #[test]
+    fn radii_that_fit_are_left_alone() {
+        let radii = CornerRadii {
+            top_left: 8.0,
+            top_right: 4.0,
+            bottom_right: 2.0,
+            bottom_left: 1.0,
+        };
+        assert_eq!(radii.clamped_to(BOX), radii);
+    }
+
+    /// Scaled by one shared factor, so a lopsided shape stays lopsided.
+    #[test]
+    fn oversized_radii_scale_together_rather_than_clipping_individually() {
+        let radii = CornerRadii {
+            top_left: 60.0,
+            top_right: 60.0,
+            bottom_right: 30.0,
+            bottom_left: 30.0,
+        };
+        let clamped = radii.clamped_to(BOX);
+
+        // The 40-tall sides bind first: 60 + 30 = 90 against 40 gives 4/9.
+        let scale = 40.0 / 90.0;
+        for (got, want) in [
+            (clamped.top_left, 60.0 * scale),
+            (clamped.top_right, 60.0 * scale),
+            (clamped.bottom_right, 30.0 * scale),
+            (clamped.bottom_left, 30.0 * scale),
+        ] {
+            assert!((got - want).abs() < 0.001, "{got} should be {want}");
+        }
+        assert!(
+            clamped.top_left > clamped.bottom_left,
+            "the proportion between corners survives the clamp"
+        );
+    }
+
+    #[test]
+    fn no_two_radii_on_a_side_can_exceed_it() {
+        let absurd = CornerRadii::uniform(10_000.0).clamped_to(BOX);
+        assert!(
+            absurd.top_left + absurd.top_right <= BOX.width as f32 + 0.001,
+            "the top pair fits across the width"
+        );
+        assert!(
+            absurd.top_left + absurd.bottom_left <= BOX.height as f32 + 0.001,
+            "the left pair fits down the height"
+        );
+    }
+
+    #[test]
+    fn hostile_radii_become_zero_rather_than_poisoning_the_others() {
+        let radii = CornerRadii {
+            top_left: f32::NAN,
+            top_right: -5.0,
+            bottom_right: f32::INFINITY,
+            bottom_left: 4.0,
+        }
+        .clamped_to(BOX);
+
+        assert_eq!(radii.top_left, 0.0);
+        assert_eq!(radii.top_right, 0.0);
+        assert_eq!(radii.bottom_right, 0.0);
+        assert_eq!(
+            radii.bottom_left, 4.0,
+            "a corner with a usable radius keeps it -- one bad value must not \
+             scale the whole shape to nothing, which is what feeding a NaN \
+             into the shared factor would do"
+        );
+    }
+
+    #[test]
+    fn an_empty_rect_clamps_every_radius_away() {
+        let empty = Rect {
+            x: 5,
+            y: 5,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            CornerRadii::uniform(8.0).clamped_to(empty),
+            CornerRadii::NONE
+        );
     }
 }

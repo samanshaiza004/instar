@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use instar_ui_protocol::{NodeKey, WireAlign, WireDisplay, WireJustify, WireSize};
 use taffy::prelude::*;
 
-use crate::text::{self, ShapedText, TextContext};
+use crate::text::{self, FontRole, ShapedText, ShapingStyle, TextContext};
 use crate::{Node, NodeKind, Tree};
 
 /// The logical-pixel viewport layout is computed against.
@@ -117,6 +117,26 @@ impl LayoutSnapshot {
 struct MeasureContext {
     text: Option<String>,
     is_button: bool,
+    /// Only the shaping-affecting half of the node's style reaches here.
+    ///
+    /// `ShapingStyle` is hashed as the text cache's key, so a field that
+    /// cannot change shaping must never enter it: adding a colour would make
+    /// every repaint miss the cache and re-shape the tree, and nothing would
+    /// fail -- it would just get slow.
+    style: ShapingStyle,
+}
+
+/// The shaping half of a node's style, and nothing else from it.
+fn shaping_style(node: &Node) -> ShapingStyle {
+    ShapingStyle {
+        role: match node.style.text.role {
+            instar_ui_protocol::WireFontRole::SystemUi => FontRole::SystemUi,
+            instar_ui_protocol::WireFontRole::Monospace => FontRole::Monospace,
+        },
+        size: f32::from(node.style.text.size),
+        weight: node.style.text.weight,
+        ..ShapingStyle::default()
+    }
 }
 
 /// Extra space a button reserves around its label, per side. Kept from the
@@ -367,7 +387,7 @@ pub fn compute(text: &mut TextContext, tree: &Tree, viewport: Viewport) -> Layou
                     let (width, height) = text.measure(
                         key,
                         context.text.as_deref().unwrap_or(""),
-                        text::ShapingStyle::default(),
+                        context.style,
                         label_available,
                     );
                     Size {
@@ -450,10 +470,12 @@ fn build_with(
         NodeKind::Text { text } => Some(MeasureContext {
             text: Some(text.clone()),
             is_button: false,
+            style: shaping_style(node),
         }),
         NodeKind::Button { label, .. } => Some(MeasureContext {
             text: Some(label.clone()),
             is_button: true,
+            style: shaping_style(node),
         }),
         _ => None,
     };

@@ -142,6 +142,7 @@ mod tests {
                     text: "x".to_string(),
                 },
                 layout: WireLayout::default(),
+                style: Default::default(),
                 children: Vec::new(),
             }],
         ))

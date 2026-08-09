@@ -335,8 +335,16 @@ impl SceneBuilder {
             _ => translation,
         };
 
+        // Background and border are the guest's to state on any node, so they
+        // are painted before the kind is consulted at all. A container still
+        // gets no *invented* appearance -- absent stays absent -- but a
+        // container that asked for a background now gets one, which is what
+        // makes a panel or a card expressible without a spurious node.
+        self.paint_surface(&node.style.paint, rect, scale, commands);
+
         match &node.kind {
-            // Structure only. Drawing a background for these would mean the
+            // Structure only, beyond whatever surface the guest asked for
+            // above. Drawing something a guest did not ask for would be the
             // host inventing appearance for a node whose whole meaning is
             // "these things are stacked".
             NodeKind::Root
@@ -345,6 +353,7 @@ impl SceneBuilder {
             | NodeKind::Stack
             | NodeKind::Scroll => {}
             NodeKind::Text { .. } => {
+                let foreground = node.style.paint.foreground.map(paint_color);
                 if let Some(shaped) = layout.text(node.key) {
                     push_shaped(
                         commands,
@@ -353,22 +362,47 @@ impl SceneBuilder {
                         shaped,
                         (rect.x as f32, rect.y as f32),
                         scale,
-                        self.theme.text,
+                        foreground.unwrap_or(self.theme.text),
                     );
                 }
             }
             NodeKind::Button { enabled, .. } => {
-                let (face, ink) = match (enabled, pressed == Some(node.key)) {
+                let (theme_face, theme_ink) = match (enabled, pressed == Some(node.key)) {
                     (false, _) => (self.theme.disabled_face, self.theme.disabled_label),
                     (true, true) => (self.theme.pressed_face, self.theme.button_label),
                     (true, false) => (self.theme.button_face, self.theme.button_label),
                 };
+                let ink = node
+                    .style
+                    .paint
+                    .foreground
+                    .map(paint_color)
+                    .unwrap_or(theme_ink);
                 let physical_rect = physical(rect, scale);
-                commands.push(PaintCommand::FillRect {
-                    rect: physical_rect,
-                    color: face,
-                });
-                if *enabled {
+                // A button gets the host's chrome only where the guest stated
+                // none. Once it states a background, `paint_surface` above has
+                // already drawn it and a theme fill on top would erase it.
+                if node.style.paint.background.is_none() {
+                    let radii = corner_radii(&node.style.paint, physical_rect, scale);
+                    if radii.is_none() {
+                        commands.push(PaintCommand::FillRect {
+                            rect: physical_rect,
+                            color: theme_face,
+                        });
+                    } else {
+                        commands.push(PaintCommand::FillRoundedRect {
+                            rect: physical_rect,
+                            radii,
+                            color: theme_face,
+                        });
+                    }
+                }
+                let stated_border = node
+                    .style
+                    .paint
+                    .border
+                    .is_some_and(|border| border.width > 0);
+                if *enabled && !stated_border {
                     commands.push(PaintCommand::StrokeRect {
                         rect: physical_rect,
                         width: 1.0,
@@ -480,6 +514,83 @@ impl SceneBuilder {
         );
         scene(metrics, commands, fonts)
     }
+}
+
+impl SceneBuilder {
+    /// The guest-stated background and border for any node, in that order.
+    ///
+    /// Absent stays absent: a node that asked for nothing gets nothing here,
+    /// which is what keeps a container structural. The background goes down
+    /// before the border so an inside-stroked border sits on top of its own
+    /// fill rather than under it.
+    fn paint_surface(
+        &self,
+        paint: &instar_ui::WirePaintStyle,
+        rect: instar_ui::Rect,
+        scale: f32,
+        commands: &mut Vec<PaintCommand>,
+    ) {
+        if paint.background.is_none() && paint.border.is_none() {
+            return;
+        }
+        let rect = physical(rect, scale);
+        let radii = corner_radii(paint, rect, scale);
+
+        if let Some(background) = paint.background {
+            let color = paint_color(background);
+            if radii.is_none() {
+                commands.push(PaintCommand::FillRect { rect, color });
+            } else {
+                commands.push(PaintCommand::FillRoundedRect { rect, radii, color });
+            }
+        }
+        // A stated border of zero width is not a hairline, it is no border.
+        // The wire keeps whatever the guest said -- `Some(width: 0)` round
+        // trips faithfully, because normalizing it away at decode would make
+        // the encoding lossy -- but the host declines to emit a command that
+        // paints nothing. The backend would draw nothing either way; the
+        // difference is a scene that says what it means.
+        if let Some(border) = paint.border.filter(|border| border.width > 0) {
+            // The width is logical like every other length, so it scales here
+            // and is bounded by the paint contract, not by this layer.
+            let width = f32::from(border.width) * scale;
+            let color = paint_color(border.color);
+            if radii.is_none() {
+                commands.push(PaintCommand::StrokeRect { rect, width, color });
+            } else {
+                commands.push(PaintCommand::StrokeRoundedRect {
+                    rect,
+                    radii,
+                    width,
+                    color,
+                });
+            }
+        }
+    }
+}
+
+fn paint_color(color: instar_ui::WireColor) -> Color {
+    Color {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a,
+    }
+}
+
+/// The node's corner radii in physical pixels, clamped to the rect they will
+/// be drawn against.
+///
+/// Clamped here as well as in the backend: this is where the logical radius
+/// becomes a physical one, and a value that fit logically can stop fitting
+/// after scaling. The backend's clamp is idempotent, so doing it twice costs
+/// nothing and neither layer has to assume the other did it.
+fn corner_radii(
+    paint: &instar_ui::WirePaintStyle,
+    rect: Rect,
+    scale: f32,
+) -> instar_paint::CornerRadii {
+    instar_paint::CornerRadii::uniform(f32::from(paint.corner_radius) * scale).clamped_to(rect)
 }
 
 /// The reserved cache key for the host-owned crash text. Protocol nodes are

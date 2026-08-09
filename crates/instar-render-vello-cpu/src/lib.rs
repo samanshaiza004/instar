@@ -27,11 +27,12 @@ use std::time::Instant;
 #[cfg(feature = "glyph-run")]
 use instar_paint::{AffineTransform, FontId, FontKey, FontResource, GlyphPosition, GlyphRun};
 use instar_paint::{
-    AlphaMask, Color, MaskId, PaintBackend, PaintCommand, PaintError, PaintScene, PhysicalSize,
-    Point, Rect, RenderTarget,
+    AlphaMask, Color, CornerRadii, MaskId, PaintBackend, PaintCommand, PaintError, PaintScene,
+    PhysicalSize, Point, Rect, RenderTarget, effective_stroke_width,
 };
 use vello_cpu::color::{AlphaColor, PremulRgba8, Srgb};
 use vello_cpu::kurbo::{Affine, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape};
+use vello_cpu::peniko;
 use vello_cpu::peniko::{Extend, ImageBrush, ImageQuality, ImageSampler};
 use vello_cpu::{ImageSource, Pixmap, PixmapMut, RenderContext, Resources};
 
@@ -182,43 +183,69 @@ impl VelloCpuBackend {
                 context.fill_rect(&kurbo_rect(*rect));
             }
             PaintCommand::StrokeRect { rect, width, color } => {
-                // Only a 1-physical-pixel stroke is in the contract; render
-                // it exactly like the legacy interpreter does -- four 1px
-                // edge fills.
-                if *width != 1.0 {
-                    return Err(PaintError::UnsupportedStrokeWidth(*width));
-                }
-                if rect.width == 0 || rect.height == 0 {
+                // Four inside edge fills rather than a stroked path. Kurbo
+                // strokes are centred on the outline, which would put half the
+                // border outside the rect the layout computed -- see
+                // `instar_paint::effective_stroke_width`. Filling inward keeps
+                // the painted extent exactly the supplied rect, and it is what
+                // the 1px hand-rolled version already did.
+                let width = effective_stroke_width(*rect, *width);
+                if width <= 0.0 {
                     return Ok(());
                 }
                 let context = self.context_mut()?;
                 context.set_paint(alpha_color(*color));
-                context.fill_rect(&kurbo_rect(Rect { height: 1, ..*rect }));
-                context.fill_rect(&kurbo_rect(Rect {
-                    y: rect.y + rect.height as i32 - 1,
-                    height: 1,
-                    ..*rect
-                }));
-                context.fill_rect(&kurbo_rect(Rect { width: 1, ..*rect }));
-                context.fill_rect(&kurbo_rect(Rect {
-                    x: rect.x + rect.width as i32 - 1,
-                    width: 1,
-                    ..*rect
-                }));
+                for edge in inside_edges(*rect, width) {
+                    context.fill_rect(&edge);
+                }
             }
             PaintCommand::FillRoundedRect { rect, radii, color } => {
                 let context = self.context_mut()?;
                 context.set_paint(alpha_color(*color));
-                let rounded = RoundedRect::from_rect(
-                    kurbo_rect(*rect),
-                    RoundedRectRadii::new(
-                        f64::from(radii.top_left),
-                        f64::from(radii.top_right),
-                        f64::from(radii.bottom_right),
-                        f64::from(radii.bottom_left),
-                    ),
+                context.fill_path(&rounded_path(*rect, *radii));
+            }
+            PaintCommand::StrokeRoundedRect {
+                rect,
+                radii,
+                width,
+                color,
+            } => {
+                // Inside again, expressed as the ring between the outer
+                // rounded rect and one inset by the stroke width. Even-odd
+                // fill of the two paths leaves exactly the border, entirely
+                // within the outer bounds -- a centred kurbo stroke would not.
+                let width = effective_stroke_width(*rect, *width);
+                if width <= 0.0 {
+                    return Ok(());
+                }
+                let inset = f64::from(width);
+                let outer = kurbo_rect(*rect);
+                let inner = KurboRect::new(
+                    outer.x0 + inset,
+                    outer.y0 + inset,
+                    outer.x1 - inset,
+                    outer.y1 - inset,
                 );
-                context.fill_path(&rounded.to_path(0.1));
+                let outer_radii = radii.clamped_to(*rect);
+                let mut path = rounded_path_from(outer, outer_radii);
+                if inner.width() > 0.0 && inner.height() > 0.0 {
+                    // The inner corner is the outer one less the border, which
+                    // is what keeps the ring an even thickness around a curve
+                    // instead of pinching at the corners.
+                    let shrink = |radius: f32| ((f64::from(radius) - inset).max(0.0)) as f32;
+                    let inner_radii = CornerRadii {
+                        top_left: shrink(outer_radii.top_left),
+                        top_right: shrink(outer_radii.top_right),
+                        bottom_right: shrink(outer_radii.bottom_right),
+                        bottom_left: shrink(outer_radii.bottom_left),
+                    };
+                    path.extend(rounded_path_from(inner, inner_radii));
+                }
+                let context = self.context_mut()?;
+                context.set_paint(alpha_color(*color));
+                context.set_fill_rule(peniko::Fill::EvenOdd);
+                context.fill_path(&path);
+                context.set_fill_rule(peniko::Fill::NonZero);
             }
             PaintCommand::AlphaMask {
                 mask,
@@ -585,6 +612,53 @@ fn alpha_color(color: Color) -> AlphaColor<Srgb> {
 /// Converts a scene [`Rect`] into a kurbo rect in the same coordinate
 /// space (y-down physical pixels). Widths/heights are u32, so the far edge
 /// is computed in f64 to avoid i32 overflow for very large rects.
+/// The four inside edges of a stroked rectangle, as fills.
+///
+/// The top and bottom span the full width; the sides fill only what is left
+/// between them, so the corners are covered exactly once. Overlapping them
+/// instead would double-composite four corner squares, which is invisible at
+/// full alpha and obvious the moment a border is translucent.
+fn inside_edges(rect: Rect, width: f32) -> [KurboRect; 4] {
+    let outer = kurbo_rect(rect);
+    let width = f64::from(width);
+    [
+        KurboRect::new(outer.x0, outer.y0, outer.x1, outer.y0 + width),
+        KurboRect::new(outer.x0, outer.y1 - width, outer.x1, outer.y1),
+        KurboRect::new(
+            outer.x0,
+            outer.y0 + width,
+            outer.x0 + width,
+            outer.y1 - width,
+        ),
+        KurboRect::new(
+            outer.x1 - width,
+            outer.y0 + width,
+            outer.x1,
+            outer.y1 - width,
+        ),
+    ]
+}
+
+fn rounded_path_from(rect: KurboRect, radii: CornerRadii) -> vello_cpu::kurbo::BezPath {
+    RoundedRect::from_rect(
+        rect,
+        RoundedRectRadii::new(
+            f64::from(radii.top_left),
+            f64::from(radii.top_right),
+            f64::from(radii.bottom_right),
+            f64::from(radii.bottom_left),
+        ),
+    )
+    .to_path(0.1)
+}
+
+/// A filled rounded rectangle, with the radii already put through the
+/// contract's clamp so the backend never sees geometry it has to invent an
+/// answer for.
+fn rounded_path(rect: Rect, radii: CornerRadii) -> vello_cpu::kurbo::BezPath {
+    rounded_path_from(kurbo_rect(rect), radii.clamped_to(rect))
+}
+
 fn kurbo_rect(rect: Rect) -> KurboRect {
     KurboRect::new(
         f64::from(rect.x),
@@ -936,21 +1010,347 @@ mod tests {
         }
     }
 
-    #[test]
-    fn non_one_pixel_stroke_width_is_rejected() {
+    /// Renders one command onto white and returns the target.
+    fn painted(command: PaintCommand) -> RenderTarget {
         let mut backend = VelloCpuBackend::new();
         let mut target = RenderTarget::new(SIZE).unwrap();
-        let stroke = scene(
-            vec![PaintCommand::StrokeRect {
-                rect: rect(0, 0, 4, 4),
-                width: 2.0,
-                color: Color::opaque(0, 0, 0),
-            }],
-            vec![],
-        );
+        backend
+            .render_into(
+                SIZE,
+                &scene(
+                    vec![
+                        PaintCommand::Clear {
+                            color: Color::opaque(255, 255, 255),
+                        },
+                        command,
+                    ],
+                    vec![],
+                ),
+                &mut target,
+            )
+            .expect("the scene renders");
+        target
+    }
+
+    fn is_ink(target: &RenderTarget, x: u32, y: u32) -> bool {
+        sample(target, x, y) != [255, 255, 255, 255]
+    }
+
+    /// The property the whole inside-stroke decision exists for: a border
+    /// paints within the rect it was given, never outside it.
+    ///
+    /// A centred stroke -- what kurbo does by default -- would put half the
+    /// width on the far side of every edge and fail this at 3px.
+    #[test]
+    fn a_border_is_painted_entirely_inside_its_rect() {
+        let bounds = rect(4, 3, 8, 6);
+        let target = painted(PaintCommand::StrokeRect {
+            rect: bounds,
+            width: 3.0,
+            color: Color::opaque(0, 0, 0),
+        });
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                let inside = (x as i32) >= bounds.x
+                    && (y as i32) >= bounds.y
+                    && (x as i32) < bounds.x + bounds.width as i32
+                    && (y as i32) < bounds.y + bounds.height as i32;
+                if !inside {
+                    assert!(
+                        !is_ink(&target, x, y),
+                        "({x}, {y}) is outside {bounds:?} and must be untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_border_covers_its_edges_and_leaves_the_middle_alone() {
+        let target = painted(PaintCommand::StrokeRect {
+            rect: rect(2, 2, 10, 8),
+            width: 2.0,
+            color: Color::opaque(0, 0, 0),
+        });
+
+        // Two pixels in from each edge is border; three in is not.
+        assert!(is_ink(&target, 2, 2), "top-left corner");
+        assert!(is_ink(&target, 3, 3), "still within a 2px border");
+        assert!(is_ink(&target, 11, 9), "bottom-right corner");
+        assert!(!is_ink(&target, 4, 4), "the interior is not filled");
+        assert!(!is_ink(&target, 6, 5), "nor is the middle");
+    }
+
+    /// A translucent border must not be double-composited where the edges
+    /// meet, which is what four overlapping full-width edge fills would do.
+    #[test]
+    fn a_translucent_borders_corners_are_not_painted_twice() {
+        let target = painted(PaintCommand::StrokeRect {
+            rect: rect(2, 2, 10, 8),
+            width: 2.0,
+            color: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 128,
+            },
+        });
+        let corner = sample(&target, 2, 2);
+        let edge = sample(&target, 6, 2);
         assert_eq!(
-            backend.render_into(SIZE, &stroke, &mut target),
-            Err(PaintError::UnsupportedStrokeWidth(2.0))
+            corner, edge,
+            "the corner and the middle of the top edge are one layer of the \
+             same colour; a corner darker than its edge means the fills overlap"
+        );
+    }
+
+    #[test]
+    fn an_oversized_border_fills_the_rect_without_escaping_it() {
+        let bounds = rect(3, 3, 6, 4);
+        let target = painted(PaintCommand::StrokeRect {
+            rect: bounds,
+            // Far past half the shorter side; clamps to 2.
+            width: 40.0,
+            color: Color::opaque(0, 0, 0),
+        });
+
+        assert!(
+            is_ink(&target, 5, 4),
+            "clamped to 2px, the middle is covered"
+        );
+        for (x, y) in [(2, 4), (9, 4), (5, 2), (5, 7)] {
+            assert!(
+                !is_ink(&target, x, y),
+                "({x}, {y}) is outside {bounds:?} and must stay clean however \
+                 large a width was asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn a_width_that_cannot_be_drawn_paints_nothing() {
+        for width in [0.0, -3.0, f32::NAN] {
+            let target = painted(PaintCommand::StrokeRect {
+                rect: rect(2, 2, 8, 6),
+                width,
+                color: Color::opaque(0, 0, 0),
+            });
+            let any_ink = (0..SIZE.height)
+                .flat_map(|y| (0..SIZE.width).map(move |x| (x, y)))
+                .any(|(x, y)| is_ink(&target, x, y));
+            assert!(!any_ink, "a width of {width} must paint nothing");
+        }
+    }
+
+    #[test]
+    fn a_rounded_border_stays_inside_its_rect_too() {
+        let bounds = rect(3, 2, 10, 8);
+        let target = painted(PaintCommand::StrokeRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(3.0),
+            width: 2.0,
+            color: Color::opaque(0, 0, 0),
+        });
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                let inside = (x as i32) >= bounds.x
+                    && (y as i32) >= bounds.y
+                    && (x as i32) < bounds.x + bounds.width as i32
+                    && (y as i32) < bounds.y + bounds.height as i32;
+                if !inside {
+                    assert!(!is_ink(&target, x, y), "({x}, {y}) is outside {bounds:?}");
+                }
+            }
+        }
+        assert!(
+            !is_ink(&target, 8, 5),
+            "a rounded border is still a border: the middle is hollow"
+        );
+        assert!(
+            is_ink(&target, 8, 2),
+            "and the top edge between the corners is drawn"
+        );
+    }
+
+    /// Renders a whole command list onto white.
+    fn painted_all(commands: Vec<PaintCommand>) -> RenderTarget {
+        let mut backend = VelloCpuBackend::new();
+        let mut target = RenderTarget::new(SIZE).unwrap();
+        let mut all = vec![PaintCommand::Clear {
+            color: Color::opaque(255, 255, 255),
+        }];
+        all.extend(commands);
+        backend
+            .render_into(SIZE, &scene(all, vec![]), &mut target)
+            .expect("the scene renders");
+        target
+    }
+
+    /// A node clipping to its own rect must not amputate its own border.
+    ///
+    /// This is the composition A3's clip and C1's inside-stroke have to make
+    /// together: the clip is exactly the rect, and an inside stroke is exactly
+    /// within it, so the complete ring survives. A centred stroke would lose
+    /// its outer half to the very clip the node asked for.
+    ///
+    /// Translucent and rounded on purpose -- it re-exercises the corner
+    /// double-composite from C1 at the same time.
+    #[test]
+    fn a_nodes_own_clip_does_not_cut_off_its_own_border() {
+        let bounds = rect(3, 2, 10, 8);
+        let border = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        let clipped = painted_all(vec![
+            PaintCommand::PushClip { rect: bounds },
+            PaintCommand::StrokeRoundedRect {
+                rect: bounds,
+                radii: CornerRadii::uniform(2.0),
+                width: 2.0,
+                color: border,
+            },
+            PaintCommand::PopClip,
+        ]);
+        let unclipped = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(2.0),
+            width: 2.0,
+            color: border,
+        }]);
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                assert_eq!(
+                    sample(&clipped, x, y),
+                    sample(&unclipped, x, y),
+                    "({x}, {y}) differs: clipping to the node's own rect \
+                     removed part of a border that is painted inside it"
+                );
+            }
+        }
+        assert!(
+            is_ink(&clipped, 8, 2),
+            "the fixture must actually have a top edge to lose"
+        );
+    }
+
+    /// Two bordered neighbours sharing an edge, with no gap between them.
+    ///
+    /// A centred stroke would put half of each border in the other's
+    /// rectangle, so the boundary would carry both colours. Inside stroking
+    /// keeps each node's ink to its own rect, which is what lets adjacent
+    /// controls be laid out flush.
+    #[test]
+    fn adjacent_bordered_siblings_do_not_bleed_into_each_other() {
+        let left = rect(0, 0, 8, 12);
+        let right = rect(8, 0, 8, 12);
+        let target = painted_all(vec![
+            PaintCommand::StrokeRect {
+                rect: left,
+                width: 3.0,
+                color: Color::opaque(255, 0, 0),
+            },
+            PaintCommand::StrokeRect {
+                rect: right,
+                width: 3.0,
+                color: Color::opaque(0, 0, 255),
+            },
+        ]);
+
+        for y in 0..SIZE.height {
+            for x in 0..8 {
+                let pixel = sample(&target, x, y);
+                assert!(
+                    pixel[2] == 0 || pixel == [255, 255, 255, 255],
+                    "({x}, {y}) is in the left sibling and carries blue: {pixel:?}"
+                );
+            }
+            for x in 8..SIZE.width {
+                let pixel = sample(&target, x, y);
+                assert!(
+                    pixel[0] == 0 || pixel == [255, 255, 255, 255],
+                    "({x}, {y}) is in the right sibling and carries red: {pixel:?}"
+                );
+            }
+        }
+        assert!(is_ink(&target, 7, 6), "the shared boundary is drawn");
+        assert!(is_ink(&target, 8, 6), "on both sides");
+    }
+
+    #[test]
+    fn a_zero_width_border_draws_nothing_at_all() {
+        let target = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: rect(2, 2, 8, 6),
+            radii: CornerRadii::uniform(2.0),
+            width: 0.0,
+            color: Color::opaque(0, 0, 0),
+        }]);
+        let any = (0..SIZE.height)
+            .flat_map(|y| (0..SIZE.width).map(move |x| (x, y)))
+            .any(|(x, y)| is_ink(&target, x, y));
+        assert!(!any, "a zero-width border is not a hairline, it is nothing");
+    }
+
+    /// A 2x1 rect asked for a 40px border and 500px corners. The clamps are
+    /// unit-tested; this proves the whole pipeline honours them rather than
+    /// panicking or emitting NaN geometry kurbo then does something arbitrary
+    /// with.
+    #[test]
+    fn an_absurd_border_on_a_tiny_rect_stays_defined() {
+        let bounds = rect(5, 5, 2, 1);
+        let target = painted_all(vec![PaintCommand::StrokeRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(500.0),
+            width: 40.0,
+            color: Color::opaque(0, 0, 0),
+        }]);
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                let inside = (x as i32) >= bounds.x
+                    && (y as i32) >= bounds.y
+                    && (x as i32) < bounds.x + bounds.width as i32
+                    && (y as i32) < bounds.y + bounds.height as i32;
+                if !inside {
+                    assert!(
+                        !is_ink(&target, x, y),
+                        "({x}, {y}) escaped a 2x1 rect that asked for a 40px border"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A radius larger than the rect is clamped rather than handed to kurbo to
+    /// interpret, so the result is defined instead of merely whatever happens."""
+    #[test]
+    fn an_absurd_radius_still_renders_within_bounds() {
+        let bounds = rect(3, 3, 8, 6);
+        let target = painted(PaintCommand::FillRoundedRect {
+            rect: bounds,
+            radii: CornerRadii::uniform(500.0),
+            color: Color::opaque(0, 0, 0),
+        });
+
+        for y in 0..SIZE.height {
+            for x in 0..SIZE.width {
+                let inside = (x as i32) >= bounds.x
+                    && (y as i32) >= bounds.y
+                    && (x as i32) < bounds.x + bounds.width as i32
+                    && (y as i32) < bounds.y + bounds.height as i32;
+                if !inside {
+                    assert!(!is_ink(&target, x, y), "({x}, {y}) escaped {bounds:?}");
+                }
+            }
+        }
+        assert!(
+            is_ink(&target, 6, 5),
+            "the middle of a heavily rounded fill is still filled"
         );
     }
 

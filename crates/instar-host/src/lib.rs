@@ -599,7 +599,18 @@ impl Host {
         if let Some(tree) = window.tree.as_ref() {
             window.interaction.retire_hidden(tree);
         }
-        window.recompute_layout(&mut self.text);
+        // Only when something that can move a rectangle changed. A paint-only
+        // commit -- a colour, a border, a corner radius -- keeps the geometry
+        // and the shaped text it already has.
+        //
+        // This is what makes the guarantee structural rather than lucky. A
+        // relayout would call `finalize` on every text node, and while an
+        // unchanged width happens to reuse rather than re-extract today, that
+        // is a property of the cache's internals rather than of this path.
+        // Not entering it at all cannot regress.
+        if changes.needs_layout() {
+            window.recompute_layout(&mut self.text);
+        }
         // After layout, because the scrollable extent is a layout answer, and
         // before the scene is lowered and the commit is acknowledged, because
         // both of those are the interface becoming interactive. Content that
@@ -1440,6 +1451,330 @@ mod tests {
             "the press belonged to a node that no longer exists; completing it \
              against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    // --- C5: a paint-only change must not touch the text cache. ---
+
+    /// The Stage 1 regression test, made mandatory.
+    ///
+    /// Both directions matter, and each catches a different mistake:
+    ///
+    /// - `rebuilt`/`relinebroken`/`extracted` at zero catches a colour change
+    ///   being routed into shaping dirtiness. Nothing would fail if it were —
+    ///   the picture would be right and the frame would just get slower, which
+    ///   is precisely the failure `TextStats` exists to see.
+    /// - the scene actually carrying the new colour catches the opposite
+    ///   mistake: treating a paint-only change as a no-op and drawing nothing.
+    ///
+    /// A test asserting only the first would pass against a host that ignored
+    /// style entirely.
+    ///
+    /// `reused` is in the tuple and is the one doing the work. The first three
+    /// counters stay at zero even when layout *does* re-run, because the cache
+    /// simply hits — so asserting only those proves nothing about whether the
+    /// layout pass was skipped. `reused` counts finalize consulting the cache,
+    /// which happens if and only if layout ran. This was written the weaker
+    /// way first, and injecting the exact mistake it was meant to catch
+    /// produced a green run.
+    #[test]
+    fn a_foreground_change_repaints_without_touching_the_text_cache() {
+        use instar_ui::{Node, WireColor};
+
+        let build = |foreground: Option<WireColor>| {
+            let mut label = Node::text(30, "steady text");
+            if let Some(color) = foreground {
+                label = label.with_foreground(color);
+            }
+            Tree::new(Node::root(0, vec![label]))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(None)).expect("valid tree");
+
+        // From here on, nothing about the text itself changes.
+        host.reset_text_stats();
+        let red = WireColor::opaque(255, 0, 0);
+        host.apply_tree(WINDOW, build(Some(red)))
+            .expect("valid tree");
+
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.extracted,
+                stats.reused
+            ),
+            (0, 0, 0, 0),
+            "a foreground change must not reshape, re-line-break, or \
+             re-extract anything: {stats:?}"
+        );
+
+        // And the other direction: the new colour reached the scene.
+        let scene = host
+            .window(WINDOW)
+            .and_then(HostWindow::scene)
+            .expect("a paint-only commit still lowers a scene");
+        let inks: Vec<instar_paint::Color> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                instar_paint::PaintCommand::GlyphRun { run } => Some(run.color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            inks.contains(&instar_paint::Color::opaque(255, 0, 0)),
+            "the glyphs should be painted in the requested foreground, got {inks:?}"
+        );
+    }
+
+    /// The control for the test above: a font-size change *is* shaping work,
+    /// so the same instrument must report it. Without this, a host that
+    /// stopped shaping entirely would pass the zero-cost assertion.
+    #[test]
+    fn a_font_size_change_does_reshape() {
+        use instar_ui::Node;
+
+        let build = |size: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::text(31, "steady text").with_font_size(size)],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(14)).expect("valid tree");
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, build(24)).expect("valid tree");
+
+        let stats = host.text_stats();
+        assert!(
+            stats.rebuilt > 0,
+            "a different font size must re-shape: {stats:?}"
+        );
+    }
+
+    /// Cursor is interaction-only: it changes nothing measured and nothing
+    /// drawn, so it must not reshape either.
+    #[test]
+    fn a_cursor_change_touches_neither_the_text_cache_nor_layout() {
+        use instar_ui::{Node, WireCursor};
+
+        let build = |cursor: WireCursor| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::text(32, "steady text").with_cursor(cursor)],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(WireCursor::Default))
+            .expect("valid tree");
+        let before = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(32)));
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, build(WireCursor::Pointer))
+            .expect("valid tree");
+
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.extracted,
+                stats.reused
+            ),
+            (0, 0, 0, 0),
+            "a cursor change is not shaping work: {stats:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(NodeKey::first(32))),
+            before,
+            "nor does it move anything"
+        );
+    }
+
+    // --- C6: border composition. ---
+
+    /// A thickly bordered node, big enough that a centred stroke would be
+    /// unmistakable.
+    fn bordered_tree() -> Tree {
+        use instar_ui::{Node, WireColor, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::button(40, "bordered")
+                    .with_layout(WireLayout {
+                        width: WireSize::Fixed(80),
+                        height: WireSize::Fixed(40),
+                        ..WireLayout::default()
+                    })
+                    .with_border(6, WireColor::opaque(255, 0, 0))
+                    .with_background(WireColor::opaque(0, 0, 255))
+                    .with_corner_radius(5),
+            ],
+        ))
+    }
+
+    /// Every rectangle the host emits for a node lies within that node's
+    /// laid-out rect.
+    ///
+    /// Asserted on the scene rather than on pixels, because this is the
+    /// host's half of the contract: it must not *ask* for anything outside
+    /// the rect. `instar-render-vello-cpu` proves the primitives then honour
+    /// it. A centred stroke would fail at whichever layer invented it.
+    #[test]
+    fn nothing_a_bordered_node_paints_leaves_its_layout_rect() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, bordered_tree())
+            .expect("valid tree");
+
+        let bounds = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(40)))
+            .expect("the bordered node is laid out");
+        let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+
+        let mut checked = 0;
+        for command in &scene.commands {
+            let rect = match command {
+                instar_paint::PaintCommand::FillRect { rect, .. }
+                | instar_paint::PaintCommand::StrokeRect { rect, .. }
+                | instar_paint::PaintCommand::FillRoundedRect { rect, .. }
+                | instar_paint::PaintCommand::StrokeRoundedRect { rect, .. } => *rect,
+                _ => continue,
+            };
+            checked += 1;
+            assert!(
+                rect.x >= bounds.x
+                    && rect.y >= bounds.y
+                    && rect.x + rect.width as i32 <= bounds.x + bounds.width
+                    && rect.y + rect.height as i32 <= bounds.y + bounds.height,
+                "{rect:?} escapes the node's layout rect {bounds:?}"
+            );
+        }
+        assert!(
+            checked >= 2,
+            "the fixture should emit at least a background and a border, got {checked}"
+        );
+    }
+
+    /// Hit-testing uses the node's outer bounds, not the area inside its
+    /// border.
+    ///
+    /// Stated as a test so nobody later decides the inset geometry is the
+    /// "real" one. A 6px border on an 80x40 node would move every edge by
+    /// six pixels, and a control whose clickable area is smaller than the
+    /// control is a bug users report as "the button doesn't work near the
+    /// edge".
+    #[test]
+    fn hit_test_bounds_are_the_visible_outer_bounds() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, bordered_tree())
+            .expect("valid tree");
+
+        let window = host.window(WINDOW).unwrap();
+        let layout = window.layout().unwrap();
+        let tree = window.tree().unwrap();
+        let bounds = layout.get(NodeKey::first(40)).unwrap();
+        let target = Some(NodeKey::first(40));
+
+        // One pixel inside each outer edge, including the corners the radius
+        // rounds -- hit-testing is rectangular and does not follow the curve.
+        for (x, y, edge) in [
+            (bounds.x, bounds.y, "top-left"),
+            (bounds.x + bounds.width - 1, bounds.y, "top-right"),
+            (bounds.x, bounds.y + bounds.height - 1, "bottom-left"),
+            (
+                bounds.x + bounds.width - 1,
+                bounds.y + bounds.height - 1,
+                "bottom-right",
+            ),
+        ] {
+            assert_eq!(
+                tree.hit_test(layout, x, y).map(|node| node.key),
+                target,
+                "the {edge} pixel is inside the control and must hit it"
+            );
+        }
+
+        // And one pixel outside each edge.
+        for (x, y, edge) in [
+            (bounds.x - 1, bounds.y + 1, "left"),
+            (bounds.x + bounds.width, bounds.y + 1, "right"),
+            (bounds.x + 1, bounds.y - 1, "top"),
+            (bounds.x + 1, bounds.y + bounds.height, "bottom"),
+        ] {
+            assert_ne!(
+                tree.hit_test(layout, x, y).map(|node| node.key),
+                target,
+                "the pixel past the {edge} edge is outside the control"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_border_changes_neither_paint_nor_bounds() {
+        use instar_ui::{Node, WireColor, WireLayout, WireSize};
+
+        let build = |width: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::text(41, "x")
+                        .with_layout(WireLayout {
+                            width: WireSize::Fixed(40),
+                            height: WireSize::Fixed(20),
+                            ..WireLayout::default()
+                        })
+                        .with_border(width, WireColor::opaque(255, 0, 0)),
+                ],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(0)).expect("valid tree");
+        let bounds = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(41)));
+        let strokes = |host: &Host| {
+            host.window(WINDOW)
+                .and_then(HostWindow::scene)
+                .map(|scene| {
+                    scene
+                        .commands
+                        .iter()
+                        .filter(|command| {
+                            matches!(
+                                command,
+                                instar_paint::PaintCommand::StrokeRect { .. }
+                                    | instar_paint::PaintCommand::StrokeRoundedRect { .. }
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(strokes(&host), 0, "a zero-width border emits no stroke");
+
+        host.apply_tree(WINDOW, build(4)).expect("valid tree");
+        assert_eq!(strokes(&host), 1, "a real one does");
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(NodeKey::first(41))),
+            bounds,
+            "and a border never affects layout either way"
         );
     }
 
