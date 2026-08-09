@@ -620,6 +620,84 @@ Scrollbar chrome stays later. Wheel and touchpad scrolling is the
 architectural claim worth proving — continuous interaction resolved entirely
 host-locally, with Wasm absent from the response loop.
 
+### C: style, sorted by what it can invalidate
+
+The vocabulary is grouped by consequence rather than by what it looks like,
+because the grouping *is* the design:
+
+```text
+shaping / layout-affecting   font role and family
+                             font size
+                             font weight
+
+paint-only                   foreground
+                             background
+                             border
+                             corner radius
+
+interaction-only             cursor
+```
+
+> **A paint-only change must not rebuild or re-line-break any text.**
+
+That gets an explicit regression test, because Stage 1 is the reason the line
+exists. `ShapingStyle` is hashed as a cache key, and the crate already carries
+a warning that adding colour to it would silently destroy every reuse — a
+colour change would re-shape the tree and nothing would fail, it would just get
+slow. A `TextStats` assertion is the only thing that catches that class.
+
+### Borders are defined here, not inherited from the renderer
+
+```text
+border                 does not affect layout
+                       painted inside the node's laid-out rect
+border width           finite and bounded
+corner radius          clamped to valid geometry
+```
+
+Painted *inside* rather than centred on the edge, which is what a stroke
+ordinarily means. A centred stroke puts half its width outside the rect the
+layout computed, so a bordered node overlaps its neighbours by a hair, clipping
+cuts the outer half off, and the bounds hit-testing uses stop matching the
+bounds the user can see. Inside-stroking keeps a node's painted extent exactly
+the rect layout gave it.
+
+That makes `StrokeRoundedRect` an internal primitive with stated geometry
+rather than "whatever a centred stroke happens to do underneath", and it is
+what makes clipping composable with it. `StrokeRect` today rejects any width
+but 1.0, so both need widening.
+
+Radii are clamped so that opposite radii cannot exceed the side they share —
+otherwise the corners overlap and the shape is not well defined. Clamped at
+the boundary, like every other untrusted number, so no backend has to.
+
+**Still no `opacity`.** Node-local alpha is already expressible in every colour
+the vocabulary has. What a property called `opacity` is assumed to mean is
+*subtree* opacity, and that is a compositing feature — an offscreen layer, a
+blend, and a whole category of interaction with clipping and text rendering. A
+deceptively simple name with layer-level consequences is worse than no property
+at all.
+
+### Then scrollbar chrome, as the last Scroll package
+
+```text
+thumb and track state    host-owned
+hover and drag           host-local
+dragging                 zero guest events
+thumb size               derived from viewport and content extent
+content or viewport
+changes                  recompute and clamp
+nested scrollbars        the same clip and translation path B1 and B2 proved
+```
+
+Chrome comes after C so it can use the real paint vocabulary. Building it first
+would mean inventing scrollbar-only drawing rules that C then replaces, and
+temporary rules have a way of outliving their reason.
+
+At that point `Scroll` is a complete proof: layout, clipping, wheel response,
+hit-testing, painting, and direct manipulation, none of which puts Wasm in the
+continuous-interaction loop.
+
 ---
 
 ## Stage 3 — focus, keyboard, scrolling
