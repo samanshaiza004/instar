@@ -49,6 +49,11 @@ pub enum NodeKind {
     Root,
     /// Stacks children vertically. Not interactive.
     Column,
+    /// Stacks children horizontally. Not interactive.
+    Row,
+    /// Lays children on top of one another at the content-box origin. Later
+    /// children paint over earlier ones. Not interactive.
+    Stack,
     /// Displays text. Not interactive. Measured by the host.
     Text { text: String },
     /// Interactive. Hit-testing resolves to these.
@@ -74,6 +79,8 @@ impl NodeKind {
         match self {
             Self::Root => "root",
             Self::Column => "column",
+            Self::Row => "row",
+            Self::Stack => "stack",
             Self::Text { .. } => "text",
             Self::Button { .. } => "button",
         }
@@ -108,6 +115,36 @@ impl Node {
         Self {
             key: NodeKey::first(key),
             kind: NodeKind::Column,
+            layout: WireLayout {
+                width: WireDimension::Fill,
+                ..WireLayout::default()
+            },
+            children,
+        }
+    }
+
+    /// A horizontal container. Defaults to `Fill` width because the common
+    /// `Row` is a toolbar or header that should span its parent; a
+    /// content-sized one would hug its children instead.
+    pub fn row(key: u32, children: Vec<Node>) -> Self {
+        Self {
+            key: NodeKey::first(key),
+            kind: NodeKind::Row,
+            layout: WireLayout {
+                width: WireDimension::Fill,
+                ..WireLayout::default()
+            },
+            children,
+        }
+    }
+
+    /// An overlapping container. Defaults to `Fill` width because the common
+    /// `Stack` is an overlay that should span whatever it covers; a
+    /// content-sized one would collapse to its widest child.
+    pub fn stack(key: u32, children: Vec<Node>) -> Self {
+        Self {
+            key: NodeKey::first(key),
+            kind: NodeKind::Stack,
             layout: WireLayout {
                 width: WireDimension::Fill,
                 ..WireLayout::default()
@@ -237,6 +274,8 @@ impl Tree {
         match batch.nodes[0].kind {
             opcode::NODE_ROOT => {}
             opcode::NODE_COLUMN => return Err(TreeError::BadRoot("column")),
+            opcode::NODE_ROW => return Err(TreeError::BadRoot("row")),
+            opcode::NODE_STACK => return Err(TreeError::BadRoot("stack")),
             opcode::NODE_TEXT => return Err(TreeError::BadRoot("text")),
             _ => return Err(TreeError::BadRoot("button")),
         }
@@ -311,6 +350,8 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
     let kind = match wire.kind {
         opcode::NODE_ROOT => NodeKind::Root,
         opcode::NODE_COLUMN => NodeKind::Column,
+        opcode::NODE_ROW => NodeKind::Row,
+        opcode::NODE_STACK => NodeKind::Stack,
         opcode::NODE_TEXT => NodeKind::Text {
             text: wire.text.clone().unwrap_or_default(),
         },
@@ -346,6 +387,8 @@ fn encode_node(encoder: &mut BatchEncoder, node: &Node) {
     let (kind, text, node_flags) = match &node.kind {
         NodeKind::Root => (opcode::NODE_ROOT, None, 0),
         NodeKind::Column => (opcode::NODE_COLUMN, None, 0),
+        NodeKind::Row => (opcode::NODE_ROW, None, 0),
+        NodeKind::Stack => (opcode::NODE_STACK, None, 0),
         NodeKind::Text { text } => (opcode::NODE_TEXT, Some(text.as_str()), 0),
         NodeKind::Button { label, enabled } => (
             opcode::NODE_BUTTON,
@@ -635,6 +678,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_row_places_children_left_to_right_without_overlap() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![Node::row(
+                1,
+                vec![Node::text(2, "a"), Node::text(3, "b"), Node::text(4, "c")],
+            )],
+        ));
+        let layout = layout(&tree);
+        let a = layout.get(NodeKey::first(2)).unwrap();
+        let b = layout.get(NodeKey::first(3)).unwrap();
+        let c = layout.get(NodeKey::first(4)).unwrap();
+
+        assert!(
+            a.x < b.x && b.x < c.x,
+            "children run left to right in declaration order: {a:?} {b:?} {c:?}"
+        );
+        assert!(
+            a.x + a.width <= b.x && b.x + b.width <= c.x,
+            "row siblings must not overlap horizontally"
+        );
+        assert_eq!(
+            (a.y, b.y, c.y),
+            (a.y, a.y, a.y),
+            "row siblings share one line: {a:?} {b:?} {c:?}"
+        );
+    }
+
+    #[test]
+    fn a_rows_gap_separates_siblings_horizontally_only() {
+        let build = |gap: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::row(1, vec![Node::text(2, "a"), Node::text(3, "b")]).with_layout(
+                        WireLayout {
+                            width: WireDimension::Fill,
+                            height: WireDimension::Content,
+                            padding: 0,
+                            gap,
+                        },
+                    ),
+                ],
+            ))
+        };
+        let tight = layout(&build(0));
+        let loose = layout(&build(10));
+
+        let tight_second = tight.get(NodeKey::first(3)).unwrap();
+        let loose_second = loose.get(NodeKey::first(3)).unwrap();
+        assert_eq!(
+            loose_second.x - tight_second.x,
+            10,
+            "a 10px gap should push the second child right by exactly 10px"
+        );
+        assert_eq!(
+            loose_second.y, tight_second.y,
+            "a row's gap is main-axis space and must not add vertical space"
+        );
+    }
+
+    #[test]
+    fn a_stack_places_every_child_at_the_same_origin() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![Node::stack(
+                1,
+                vec![
+                    Node::text(2, "small"),
+                    Node::text(3, "a much longer line of text"),
+                ],
+            )],
+        ));
+        let layout = layout(&tree);
+        let small = layout.get(NodeKey::first(2)).unwrap();
+        let long = layout.get(NodeKey::first(3)).unwrap();
+
+        assert_eq!(
+            (small.x, small.y),
+            (long.x, long.y),
+            "every stack child starts at the content-box origin: {small:?} {long:?}"
+        );
+    }
+
+    #[test]
+    fn a_stack_sizes_to_its_largest_child() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::stack(
+                    1,
+                    vec![
+                        Node::text(2, "small"),
+                        Node::text(3, "a much longer line of text"),
+                    ],
+                )
+                .with_layout(WireLayout {
+                    width: WireDimension::Content,
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let layout = layout(&tree);
+        let stack = layout.get(NodeKey::first(1)).unwrap();
+        let small = layout.get(NodeKey::first(2)).unwrap();
+        let long = layout.get(NodeKey::first(3)).unwrap();
+
+        assert_eq!(
+            (stack.width, stack.height),
+            (long.width, long.height),
+            "the stack should take the largest child's size, not the sum: \
+             stack {stack:?}, small {small:?}, long {long:?}"
+        );
+        assert!(
+            small.width < long.width,
+            "children must keep their natural size rather than stretch to the \
+             cell: {small:?} {long:?}"
+        );
+    }
+
     // --- Hit-testing, against host-computed geometry. ---
 
     #[test]
@@ -684,6 +848,26 @@ mod tests {
         // A snapshot missing the button entirely: nothing to hit.
         let layout = LayoutSnapshot::from_rects([(NodeKey::first(0), Rect::new(0, 0, 400, 300))]);
         assert_eq!(tree.hit_test(&layout, 10, 10), None);
+    }
+
+    #[test]
+    fn hit_testing_a_stack_returns_the_last_matching_child() {
+        let tree = Tree::new(Node::root(
+            0,
+            vec![Node::stack(
+                1,
+                vec![Node::button(2, "back"), Node::button(3, "front")],
+            )],
+        ));
+        let layout = layout(&tree);
+        let stack = layout.get(NodeKey::first(1)).unwrap();
+
+        let hit = tree.hit_test(&layout, stack.x + 1, stack.y + 1);
+        assert_eq!(
+            hit.map(|node| node.key),
+            Some(NodeKey::first(3)),
+            "the last child paints on top and wins the hit-test"
+        );
     }
 
     #[test]
@@ -779,6 +963,40 @@ mod tests {
         assert_eq!(
             Tree::decode(&encoder.finish()),
             Err(TreeError::BadRoot("column"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_tree_whose_root_is_a_row() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROW,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        assert_eq!(
+            Tree::decode(&encoder.finish()),
+            Err(TreeError::BadRoot("row"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_tree_whose_root_is_a_stack() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_STACK,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        assert_eq!(
+            Tree::decode(&encoder.finish()),
+            Err(TreeError::BadRoot("stack"))
         );
     }
 

@@ -13,11 +13,13 @@
 //!
 //! # The vocabulary is deliberately tiny
 //!
-//! Four node kinds and four layout properties (see
-//! [`instar_ui_protocol::WireLayout`]). No grid, no general CSS surface, no
-//! arbitrary positioning. Everything here is a flex column, because that is
-//! the entire Phase 1 commitment — Taffy can express far more, and exposing
-//! that would turn an internal choice into a compatibility obligation.
+//! Six node kinds and four layout properties (see
+//! [`instar_ui_protocol::WireLayout`]). No general CSS surface, no arbitrary
+//! positioning. Containers are a flex column, a flex row, or one grid cell:
+//! `Row` mirrors `Column` on the other axis, and `Stack` overlaps its children
+//! in that cell. Grid stays an implementation detail of this module — Taffy
+//! can express far more than Instar promises, and exposing that would turn an
+//! internal choice into a compatibility obligation.
 
 use std::collections::HashMap;
 
@@ -132,31 +134,101 @@ fn text_available(value: AvailableSpace) -> text::Available {
 fn dimension(value: WireDimension) -> Dimension {
     match value {
         // Fill is expressed as stretch on the cross axis (see `style`), not as
-        // a dimension, so it stays `auto` here.
+        // a dimension, so it stays `auto` here. On a row's main axis that
+        // makes a Fill-width child content-sized for now: growing into free
+        // main-axis space is flex grow, which is not part of this stage's
+        // vocabulary.
         WireDimension::Fill | WireDimension::Content => Dimension::auto(),
         WireDimension::Fixed(px) => Dimension::length(f32::from(px)),
     }
 }
 
-fn style(node: &Node) -> Style {
+/// What a node's children should treat as the cross axis.
+///
+/// Fill is implemented as cross-axis stretch, so the meaning of a child's
+/// `Fill` dimension depends on which way its parent lays out. Under a row the
+/// cross axis is height, and `Tree::from_wire` refuses `Fill` height, so a row
+/// child never reaches STRETCH. A stack has no cross axis: its children keep
+/// their natural size rather than being stretched to the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentAxis {
+    Column,
+    Row,
+    Stack,
+}
+
+fn style(node: &Node, parent: ParentAxis) -> Style {
     let layout = node.layout;
+    let fill_cross_axis = match parent {
+        ParentAxis::Column => layout.width == WireDimension::Fill,
+        ParentAxis::Row => layout.height == WireDimension::Fill,
+        ParentAxis::Stack => false,
+    };
+    let (display, flex_direction, gap) = match &node.kind {
+        NodeKind::Stack => (
+            Display::Grid,
+            FlexDirection::Row,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        NodeKind::Row => (
+            Display::Flex,
+            FlexDirection::Row,
+            // Gap is main-axis space: width for a row, height for a column.
+            Size {
+                width: LengthPercentage::length(f32::from(layout.gap)),
+                height: LengthPercentage::length(0.0),
+            },
+        ),
+        _ => (
+            Display::Flex,
+            FlexDirection::Column,
+            Size {
+                width: LengthPercentage::length(0.0),
+                height: LengthPercentage::length(f32::from(layout.gap)),
+            },
+        ),
+    };
     Style {
-        display: Display::Flex,
-        // Everything is a column. That is the whole Phase 1 layout model.
-        flex_direction: FlexDirection::Column,
+        display,
+        flex_direction,
         size: Size {
             width: dimension(layout.width),
             height: dimension(layout.height),
         },
         // Fill takes the parent's cross-axis extent; Content shrinks to fit.
-        align_self: Some(match layout.width {
-            WireDimension::Fill => AlignSelf::STRETCH,
-            _ => AlignSelf::START,
+        // Under a row the cross axis is height, and the `FillHeight` ban means
+        // a row child never reaches STRETCH. Stack children are never
+        // stretched: they overlap at their natural sizes.
+        align_self: Some(if fill_cross_axis {
+            AlignSelf::STRETCH
+        } else {
+            AlignSelf::START
         }),
+        justify_self: (parent == ParentAxis::Stack).then_some(AlignSelf::START),
         padding: taffy::Rect::length(f32::from(layout.padding)),
-        gap: Size {
-            width: LengthPercentage::length(0.0),
-            height: LengthPercentage::length(f32::from(layout.gap)),
+        gap,
+        grid_template_rows: if matches!(node.kind, NodeKind::Stack) {
+            vec![auto()]
+        } else {
+            Vec::new()
+        },
+        grid_template_columns: if matches!(node.kind, NodeKind::Stack) {
+            vec![auto()]
+        } else {
+            Vec::new()
+        },
+        grid_row: if parent == ParentAxis::Stack {
+            line(1)
+        } else {
+            Default::default()
+        },
+        grid_column: if parent == ParentAxis::Stack {
+            line(1)
+        } else {
+            Default::default()
         },
         ..Default::default()
     }
@@ -293,6 +365,17 @@ fn build(
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
 ) -> taffy::NodeId {
+    // The root's style is replaced wholesale in `compute`; this parent only
+    // matters for its children, and the root lays out as a column.
+    build_with(taffy, node, keys, ParentAxis::Column)
+}
+
+fn build_with(
+    taffy: &mut TaffyTree<MeasureContext>,
+    node: &Node,
+    keys: &mut Vec<(taffy::NodeId, NodeKey)>,
+    parent: ParentAxis,
+) -> taffy::NodeId {
     let context = match &node.kind {
         NodeKind::Text { text } => Some(MeasureContext {
             text: Some(text.clone()),
@@ -305,21 +388,26 @@ fn build(
         _ => None,
     };
 
+    let parent_for_children = match &node.kind {
+        NodeKind::Row => ParentAxis::Row,
+        NodeKind::Stack => ParentAxis::Stack,
+        _ => ParentAxis::Column,
+    };
     let id = if node.children.is_empty() {
         match context {
             Some(context) => taffy
-                .new_leaf_with_context(style(node), context)
+                .new_leaf_with_context(style(node, parent), context)
                 .expect("taffy leaf"),
-            None => taffy.new_leaf(style(node)).expect("taffy leaf"),
+            None => taffy.new_leaf(style(node, parent)).expect("taffy leaf"),
         }
     } else {
         let children: Vec<taffy::NodeId> = node
             .children
             .iter()
-            .map(|child| build(taffy, child, keys))
+            .map(|child| build_with(taffy, child, keys, parent_for_children))
             .collect();
         taffy
-            .new_with_children(style(node), &children)
+            .new_with_children(style(node, parent), &children)
             .expect("taffy branch")
     };
 

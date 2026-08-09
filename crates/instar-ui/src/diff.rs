@@ -623,6 +623,33 @@ mod tests {
         );
     }
 
+    /// Row and Stack are kinds like any other: their names must reach
+    /// `KindChanged` so a guest that swaps a container for a container is told
+    /// which one it used to be.
+    #[test]
+    fn reusing_a_key_for_a_row_or_stack_is_refused_with_its_name() {
+        let previous = snapshot(vec![Node::text(5, "hello")]);
+        let as_row = snapshot(vec![Node::row(5, vec![])]);
+        let as_stack = snapshot(vec![Node::stack(5, vec![])]);
+
+        assert_eq!(
+            diff(Some(&previous), &as_row),
+            Err(TreeError::KindChanged {
+                key: NodeKey::first(5),
+                was: "text",
+                now: "row",
+            })
+        );
+        assert_eq!(
+            diff(Some(&previous), &as_stack),
+            Err(TreeError::KindChanged {
+                key: NodeKey::first(5),
+                was: "text",
+                now: "stack",
+            })
+        );
+    }
+
     #[test]
     fn moving_a_node_between_parents_dirties_both_parents() {
         let previous = Tree::new(Node::root(

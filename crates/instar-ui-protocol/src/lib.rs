@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -70,10 +70,9 @@ pub mod limits {
 
 /// Node kind opcodes.
 ///
-/// Deliberately four. Phase 1's layout vocabulary is meant to stay small
-/// enough to reason about completely; a general CSS surface is not a goal, and
-/// every kind added here is one the host must lay out, hit-test, and paint
-/// forever.
+/// Deliberately six. The layout vocabulary is meant to stay small enough to
+/// reason about completely; a general CSS surface is not a goal, and every
+/// kind added here is one the host must lay out, hit-test, and paint forever.
 pub mod opcode {
     /// The single outermost node. Fills the viewport.
     pub const NODE_ROOT: u8 = 0;
@@ -83,6 +82,11 @@ pub mod opcode {
     pub const NODE_TEXT: u8 = 2;
     /// Interactive, with a text label.
     pub const NODE_BUTTON: u8 = 3;
+    /// Stacks its children horizontally.
+    pub const NODE_ROW: u8 = 4;
+    /// Overlaps its children at the content-box origin; later children paint
+    /// over earlier ones.
+    pub const NODE_STACK: u8 = 5;
 
     pub const SECTION_END: u8 = 0;
     pub const SECTION_TREE: u8 = 1;
@@ -575,7 +579,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
         let key = reader.node_key("node key")?;
         let node_flags = reader.u8("node flags")?;
         let text = match kind {
-            opcode::NODE_ROOT | opcode::NODE_COLUMN => None,
+            opcode::NODE_ROOT | opcode::NODE_COLUMN | opcode::NODE_ROW | opcode::NODE_STACK => None,
             opcode::NODE_TEXT => Some(reader.text("text content")?),
             opcode::NODE_BUTTON => Some(reader.text("button label")?),
             value => {
@@ -777,6 +781,62 @@ mod tests {
             node: NodeKey::new(7, 1),
         };
         assert_eq!(WireEvent::decode(&event.encode()).unwrap(), event);
+    }
+
+    /// Row and Stack are containers like Root and Column: they carry no text,
+    /// and the decoder must not try to read any.
+    #[test]
+    fn row_and_stack_round_trip() {
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                fill_width(),
+                2,
+            )
+            .node(
+                opcode::NODE_ROW,
+                NodeKey::first(1),
+                0,
+                None,
+                fill_width(),
+                1,
+            )
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                0,
+                Some("row child"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_STACK,
+                NodeKey::first(3),
+                0,
+                None,
+                fill_width(),
+                1,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::first(4),
+                flags::ENABLED,
+                Some("stack child"),
+                WireLayout::default(),
+                0,
+            );
+
+        let batch = decode_batch(&encoder.finish()).unwrap();
+        assert_eq!(batch.nodes[1].kind, opcode::NODE_ROW);
+        assert_eq!(batch.nodes[1].text, None);
+        assert_eq!(batch.nodes[1].layout, fill_width());
+        assert_eq!(batch.nodes[3].kind, opcode::NODE_STACK);
+        assert_eq!(batch.nodes[3].text, None);
+        assert_eq!(batch.nodes[3].layout, fill_width());
     }
 
     #[test]
@@ -996,7 +1056,7 @@ mod tests {
         assert!(WireEvent::decode(b"").is_err());
         assert!(WireEvent::decode(b"IUE1").is_err());
         assert!(matches!(
-            WireEvent::decode(b"IUE1\x02\x09"),
+            WireEvent::decode(b"IUE1\x03\x09"),
             Err(ProtocolError::UnknownOpcode {
                 context: "event",
                 ..

@@ -271,7 +271,7 @@ impl SceneBuilder {
                 // Structure only. Drawing a background for these would mean the
                 // host inventing appearance for a node whose whole meaning is
                 // "these things are stacked".
-                NodeKind::Root | NodeKind::Column => {}
+                NodeKind::Root | NodeKind::Column | NodeKind::Row | NodeKind::Stack => {}
                 NodeKind::Text { .. } => {
                     if let Some(shaped) = layout.text(node.key) {
                         text.push(TextToPaint {
