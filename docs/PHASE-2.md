@@ -398,6 +398,83 @@ had no defined distribution, and `grow` defines it.
 An SDK may still offer `ui.width(Fill)` as sugar and lower it per context. The
 sugar is allowed to be clever; the wire is not.
 
+### A3: Display, Visibility, Overflow, frozen before the code
+
+Three properties that all mean some version of "less than fully present", and
+whose whole value is being *different* from each other.
+
+```text
+Display::Normal     participates in layout
+
+Display::None       retained in the Instar tree
+                    absent from layout
+                    no paint
+                    no hit-test
+                    no accessibility
+                    descendants likewise absent
+```
+
+```text
+Visibility::Visible normal presentation
+
+Visibility::Hidden  still participates in layout
+                    no paint
+                    no hit-test
+                    no accessibility
+                    suppresses the whole subtree
+```
+
+The single line separating them: `Display::None` leaves layout, `Hidden` stays
+in it and reserves its space. Everything else the two do is the same, which is
+exactly why they need to be two names rather than one property with a flag.
+
+**`Hidden` is subtree-wide, and CSS's version is not.** In CSS a descendant of
+a `visibility: hidden` node can set `visibility: visible` and reappear inside
+an invisible ancestor. That is a genuinely strange rule to have to hold, it
+makes "is this node visible?" a walk to the root instead of a lookup, and no
+interface Instar is trying to support needs it. Suppression here is absolute.
+
+```rust
+enum Overflow { Visible, Clip }
+```
+
+`Clip` means, and means only:
+
+```text
+layout            unaffected
+descendant paint  intersected with this node's rectangle
+descendant hits   intersected with the same rectangle
+nested clips      intersect
+scrolling         no
+scroll offset     neither created nor modified
+```
+
+**There is deliberately no `Overflow::Scroll`.** CSS makes scrolling a value of
+the overflow property, and copying that would make CSS's overflow model
+Instar's architecture by accident. The two are separate things here:
+`Overflow::Clip` is a rectangle intersection and holds no state, while `Scroll`
+(B1–B3) is a *node kind* — a retained viewport with a host-owned offset,
+transient state, and a retirement obligation. A property value cannot carry
+that, and pretending it can is how the distinction gets lost.
+
+### Becoming invisible retires interaction, exactly as deletion does
+
+> When a subtree becomes non-interactive through `Display::None` or
+> `Visibility::Hidden`, any host transient state referencing that subtree is
+> retired before the new state becomes interactive.
+
+The same class of invariant as `Interaction::retire` on deletion, and it has to
+land in A3 rather than Stage 3, because otherwise it is a bug waiting for focus
+to exist. Press is what there is to retire today; focus, hover, pointer
+capture, and scroll offsets join it as they arrive.
+
+Deletion and hiding are not the same event, and the ledger says so — a hidden
+node is still live at its generation, and it is still in the tree. What they
+share is the only thing that matters here: a press whose target can no longer
+be hit must not be completable. Without this, pressing a button and hiding it
+mid-press leaves a press outstanding against something the user can neither
+see nor reach.
+
 ### Scroll: the invariants, frozen before the node exists
 
 Stage 3's scroll semantics were written down before there was a `Scroll` node
