@@ -478,7 +478,7 @@ mod tests {
     use super::*;
     use instar_paint::PaintSceneError;
     use instar_ui::Viewport;
-    use instar_ui::protocol::{BatchEncoder, WireDimension, WireLayout, flags, opcode};
+    use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, WindowId};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
@@ -503,10 +503,8 @@ mod tests {
 
     fn tree() -> Tree {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder

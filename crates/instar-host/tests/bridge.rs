@@ -51,7 +51,7 @@ use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, Wake};
 use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
-use instar_ui::protocol::{BatchEncoder, WireDimension, WireLayout, flags, opcode};
+use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
 use instar_ui::{NodeKey, NodeKind};
 use instar_window::{
     LogicalPoint, LogicalSize, PhysicalSize, PointerButton, PointerState, RawPointerEvent,
@@ -399,10 +399,8 @@ fn click(bridge: &mut HostBridge, key: NodeKey) {
 /// A valid batch the fixture would never send, so applying it is visible.
 fn foreign_batch(text: &str) -> Vec<u8> {
     let fill = WireLayout {
-        width: WireDimension::Fill,
-        height: WireDimension::Content,
-        padding: 0,
-        gap: 0,
+        align_self: Some(WireAlign::Stretch),
+        ..WireLayout::default()
     };
     let mut encoder = BatchEncoder::new();
     encoder

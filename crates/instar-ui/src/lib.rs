@@ -32,7 +32,9 @@ pub mod text;
 
 pub use diff::{ChangeSet, diff};
 pub use instar_ui_protocol as protocol;
-pub use instar_ui_protocol::{NodeKey, ProtocolError, WireDimension, WireLayout, limits};
+pub use instar_ui_protocol::{
+    NodeKey, ProtocolError, WireAlign, WireJustify, WireLayout, WireSize, limits,
+};
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
 pub use text::{
@@ -88,7 +90,11 @@ impl NodeKind {
 }
 
 /// One node in the retained tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: [`WireLayout`] carries flex factors, and `f32` has no total
+/// equality. Decoding guarantees they are finite, which makes `PartialEq`
+/// behave, but the trait bound cannot say so.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub key: NodeKey,
     pub kind: NodeKind,
@@ -99,58 +105,42 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn root(key: u32, children: Vec<Node>) -> Self {
+    /// A container that spans its parent's cross axis.
+    ///
+    /// Every container constructor here wants the same thing and used to spell
+    /// it `width: Fill`, which only read correctly under a column. `Stretch`
+    /// says it once and means it under either direction.
+    fn container(key: u32, kind: NodeKind, children: Vec<Node>) -> Self {
         Self {
             key: NodeKey::first(key),
-            kind: NodeKind::Root,
+            kind,
             layout: WireLayout {
-                width: WireDimension::Fill,
+                align_self: Some(WireAlign::Stretch),
                 ..WireLayout::default()
             },
             children,
         }
+    }
+
+    pub fn root(key: u32, children: Vec<Node>) -> Self {
+        Self::container(key, NodeKind::Root, children)
     }
 
     pub fn column(key: u32, children: Vec<Node>) -> Self {
-        Self {
-            key: NodeKey::first(key),
-            kind: NodeKind::Column,
-            layout: WireLayout {
-                width: WireDimension::Fill,
-                ..WireLayout::default()
-            },
-            children,
-        }
+        Self::container(key, NodeKind::Column, children)
     }
 
-    /// A horizontal container. Defaults to `Fill` width because the common
-    /// `Row` is a toolbar or header that should span its parent; a
-    /// content-sized one would hug its children instead.
+    /// A horizontal container. Spans its parent's cross axis, because the
+    /// common `Row` is a toolbar or header rather than something that hugs its
+    /// children.
     pub fn row(key: u32, children: Vec<Node>) -> Self {
-        Self {
-            key: NodeKey::first(key),
-            kind: NodeKind::Row,
-            layout: WireLayout {
-                width: WireDimension::Fill,
-                ..WireLayout::default()
-            },
-            children,
-        }
+        Self::container(key, NodeKind::Row, children)
     }
 
-    /// An overlapping container. Defaults to `Fill` width because the common
-    /// `Stack` is an overlay that should span whatever it covers; a
-    /// content-sized one would collapse to its widest child.
+    /// An overlapping container. Spans its parent's cross axis, because the
+    /// common `Stack` is an overlay over whatever it covers.
     pub fn stack(key: u32, children: Vec<Node>) -> Self {
-        Self {
-            key: NodeKey::first(key),
-            kind: NodeKind::Stack,
-            layout: WireLayout {
-                width: WireDimension::Fill,
-                ..WireLayout::default()
-            },
-            children,
-        }
+        Self::container(key, NodeKind::Stack, children)
     }
 
     pub fn text(key: u32, text: impl Into<String>) -> Self {
@@ -176,6 +166,19 @@ impl Node {
 
     pub fn with_layout(mut self, layout: WireLayout) -> Self {
         self.layout = layout;
+        self
+    }
+
+    /// Share of surplus main-axis space. See [`WireLayout::grow`].
+    pub fn with_grow(mut self, grow: f32) -> Self {
+        self.layout.grow = grow;
+        self
+    }
+
+    /// This node's own cross-axis placement, overriding the parent's
+    /// `align_items`.
+    pub fn with_align_self(mut self, align: WireAlign) -> Self {
+        self.layout.align_self = Some(align);
         self
     }
 
@@ -222,8 +225,6 @@ pub enum TreeError {
     BadRoot(&'static str),
     #[error("{0} is a root node, but only the outermost node may be one")]
     NestedRoot(NodeKey),
-    #[error("{0} sets height to Fill, which Phase 1 does not support")]
-    FillHeight(NodeKey),
     /// A key that named one kind of node in the retained tree names another in
     /// the new snapshot.
     ///
@@ -241,7 +242,7 @@ pub enum TreeError {
 }
 
 /// A committed UI tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tree {
     pub root: Node,
 }
@@ -284,15 +285,6 @@ impl Tree {
                 return Err(TreeError::NestedRoot(node.key));
             }
         }
-        for node in &batch.nodes {
-            // Phase 1's vocabulary has no fill height: a column of
-            // fill-height children has no defined distribution, and choosing
-            // one silently would be inventing layout semantics.
-            if node.layout.height == WireDimension::Fill {
-                return Err(TreeError::FillHeight(node.key));
-            }
-        }
-
         let mut cursor = 0usize;
         let root = assemble(&batch.nodes, &mut cursor)?;
         Ok(Self { root })
@@ -566,10 +558,9 @@ mod tests {
     fn padding_insets_children() {
         let padded = Tree::new(
             Node::root(0, vec![Node::text(1, "hi")]).with_layout(WireLayout {
-                width: WireDimension::Fill,
-                height: WireDimension::Content,
+                align_self: Some(WireAlign::Stretch),
                 padding: 20,
-                gap: 0,
+                ..WireLayout::default()
             }),
         );
         let layout = layout(&padded);
@@ -589,10 +580,9 @@ mod tests {
                 vec![
                     Node::column(1, vec![Node::text(2, "a"), Node::text(3, "b")]).with_layout(
                         WireLayout {
-                            width: WireDimension::Fill,
-                            height: WireDimension::Content,
-                            padding: 0,
+                            align_self: Some(WireAlign::Stretch),
                             gap,
+                            ..WireLayout::default()
                         },
                     ),
                 ],
@@ -615,40 +605,285 @@ mod tests {
         let tree = Tree::new(Node::root(
             0,
             vec![Node::button(1, "x").with_layout(WireLayout {
-                width: WireDimension::Fixed(120),
-                height: WireDimension::Fixed(40),
-                padding: 0,
-                gap: 0,
+                width: WireSize::Fixed(120),
+                height: WireSize::Fixed(40),
+                ..WireLayout::default()
             })],
         ));
         let button = layout(&tree).get(NodeKey::first(1)).unwrap();
         assert_eq!((button.width, button.height), (120, 40));
     }
 
+    /// What `fill_width_is_wider_than_content_width` used to assert, said in
+    /// the vocabulary that replaced `Fill`. Spanning the parent is cross-axis
+    /// alignment, and under the root — a column — the cross axis is width.
     #[test]
-    fn fill_width_is_wider_than_content_width() {
-        let build = |width: WireDimension| {
+    fn stretching_is_wider_than_content_width() {
+        let build = |align_self: Option<WireAlign>| {
             Tree::new(Node::root(
                 0,
                 vec![Node::button(1, "x").with_layout(WireLayout {
-                    width,
-                    height: WireDimension::Content,
-                    padding: 0,
-                    gap: 0,
+                    align_self,
+                    ..WireLayout::default()
                 })],
             ))
         };
-        let content = layout(&build(WireDimension::Content))
-            .get(NodeKey::first(1))
-            .unwrap();
-        let fill = layout(&build(WireDimension::Fill))
+        let content = layout(&build(None)).get(NodeKey::first(1)).unwrap();
+        let stretched = layout(&build(Some(WireAlign::Stretch)))
             .get(NodeKey::first(1))
             .unwrap();
         assert!(
-            fill.width > content.width,
-            "fill ({}) should exceed content ({}) for a one-character label",
-            fill.width,
+            stretched.width > content.width,
+            "stretch ({}) should exceed content ({}) for a one-character label",
+            stretched.width,
             content.width
+        );
+    }
+
+    /// `grow` is the *other* axis, and the two must not be confused again:
+    /// growing changes the main-axis extent and leaves the cross axis alone.
+    #[test]
+    fn grow_expands_along_the_main_axis_not_the_cross_axis() {
+        let build = |grow: f32| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::button(1, "x").with_layout(WireLayout {
+                    grow,
+                    ..WireLayout::default()
+                })],
+            ))
+        };
+        let inert = layout(&build(0.0)).get(NodeKey::first(1)).unwrap();
+        let grown = layout(&build(1.0)).get(NodeKey::first(1)).unwrap();
+        assert!(
+            grown.height > inert.height,
+            "under a column the main axis is height: {} should exceed {}",
+            grown.height,
+            inert.height
+        );
+        assert_eq!(
+            grown.width, inert.width,
+            "growing must not touch the cross axis"
+        );
+    }
+
+    /// A row of three fixed-width children inside a fixed-width parent, so the
+    /// surplus is a known quantity and the split can be asserted as a ratio.
+    fn grown_row(factors: [f32; 3]) -> LayoutSnapshot {
+        let children = factors
+            .iter()
+            .enumerate()
+            .map(|(index, grow)| {
+                Node::text(index as u32 + 2, "x").with_layout(WireLayout {
+                    width: WireSize::Fixed(10),
+                    grow: *grow,
+                    ..WireLayout::default()
+                })
+            })
+            .collect();
+        let tree = Tree::new(Node::root(
+            0,
+            vec![Node::row(1, children).with_layout(WireLayout {
+                width: WireSize::Fixed(400),
+                ..WireLayout::default()
+            })],
+        ));
+        layout(&tree)
+    }
+
+    /// The surplus a [`grown_row`] has to distribute: the container's fixed
+    /// width less the three children's preferred widths.
+    const ROW_SURPLUS: f32 = 400.0 - 30.0;
+
+    /// Checks each child's share against the exact fraction it is owed.
+    ///
+    /// Per share, not as a ratio between the two: they are rounded to whole
+    /// pixels independently, so a ratio compounds two roundings and can be
+    /// 2px out while both shares are individually correct. Comparing each
+    /// against its own real-valued target keeps the tolerance at the one pixel
+    /// that rounding actually costs, and keeps the assertion about Instar's
+    /// distribution rather than Taffy's rounding rule.
+    fn assert_shares(snapshot: &LayoutSnapshot, factors: [f32; 3]) {
+        let total: f32 = factors.iter().sum();
+        for (index, factor) in factors.iter().enumerate() {
+            let key = NodeKey::first(index as u32 + 2);
+            let share = snapshot.get(key).unwrap().width - 10;
+            let expected = ROW_SURPLUS * factor / total;
+            assert!(
+                (share as f32 - expected).abs() <= 1.0,
+                "child {index} with grow {factor} took {share} of {ROW_SURPLUS}, \
+                 owed about {expected:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn grow_splits_surplus_in_proportion() {
+        let snapshot = grown_row([1.0, 2.0, 0.0]);
+        assert_shares(&snapshot, [1.0, 2.0, 0.0]);
+        assert_eq!(
+            snapshot.get(NodeKey::first(4)).unwrap().width,
+            10,
+            "grow: 0 stays at its preferred size"
+        );
+        let total: i32 = [2, 3, 4]
+            .iter()
+            .map(|key| snapshot.get(NodeKey::first(*key)).unwrap().width)
+            .sum();
+        assert_eq!(total, 400, "and the surplus is fully consumed");
+    }
+
+    /// The reason the wire carries a float here rather than an integer.
+    #[test]
+    fn a_fractional_grow_distributes_proportionally() {
+        assert_shares(&grown_row([0.5, 1.5, 0.0]), [0.5, 1.5, 0.0]);
+    }
+
+    #[test]
+    fn shrink_contracts_children_that_would_overflow() {
+        let build = |shrink: f32| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::row(
+                        1,
+                        vec![Node::text(2, "x").with_layout(WireLayout {
+                            width: WireSize::Fixed(600),
+                            shrink,
+                            ..WireLayout::default()
+                        })],
+                    )
+                    .with_layout(WireLayout {
+                        width: WireSize::Fixed(200),
+                        ..WireLayout::default()
+                    }),
+                ],
+            ))
+        };
+        let rigid = layout(&build(0.0)).get(NodeKey::first(2)).unwrap();
+        let yielding = layout(&build(1.0)).get(NodeKey::first(2)).unwrap();
+
+        assert_eq!(
+            rigid.width, 600,
+            "shrink: 0 overflows rather than giving way"
+        );
+        assert_eq!(
+            yielding.width, 200,
+            "the default shrink contracts to the container"
+        );
+    }
+
+    #[test]
+    fn minimum_and_maximum_bound_the_computed_size() {
+        let build = |min: Option<u16>, max: Option<u16>| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::text(1, "hi").with_layout(WireLayout {
+                    min_width: min,
+                    max_width: max,
+                    ..WireLayout::default()
+                })],
+            ))
+        };
+        let natural = layout(&build(None, None)).get(NodeKey::first(1)).unwrap();
+        assert!(
+            natural.width < 300,
+            "the fixture assumes 'hi' measures narrower than its minimum"
+        );
+
+        assert_eq!(
+            layout(&build(Some(300), None))
+                .get(NodeKey::first(1))
+                .unwrap()
+                .width,
+            300,
+            "a minimum wins over a smaller content size"
+        );
+        assert_eq!(
+            layout(&build(None, Some(4)))
+                .get(NodeKey::first(1))
+                .unwrap()
+                .width,
+            4,
+            "a maximum caps a larger content size"
+        );
+    }
+
+    #[test]
+    fn align_items_applies_to_children_that_state_no_align_self() {
+        let build = |align_items: WireAlign, child: Option<WireAlign>| {
+            let mut text = Node::text(2, "x");
+            if let Some(child) = child {
+                text = text.with_align_self(child);
+            }
+            Tree::new(Node::root(
+                0,
+                vec![Node::column(1, vec![text]).with_layout(WireLayout {
+                    width: WireSize::Fixed(400),
+                    align_items,
+                    ..WireLayout::default()
+                })],
+            ))
+        };
+
+        let start = layout(&build(WireAlign::Start, None))
+            .get(NodeKey::first(2))
+            .unwrap();
+        let inherited_stretch = layout(&build(WireAlign::Stretch, None))
+            .get(NodeKey::first(2))
+            .unwrap();
+        assert!(
+            inherited_stretch.width > start.width,
+            "a child with no align_self takes the parent's align_items"
+        );
+
+        let overridden = layout(&build(WireAlign::Stretch, Some(WireAlign::Start)))
+            .get(NodeKey::first(2))
+            .unwrap();
+        assert_eq!(
+            overridden.width, start.width,
+            "the child's own align_self overrides the parent's align_items"
+        );
+    }
+
+    #[test]
+    fn justify_content_distributes_along_the_main_axis() {
+        let build = |justify: WireJustify| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::row(1, vec![Node::text(2, "a"), Node::text(3, "b")]).with_layout(
+                        WireLayout {
+                            width: WireSize::Fixed(400),
+                            justify_content: justify,
+                            ..WireLayout::default()
+                        },
+                    ),
+                ],
+            ))
+        };
+
+        let start = layout(&build(WireJustify::Start));
+        let centred = layout(&build(WireJustify::Center));
+        let between = layout(&build(WireJustify::SpaceBetween));
+
+        assert_eq!(
+            start.get(NodeKey::first(2)).unwrap().x,
+            0,
+            "Start leaves the first child at the origin"
+        );
+        assert!(
+            centred.get(NodeKey::first(2)).unwrap().x > 0,
+            "Center moves the group inward"
+        );
+
+        let first = between.get(NodeKey::first(2)).unwrap();
+        let second = between.get(NodeKey::first(3)).unwrap();
+        assert_eq!(first.x, 0, "SpaceBetween pins the first child to the edge");
+        assert_eq!(
+            second.x + second.width,
+            400,
+            "and the last to the other edge"
         );
     }
 
@@ -715,10 +950,9 @@ mod tests {
                 vec![
                     Node::row(1, vec![Node::text(2, "a"), Node::text(3, "b")]).with_layout(
                         WireLayout {
-                            width: WireDimension::Fill,
-                            height: WireDimension::Content,
-                            padding: 0,
+                            align_self: Some(WireAlign::Stretch),
                             gap,
+                            ..WireLayout::default()
                         },
                     ),
                 ],
@@ -776,7 +1010,7 @@ mod tests {
                     ],
                 )
                 .with_layout(WireLayout {
-                    width: WireDimension::Content,
+                    width: WireSize::Content,
                     ..WireLayout::default()
                 }),
             ],
@@ -1023,31 +1257,6 @@ mod tests {
         assert_eq!(
             Tree::decode(&encoder.finish()),
             Err(TreeError::NestedRoot(NodeKey::first(1)))
-        );
-    }
-
-    /// Phase 1 has no fill height: a column of fill-height children has no
-    /// defined distribution, and picking one silently would be inventing
-    /// layout semantics rather than implementing them.
-    #[test]
-    fn rejects_fill_height() {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(0),
-            0,
-            None,
-            WireLayout {
-                width: WireDimension::Fill,
-                height: WireDimension::Fill,
-                padding: 0,
-                gap: 0,
-            },
-            0,
-        );
-        assert_eq!(
-            Tree::decode(&encoder.finish()),
-            Err(TreeError::FillHeight(NodeKey::first(0)))
         );
     }
 

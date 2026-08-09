@@ -633,7 +633,7 @@ mod tests {
     use super::*;
     use crate::bridge::{HostBridge, HostUserEvent, Wake};
     use instar_kernel::bridge::commit_request;
-    use instar_ui::protocol::{BatchEncoder, NodeKey, WireDimension, WireLayout, flags, opcode};
+    use instar_ui::protocol::{BatchEncoder, NodeKey, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, PhysicalSize, PointerButton};
     use std::time::{Duration, Instant};
 
@@ -657,10 +657,8 @@ mod tests {
     /// root > column > (text, button).
     fn counter_batch() -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
@@ -1007,10 +1005,8 @@ mod tests {
     /// A batch whose key 2 is a *button* where [`counter_batch`] makes it text.
     fn kind_swapped_batch() -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
@@ -1198,10 +1194,8 @@ mod tests {
     /// A batch with the counter's button removed, keeping every other key.
     fn batch_without_the_button() -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
@@ -1222,10 +1216,8 @@ mod tests {
     /// `generation`.
     fn batch_with_button_7(generation: u32) -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
@@ -1253,10 +1245,8 @@ mod tests {
     /// The counter batch with button 3 at `generation`.
     fn counter_batch_with_button_generation(generation: u32) -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder
@@ -1394,10 +1384,8 @@ mod tests {
     /// something without touching the button.
     fn foreign_text_batch(text: &str) -> Vec<u8> {
         let fill = WireLayout {
-            width: WireDimension::Fill,
-            height: WireDimension::Content,
-            padding: 0,
-            gap: 0,
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
         };
         let mut encoder = BatchEncoder::new();
         encoder

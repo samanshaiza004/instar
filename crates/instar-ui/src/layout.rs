@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use instar_ui_protocol::{NodeKey, WireDimension};
+use instar_ui_protocol::{NodeKey, WireAlign, WireJustify, WireSize};
 use taffy::prelude::*;
 
 use crate::text::{self, ShapedText, TextContext};
@@ -131,39 +131,54 @@ fn text_available(value: AvailableSpace) -> text::Available {
     }
 }
 
-fn dimension(value: WireDimension) -> Dimension {
+fn dimension(value: WireSize) -> Dimension {
     match value {
-        // Fill is expressed as stretch on the cross axis (see `style`), not as
-        // a dimension, so it stays `auto` here. On a row's main axis that
-        // makes a Fill-width child content-sized for now: growing into free
-        // main-axis space is flex grow, which is not part of this stage's
-        // vocabulary.
-        WireDimension::Fill | WireDimension::Content => Dimension::auto(),
-        WireDimension::Fixed(px) => Dimension::length(f32::from(px)),
+        WireSize::Content => Dimension::auto(),
+        WireSize::Fixed(px) => Dimension::length(f32::from(px)),
     }
 }
 
-/// What a node's children should treat as the cross axis.
-///
-/// Fill is implemented as cross-axis stretch, so the meaning of a child's
-/// `Fill` dimension depends on which way its parent lays out. Under a row the
-/// cross axis is height, and `Tree::from_wire` refuses `Fill` height, so a row
-/// child never reaches STRETCH. A stack has no cross axis: its children keep
-/// their natural size rather than being stretched to the cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParentAxis {
-    Column,
-    Row,
-    Stack,
+fn bound(value: Option<u16>) -> Dimension {
+    match value {
+        Some(px) => Dimension::length(f32::from(px)),
+        None => Dimension::auto(),
+    }
 }
 
-fn style(node: &Node, parent: ParentAxis) -> Style {
+fn align(value: WireAlign) -> AlignItems {
+    match value {
+        WireAlign::Start => AlignItems::START,
+        WireAlign::Center => AlignItems::CENTER,
+        WireAlign::End => AlignItems::END,
+        WireAlign::Stretch => AlignItems::STRETCH,
+    }
+}
+
+fn justify(value: WireJustify) -> JustifyContent {
+    match value {
+        WireJustify::Start => JustifyContent::START,
+        WireJustify::Center => JustifyContent::CENTER,
+        WireJustify::End => JustifyContent::END,
+        WireJustify::SpaceBetween => JustifyContent::SPACE_BETWEEN,
+        WireJustify::SpaceAround => JustifyContent::SPACE_AROUND,
+        WireJustify::SpaceEvenly => JustifyContent::SPACE_EVENLY,
+    }
+}
+
+/// A2 collapsed this from three variants to one question.
+///
+/// It began as `ParentAxis { Column, Row, Stack }`, because `Fill` meant
+/// cross-axis stretch and a child therefore had to know which way its parent
+/// laid out before it could know which axis `Fill` referred to. Deleting
+/// `Fill` deleted that: a child now states `align_self` directly, and
+/// `Row` versus `Column` is read off the *parent's own* kind when styling the
+/// parent, never handed down.
+///
+/// What survives is placement inside a [`NodeKind::Stack`], which is a grid
+/// and needs its children pinned to the single cell. That is a yes-or-no
+/// question, so it is a bool.
+fn style(node: &Node, parent_is_stack: bool) -> Style {
     let layout = node.layout;
-    let fill_cross_axis = match parent {
-        ParentAxis::Column => layout.width == WireDimension::Fill,
-        ParentAxis::Row => layout.height == WireDimension::Fill,
-        ParentAxis::Stack => false,
-    };
     let (display, flex_direction, gap) = match &node.kind {
         NodeKind::Stack => (
             Display::Grid,
@@ -191,6 +206,18 @@ fn style(node: &Node, parent: ParentAxis) -> Style {
             },
         ),
     };
+
+    // `None` means "inherit the parent's align_items", which is exactly what
+    // Taffy does with an absent `align_self` — so absence is passed through
+    // rather than resolved here. The one exception is a stack child, which
+    // overlaps at its natural size unless it asked for something else;
+    // inheriting a stretch there would defeat the point of the stack.
+    let align_self = match (layout.align_self, parent_is_stack) {
+        (Some(value), _) => Some(align(value)),
+        (None, true) => Some(AlignItems::START),
+        (None, false) => None,
+    };
+
     Style {
         display,
         flex_direction,
@@ -198,16 +225,22 @@ fn style(node: &Node, parent: ParentAxis) -> Style {
             width: dimension(layout.width),
             height: dimension(layout.height),
         },
-        // Fill takes the parent's cross-axis extent; Content shrinks to fit.
-        // Under a row the cross axis is height, and the `FillHeight` ban means
-        // a row child never reaches STRETCH. Stack children are never
-        // stretched: they overlap at their natural sizes.
-        align_self: Some(if fill_cross_axis {
-            AlignSelf::STRETCH
-        } else {
-            AlignSelf::START
-        }),
-        justify_self: (parent == ParentAxis::Stack).then_some(AlignSelf::START),
+        min_size: Size {
+            width: bound(layout.min_width),
+            height: bound(layout.min_height),
+        },
+        max_size: Size {
+            width: bound(layout.max_width),
+            height: bound(layout.max_height),
+        },
+        // Finite and in range because `Reader::flex_factor` is the only way
+        // one reaches this crate.
+        flex_grow: layout.grow,
+        flex_shrink: layout.shrink,
+        align_self,
+        align_items: Some(align(layout.align_items)),
+        justify_content: Some(justify(layout.justify_content)),
+        justify_self: parent_is_stack.then_some(AlignItems::START),
         padding: taffy::Rect::length(f32::from(layout.padding)),
         gap,
         grid_template_rows: if matches!(node.kind, NodeKind::Stack) {
@@ -220,12 +253,12 @@ fn style(node: &Node, parent: ParentAxis) -> Style {
         } else {
             Vec::new()
         },
-        grid_row: if parent == ParentAxis::Stack {
+        grid_row: if parent_is_stack {
             line(1)
         } else {
             Default::default()
         },
-        grid_column: if parent == ParentAxis::Stack {
+        grid_column: if parent_is_stack {
             line(1)
         } else {
             Default::default()
@@ -262,6 +295,15 @@ pub fn compute(text: &mut TextContext, tree: &Tree, viewport: Viewport) -> Layou
                 width: LengthPercentage::length(0.0),
                 height: LengthPercentage::length(f32::from(tree.root.layout.gap)),
             },
+            // Carried across explicitly, because this style *replaces* the one
+            // `style()` built rather than amending it, and an absent
+            // `align_items` is not neutral: Taffy follows CSS and treats it as
+            // stretch. Every child used to set `align_self` outright, so the
+            // omission was invisible; now that a child may say `None` to mean
+            // "inherit", inheriting the wrong default silently stretches the
+            // entire interface.
+            align_items: Some(align(tree.root.layout.align_items)),
+            justify_content: Some(justify(tree.root.layout.justify_content)),
             ..Default::default()
         },
     );
@@ -365,16 +407,16 @@ fn build(
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
 ) -> taffy::NodeId {
-    // The root's style is replaced wholesale in `compute`; this parent only
-    // matters for its children, and the root lays out as a column.
-    build_with(taffy, node, keys, ParentAxis::Column)
+    // The root's style is replaced wholesale in `compute`, and the root is
+    // never a stack child.
+    build_with(taffy, node, keys, false)
 }
 
 fn build_with(
     taffy: &mut TaffyTree<MeasureContext>,
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
-    parent: ParentAxis,
+    parent_is_stack: bool,
 ) -> taffy::NodeId {
     let context = match &node.kind {
         NodeKind::Text { text } => Some(MeasureContext {
@@ -388,26 +430,24 @@ fn build_with(
         _ => None,
     };
 
-    let parent_for_children = match &node.kind {
-        NodeKind::Row => ParentAxis::Row,
-        NodeKind::Stack => ParentAxis::Stack,
-        _ => ParentAxis::Column,
-    };
+    let children_are_stacked = matches!(node.kind, NodeKind::Stack);
     let id = if node.children.is_empty() {
         match context {
             Some(context) => taffy
-                .new_leaf_with_context(style(node, parent), context)
+                .new_leaf_with_context(style(node, parent_is_stack), context)
                 .expect("taffy leaf"),
-            None => taffy.new_leaf(style(node, parent)).expect("taffy leaf"),
+            None => taffy
+                .new_leaf(style(node, parent_is_stack))
+                .expect("taffy leaf"),
         }
     } else {
         let children: Vec<taffy::NodeId> = node
             .children
             .iter()
-            .map(|child| build_with(taffy, child, keys, parent_for_children))
+            .map(|child| build_with(taffy, child, keys, children_are_stacked))
             .collect();
         taffy
-            .new_with_children(style(node, parent), &children)
+            .new_with_children(style(node, parent_is_stack), &children)
             .expect("taffy branch")
     };
 

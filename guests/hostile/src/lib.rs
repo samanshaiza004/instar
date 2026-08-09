@@ -42,7 +42,7 @@ wit_bindgen::generate!({
 });
 
 use instar_ui_protocol::{
-    BatchEncoder, NodeKey, WireDimension, WireEvent, WireLayout, flags, limits, opcode,
+    BatchEncoder, NodeKey, WireAlign, WireEvent, WireLayout, flags, limits, opcode,
 };
 
 use crate::instar::kernel::kernel_runtime;
@@ -73,10 +73,12 @@ const FLOOD_LINES: usize = 4_000;
 
 fn container(padding: u16, gap: u16) -> WireLayout {
     WireLayout {
-        width: WireDimension::Fill,
-        height: WireDimension::Content,
+        // Span the parent's cross axis. This said `width: Fill` until the
+        // wire stopped having a name that meant three things.
+        align_self: Some(WireAlign::Stretch),
         padding,
         gap,
+        ..WireLayout::default()
     }
 }
 

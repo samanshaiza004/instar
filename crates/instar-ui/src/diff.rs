@@ -304,7 +304,7 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{WireDimension, WireLayout};
+    use crate::{WireLayout, WireSize};
 
     /// A root (0) containing a single column (1) with the given children.
     fn snapshot(children: Vec<Node>) -> Tree {
@@ -517,11 +517,11 @@ mod tests {
             ),
             (
                 WireLayout {
-                    width: WireDimension::Fixed(100),
+                    width: WireSize::Fixed(100),
                     ..WireLayout::default()
                 },
                 WireLayout {
-                    width: WireDimension::Fixed(200),
+                    width: WireSize::Fixed(200),
                     ..WireLayout::default()
                 },
             ),
