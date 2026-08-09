@@ -28,6 +28,21 @@ obligation. It is enforced by
 `crates/instar-shell/tests/layering.rs`, as a subset rule rather than a
 blocklist — a blocklist stops covering the crate that does not exist yet.
 
+## Why editing the protocol rebuilds them
+
+A guest is its own workspace, so to the outer build the whole compilation is one
+opaque command: cargo tracks none of what a guest is made of unless the build
+script says so. `crates/instar-guest-build` says so, and it derives the list
+from the manifests rather than keeping one by hand — the guest's sources, its
+`Cargo.toml` and `Cargo.lock`, the kernel's WIT, the workspace manifest, and
+every crate the guest reaches by path.
+
+The failure this avoids is quiet rather than loud: change the wire format,
+leave a guest holding its previous `.wasm`, and the suite tests a v1 guest
+against a v2 host — three crates failing for a reason none of them state. If
+you ever find yourself reaching for `cargo clean` to make a protocol change
+take, something here has stopped being true.
+
 ## Why `counter` is not a fixture
 
 `instar-ui`'s interaction tests and `instar-shell`'s render tests both run the

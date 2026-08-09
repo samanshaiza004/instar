@@ -54,22 +54,14 @@ pub fn build_guest(name: &str, package: &str, env_var: &str) {
         guest.display()
     );
 
-    println!("cargo:rerun-if-changed={}", guest.join("src").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        guest.join("Cargo.toml").display()
-    );
     // Every guest generates against the kernel's WIT, so a change to either
     // world must rebuild all of them.
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("crates/instar-kernel/wit").display()
-    );
-    // And they all link the wire format.
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("crates/instar-ui-protocol/src").display()
-    );
+    watch(&root.join("crates/instar-kernel/wit"));
+    // Every crate a guest links inherits its version and edition from the
+    // workspace manifest, so that file is an input to the guest too.
+    watch(&root.join("Cargo.toml"));
+    // The guest itself, and every workspace crate it links, transitively.
+    watch_package(&guest, &mut Vec::new());
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR always set by cargo"));
     let target_dir = out_dir.join(format!("{name}-target"));
@@ -119,4 +111,105 @@ pub fn build_guest(name: &str, package: &str, env_var: &str) {
     );
 
     println!("cargo:rustc-env={env_var}={}", wasm.display());
+}
+
+/// Declares `path` as an input of the calling crate's build. Cargo scans
+/// directories recursively, so a directory covers the files under it.
+fn watch(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+/// Declares the crate at `dir` as an input, then does the same for every crate
+/// it depends on by path — transitively.
+///
+/// A guest is its own cargo workspace, so cargo sees this build script as an
+/// opaque command and tracks none of what the guest is compiled from. Anything
+/// not declared here is invisible: edit it, and the guest keeps its previous
+/// `.wasm`, which is how a test suite ends up running a guest that speaks an
+/// older wire protocol than the host it is being tested against.
+///
+/// The dependencies are read out of the manifests rather than listed by hand,
+/// because a hand-written list only stays right until a guest gains a
+/// dependency, and it goes wrong silently.
+fn watch_package(dir: &Path, seen: &mut Vec<PathBuf>) {
+    let canonical = dir
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("cannot resolve {}: {error}", dir.display()));
+    if seen.contains(&canonical) {
+        return;
+    }
+    seen.push(canonical);
+
+    watch(&dir.join("src"));
+    let manifest = dir.join("Cargo.toml");
+    watch(&manifest);
+    // Only the guests carry a lock file of their own, and it is what pins the
+    // versions their build resolves.
+    let lock = dir.join("Cargo.lock");
+    if lock.is_file() {
+        watch(&lock);
+    }
+
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest.display()));
+    for dep in path_dependencies(&text) {
+        let dep = dir.join(dep);
+        // Something that does not resolve to a crate is not a dependency. A
+        // real one that fails to resolve fails the guest's own build moments
+        // later, with cargo's diagnosis rather than a guess from here.
+        if dep.join("Cargo.toml").is_file() {
+            watch_package(&dep, seen);
+        }
+    }
+}
+
+/// The `path = "..."` values in a manifest.
+///
+/// A scan rather than a TOML parse: this crate is a build dependency of four
+/// others and has no dependencies of its own, which is worth more than
+/// exactness on manifests we do not write. It over-reports rather than guesses
+/// — anything that is not a crate is dropped by the caller — and skips
+/// comments, so a commented-out dependency does not become an input.
+fn path_dependencies(manifest: &str) -> Vec<&str> {
+    manifest
+        .lines()
+        .filter_map(|line| {
+            let uncommented = line.split('#').next().unwrap_or_default();
+            let (_, rest) = uncommented.split_once("path")?;
+            let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+            rest.strip_prefix('"')?.split('"').next()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_dependencies;
+
+    #[test]
+    fn reads_a_dependency_in_either_shape() {
+        let manifest = "\
+[dependencies]
+wit-bindgen = \"0.60.0\"
+instar-ui-protocol = { path = \"../../crates/instar-ui-protocol\" }
+
+[dependencies.other]
+path = \"../other\"
+";
+        assert_eq!(
+            path_dependencies(manifest),
+            ["../../crates/instar-ui-protocol", "../other"]
+        );
+    }
+
+    #[test]
+    fn skips_comments() {
+        let manifest = "# gone = { path = \"../gone\" }\nkept = { path = \"../kept\" } # note\n";
+        assert_eq!(path_dependencies(manifest), ["../kept"]);
+    }
+
+    #[test]
+    fn ignores_a_manifest_with_no_path_dependencies() {
+        assert!(path_dependencies("[dependencies]\nwit-bindgen = \"0.60.0\"\n").is_empty());
+    }
 }
