@@ -328,11 +328,75 @@ implemented over a single grid cell internally, which is the ordinary way to
 overlap children and stays an implementation detail of `instar-ui::layout` —
 the module already owns the rule that no Taffy type reaches its public API.
 
-**No floats on the wire.** The vocabulary A2 adds — flex factors especially —
-is float-shaped in CSS and stays integral here. A `f32` crossing a trust
-boundary carries NaN and infinity, which propagate silently through layout
-arithmetic into geometry, and bounding them costs more than the expressiveness
-is worth.
+### Numerics on the wire: bounded integers for lengths, validated floats for ratios
+
+This first said "no floats on the wire, ever". That was the wrong rule — it
+answered a question about *trust* with a decision about *representation*, and
+would have made flex factors integers to avoid a hazard that validation closes
+properly.
+
+```text
+dimensional quantities   bounded integers, while the protocol only needs
+                         integral logical pixels
+intrinsic ratios         validated floats
+```
+
+Lengths — `Fixed`, `min`/`max`, padding, gap — stay `u16` under `MAX_LENGTH`.
+That buys no NaN, infinity, or negative-zero class at all, cheap decode
+validation, straightforward overflow reasoning, a hard ceiling on pathological
+layout arithmetic, and a deterministic wire representation. None of that is
+worth giving up while every length Instar can express is an integral logical
+pixel.
+
+Flex factors are dimensionless ratios where `0.5` and `0.25` are legitimate,
+and making them integers would distort the API for very little. So they are
+`f32`, and the trust-boundary rule lives in one place at decode:
+
+```text
+flex factor must be finite, >= 0, <= MAX_FLEX_FACTOR, with -0.0 canonicalized
+```
+
+`MAX_FLEX_FACTOR` is deliberately boring at 1024.0 — far past anything sensible.
+The ceiling existing matters; its exact value does not.
+
+> The mistake would not be accepting a float across a trust boundary. It would
+> be letting arbitrary IEEE-754 reach Taffy. Decode converts hostile bytes into
+> Instar's validated domain, and layout only ever sees the far side of that.
+
+Fractional *lengths* — `12.5px`, percentages, transforms, animation — are a
+deliberate later change if a feature ever needs them, not complexity paid for
+in advance.
+
+### `Fill` leaves the wire in A2
+
+A1 made `Fill` axis-dependent by adding a second axis: cross-axis stretch under
+a column, height under a row, content-sized on a row's main axis. That is one
+name for three behaviours, and the rule it implies —
+
+> "Fill means stretch in one axis but content-size in the other, unless grow is
+> also set"
+
+— is too clever to teach, test, or keep. The concepts are orthogonal and the
+wire says so explicitly:
+
+```text
+preferred size         Content | Fixed
+main-axis expansion    grow
+main-axis contraction  shrink
+cross-axis filling     align_self: Stretch
+```
+
+Taffy already separates these — `flex_grow` is main-axis expansion,
+`align_items`/`align_self` are cross-axis — so this is the wire describing
+layout intent rather than inheriting a conflation Instar invented.
+
+Breaking v2/v3 to do it is cheap now and expensive later, which is the whole
+argument for doing it in A2 rather than living with the name. `TreeError::
+FillHeight` goes with it: it existed because a column of fill-height children
+had no defined distribution, and `grow` defines it.
+
+An SDK may still offer `ui.width(Fill)` as sugar and lower it per context. The
+sugar is allowed to be clever; the wire is not.
 
 ### Scroll: the invariants, frozen before the node exists
 
