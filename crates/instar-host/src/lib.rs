@@ -599,7 +599,18 @@ impl Host {
         if let Some(tree) = window.tree.as_ref() {
             window.interaction.retire_hidden(tree);
         }
-        window.recompute_layout(&mut self.text);
+        // Only when something that can move a rectangle changed. A paint-only
+        // commit -- a colour, a border, a corner radius -- keeps the geometry
+        // and the shaped text it already has.
+        //
+        // This is what makes the guarantee structural rather than lucky. A
+        // relayout would call `finalize` on every text node, and while an
+        // unchanged width happens to reuse rather than re-extract today, that
+        // is a property of the cache's internals rather than of this path.
+        // Not entering it at all cannot regress.
+        if changes.needs_layout() {
+            window.recompute_layout(&mut self.text);
+        }
         // After layout, because the scrollable extent is a layout answer, and
         // before the scene is lowered and the commit is acknowledged, because
         // both of those are the interface becoming interactive. Content that
@@ -1440,6 +1451,154 @@ mod tests {
             "the press belonged to a node that no longer exists; completing it \
              against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    // --- C5: a paint-only change must not touch the text cache. ---
+
+    /// The Stage 1 regression test, made mandatory.
+    ///
+    /// Both directions matter, and each catches a different mistake:
+    ///
+    /// - `rebuilt`/`relinebroken`/`extracted` at zero catches a colour change
+    ///   being routed into shaping dirtiness. Nothing would fail if it were —
+    ///   the picture would be right and the frame would just get slower, which
+    ///   is precisely the failure `TextStats` exists to see.
+    /// - the scene actually carrying the new colour catches the opposite
+    ///   mistake: treating a paint-only change as a no-op and drawing nothing.
+    ///
+    /// A test asserting only the first would pass against a host that ignored
+    /// style entirely.
+    ///
+    /// `reused` is in the tuple and is the one doing the work. The first three
+    /// counters stay at zero even when layout *does* re-run, because the cache
+    /// simply hits — so asserting only those proves nothing about whether the
+    /// layout pass was skipped. `reused` counts finalize consulting the cache,
+    /// which happens if and only if layout ran. This was written the weaker
+    /// way first, and injecting the exact mistake it was meant to catch
+    /// produced a green run.
+    #[test]
+    fn a_foreground_change_repaints_without_touching_the_text_cache() {
+        use instar_ui::{Node, WireColor};
+
+        let build = |foreground: Option<WireColor>| {
+            let mut label = Node::text(30, "steady text");
+            if let Some(color) = foreground {
+                label = label.with_foreground(color);
+            }
+            Tree::new(Node::root(0, vec![label]))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(None)).expect("valid tree");
+
+        // From here on, nothing about the text itself changes.
+        host.reset_text_stats();
+        let red = WireColor::opaque(255, 0, 0);
+        host.apply_tree(WINDOW, build(Some(red)))
+            .expect("valid tree");
+
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.extracted,
+                stats.reused
+            ),
+            (0, 0, 0, 0),
+            "a foreground change must not reshape, re-line-break, or \
+             re-extract anything: {stats:?}"
+        );
+
+        // And the other direction: the new colour reached the scene.
+        let scene = host
+            .window(WINDOW)
+            .and_then(HostWindow::scene)
+            .expect("a paint-only commit still lowers a scene");
+        let inks: Vec<instar_paint::Color> = scene
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                instar_paint::PaintCommand::GlyphRun { run } => Some(run.color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            inks.contains(&instar_paint::Color::opaque(255, 0, 0)),
+            "the glyphs should be painted in the requested foreground, got {inks:?}"
+        );
+    }
+
+    /// The control for the test above: a font-size change *is* shaping work,
+    /// so the same instrument must report it. Without this, a host that
+    /// stopped shaping entirely would pass the zero-cost assertion.
+    #[test]
+    fn a_font_size_change_does_reshape() {
+        use instar_ui::Node;
+
+        let build = |size: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::text(31, "steady text").with_font_size(size)],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(14)).expect("valid tree");
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, build(24)).expect("valid tree");
+
+        let stats = host.text_stats();
+        assert!(
+            stats.rebuilt > 0,
+            "a different font size must re-shape: {stats:?}"
+        );
+    }
+
+    /// Cursor is interaction-only: it changes nothing measured and nothing
+    /// drawn, so it must not reshape either.
+    #[test]
+    fn a_cursor_change_touches_neither_the_text_cache_nor_layout() {
+        use instar_ui::{Node, WireCursor};
+
+        let build = |cursor: WireCursor| {
+            Tree::new(Node::root(
+                0,
+                vec![Node::text(32, "steady text").with_cursor(cursor)],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, build(WireCursor::Default))
+            .expect("valid tree");
+        let before = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(32)));
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, build(WireCursor::Pointer))
+            .expect("valid tree");
+
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.extracted,
+                stats.reused
+            ),
+            (0, 0, 0, 0),
+            "a cursor change is not shaping work: {stats:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(NodeKey::first(32))),
+            before,
+            "nor does it move anything"
         );
     }
 
