@@ -714,26 +714,181 @@ continuous-interaction loop.
 
 ---
 
-## Stage 3 — focus, keyboard, scrolling
+## What is left, and the order
 
-`instar-window` gains `KeyboardInput`, `MouseWheel`, `Focused` translation and
-a cursor-icon output — it still never learns what a `NodeKey` is.
-
-### Scroll semantics, frozen before the node exists
+Package C ends the vocabulary work. There is now enough visual language to
+find out whether the architecture works as a desktop toolkit, and that
+question is worth more than another control.
 
 ```text
-Scroll owns transient:  offset_x/y, max offset, scrollbar hover/drag state
-layout determines:      viewport rect, content extent
-paint:                  children clipped to viewport, translated by -offset
-hit test:               clip first, then transform into content coordinates
-guest:                  never participates in wheel/touchpad response;
-                        no scroll event unless explicitly subscribed
-content shrinks:        offset = clamp(offset, new_extent)
-removed / Display::None: transient scroll state is dropped with it
+D  scrollbar chrome          completes a subsystem rather than opening one
+E  focus and keyboard        more important to a real app than more widgets
+F  AccessKit
+G  UI Gallery                stresses every primitive
+H  Calculator + thin SDK     stresses the application API
+I  performance and overhead audit
 ```
 
-The stage's acceptance is a test proving **zero `SendToGuest`** for hover, focus
-movement, and wheel events while each still produces a `Render`.
+> **The freeze criterion: no new ordinary UI feature enters Phase 2 unless the
+> UI Gallery or the Calculator demonstrates that it is required.**
+
+Written down because the failure mode is specific and attractive. A toolkit
+with twelve controls and no application is a project that has stopped asking
+its own question, and every control added on speculation is one the host must
+lay out, hit-test, paint, and expose to accessibility forever.
+
+### D — scrollbar chrome
+
+All of it host-owned, which is what makes it the completion of B1 and B2
+rather than a new surface:
+
+```text
+ScrollState
+├── offset
+├── hovered_part
+├── dragging_thumb
+├── drag_origin
+└── drag_origin_offset
+```
+
+A guest contributes styling and policy, if anything. Wheel, thumb hover, track
+click, thumb drag, clamping, and repaint stay host-local.
+
+```text
+wheel               -> 0 SendToGuest
+thumb drag          -> 0 SendToGuest
+hover               -> 0 SendToGuest
+track interaction   -> 0 SendToGuest
+
+content shrinks     -> thumb and offset clamp coherently
+nested scroll       -> the viewport and clip behaviour B1 established
+Display::None       -> state retained, interaction disabled
+deletion            -> ScrollState destroyed
+```
+
+**The acceptance test stalls the guest for 100 ms mid-drag** and requires the
+scrollbar to stay perfectly responsive. Every other assertion here can be
+satisfied by an implementation that merely happens not to call the guest; this
+one fails unless the guest is genuinely absent from the loop. It is the
+clearest possible statement of the claim, so it is the one to make.
+
+### E — focus and keyboard
+
+The same ownership split that already governs pressed-state and scrolling:
+**transient interaction belongs to the host; the guest receives semantic
+outcomes.**
+
+```text
+host owns    the focused NodeKey, tab traversal, focus-visible state,
+             keyboard activation, focus-ring presentation
+guest gets   ButtonActivated, and FocusChanged only if it subscribes
+```
+
+```text
+Tab / Shift+Tab traverse
+Enter activates the focused button
+Space follows button semantics
+a hidden, removed or disabled node loses focus safely
+a reused id cannot inherit stale focus
+focus movement needs no guest round trip
+```
+
+The reused-id case is where generational `NodeKey` earns its place a second
+time: focus is exactly the kind of long-lived reference that outlives the node
+it names, and the generation makes "is this still the same node?" answerable
+rather than a rule someone has to remember.
+
+**Navigation is semantic, never an offset.**
+
+```text
+reveal(node, alignment)
+ensure_visible(node)
+```
+
+Tab traversal immediately needs "bring the focused thing into view", so the
+abstraction gets established here rather than being retrofitted when the editor
+needs `reveal_range`. A guest that could set a scroll offset directly would be
+a guest that can scroll a view out from under someone reading it — the same
+reason the offset is host-owned at all.
+
+### F — AccessKit, and not later
+
+Deferring accessibility until an application needs it is how it becomes
+scaffolding. By E there is retained semantics, stable generational identity,
+layout, visibility, clipping, scroll, focus, keyboard activation, and style —
+enough substrate for the mapping to be meaningful.
+
+```text
+Window       -> Window
+Text         -> Label
+Button       -> Button
+containers   -> GenericContainer
+Scroll       -> ScrollView
+```
+
+Boring on purpose. `NodeKey::to_accesskit_id` already packs identity, and
+remove-then-reuse already becomes a new accessibility object rather than
+recycling one a screen reader may still hold.
+
+> **The architectural test: an accessibility action routes through the same
+> interaction machinery as a mouse or keyboard action.** No AccessKit-only
+> activation path. Two paths to the same outcome is two places for the rules to
+> diverge, and the one used least is the one that rots.
+
+### G and H — dogfooding, which is the actual experiment
+
+The Gallery proves every primitive works: nested rows and stacks, long scroll
+areas, hidden and display-none controls, clipping, borders and radii, font
+variants, disabled controls, keyboard traversal, scrollbars, accessibility,
+resize, DPI changes.
+
+The Calculator proves an application is *pleasant to write*, which is a
+different question and the one a gallery cannot answer. A gallery can be green
+on every primitive while the API underneath it is miserable.
+
+A thin `instar-sdk` grows from whatever the Calculator makes painful, and from
+nothing else. Its job is to **make constructing an authoritative semantic
+snapshot pleasant** —
+
+```rust
+column((
+    text(display),
+    row((button("7"), button("8"), button("9"))),
+))
+```
+
+— and explicitly not to become a component framework, a signals system, a hooks
+analogue, or a reconciliation layer. The host already reconciles; a second
+reconciler in the guest would be the delta protocol arriving through the back
+door.
+
+## Closing Phase 2
+
+The claim, deliberately narrow:
+
+> A Wasm guest can describe a normal desktop interface declaratively while
+> Instar provides retained layout, rendering, scrolling, transient interaction,
+> keyboard and focus behaviour, and accessibility — without polling and without
+> continuous guest participation.
+
+That is a substantial proof and it is not "Instar is ready for Scratchpad".
+Stretching it would be claiming the text editor works before anything has tried
+to write one.
+
+### Two research items, kept apart from feature work
+
+**Runtime memory.** There is enough evidence to stop hand-waving and not enough
+to optimize. A dedicated gate after Phase 2 measures 1, 2, 5 and 10 empty
+Instar apps for RSS, PSS or private dirty where the platform offers it, virtual
+memory, thread count, linear memories, compiled code, `Engine` sharing, and
+`Store` cost. The question is whether the ~41 MB kernel and Wasm addition is
+genuinely additive *physical* memory per app, and no architectural decision
+about it should be taken before that is known.
+
+**The 105 ms Stage 1 outlier** stays recorded and unexplained. Current runs sit
+near 5 ms with small tails, which is evidence about the tree as it is now and
+not an explanation of the historical reading. Do not chase it unless it
+reproduces; do not quietly delete it either.
 
 ---
 

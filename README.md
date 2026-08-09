@@ -22,9 +22,15 @@ every guest turn.
 > Phase 2 has since built the retained UI foundation on top of it: full
 > snapshots diffed against a retained tree, generational node identity, an
 > explicit layout vocabulary with rows, stacks and overlap, visibility and
-> clipping, and a scroll viewport whose offset the host owns — so a wheel
-> moves the view with no Wasm round trip. Styling and scrollbar chrome are
-> not built yet.
+> clipping, a scroll viewport whose offset the host owns — so a wheel moves
+> the view with no Wasm round trip — and a style vocabulary sorted by what a
+> change to it can invalidate.
+>
+> What remains of Phase 2 is scrollbar chrome, focus and keyboard,
+> accessibility, and two guest applications whose job is to find out whether
+> any of this is pleasant to use: [docs/PHASE-2.md](docs/PHASE-2.md). Then
+> text, which is where the ownership model gets its real test:
+> [docs/PHASE-3.md](docs/PHASE-3.md).
 
 ## Why the rewrite
 

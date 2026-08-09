@@ -522,8 +522,17 @@ Recorded so it is not mistaken for design:
 - **One window, one guest.** `PresentationState` is per-runtime, not per-window.
 - **No quota enforcement.** A guest that spins on CPU without yielding is out of
   scope.
-- **No style vocabulary yet.** Colour, border, corner radius, font role/size/
-  weight, and cursor are package C; `PHASE-2.md` freezes their contract. Until
-  then the host chooses every colour from its own theme.
+- **Runtime memory is unmeasured per app.** The ~41 MB kernel and Wasm addition
+  has never been checked for whether it is genuinely additive *physical* memory
+  across several running apps. A dedicated gate answers that before any
+  architectural decision rests on it.
 - **No scrollbar chrome.** Wheel and touchpad scrolling work; there is nothing
-  drawn to drag.
+  drawn to drag. Package D, and the completion of `Scroll`.
+- **No focus or keyboard.** Package E, and the point at which generational
+  `NodeKey` earns its place a second time — focus is exactly the kind of
+  long-lived reference that outlives the node it names.
+- **No accessibility.** Package F. `NodeKey::to_accesskit_id` is ready; the
+  mapping is not written.
+- **No SDK.** A guest builds a snapshot through `BatchEncoder` directly, which
+  is tolerable for a counter and is expected not to be for a calculator. The
+  thin SDK grows from what package H finds painful, and from nothing else.
