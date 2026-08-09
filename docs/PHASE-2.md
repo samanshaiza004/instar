@@ -572,6 +572,54 @@ offset at `150` paints at viewport `y = 50`, is activated by a click at
 viewport `y = 50`, is *not* activated by a click at its unscrolled position,
 and nothing outside the viewport paints or hits.
 
+### B2: the wheel, and the proof the guest is not in the loop
+
+```text
+instar-window   emits RawScrollEvent
+                knows WindowId, pointer position, wheel delta
+                knows no NodeKey and no ScrollState
+
+pixel deltas    physical -> logical at the window boundary
+line deltas     stay explicitly "lines"; UI policy turns them into a
+                logical step
+
+instar-ui       finds the deepest eligible Scroll under the pointer
+                applies the delta to the host-owned offset
+                clamps to the content extent
+
+nested Scroll   the deepest viewport consumes what it can
+                the unconsumed remainder bubbles to ancestor Scrolls
+
+offset changed      -> Render
+nothing consumed    -> no effect at all
+SendToGuest         -> never, for ordinary scrolling
+```
+
+**The residual bubbles.** "The nearest scroll owns the whole event" is simpler
+and is the classic nested-scroll trap: an inner viewport already at its limit
+swallows input that should have kept scrolling the outer one, and the page
+feels stuck for no reason the user can see. Consuming what is available and
+passing the remainder up costs one subtraction and removes the whole class.
+
+**One sign convention, fixed at the window boundary.** By the time a delta
+reaches `instar-ui`, `+y` means *increase the scroll offset*, which reveals
+content further down. Platform wheel direction, natural-scrolling settings, and
+winit's own conventions are resolved in `instar-window` and never travel
+inward. Retained UI that has to ask which way `+y` points on this OS is
+retained UI with a platform leak in it.
+
+**Acceptance is stronger than "the offset changed".** A button starts below the
+viewport; wheel input arrives; its host-owned offset changes, and its painted
+*and* hit-tested position both move to match — the same button, reachable where
+it now appears. Across the whole operation, zero `SendToGuest`. Then the
+converse: a viewport already at its limit produces neither a guest event nor a
+pointless `Render`, because a redraw that changes no pixel is still a frame
+somebody paid for.
+
+Scrollbar chrome stays later. Wheel and touchpad scrolling is the
+architectural claim worth proving — continuous interaction resolved entirely
+host-locally, with Wasm absent from the response loop.
+
 ---
 
 ## Stage 3 — focus, keyboard, scrolling
