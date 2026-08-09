@@ -511,6 +511,67 @@ The order is not an optimization.
 The stage acceptance is unchanged: a test proving **zero `SendToGuest`** for
 hover, focus movement, and wheel events, while each still produces a `Render`.
 
+### B1 is the retained viewport, and nothing else
+
+No wheel events, no scrollbar chrome. Those are B2 and Stage 3. B1 exists so
+that when input arrives there is already a correct, tested thing for it to move.
+
+```text
+Scroll owns          host-local offset
+guest owns           content, not the current scroll position
+
+viewport rect        the Scroll's laid-out rect
+content extent       the laid-out bounds of its content
+
+paint                apply ancestor clip
+                     intersect with the viewport
+                     translate descendants by -offset
+                     paint descendants
+
+hit test             apply ancestor clip
+                     reject outside the viewport
+                     translate the point by +offset
+                     descend in content coordinates
+
+content shrinks      clamp the offset before the next presentation
+                     becomes interactive
+Display::None        no interaction; the offset stays retained
+Visibility::Hidden   the same
+deletion             destroys the retained scroll state
+a commit that
+leaves Scroll alive  preserves the host-owned offset
+```
+
+**Exactly one content child.** An app that wants several things puts a
+container there:
+
+```text
+Scroll
+└── Stack
+    ├── …
+    └── …
+```
+
+Two reasons, and the second is the real one. It gives one unambiguous content
+extent — with several children the extent is a union, and a union of
+overlapping boxes is a question with more than one defensible answer. And it
+stops `Scroll` quietly becoming a layout container as well as a viewport: a
+node that both distributes children *and* owns transient offset state is two
+things wearing one name, which is the mistake `Fill` already taught this
+protocol once.
+
+**Scroll does not invent a second clipping path.** A3 established the order —
+ancestor clip, then this node's clip, then descend — and B1 extends that same
+path with a translation between the clip and the descent. Nested
+`Overflow::Clip → Scroll → child` must work by composition, not by a parallel
+mechanism, and there is a test for exactly that shape.
+
+The transform is where the interesting failure lives, so it is tested
+concretely rather than by property: a button at content `y = 200` with the
+offset at `150` paints at viewport `y = 50`, is activated by a click at
+viewport `y = 50`, is *not* activated by a click at its unscrolled position,
+and nothing outside the viewport paints or hits.
+
 ---
 
 ## Stage 3 — focus, keyboard, scrolling
