@@ -647,6 +647,171 @@ mod tests {
         );
     }
 
+    /// A tree with two nested viewports, for the transform matrix.
+    fn nested_fixture() -> Tree {
+        use crate::{WireAlign, WireLayout, WireSize};
+        let bounded = |height: u16| WireLayout {
+            height: WireSize::Fixed(height),
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![
+                            Node::button(12, "near"),
+                            Node::scroll(
+                                20,
+                                Node::column(
+                                    21,
+                                    vec![
+                                        Node::button(22, "inner"),
+                                        Node::text(23, "tall").with_layout(WireLayout {
+                                            height: WireSize::Fixed(400),
+                                            ..WireLayout::default()
+                                        }),
+                                    ],
+                                ),
+                            )
+                            .with_layout(bounded(80)),
+                            Node::text(13, "tall").with_layout(WireLayout {
+                                height: WireSize::Fixed(600),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(bounded(120)),
+            ],
+        ))
+    }
+
+    fn transform_of(update: &TreeUpdate, key: NodeKey) -> Option<[f64; 6]> {
+        update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == ak_id(key))
+            .unwrap_or_else(|| panic!("{key:?} is missing"))
+            .1
+            .transform()
+            .map(|affine| affine.as_coeffs())
+    }
+
+    /// The accessibility transform chain, across the cases that previously
+    /// all collapsed to the identity.
+    ///
+    /// Each of the three shipped bugs was invisible at scale 1 with nothing
+    /// scrolled, which described every fixture in this file. The matrix exists
+    /// so that the *absence* of a transform is only ever correct when it is
+    /// genuinely the identity.
+    #[test]
+    fn the_transform_chain_is_right_at_every_scale_and_offset() {
+        let tree = nested_fixture();
+        let mut text = TextContext::new();
+        let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
+        let root = NodeKey::first(0);
+        let outer = NodeKey::first(10);
+        let inner = NodeKey::first(20);
+
+        for (scale, outer_y, inner_y) in [
+            (1.0, 0, 0),    // control: everything is the identity
+            (2.0, 0, 0),    // a missing DPI scale
+            (1.0, 100, 0),  // a missing scroll translation
+            (2.0, 100, 0),  // both at once, which is where order shows
+            (2.0, 100, 30), // ancestor composition
+        ] {
+            let mut scroll = ScrollState::new();
+            if outer_y != 0 {
+                scroll.set(outer, crate::ScrollOffset { x: 0, y: outer_y });
+            }
+            if inner_y != 0 {
+                scroll.set(inner, crate::ScrollOffset { x: 0, y: inner_y });
+            }
+            let update = project(&tree, &layout, &FocusState::new(), &scroll, scale).unwrap();
+            let label = format!("scale {scale}, outer {outer_y}, inner {inner_y}");
+
+            assert_eq!(
+                transform_of(&update, root),
+                (scale != 1.0).then_some([scale, 0.0, 0.0, scale, 0.0, 0.0]),
+                "{label}: the root carries the scale and nothing else"
+            );
+            assert_eq!(
+                transform_of(&update, outer),
+                (outer_y != 0).then_some([1.0, 0.0, 0.0, 1.0, 0.0, f64::from(-outer_y)]),
+                "{label}: a viewport carries its own offset, unscaled -- the \
+                 root's scale is applied to it by composition, and scaling it \
+                 here would apply it twice"
+            );
+            assert_eq!(
+                transform_of(&update, inner),
+                (inner_y != 0).then_some([1.0, 0.0, 0.0, 1.0, 0.0, f64::from(-inner_y)]),
+                "{label}: a nested viewport carries *its own* offset, not the \
+                 sum -- AccessKit composes ancestors, so adding them here \
+                 would move the inner content twice"
+            );
+            assert_eq!(
+                transform_of(&update, NodeKey::first(12)),
+                None,
+                "{label}: an ordinary node states no transform at all"
+            );
+        }
+    }
+
+    /// The guard against fixing accessibility by contaminating layout.
+    ///
+    /// Instar's layout is logical, everywhere and always. The only place a
+    /// physical pixel appears is the accessibility root's transform and the
+    /// paint scene. If a DPI change ever moves a logical rectangle, someone
+    /// has pushed device pixels down into `instar-ui`, and every consumer of
+    /// layout -- hit testing, scroll extents, reveal arithmetic -- inherits
+    /// the mistake.
+    #[test]
+    fn a_dpi_change_does_not_move_a_single_logical_rectangle() {
+        let tree = nested_fixture();
+        let mut text = TextContext::new();
+
+        // The same window: a scale change does not alter the logical viewport,
+        // which is the whole point of the logical viewport.
+        let at_1x = tree.layout(&mut text, Viewport::new(400.0, 300.0));
+        let at_2x = tree.layout(&mut text, Viewport::new(400.0, 300.0));
+
+        for node in tree.iter() {
+            assert_eq!(
+                at_1x.get(node.key),
+                at_2x.get(node.key),
+                "{:?} moved across a DPI change",
+                node.key
+            );
+        }
+
+        // And the projection still reports those same logical rectangles at
+        // both scales -- the conversion lives in the transform, not the bounds.
+        let scroll = ScrollState::new();
+        let focus = FocusState::new();
+        let one = project(&tree, &at_1x, &focus, &scroll, 1.0).unwrap();
+        let two = project(&tree, &at_2x, &focus, &scroll, 2.0).unwrap();
+        let bounds = |update: &TreeUpdate, key: NodeKey| {
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == ak_id(key))
+                .and_then(|(_, node)| node.bounds())
+        };
+        for node in tree.iter() {
+            assert_eq!(
+                bounds(&one, node.key),
+                bounds(&two, node.key),
+                "{:?}'s reported bounds changed with the scale factor; the \
+                 scale belongs in the root transform, not in every rectangle",
+                node.key
+            );
+        }
+    }
+
     /// A DPI change moves every node on screen without changing one logical
     /// rectangle, so bounds alone cannot notice it.
     #[test]

@@ -551,6 +551,58 @@ the causal precondition had simply been ordered out of reach.
 > A fixture is discriminating only if the fault can actually reach the state
 > being asserted.
 
+### Scene structure and raster output prove different things
+
+> **Scene structure proves drawing intent; raster output proves final
+> presentation.**
+
+The focus ring was pushed into every frame's command stream and never reached a
+pixel: the stroke was emitted before the match that fills a button's face, so
+each frame drew the ring and then painted over it. A test asserting the
+`StrokeRect` was present passed throughout, and was right about what it
+asserted. It simply asserted the wrong layer.
+
+This is not an argument for pixel-testing everything. Golden images are a
+maintenance sink, and the existing scene-level tests earn their place: they say
+*why* something is drawn, which pixels cannot. The rule is narrower.
+
+> Host-generated chrome that a later command can occlude gets a pixel test.
+
+Three things qualify so far, and they share every risk factor — host-generated,
+drawn late, near a clip boundary, and with no guest node whose absence would be
+noticed:
+
+```text
+focus ring       covered by the button face it surrounds
+scrollbar thumb  drawn outside the clip, over content
+caret/selection  Phase 3, same shape
+```
+
+### Five layers, none of which substitutes for another
+
+The defects found by the first real application, and then by the first real
+screen reader, land at different heights. Trying to make one suite omniscient
+is how each of them survived.
+
+```text
+unit          proves a local algorithm
+scene         proves drawing intent
+integration   proves seam reachability
+pixel         proves the final visual result
+platform      proves native interpretation
+```
+
+The wheel, the pointer move and the keyboard were correct at the unit layer and
+unreachable at the integration layer. The focus ring was correct at the scene
+layer and invisible at the pixel layer. The accessibility bounds were correct at
+every layer above the platform, and wrong in the one coordinate space no
+automated test could see — logical where AccessKit documents physical, which is
+the identity at scale 1 and therefore invisible to every fixture that existed.
+
+Each layer is cheap to reach for once and expensive to reach for everywhere.
+Which is why the rule is selective rather than uniform, and why the ones above
+are named individually.
+
 Put together, the three failure modes give one formulation:
 
 > **Green is evidence only when the mutation occurred, the intended test

@@ -131,18 +131,49 @@ thing a viewer found confusing.
 **Calculator likely needs it.** No — a calculator has one scroll region at
 most.
 
-**Decision.** Record only, but note that this is not purely a guest-side
-question. Two candidate host changes exist and neither should be made on one
-data point:
+**Decision.** Unresolved on purpose, and the visual catalog is what resolves
+it. Neither answer is inherently correct: AppKit supports both overlay and
+legacy scroller styles, and derives the preferred one from a *user preference*
+rather than from the widget — non-overlay scrollers inset content, overlay ones
+sit over it. That is strong evidence this is a presentation-policy axis, not
+something `Scroll` should silently decide for all time.
 
-- reserve layout space for a scrollbar instead of overlaying it, so nested
-  viewports inset each other naturally (this changes every existing layout)
-- give a `Scroll` a default chrome — a hairline on the viewport edge — which
-  is the host inventing appearance, and the rule so far has been that it does
-  not
+So Instar does not change from overlay to reserved-space bars on the strength
+of one fixture. Nor does it give every `Scroll` default background or border
+chrome: plenty of legitimate scroll regions should disappear into the surface
+around them, and forcing a box on each one would make ordinary lists need to
+undo host styling.
 
-The Gallery should first try expressing it with what exists, and the visual
-catalog is the place to do that.
+The catalog carries the question as a pair of fixtures:
+
+```text
+Nested Scroll -- plain
+Outer Scroll
+└── Inner Scroll
+
+Nested Scroll -- delineated
+Outer Scroll
+└── Inner Scroll
+    background, border, radius, spacing
+```
+
+and answers two questions with them:
+
+1. Can the existing style and layout primitives make a nested region visually
+   obvious, with no new runtime semantics?
+2. Once it is visually separated, are the coincident overlay bars still
+   genuinely confusing?
+
+If (1) is yes and (2) becomes acceptable, this entry closes as application
+presentation responsibility. If the bars stay unusable even with an obvious
+viewport boundary, that is evidence for a host-level scrollbar policy —
+something like `Overlay | Inset`, decided by host or platform rather than by
+guest micromanagement.
+
+One thing that should *not* happen either way: an inner scrollbar moving inward
+merely because it is nested. That makes geometry depend on hierarchy depth, has
+no obvious answer at three levels, and stops a scrollbar corresponding to the
+edge of the viewport it scrolls.
 
 ---
 

@@ -444,3 +444,37 @@ fn a_focused_control_actually_shows_a_ring_in_the_pixels() {
          is a ring the user cannot see."
     );
 }
+
+/// The scrollbar thumb is the other piece of host chrome that can be drawn
+/// and then lost.
+///
+/// The focus ring proved this failure mode is real: a `StrokeRect` pushed
+/// before a later fill exists perfectly in the command stream and never
+/// reaches a pixel. The thumb shares every risk factor — host-generated, drawn
+/// late, near a clip boundary, and with no guest node to notice its absence —
+/// so it gets the same kind of test rather than a scene assertion.
+#[test]
+fn a_scrollable_viewport_actually_shows_a_thumb_in_the_pixels() {
+    let wake: Wake = Arc::new(|| {});
+    let component =
+        std::fs::read(env!("GALLERY_WASM")).expect("the Gallery guest is built by build.rs");
+    let mut bridge = HostBridge::spawn_with_monospace_face(component, WINDOW, wake, default_font())
+        .expect("the Gallery guest starts");
+    bridge.on_window_event(WindowOutput::MetricsChanged(metrics(1.0)));
+    await_commit(&mut bridge).expect("the Gallery commits its interface");
+
+    let mut presenter = presenter();
+    let pixels = frame(&bridge, &mut presenter);
+    let theme = bridge.host().theme();
+
+    assert!(
+        near(&pixels, theme.scrollbar_thumb, 12) > 100,
+        "the Gallery's content overflows its viewport, so a thumb must be \
+         visible: only {} pixels near the thumb colour",
+        near(&pixels, theme.scrollbar_thumb, 12)
+    );
+    // Not the track: it is a 40-alpha wash, so what lands in the buffer is the
+    // background composited with it rather than the colour itself. Asserting
+    // on it would be asserting on a blend, and the thumb is the part that has
+    // to be visible anyway.
+}
