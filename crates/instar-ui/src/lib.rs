@@ -25,6 +25,7 @@
 //! constructor goes away. Nothing else has to change, which is exactly why the
 //! two are separate types.
 
+pub mod accessibility;
 pub mod diff;
 pub mod focus;
 pub mod layout;
@@ -32,6 +33,7 @@ pub mod ledger;
 pub mod scroll;
 pub mod text;
 
+pub use accessibility::project as project_accessibility;
 pub use diff::{ChangeSet, diff};
 pub use focus::{FocusMove, FocusState, RevealAlignment, focusable_order, reveal};
 pub use instar_ui_protocol as protocol;
