@@ -1184,7 +1184,7 @@ F1  semantic projection       DONE
 F2  incremental updates       DONE
 F3  action convergence        DONE
 F0  shell adapter plumbing    DONE / structurally verified
-F4  native AT behavior        PENDING
+F4  native AT behavior        PENDING -- see docs/F4-SMOKE.md
 
 Accessibility semantics       COMPLETE
 Platform accessibility        NOT YET VERIFIED

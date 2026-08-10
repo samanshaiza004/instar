@@ -2535,6 +2535,115 @@ mod tests {
         assert!(window.scroll.get(NodeKey::first(100)).y > 0);
     }
 
+    /// The exact tree `guests/a11y-smoke` commits, in host terms.
+    ///
+    /// Kept in step with that guest by hand. It is worth the duplication: F4
+    /// is a manual session against a real screen reader, and this is what
+    /// makes a failure there point at the platform boundary rather than at
+    /// the fixture.
+    fn smoke_fixture() -> Tree {
+        use instar_ui::{Node, WireAlign, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(3, "Nothing pressed yet"),
+                Node::scroll(
+                    1,
+                    Node::column(
+                        2,
+                        vec![
+                            Node::button(4, "Unavailable").disabled(),
+                            Node::button(5, "Ordinary button"),
+                            Node::text(6, "Scroll past this").with_layout(WireLayout {
+                                height: WireSize::Fixed(600),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(7, "Offscreen button"),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(200),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    /// The F4 fixture is shaped the way the manual procedure assumes.
+    ///
+    /// Everything a screen reader will be asked to do is reachable here
+    /// without one: the disabled button is present and marked, the offscreen
+    /// button starts outside the viewport, focusing it reveals it, and
+    /// activating it through the accessibility source produces an
+    /// accessibility-observable change. If this test is green and the manual
+    /// session still fails, the failure is at the native boundary.
+    #[test]
+    fn the_smoke_fixture_exercises_what_the_manual_pass_will_ask_of_it() {
+        // A bare host, not `ready_host`: the guest's first tree *is* this
+        // fixture, and the node ids below are the guest's own.
+        let mut host = Host::new();
+        host.handle(WindowOutput::MetricsChanged(metrics(1.0)));
+        host.apply_tree(WINDOW, smoke_fixture()).expect("valid");
+
+        let update = host.accessibility_update(WINDOW).expect("a tree");
+        let find = |key: NodeKey| {
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == ak(key))
+                .map(|(_, node)| node.clone())
+                .unwrap_or_else(|| panic!("{key:?} is missing from the projection"))
+        };
+
+        assert!(
+            find(NodeKey::first(4)).is_disabled(),
+            "the disabled button must be announced as unavailable, not omitted"
+        );
+        assert!(!find(NodeKey::first(5)).is_disabled());
+        assert!(
+            !find(NodeKey::first(7)).is_disabled(),
+            "the offscreen button is enabled -- it is merely out of view"
+        );
+
+        // Out of view to begin with, or the reveal step proves nothing.
+        let offscreen = NodeKey::first(7);
+        let scroll = NodeKey::first(1);
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.get(scroll).y,
+            0,
+            "nothing is scrolled yet"
+        );
+
+        // Focus reveals it. This is the E3 path, reached from the keyboard
+        // source; the manual pass reaches it from the accessibility source.
+        host.dispatch(
+            WINDOW,
+            InteractionIntent::Focus(offscreen),
+            InteractionSource::Accessibility,
+        );
+        assert_eq!(focused(&host), Some(offscreen));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.get(scroll).y > 0,
+            "focusing the offscreen button must scroll it into view -- if this \
+             is zero the 600pt spacer is not pushing it out of the viewport, \
+             and the manual pass would prove nothing"
+        );
+
+        // And activating it through the accessibility seam reaches the guest.
+        host.reset_interaction_stats();
+        let effects = host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(offscreen));
+        assert_eq!(host.interaction_stats().activate, 1);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::SendToGuest(_))),
+            "activation must reach the guest, or the readout never changes and \
+             there is nothing for a screen reader to observe"
+        );
+    }
+
     // --- F0: the transport seam, minus the platform adapter. ---
 
     fn host_for_actions() -> Host {
