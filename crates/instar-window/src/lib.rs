@@ -188,6 +188,37 @@ pub struct RawScrollEvent {
     pub delta: ScrollDelta,
 }
 
+/// The keys Instar's retained UI vocabulary responds to.
+///
+/// Deliberately not a general keyboard mapping. These are the keys that mean
+/// something to a button and to focus traversal; character input, editing
+/// shortcuts and IME belong to Phase 3's text service, which needs a far
+/// richer contract than an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Tab,
+    Enter,
+    Space,
+    Escape,
+    /// Anything else. Carried so the host can see that a key happened without
+    /// this crate growing an opinion about what it was.
+    Other,
+}
+
+/// A key going down or coming up.
+///
+/// Like [`RawPointerEvent`], it carries no interpretation: no focused node, no
+/// activation. Which control this reaches, if any, is `instar-ui`'s to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawKeyEvent {
+    pub window_id: WindowId,
+    pub key: Key,
+    /// `true` on press, `false` on release. Both are delivered, because a
+    /// button held with Space is pressed-looking for as long as it is held.
+    pub pressed: bool,
+    pub shift: bool,
+}
+
 /// The window's geometry changed: resized, moved between monitors, or the
 /// user changed display scaling.
 ///
@@ -207,6 +238,7 @@ pub struct WindowMetricsChanged {
 pub enum WindowOutput {
     Pointer(RawPointerEvent),
     Scroll(RawScrollEvent),
+    Key(RawKeyEvent),
     MetricsChanged(WindowMetricsChanged),
     /// The window's presentation geometry is temporarily unusable.
     ///
