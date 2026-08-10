@@ -154,3 +154,23 @@ rebuilds in ~370 µs.
 - **The `MAX_NODE_IDS` scan** is O(observed ids) per commit — negligible for a
   guest holding tens of ids, ~65k entries for one that has burned the budget.
   Not measured, and not worth measuring until a guest churns ids at all.
+
+## Debug builds of a software renderer are not indicative
+
+Measured on the Gallery, same guest, same 960x640 window:
+
+```text
+debug     44-119 ms/frame
+release     5-7  ms/frame
+```
+
+Roughly 10-20x, and it is entirely the rasterizer: `vello_cpu` in a debug
+profile is unoptimized software rendering per pixel. Cost then scales with the
+pixel count, so a maximized window on a 2x display — around 2.6 megapixels,
+four times a 960x640 one — lands near 270 ms in debug and around 25 ms in
+release.
+
+Recorded because the first person to open the Gallery full-screen reasonably
+described it as "unbelievably laggy", and the answer is the profile rather than
+anything in the frame path. Anything judging how Instar *feels* has to be a
+release build. The gates in this document already are.

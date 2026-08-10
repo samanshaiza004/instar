@@ -286,16 +286,32 @@ fn catalog() -> Vec<El> {
                     vec![swatch(104, "one"), swatch(105, "two"), swatch(106, "three")],
                 ),
                 caption(107, "stack: children share one cell, later on top"),
+                // The upper child gets its own opaque background, so the
+                // layering is legible. Two transparent labels in one cell are
+                // correct Stack behaviour and read as corrupted glyphs, which
+                // demonstrates the primitive to nobody.
                 El::stack(
                     108,
                     vec![
-                        swatch(109, "underneath                    ").layout(WireLayout {
-                            height: WireSize::Fixed(40),
-                            ..WireLayout::default()
-                        }),
-                        El::text(110, "on top").style(WireStyle {
+                        El::text(109, "")
+                            .layout(WireLayout {
+                                height: WireSize::Fixed(44),
+                                align_self: Some(WireAlign::Stretch),
+                                ..WireLayout::default()
+                            })
+                            .style(WireStyle {
+                                paint: WirePaintStyle {
+                                    background: Some(SURFACE),
+                                    corner_radius: 4,
+                                    ..WirePaintStyle::default()
+                                },
+                                ..WireStyle::default()
+                            }),
+                        El::text(110, "  on top  ").style(WireStyle {
                             paint: WirePaintStyle {
-                                foreground: Some(WireColor::opaque(0xff, 0xd0, 0x70)),
+                                foreground: Some(WireColor::opaque(0x10, 0x10, 0x14)),
+                                background: Some(WireColor::opaque(0xff, 0xd0, 0x70)),
+                                corner_radius: 4,
                                 ..WirePaintStyle::default()
                             },
                             ..WireStyle::default()
@@ -373,13 +389,19 @@ fn catalog() -> Vec<El> {
             "Clipping",
             vec![
                 caption(162, "overflow: clip, on a box smaller than its content"),
+                // `min_width` is what makes this a clipping specimen rather
+                // than a wrapping one. Without it the label simply wraps to
+                // the box and nothing overflows to clip.
                 El::column(
                     163,
-                    vec![swatch(164, "this text is wider than the box that holds it")],
+                    vec![swatch(164, "clipped on the right").layout(WireLayout {
+                        min_width: Some(280),
+                        ..WireLayout::default()
+                    })],
                 )
                 .layout(WireLayout {
                     width: WireSize::Fixed(160),
-                    height: WireSize::Fixed(28),
+                    height: WireSize::Fixed(30),
                     overflow: WireOverflow::Clip,
                     ..WireLayout::default()
                 }),
@@ -425,7 +447,13 @@ fn catalog() -> Vec<El> {
                 row_of(
                     193,
                     vec![
-                        surface(194, "fill", Some(SURFACE), None, 0),
+                        surface(
+                            194,
+                            "fill",
+                            Some(WireColor::opaque(0x3a, 0x3a, 0x48)),
+                            None,
+                            0,
+                        ),
                         surface(195, "border", None, Some(2), 0),
                         surface(196, "radius", Some(ACCENT), None, 10),
                         surface(197, "all", Some(SURFACE), Some(2), 8),
