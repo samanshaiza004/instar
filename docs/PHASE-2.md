@@ -1180,15 +1180,14 @@ reverse of the direction everything else here has taken.
 #### Status
 
 ```text
-F1  projection             DONE
-F2  incremental updates    DONE
-F3  action convergence     DONE
+F1  semantic projection       DONE
+F2  incremental updates       DONE
+F3  action convergence        DONE
+F0  shell adapter plumbing    DONE / structurally verified
+F4  native AT behavior        PENDING
 
-F0  platform adapter       WIRED, NOT YET VERIFIED
-F4  AT / platform smoke    NOT YET VERIFIED
-
-F semantic core            COMPLETE
-F accessibility support    NOT COMPLETE
+Accessibility semantics       COMPLETE
+Platform accessibility        NOT YET VERIFIED
 ```
 
 Both halves of that distinction matter. F1–F3 are a subsystem in their own
@@ -1237,12 +1236,21 @@ action routing, and platform behaviour is a manual smoke test.
 
 #### F0, as built
 
-**Adapter lifecycle and event plumbing compile and are tested to the edge of
-the platform. Native accessibility behaviour awaits F4 smoke.** That is the
-whole claim. Nothing below was observed working with an assistive technology.
+**Everything F0 claims is verified; what is unverified is specifically the
+native AT ↔ AccessKit boundary.** Build and lint coverage, proxy event
+conversion, the update seam, lifecycle ordering on a real macOS window, and the
+failure behaviour around the visibility requirement — all of these are checked.
+Nothing below was observed working with an assistive technology, and that is
+F4, not F0.
 
-One adapter, one window, created invisible-then-shown in `resumed` and dropped
-with the window it describes. `ShellEvent` is the loop's user-event type, with
+One adapter, one window — as one field, not two `Option`s. `NativeWindow`
+holds the `Arc<Window>` and its adapter together, constructed in a single step
+with nothing fallible between the adapter and `set_visible(true)`. Two options
+could drift; there is no state in which a visible window lacks its adapter, and
+dropping the pair drops both. `Adapter::process_event` is the first statement
+in `window_event`, ahead of every early return, and `window_event` is the sole
+entry point for winit window events — so the "before the application handles
+it, for every event" requirement holds structurally rather than by discipline. `ShellEvent` is the loop's user-event type, with
 two variants — the runtime thread's payload-free wake, and
 `accesskit_winit::Event` — because a single queue is what puts platform
 requests on the main thread.

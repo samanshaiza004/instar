@@ -69,6 +69,21 @@ impl From<accesskit_winit::Event> for ShellEvent {
     }
 }
 
+/// A native window and the one accessibility adapter that describes it.
+///
+/// One field rather than two `Option`s, because the requirement is that
+/// exactly one adapter exists per native window and never outlives it. Two
+/// options can drift apart -- one cleared, one not, or one set a few lines
+/// before the other and a fallible step in between. This cannot: there is no
+/// state in which a window exists without its adapter, and dropping the pair
+/// drops both.
+struct NativeWindow {
+    /// `Arc` because softbuffer's surface holds the window too, and winit's
+    /// `Window` is not `Clone`.
+    window: Arc<Window>,
+    adapter: accesskit_winit::Adapter,
+}
+
 /// The real sink: one `update_if_active` call, and nothing else.
 ///
 /// This is the smallest thing that cannot be tested without a desktop and an
@@ -226,15 +241,8 @@ struct Shell {
     /// return an error *to*. Reported after the loop ends, so a shell that
     /// could not start exits non-zero rather than looking like a clean run.
     startup_error: Option<String>,
-    /// `Arc` because softbuffer's surface holds the window too, and winit's
-    /// `Window` is not `Clone`.
-    window: Option<Arc<Window>>,
+    native: Option<NativeWindow>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    /// Exactly one adapter, for exactly this window. It is created after the
-    /// window and dropped with it, because a platform adapter outliving the
-    /// native window it describes is what leaves an assistive technology
-    /// reading a window that is gone.
-    adapter: Option<accesskit_winit::Adapter>,
     /// Whether anything is listening, and the rules that follow from it.
     a11y: Accessibility,
     state: Option<WindowState>,
@@ -249,9 +257,8 @@ impl Shell {
             component,
             debug,
             startup_error: None,
-            window: None,
+            native: None,
             surface: None,
-            adapter: None,
             a11y: Accessibility::default(),
             state: None,
             bridge: None,
@@ -282,8 +289,8 @@ impl Shell {
                     // times for one logical change — a click alone produces a
                     // press frame, a release frame, and a commit frame — and
                     // the compositor only ever shows the last.
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
+                    if let Some(native) = self.native.as_ref() {
+                        native.window.request_redraw();
                     }
                 }
                 HostEffect::GuestGone { generation, error } => match error {
@@ -315,18 +322,20 @@ impl Shell {
     /// whether to ask the bridge at all; see that module for why the order
     /// matters.
     fn flush_accessibility(&mut self) {
-        let (Some(adapter), Some(bridge)) = (self.adapter.as_mut(), self.bridge.as_mut()) else {
+        let (Some(native), Some(bridge)) = (self.native.as_mut(), self.bridge.as_mut()) else {
             return;
         };
-        self.a11y
-            .flush(|| bridge.accessibility_update(), &mut AdapterSink(adapter));
+        self.a11y.flush(
+            || bridge.accessibility_update(),
+            &mut AdapterSink(&mut native.adapter),
+        );
     }
 
     /// A platform accessibility request, now safely on the main thread.
     fn on_accessibility(&mut self, event: accesskit_winit::Event, event_loop: &ActiveEventLoop) {
         match self.a11y.classify(event.window_event) {
             A11yRequest::SendFullTree => {
-                let (Some(adapter), Some(bridge)) = (self.adapter.as_mut(), self.bridge.as_mut())
+                let (Some(native), Some(bridge)) = (self.native.as_mut(), self.bridge.as_mut())
                 else {
                     return;
                 };
@@ -334,7 +343,7 @@ impl Shell {
                 // holds nothing, so a diff would describe changes to a tree it
                 // does not have.
                 if let Some(update) = bridge.full_accessibility_tree() {
-                    AdapterSink(adapter).send(update);
+                    AdapterSink(&mut native.adapter).send(update);
                 }
             }
             A11yRequest::Forward { action, target } => {
@@ -437,7 +446,7 @@ impl Shell {
 
 impl ApplicationHandler<ShellEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.native.is_some() {
             return;
         }
 
@@ -460,12 +469,21 @@ impl ApplicationHandler<ShellEvent> for Shell {
         // and answering it means reading the retained tree. Routing activation
         // through the proxy costs a placeholder tree for one frame and buys the
         // rule that no platform callback ever touches host state.
-        self.adapter = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+        let adapter = accesskit_winit::Adapter::with_event_loop_proxy(
             event_loop,
             &window,
             self.proxy.clone(),
-        ));
-        window.set_visible(true);
+        );
+        // The pair is built here, in one step, and only shown once both exist.
+        // Nothing fallible runs between the adapter and the window becoming
+        // visible, so there is no path on which a visible window lacks one.
+        let native = NativeWindow {
+            window: Arc::new(window),
+            adapter,
+        };
+        native.window.set_visible(true);
+        let window = Arc::clone(&native.window);
+        self.native = Some(native);
 
         let physical: instar_window::PhysicalSize = window.inner_size().into();
         let state = WindowState::new(window.id().into(), window.scale_factor(), physical);
@@ -504,7 +522,6 @@ impl ApplicationHandler<ShellEvent> for Shell {
             eprintln!("instar: {} started", bridge.generation());
         }
 
-        let window = Arc::new(window);
         match softbuffer::Context::new(Arc::clone(&window))
             .and_then(|context| softbuffer::Surface::new(&context, Arc::clone(&window)))
         {
@@ -533,7 +550,6 @@ impl ApplicationHandler<ShellEvent> for Shell {
 
         self.bridge = Some(bridge);
         self.state = Some(state);
-        self.window = Some(window);
         self.apply(effects, event_loop);
     }
 
@@ -554,8 +570,8 @@ impl ApplicationHandler<ShellEvent> for Shell {
     ) {
         // Before anything else, as `accesskit_winit` requires: the adapter
         // tracks focus and geometry from the raw stream.
-        if let (Some(adapter), Some(window)) = (self.adapter.as_mut(), self.window.as_ref()) {
-            adapter.process_event(window, &event);
+        if let Some(native) = self.native.as_mut() {
+            native.adapter.process_event(&native.window, &event);
         }
 
         if matches!(event, WindowEvent::RedrawRequested) {
@@ -592,14 +608,14 @@ impl ApplicationHandler<ShellEvent> for Shell {
     /// change. This is what closes the metrics barrier on platforms that send
     /// no separate `Resized`.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(state), Some(window), Some(bridge)) = (
+        let (Some(state), Some(native), Some(bridge)) = (
             self.state.as_mut(),
-            self.window.as_ref(),
+            self.native.as_ref(),
             self.bridge.as_mut(),
         ) else {
             return;
         };
-        let Some(metrics) = state.take_pending_metrics(window.inner_size().into()) else {
+        let Some(metrics) = state.take_pending_metrics(native.window.inner_size().into()) else {
             return;
         };
         let effects = bridge.on_window_event(WindowOutput::MetricsChanged(metrics));

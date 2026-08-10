@@ -172,6 +172,34 @@ Modelled as a type, not a flag: the only way to obtain usable metrics is
 `MetricsState::usable()`, which returns `None` unless `Ready`. Stale values are
 reachable only through a name that says so.
 
+### Accessibility deltas have a consumer, or they are not produced
+
+`Host::accessibility_update` **drains**: what it returns is not offered again.
+That makes the question of *who is listening* a correctness question rather
+than a performance one.
+
+> **Accessibility projection deltas are consumed only by an attached
+> accessibility sink. Detachment must not consume state needed to construct the
+> next attached tree.**
+
+So the shell does not ask the host for an update while nothing is attached. Not
+to save work — to avoid destroying it. A change drained into a sink that
+discards it is a change the next assistive technology is never told about, and
+nothing downstream can notice the omission.
+
+The same rule explains why attachment begins with a full projection rather than
+resuming an incremental history: an adapter that has just attached holds
+nothing for a delta to be relative to. AccessKit states this from its own side —
+for an adapter created through an `EventLoopProxy`, the first applicable update
+must contain a full tree — so the invariant and the platform contract agree.
+
+```text
+detached   -> produce nothing, consume nothing
+attaching  -> reset the projection, send the whole tree
+attached   -> send each delta exactly once
+detaching  -> stop producing; the next attach starts over
+```
+
 ### The commit ordering is normative
 
 ```text
@@ -511,6 +539,17 @@ That is a different failure from an assertion being too weak. The assertion was
 exact; the *fixture* had no entropy left for the two answers to differ in. When
 a fault injection comes back green, the fixture is the second thing to suspect
 after the injection itself.
+
+Ordering is a second way to lose that entropy, and it looks nothing like the
+first. A test that the metrics barrier suppresses accessibility updates raised
+the barrier and *then* pressed Tab. But input is refused while the barrier is
+up, so focus never moved, so there was no update to suppress — the test passed
+with the barrier removed entirely. Banking the focus change before raising the
+barrier restored the discrimination. Nothing about that fixture was too small;
+the causal precondition had simply been ordered out of reach.
+
+> A fixture is discriminating only if the fault can actually reach the state
+> being asserted.
 
 Put together, the three failure modes give one formulation:
 
