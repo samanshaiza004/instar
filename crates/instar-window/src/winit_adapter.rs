@@ -10,9 +10,11 @@
 //! event loop needs a display server. That is the reason for the split: the
 //! part that cannot be tested in CI is the part with no logic in it.
 
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
-use crate::{PhysicalSize, PointerButton, PointerState, WindowId, WindowOutput, WindowState};
+use crate::{
+    PhysicalSize, PointerButton, PointerState, ScrollDelta, WindowId, WindowOutput, WindowState,
+};
 
 impl From<winit::window::WindowId> for WindowId {
     fn from(id: winit::window::WindowId) -> Self {
@@ -116,6 +118,180 @@ pub fn translate(
             .on_mouse_input((*button).into(), (*element_state).into())
             .map(WindowOutput::Pointer),
 
+        // winit's positive Y means "the content should move down", which
+        // reveals what is *above* -- so it is Instar's negative offset delta.
+        // That is the whole of `natural: false`: the sign is inverted exactly
+        // once, in `WindowState::on_wheel`, and this is the caller that says
+        // so. The platform has already applied the user's natural-scrolling
+        // preference before winit sees it, so there is nothing else to ask.
+        WindowEvent::MouseWheel { delta, .. } => state
+            .on_wheel(
+                match delta {
+                    // A count of notches, not a distance: no scale factor.
+                    MouseScrollDelta::LineDelta(x, y) => ScrollDelta::Lines {
+                        x: f64::from(*x),
+                        y: f64::from(*y),
+                    },
+                    // Physical pixels, which `on_wheel` converts.
+                    MouseScrollDelta::PixelDelta(position) => ScrollDelta::Logical {
+                        x: position.x,
+                        y: position.y,
+                    },
+                },
+                false,
+            )
+            .map(WindowOutput::Scroll),
+
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The wheel's trip from winit into Instar's coordinate and sign
+    //! conventions.
+    //!
+    //! The scroll subsystem itself -- bubbling, clamping, scrollbar geometry --
+    //! is tested in `instar-ui` and `instar-host`. What is checked here is only
+    //! that a wheel event *arrives*, in the right units and pointing the right
+    //! way. That link was missing entirely: everything downstream of it existed
+    //! and was tested, and no wheel ever reached any of it.
+
+    use super::*;
+    use crate::{LogicalPoint, RawScrollEvent};
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{DeviceId, MouseScrollDelta, TouchPhase};
+
+    const WINDOW: WindowId = WindowId::from_raw(1);
+
+    fn state(scale: f64) -> WindowState {
+        let mut state = WindowState::new(
+            WINDOW,
+            scale,
+            PhysicalSize {
+                width: (400.0 * scale) as u32,
+                height: (300.0 * scale) as u32,
+            },
+        );
+        // A wheel needs somewhere to be: `on_wheel` yields nothing until the
+        // cursor position is known.
+        state.on_cursor_moved(20.0 * scale, 40.0 * scale);
+        state
+    }
+
+    fn wheel(delta: MouseScrollDelta) -> WindowEvent {
+        WindowEvent::MouseWheel {
+            device_id: DeviceId::dummy(),
+            delta,
+            phase: TouchPhase::Moved,
+        }
+    }
+
+    fn scrolled(state: &mut WindowState, delta: MouseScrollDelta) -> RawScrollEvent {
+        match translate(state, WINDOW, &wheel(delta)) {
+            Some(WindowOutput::Scroll(event)) => event,
+            other => panic!("a wheel must translate to a scroll, got {other:?}"),
+        }
+    }
+
+    /// The direction, which is the half of this a test can be silently wrong
+    /// about.
+    ///
+    /// winit's positive Y means the content should move down, revealing what is
+    /// *above* it. Instar counts offset from the content's origin, so revealing
+    /// what is above is a decrease. Wheeling away from you must arrive negative.
+    #[test]
+    fn wheeling_away_from_you_reveals_what_is_above() {
+        let mut state = state(1.0);
+
+        let away = scrolled(&mut state, MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert_eq!(
+            away.delta,
+            ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            "winit's positive Y reveals content above, which is a negative Instar \
+             offset delta"
+        );
+
+        let toward = scrolled(&mut state, MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(
+            toward.delta,
+            ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            "and the opposite direction is the opposite sign, not a clamp"
+        );
+    }
+
+    /// Lines are a count and pixels are a distance, so only one of them is a
+    /// scale-factor question.
+    #[test]
+    fn only_the_pixel_delta_is_converted_for_scale() {
+        let mut state = state(2.0);
+
+        let lines = scrolled(&mut state, MouseScrollDelta::LineDelta(0.0, 3.0));
+        assert_eq!(
+            lines.delta,
+            ScrollDelta::Lines { x: 0.0, y: -3.0 },
+            "three notches are three notches at any scale factor"
+        );
+
+        let pixels = scrolled(
+            &mut state,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 60.0)),
+        );
+        assert_eq!(
+            pixels.delta,
+            ScrollDelta::Logical { x: 0.0, y: -30.0 },
+            "60 physical pixels at scale 2 is 30 logical"
+        );
+
+        assert_eq!(
+            pixels.logical_pos,
+            LogicalPoint { x: 20.0, y: 40.0 },
+            "and the scroll happens where the cursor is, in logical space"
+        );
+    }
+
+    /// Horizontal survives the trip too, and is not quietly folded into vertical.
+    #[test]
+    fn the_horizontal_axis_is_carried_independently() {
+        let mut state = state(1.0);
+        let diagonal = scrolled(&mut state, MouseScrollDelta::LineDelta(2.0, 5.0));
+        assert_eq!(diagonal.delta, ScrollDelta::Lines { x: -2.0, y: -5.0 });
+    }
+
+    /// A wheel with nowhere to be is not an event.
+    #[test]
+    fn a_wheel_before_the_cursor_is_known_is_dropped() {
+        let mut fresh = WindowState::new(
+            WINDOW,
+            1.0,
+            PhysicalSize {
+                width: 400,
+                height: 300,
+            },
+        );
+        assert!(
+            translate(
+                &mut fresh,
+                WINDOW,
+                &wheel(MouseScrollDelta::LineDelta(0.0, 1.0))
+            )
+            .is_none(),
+            "inventing a position would scroll whatever sits at the origin"
+        );
+    }
+
+    /// The wrong-window guard applies to wheels like everything else, because it
+    /// is this window's scale factor that would otherwise be used.
+    #[test]
+    fn a_wheel_for_another_window_is_not_translated() {
+        let mut state = state(2.0);
+        assert!(
+            translate(
+                &mut state,
+                WindowId::from_raw(2),
+                &wheel(MouseScrollDelta::LineDelta(0.0, 1.0))
+            )
+            .is_none()
+        );
     }
 }

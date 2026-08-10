@@ -296,6 +296,23 @@ pub struct TextContext {
     layout_context: parley::LayoutContext,
 }
 
+/// Rounds a measured width up to a whole logical pixel.
+///
+/// Taffy rounds computed layout to integers. A node sized to its own text
+/// therefore lands a fraction of a pixel *narrower* than the text it was
+/// measured from -- and `finalize` then re-breaks the text to that rounded
+/// width, wrapping a label that fits. Whether it happened depended on which
+/// way the fraction fell, so the same string wrapped or did not according to
+/// the font, the size, and the letters in it.
+///
+/// Reporting the ceiling closes it at the source: a box sized from a
+/// measurement is never smaller than what was measured. A node that is
+/// genuinely constrained still wraps, because that width comes from its
+/// parent and not from here.
+fn ceil(width: f32) -> f32 {
+    width.ceil()
+}
+
 impl TextContext {
     /// Builds the long-lived Parley resources.
     ///
@@ -413,11 +430,11 @@ impl TextContext {
         match available {
             Available::MinContent => {
                 self.stats.reused += 1;
-                return (entry.content_widths.min, entry.unbroken_height);
+                return (ceil(entry.content_widths.min), entry.unbroken_height.ceil());
             }
             Available::MaxContent => {
                 self.stats.reused += 1;
-                return (entry.content_widths.max, entry.unbroken_height);
+                return (ceil(entry.content_widths.max), entry.unbroken_height.ceil());
             }
             Available::Definite(width) => {
                 // A real height needs a real break, so this one does mutate --
@@ -430,7 +447,7 @@ impl TextContext {
                 );
             }
         }
-        (entry.layout.width(), entry.layout.height())
+        (ceil(entry.layout.width()), entry.layout.height().ceil())
     }
 
     /// Runs after Taffy has final geometry: re-breaks if needed, then extracts.

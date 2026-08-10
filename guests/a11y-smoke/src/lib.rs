@@ -26,9 +26,8 @@
 //! scroll deliberately: inside, it would scroll away exactly when the offscreen
 //! button is reached, which is the moment it is needed.
 //!
-//! The scroll's height is fixed rather than grown. `grow` distributes surplus
-//! space, and this content is taller than the window — there is no surplus, so
-//! an ungrown scroll sizes to its content and stops being a viewport at all.
+//! The scroll grows to fill what the readout leaves, so the viewport follows a
+//! resized window instead of being a literal that stops matching it.
 
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
@@ -55,10 +54,6 @@ const OFFSCREEN: NodeKey = NodeKey::first(7);
 /// Tall enough that the last button starts well outside the viewport, so
 /// reaching it is a real reveal rather than an accident of rounding.
 const SPACER_HEIGHT: u16 = 600;
-
-/// The scroll's viewport. Fixed, because a scroll that sizes to its content
-/// has nothing to scroll.
-const VIEWPORT_HEIGHT: u16 = 200;
 
 struct Smoke {
     ordinary: u32,
@@ -107,7 +102,7 @@ impl Smoke {
                 0,
                 None,
                 WireLayout {
-                    height: WireSize::Fixed(VIEWPORT_HEIGHT),
+                    grow: 1.0,
                     align_self: Some(WireAlign::Stretch),
                     ..WireLayout::default()
                 },

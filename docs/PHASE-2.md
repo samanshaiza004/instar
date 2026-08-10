@@ -1177,6 +1177,43 @@ For `Scroll`, semantic actions only. Exposing raw offset actions would widen
 Instar's public conceptual model to match a platform schema, which is the
 reverse of the direction everything else here has taken.
 
+#### Three defects the first non-counter guest found
+
+Dogfooding found in one session what the automated suite had not, which is the
+argument for G in miniature. All three were in shipped, tested packages.
+
+**Labels wrapped according to their own fractional widths.** Taffy rounds
+computed layout to integers, so a node sized from its own text landed a
+fraction of a pixel narrower than the text it was measured from — and the
+finalize pass then re-broke the label to that rounded width. "Ordinary button"
+needed 89.36pt and got 89.00; "Nothing pressed yet" needed 114.52 and got 115,
+so it was fine. The same string wrapped or did not according to the font, the
+size, and the letters in it. Fixed by reporting measured dimensions as
+ceilings: a box sized from a measurement is never smaller than what was
+measured. A genuinely constrained node still wraps, because that width comes
+from its parent.
+
+**No wheel event ever reached the scroll subsystem.** B2 built residual
+bubbling, D built the scrollbar chrome, `WindowState::on_wheel` settled the
+sign convention, and `Host::on_scroll` routed it — and `winit_adapter::translate`
+had no `MouseWheel` arm, so none of it was reachable from the application. The
+scrollbar rendered and did nothing. Every layer was tested in isolation and the
+seam between two of them did not exist. Now wired, with the sign pinned by a
+test: winit's positive Y reveals content *above*, which is a negative Instar
+offset delta.
+
+**A viewport could not be bounded by its parent.** A `Scroll` is a flex item,
+and its automatic minimum size decides whether `grow` and `shrink` can reach
+it. Taffy's default overflow is visible, so that minimum was the content's own
+size — a viewport with tall content sized to the content and broke the layout
+around it. The only way to bound one was a fixed height, which does not follow
+a resized window. Declaring `Overflow::Scroll` is what CSS does for the same
+reason: a scroll container's automatic minimum size is zero, because clipping
+is the whole point of it.
+
+The pattern worth naming: the first two are seams, not units. Every part on
+either side was correct and tested.
+
 #### Status
 
 ```text

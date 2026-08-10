@@ -269,6 +269,14 @@ fn style(node: &Node, parent: ChildOf) -> Style {
     Style {
         display,
         flex_direction,
+        overflow: if matches!(node.kind, NodeKind::Scroll) {
+            taffy::Point {
+                x: taffy::Overflow::Scroll,
+                y: taffy::Overflow::Scroll,
+            }
+        } else {
+            taffy::Point::default()
+        },
         size: Size {
             width: dimension(layout.width),
             height: dimension(layout.height),
@@ -547,5 +555,131 @@ fn accumulate(
 
     for child in taffy.children(id).unwrap_or_default() {
         accumulate(taffy, child, x, y, keys, out);
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_sizing {
+    use super::*;
+    use crate::{Node, TextContext, Tree};
+
+    /// A viewport can be bounded by its parent instead of by a literal.
+    ///
+    /// A `Scroll` is a flex item like any other, and its automatic minimum
+    /// size is what decides whether `grow` and `shrink` can reach it. With
+    /// Taffy's default (visible) overflow that minimum is the content's own
+    /// size, so a viewport with tall content could never be squeezed to its
+    /// parent -- it sized to the content and the surrounding layout broke
+    /// around it. The only way to bound one was a fixed height, which does not
+    /// follow a resized window.
+    ///
+    /// Declaring the overflow is what CSS does for the same reason: a scroll
+    /// container's automatic minimum size is zero, because clipping is the
+    /// entire point of it.
+    #[test]
+    fn a_viewport_fills_the_space_it_is_given_and_its_content_does_not() {
+        use crate::{WireAlign, WireLayout, WireSize};
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(3, "header").with_layout(WireLayout {
+                    height: WireSize::Fixed(20),
+                    ..WireLayout::default()
+                }),
+                Node::scroll(
+                    1,
+                    Node::column(
+                        2,
+                        vec![Node::text(6, "tall").with_layout(WireLayout {
+                            height: WireSize::Fixed(600),
+                            ..WireLayout::default()
+                        })],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    grow: 1.0,
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut text = TextContext::new();
+        let snapshot = compute(&mut text, &tree, Viewport::new(480.0, 320.0));
+
+        let header = snapshot.get(NodeKey::first(3)).expect("the header");
+        let viewport = snapshot.get(NodeKey::first(1)).expect("the scroll");
+        assert_eq!(
+            header.height + viewport.height,
+            320,
+            "the viewport takes exactly what the header left of the window, \
+             rather than sizing to its 600pt content"
+        );
+        assert!(
+            viewport.height < 600,
+            "and is therefore smaller than its content, or there is nothing \
+             to scroll: got {}",
+            viewport.height
+        );
+        assert_eq!(
+            snapshot.get(NodeKey::first(2)).expect("its content").height,
+            600,
+            "and the content keeps its own height -- squeezing it to the \
+             viewport would leave nothing to scroll"
+        );
+    }
+
+    /// A node sized from its own text is never narrower than that text.
+    ///
+    /// Taffy rounds computed layout to integers, so a box sized from a
+    /// fractional measurement lands a fraction of a pixel short -- and the
+    /// finalize pass then re-breaks the label to that rounded width. The label
+    /// wrapped or did not according to which way its fraction fell, which is
+    /// why it stayed hidden: the counter guest's strings happened to round up.
+    ///
+    /// Several labels, deliberately, because a single string proves only that
+    /// one fraction fell the right way.
+    #[test]
+    fn a_label_given_all_the_room_it_asked_for_does_not_wrap() {
+        let labels = [
+            "Ordinary button",
+            "Scroll past this",
+            "Nothing pressed yet",
+            "Offscreen button",
+            "Unavailable",
+            "Click me",
+            "Crash on purpose",
+        ];
+        let children: Vec<Node> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let id = i as u32 + 1;
+                if i % 2 == 0 {
+                    Node::button(id, *label)
+                } else {
+                    Node::text(id, *label)
+                }
+            })
+            .collect();
+
+        let tree = Tree::new(Node::root(0, children));
+        let mut text = TextContext::new();
+        // Far more room than any of these needs, so a wrap can only come from
+        // the node being sized short of its own measurement.
+        let snapshot = compute(&mut text, &tree, Viewport::new(2000.0, 2000.0));
+
+        for (i, label) in labels.iter().enumerate() {
+            let key = NodeKey::first(i as u32 + 1);
+            assert!(
+                snapshot.get(key).is_some(),
+                "{label} should have been laid out"
+            );
+            assert_eq!(
+                text.line_count(key),
+                1,
+                "{label:?} wrapped despite having room -- its box was rounded \
+                 below the width it was measured at"
+            );
+        }
     }
 }
