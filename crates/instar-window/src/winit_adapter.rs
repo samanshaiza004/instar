@@ -11,9 +11,10 @@
 //! part that cannot be tested in CI is the part with no logic in it.
 
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{Key as WinitKey, NamedKey};
 
 use crate::{
-    PhysicalSize, PointerButton, PointerState, RawPointerMoved, ScrollDelta, WindowId,
+    Key, PhysicalSize, PointerButton, PointerState, RawPointerMoved, ScrollDelta, WindowId,
     WindowOutput, WindowState,
 };
 
@@ -148,7 +149,49 @@ pub fn translate(
             )
             .map(WindowOutput::Scroll),
 
+        // Winit reports modifiers as their own event rather than on the key
+        // events they apply to, so the state is held until a key arrives.
+        WindowEvent::ModifiersChanged(modifiers) => {
+            state.on_modifiers_changed(modifiers.state().shift_key());
+            None
+        }
+
+        // Package E built focus traversal, Enter/Space activation and the
+        // focus ring, and `Host::on_key` routed all of it -- with nothing
+        // translating a key. This arm is what makes any of it reachable.
+        //
+        // The *logical* key, not the physical one: Instar asks which key this
+        // is in the user's layout, and a physical-position mapping is for
+        // games that want WASD to stay where it is regardless of what the
+        // keycaps say.
+        WindowEvent::KeyboardInput { event, .. } => Some(WindowOutput::Key(state.on_key(
+            instar_key(&event.logical_key),
+            event.state.is_pressed(),
+            event.repeat,
+        ))),
+
         _ => None,
+    }
+}
+
+/// Winit's logical key, in Instar's deliberately small vocabulary.
+///
+/// The *logical* key, not the physical one: Instar asks which key this is in
+/// the user's layout, and a physical-position mapping is for games that want
+/// WASD to stay put regardless of what the keycaps say.
+///
+/// Split out from the match arm because `winit::event::KeyEvent` cannot be
+/// constructed in a test -- its `platform_specific` field is not portable --
+/// and the mapping is the part worth checking.
+fn instar_key(logical: &WinitKey) -> Key {
+    match logical {
+        WinitKey::Named(NamedKey::Tab) => Key::Tab,
+        WinitKey::Named(NamedKey::Enter) => Key::Enter,
+        WinitKey::Named(NamedKey::Space) => Key::Space,
+        WinitKey::Named(NamedKey::Escape) => Key::Escape,
+        // Carried rather than dropped: the host is entitled to know a key
+        // happened without this crate growing an opinion about which one.
+        _ => Key::Other,
     }
 }
 
@@ -257,6 +300,85 @@ mod tests {
     fn a_move_for_another_window_is_not_translated() {
         let mut state = state(2.0);
         assert!(translate(&mut state, WindowId::from_raw(2), &moved(100.0, 60.0)).is_none());
+    }
+
+    /// Every key Instar's vocabulary names maps to itself, and everything
+    /// else maps to `Other` rather than to nothing.
+    ///
+    /// Package E built focus traversal, Enter/Space activation and the focus
+    /// ring, and `Host::on_key` routed all of it -- with nothing translating a
+    /// key. None of it was reachable from the running application.
+    #[test]
+    fn the_keys_the_vocabulary_names_map_to_themselves() {
+        for (named, want) in [
+            (NamedKey::Tab, Key::Tab),
+            (NamedKey::Enter, Key::Enter),
+            (NamedKey::Space, Key::Space),
+            (NamedKey::Escape, Key::Escape),
+        ] {
+            assert_eq!(
+                instar_key(&WinitKey::Named(named)),
+                want,
+                "{named:?} lost its identity in transit"
+            );
+        }
+
+        assert_eq!(
+            instar_key(&WinitKey::Named(NamedKey::F1)),
+            Key::Other,
+            "an unnamed key is still an event -- the host is entitled to know \
+             a key happened"
+        );
+        assert_eq!(
+            instar_key(&WinitKey::Character("a".into())),
+            Key::Other,
+            "and character input is Phase 3's, not a fifth named key"
+        );
+    }
+
+    /// Shift arrives on its own event, and has to still be attached to the key
+    /// it modifies. Reverse focus traversal is the only reason Instar asks.
+    #[test]
+    fn shift_is_remembered_from_its_own_event_until_a_key_arrives() {
+        let mut state = state(1.0);
+        assert!(
+            !state.on_key(Key::Tab, true, false).shift,
+            "nothing is held to begin with"
+        );
+
+        translate(
+            &mut state,
+            WINDOW,
+            &WindowEvent::ModifiersChanged(winit::keyboard::ModifiersState::SHIFT.into()),
+        );
+        assert!(
+            state.on_key(Key::Tab, true, false).shift,
+            "shift-tab must reach the host as shifted, or focus only ever \
+             traverses forwards"
+        );
+
+        translate(
+            &mut state,
+            WINDOW,
+            &WindowEvent::ModifiersChanged(winit::keyboard::ModifiersState::empty().into()),
+        );
+        assert!(
+            !state.on_key(Key::Tab, true, false).shift,
+            "and releasing it must be noticed"
+        );
+    }
+
+    /// Both directions are delivered: a button held with Space is
+    /// pressed-looking until the release says otherwise.
+    #[test]
+    fn a_key_release_is_carried_as_a_release() {
+        let state = state(1.0);
+        assert!(state.on_key(Key::Space, true, false).pressed);
+        assert!(!state.on_key(Key::Space, false, false).pressed);
+        assert!(
+            state.on_key(Key::Space, true, true).repeat,
+            "autorepeat is carried, because what it means is the host's call"
+        );
     }
 
     /// The direction, which is the half of this a test can be silently wrong

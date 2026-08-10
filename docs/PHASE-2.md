@@ -1177,7 +1177,7 @@ For `Scroll`, semantic actions only. Exposing raw offset actions would widen
 Instar's public conceptual model to match a platform schema, which is the
 reverse of the direction everything else here has taken.
 
-#### Four defects the first non-counter guest found
+#### Five defects the first non-counter guest found
 
 Dogfooding found in one session what the automated suite had not, which is the
 argument for G in miniature. All three were in shipped, tested packages.
@@ -1219,13 +1219,36 @@ was implemented and had six tests, every one of which called it directly.
 `WindowOutput` now has a `PointerMoved` term, and the drag has a test driven
 only through `handle`, so losing the term again fails.
 
-The pattern worth naming: three of these four are **seams, not units**. Every
-part on either side was correct and tested, and each seam was a single missing
-arm in one `match`. Package-level verification cannot see them, because at
-package level nothing is missing.
+**Tab did not move focus.** The audit that the previous two defects prompted
+found the third instance immediately, in the same `match`: nothing translated
+`KeyboardInput`. Package E's focus traversal, Enter/Space activation and focus
+ring were complete, tested, and unreachable, exactly as the wheel and the
+pointer move had been. Winit reports modifiers as a separate event, so
+`WindowState` now holds shift until a key arrives — without it, focus could
+only ever traverse forwards.
 
-Two of the three were the same `match`. Worth checking the rest of that
-function's arms against what each layer downstream already implements.
+The pattern worth naming: **three of these five are seams, not units**, and all
+three were arms of one `match`. Every part on either side was correct and
+tested. Package-level verification cannot see this, because at package level
+nothing is missing — the enum has the variant, the host routes it, the
+arithmetic is right, and the absent thing is a line in another crate.
+
+So the rule is now enforced rather than remembered:
+
+> **Every term in the input vocabulary must be produced by something.**
+
+`every_window_output_term_is_produced_by_the_winit_adapter` reads the
+`WindowOutput` enum and asserts that `winit_adapter::translate` constructs each
+variant. It is a source-level test, like the layering rules it sits beside,
+because a `match` arm returning `None` is perfectly well-typed — which is
+precisely why three of them went unnoticed. Reinstating any of the three
+shipped defects turns it red.
+
+Its own first draft was wrong in the way worth recording: it searched the whole
+file, so the adapter's *test* module naming `WindowOutput::PointerMoved` in an
+assertion satisfied the search for the arm that assertion was meant to be
+testing. Deleting the production arm left it green. It now reads only the
+source above `#[cfg(test)]`.
 
 #### Status
 

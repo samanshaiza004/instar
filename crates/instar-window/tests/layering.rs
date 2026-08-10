@@ -78,3 +78,85 @@ fn pointer_events_use_instar_types_not_winit_types() {
     assert_eq!(event.button, PointerButton::Primary);
     assert_eq!(event.state, PointerState::Pressed);
 }
+
+/// Every term in the input vocabulary must be produced by something.
+///
+/// This is the rule that failed three times in one session, in one `match`.
+/// `WindowOutput::Scroll`, `WindowOutput::PointerMoved` and `WindowOutput::Key`
+/// each had a complete, tested implementation waiting on the far side of the
+/// host, and `winit_adapter::translate` had no arm that produced them — so a
+/// wheel did nothing, a scrollbar thumb took a press and never moved, and Tab
+/// did not move focus. Every layer was correct. The seam did not exist.
+///
+/// Unit tests cannot see this. At the level of any one package nothing is
+/// missing: the enum has the variant, the host handles it, the arithmetic is
+/// right. What is absent is a line in a different crate, and the only way to
+/// notice is to ask whether anything ever constructs the term.
+///
+/// Source inspection rather than types because a `match` arm returning `None`
+/// is perfectly well-typed, which is exactly why this went unnoticed. If a
+/// term is ever genuinely produced somewhere else, extend the search — do not
+/// delete the rule.
+#[test]
+fn every_window_output_term_is_produced_by_the_winit_adapter() {
+    let lib = include_str!("../src/lib.rs");
+    // Production code only. The adapter's own test module names these terms in
+    // its assertions, and counting those would let a test satisfy the search
+    // for the arm it is meant to be testing -- which is exactly how the first
+    // draft of this test passed with the pointer-move arm deleted.
+    let adapter = include_str!("../src/winit_adapter.rs")
+        .split_once("#[cfg(test)]")
+        .map_or_else(
+            || panic!("the adapter's test module marks the end of production code"),
+            |(production, _)| production,
+        );
+
+    // The variants declared on the enum, read from its own definition so a
+    // new term is covered the moment it is added.
+    let body = lib
+        .split_once("pub enum WindowOutput {")
+        .expect("WindowOutput is declared in lib.rs")
+        .1
+        .split_once("\n}")
+        .expect("the enum ends")
+        .0;
+
+    let terms: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            // Variant lines, not doc comments or attributes.
+            line.chars().next().is_some_and(char::is_uppercase)
+        })
+        .map(|line| {
+            line.split(['(', ' ', '{', ','])
+                .next()
+                .expect("a variant name")
+        })
+        .collect();
+
+    assert!(
+        terms.len() >= 7,
+        "only found {terms:?} -- the parser stopped matching the enum's shape"
+    );
+
+    // `MetricsInvalidated` is the exception, and a deliberate one: it is not a
+    // translation of any single winit event but a barrier raised alongside
+    // `ScaleFactorChanged`. It is produced in the adapter all the same, so it
+    // needs no special case here -- if that ever changes, this comment is the
+    // place to record why.
+    let missing: Vec<&&str> = terms
+        .iter()
+        .filter(|term| !adapter.contains(&format!("WindowOutput::{term}")))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these input terms are declared, and routed by instar-host, but \
+         nothing in winit_adapter::translate ever produces them: {missing:?}\n\n\
+         A term with no producer is a subsystem that is complete, tested, and \
+         unreachable from the running application. That has happened three \
+         times: the wheel, the pointer move, and the keyboard. Add the missing \
+         `match` arm rather than removing the term."
+    );
+}

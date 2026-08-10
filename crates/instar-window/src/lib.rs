@@ -321,6 +321,13 @@ pub struct WindowState {
     /// Set when the scale factor changed but the matching physical size has
     /// not arrived yet. See [`WindowState::on_scale_factor_changed`].
     metrics_pending: bool,
+    /// Whether shift is held, tracked because winit reports modifier state
+    /// separately from the key events it applies to.
+    ///
+    /// Only shift, because [`Key`] is deliberately not a general keyboard
+    /// mapping: shift is the one modifier Instar's vocabulary asks about, and
+    /// it asks in order to reverse focus traversal.
+    shift: bool,
 }
 
 impl WindowState {
@@ -331,6 +338,7 @@ impl WindowState {
             physical_size,
             last_cursor: None,
             metrics_pending: false,
+            shift: false,
         }
     }
 
@@ -438,6 +446,27 @@ impl WindowState {
 
     pub fn on_cursor_left(&mut self) {
         self.last_cursor = None;
+    }
+
+    /// Winit reports modifier state as its own event, not on the key events it
+    /// applies to, so it is held here until a key arrives.
+    pub fn on_modifiers_changed(&mut self, shift: bool) {
+        self.shift = shift;
+    }
+
+    /// A key went down or came up.
+    ///
+    /// Both directions are delivered: a button held with Space is
+    /// pressed-looking for as long as it is held, so the release is what ends
+    /// that, not a detail to filter out here.
+    pub fn on_key(&self, key: Key, pressed: bool, repeat: bool) -> RawKeyEvent {
+        RawKeyEvent {
+            window_id: self.window_id,
+            key,
+            pressed,
+            shift: self.shift,
+            repeat,
+        }
     }
 
     /// A button was pressed or released at the last known cursor position.
