@@ -1924,8 +1924,27 @@ mod tests {
 /// layering, `instar-host` routes; `instar-ui` decides what input means.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Interaction {
-    /// The node a press landed on, if any. Cleared on release.
-    pressed: Option<NodeKey>,
+    /// The node a press landed on, if any, and what pressed it.
+    pressed: Option<Press>,
+}
+
+/// What began a press.
+///
+/// A press has to remember this. With one shared capture slot a pointer
+/// release would complete a Space press and a Space release would complete a
+/// pointer press — two input paths using one another's state, which produces
+/// activations nobody performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressSource {
+    Pointer,
+    Keyboard,
+}
+
+/// A press in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Press {
+    pub key: NodeKey,
+    pub source: PressSource,
 }
 
 impl Interaction {
@@ -1933,8 +1952,103 @@ impl Interaction {
         Self::default()
     }
 
+    /// The node currently drawn as pressed, whatever pressed it.
+    ///
+    /// Presentation does not care about the source: a button held with Space
+    /// looks the same as one held with the mouse.
     pub fn pressed(&self) -> Option<NodeKey> {
+        self.pressed.map(|press| press.key)
+    }
+
+    /// The press including its source, for the release paths that must only
+    /// complete their own.
+    pub fn press(&self) -> Option<Press> {
         self.pressed
+    }
+
+    /// Space went down on the focused control.
+    ///
+    /// Captures it, exactly as a pointer press captures what it landed on, so
+    /// the release completes against *this* node rather than whatever is
+    /// focused by then. Returns whether anything changed, which is the
+    /// caller's cue to repaint — a repeat while already held changes nothing.
+    pub fn on_keyboard_press(&mut self, tree: &Tree, focused: Option<NodeKey>) -> bool {
+        let Some(key) = focused else {
+            return false;
+        };
+        if !tree
+            .find(key)
+            .is_some_and(|node| node.kind.is_interactive())
+        {
+            return false;
+        }
+        if self.pressed.map(|press| press.key) == Some(key) {
+            return false;
+        }
+        self.pressed = Some(Press {
+            key,
+            source: PressSource::Keyboard,
+        });
+        true
+    }
+
+    /// Space came up.
+    ///
+    /// Activates only when the captured key is still the focused, interactive
+    /// one — and only when the capture was a keyboard press, so a Space
+    /// release cannot complete a press the mouse started. The capture is
+    /// cleared either way, because the key is no longer down.
+    pub fn on_keyboard_release(
+        &mut self,
+        tree: &Tree,
+        focused: Option<NodeKey>,
+    ) -> Option<UiAction> {
+        let press = self.pressed?;
+        if press.source != PressSource::Keyboard {
+            return None;
+        }
+        self.pressed = None;
+        if focused != Some(press.key) {
+            return None;
+        }
+        tree.find(press.key)
+            .filter(|node| node.kind.is_interactive())
+            .map(|_| UiAction::ButtonActivated(press.key))
+    }
+
+    /// Enter activates outright: there is no held state to show, so there is
+    /// nothing to capture and nothing a release could complete.
+    pub fn on_enter(&self, tree: &Tree, focused: Option<NodeKey>) -> Option<UiAction> {
+        let key = focused?;
+        tree.find(key)
+            .filter(|node| node.kind.is_interactive())
+            .map(|_| UiAction::ButtonActivated(key))
+    }
+
+    /// Drops a keyboard press whose captured node is no longer the focused,
+    /// interactive one.
+    ///
+    /// The general form of the rule this stage keeps rediscovering: any
+    /// transient interaction naming a `NodeKey` is retired when that key stops
+    /// being eligible. Focus moving away, the node being disabled, hidden or
+    /// removed, and a commit that replaces its generation all land here.
+    pub fn retire_keyboard_press(&mut self, tree: &Tree, focused: Option<NodeKey>) -> bool {
+        let Some(press) = self.pressed else {
+            return false;
+        };
+        if press.source != PressSource::Keyboard {
+            return false;
+        }
+        let still_eligible = focused == Some(press.key)
+            && tree
+                .find(press.key)
+                .is_some_and(|node| node.kind.is_interactive())
+            && reachable_for_interaction(&tree.root, press.key);
+        if still_eligible {
+            return false;
+        }
+        self.pressed = None;
+        true
     }
 
     /// A press landed at `(x, y)`. Records the target; activates nothing.
@@ -1951,7 +2065,10 @@ impl Interaction {
     ) {
         self.pressed = tree
             .hit_test_scrolled(layout, scroll, x, y)
-            .map(|node| node.key);
+            .map(|node| Press {
+                key: node.key,
+                source: PressSource::Pointer,
+            });
     }
 
     /// A release landed at `(x, y)`.
@@ -1967,9 +2084,14 @@ impl Interaction {
         x: i32,
         y: i32,
     ) -> Option<UiAction> {
-        let pressed = self.pressed.take()?;
+        // Only a pointer press. A pointer release completing a Space press
+        // would activate a button the user is still holding the keyboard on.
+        let press = self
+            .pressed
+            .filter(|press| press.source == PressSource::Pointer)?;
+        self.pressed = None;
         let released_on = tree.hit_test_scrolled(layout, scroll, x, y)?.key;
-        (released_on == pressed).then_some(UiAction::ButtonActivated(pressed))
+        (released_on == press.key).then_some(UiAction::ButtonActivated(press.key))
     }
 
     /// Abandons any in-progress press.
@@ -2014,7 +2136,7 @@ impl Interaction {
     pub fn retire(&mut self, removed: &[NodeKey]) {
         if self
             .pressed
-            .is_some_and(|pressed| removed.contains(&pressed))
+            .is_some_and(|press| removed.contains(&press.key))
         {
             self.pressed = None;
         }
@@ -2044,13 +2166,13 @@ impl Interaction {
     /// shipping the hole and waiting for focus, hover, and pointer capture to
     /// each fall into it. They retire here too as they arrive.
     pub fn retire_hidden(&mut self, tree: &Tree) {
-        let Some(pressed) = self.pressed else {
+        let Some(press) = self.pressed else {
             return;
         };
         // Walking from the root, because suppression is inherited: a node may
         // be perfectly visible itself and sit under a hidden ancestor. Looking
         // the key up directly would miss exactly that case.
-        if !reachable_for_interaction(&tree.root, pressed) {
+        if !reachable_for_interaction(&tree.root, press.key) {
             self.pressed = None;
         }
     }
