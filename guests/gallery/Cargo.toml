@@ -1,10 +1,10 @@
 [package]
-name = "a11y-smoke"
+name = "gallery"
 version = "0.0.0"
 edition = "2024"
 license = "MPL-2.0"
 publish = false
-description = "Instar's accessibility smoke fixture: the compact tree F4 drives a real screen reader against. Not part of the Instar workspace; targets wasm32-wasip2."
+description = "Instar's UI Gallery: first an integration harness for every native input path, second a visual catalog. Not part of the Instar workspace; targets wasm32-wasip2."
 
 [lib]
 crate-type = ["cdylib"]

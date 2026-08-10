@@ -180,10 +180,14 @@ pub fn translate(
 /// the user's layout, and a physical-position mapping is for games that want
 /// WASD to stay put regardless of what the keycaps say.
 ///
-/// Split out from the match arm because `winit::event::KeyEvent` cannot be
-/// constructed in a test -- its `platform_specific` field is not portable --
-/// and the mapping is the part worth checking.
-fn instar_key(logical: &WinitKey) -> Key {
+/// Split out from the match arm, and public, because `winit::event::KeyEvent`
+/// cannot be constructed outside winit -- its `platform_specific` field is a
+/// private platform type. An integration test therefore cannot start from a
+/// real `KeyboardInput` event, and the closest it can get is the real mapping
+/// applied to a real `winit::keyboard::Key`. Exporting this is what lets those
+/// tests use the mapping rather than reimplement it, which would leave them
+/// agreeing with themselves.
+pub fn instar_key(logical: &WinitKey) -> Key {
     match logical {
         WinitKey::Named(NamedKey::Tab) => Key::Tab,
         WinitKey::Named(NamedKey::Enter) => Key::Enter,

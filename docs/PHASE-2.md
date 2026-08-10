@@ -1391,10 +1391,78 @@ recycling one a screen reader may still hold.
 
 ### G and H — dogfooding, which is the actual experiment
 
-The Gallery proves every primitive works: nested rows and stacks, long scroll
-areas, hidden and display-none controls, clipping, borders and radii, font
-variants, disabled controls, keyboard traversal, scrollbars, accessibility,
-resize, DPI changes.
+#### G is first an integration harness, second a visual catalog
+
+That ordering was not the original plan, and the five defects the first
+non-counter guest found are what changed it. Three of them were seams: a
+complete, tested subsystem on either side of a missing `match` arm. Phase 2's
+remaining risk is no longer local correctness — there are hundreds of tests
+proving individual pieces — it is **composition** correctness, and a catalog of
+pretty controls does not probe that.
+
+So the Gallery leads with an Interaction Lab, and its frozen success criterion
+is:
+
+> **Every currently supported native input modality must be demonstrably
+> capable of entering through the real platform adapter and producing its
+> intended user-visible effect, in one application.**
+
+"Demonstrably" is doing work there. `crates/instar-shell/tests/interaction_lab.rs`
+starts every test from a `winit::event::WindowEvent`, runs it through the real
+`translate`, the real `HostBridge`, and the real Gallery guest on a real second
+thread, and asserts on something a person could see. **Nothing in it calls
+`Host::on_wheel`, `Host::on_pointer_moved` or `Host::on_key`** — those already
+had tests, and those tests are precisely what failed to notice that nothing
+ever called them.
+
+```text
+CursorMoved       -> PointerMoved -> dragged thumb moves content
+MouseWheel        -> Scroll       -> viewport moves; residual bubbles outward
+KeyboardInput     -> Key          -> focus traverses, ring appears
+ModifiersChanged  + Tab           -> traversal reverses
+Enter / Space                     -> guest's own counter changes
+AccessKit action                  -> same seam, same effects
+```
+
+Reinstating any of the three shipped defects turns the Lab red, each at the
+semantically right test. That is the runtime proof; the source-level producer
+and consumer tests are the backstop that fails faster.
+
+One honest limit, stated rather than worked around: `winit::event::KeyEvent`
+cannot be constructed outside winit — `platform_specific` is a private platform
+type — so keyboard tests start one step in, at the real `instar_key` mapping
+with shift from a real translated `ModifiersChanged`. The `KeyboardInput` arm's
+existence is held by the producer test instead.
+
+#### The guest-stall button
+
+`native_interaction_survives_a_blocked_guest` is the architecture's central
+claim, demonstrated rather than argued. The Gallery has a button that blocks
+the wasm thread for 500ms; while it is blocked, the test wheels, drags the
+scrollbar thumb, traverses focus and shows the ring — and asserts the guest's
+own state has *not* changed, so the stall genuinely happened, and that all of
+it completed inside the stall window. Then the queued commit arrives.
+
+That is one test that would fail if any of: scroll ownership, focus ownership,
+pressed presentation, or the two-thread split were quietly wrong.
+
+#### The Gallery is also the F4 fixture
+
+There is no separate accessibility test app. `guests/a11y-smoke` was folded into
+the Gallery and deleted: a fixture nothing else runs is a fixture that drifts
+from what it represents, and the Gallery is exercised on every test run. See
+`docs/F4-SMOKE.md`.
+
+#### What the catalog still owes
+
+The visual half — Row/Stack, grow/shrink/min/max, hidden and display-none,
+clipping, text weights and sizes, backgrounds, borders and radii, disabled
+state, scrollbars — proves every primitive works. It comes after the Lab
+because it probes the layer that already has the most tests.
+
+Missing primitives go in `docs/GALLERY-LEDGER.md` rather than into the wire.
+The rule is unchanged: the Gallery discovers missing primitives; it does not
+automatically justify implementing them.
 
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
