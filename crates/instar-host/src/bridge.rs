@@ -679,8 +679,14 @@ impl HostBridge {
     /// caller still has to do. The send is non-blocking: winit's thread waits
     /// for nothing.
     pub fn on_window_event(&mut self, event: WindowOutput) -> Vec<HostEffect> {
-        self.host
-            .handle(event)
+        let effects = self.host.handle(event);
+        self.consume_guest_sends(effects)
+    }
+
+    /// Turns every [`HostEffect::SendToGuest`] into a queued runtime command,
+    /// leaving only what the caller still has to do.
+    fn consume_guest_sends(&mut self, effects: Vec<HostEffect>) -> Vec<HostEffect> {
+        effects
             .into_iter()
             .filter(|effect| match effect {
                 HostEffect::SendToGuest(bytes) => {
@@ -691,6 +697,42 @@ impl HostBridge {
                 _ => true,
             })
             .collect()
+    }
+
+    /// Routes one accessibility action, on the main thread.
+    ///
+    /// Filters [`HostEffect::SendToGuest`] exactly as
+    /// [`Self::on_window_event`] does -- an activation arriving from an
+    /// assistive technology reaches the guest by the same route a click does,
+    /// because by this point they are the same intent.
+    pub fn on_accessibility_action(
+        &mut self,
+        action: accesskit::Action,
+        target: accesskit::NodeId,
+    ) -> Vec<HostEffect> {
+        let window = self.window;
+        let effects = self.host.on_accessibility_action(window, action, target);
+        self.consume_guest_sends(effects)
+    }
+
+    /// What the platform accessibility adapter has not yet been told.
+    ///
+    /// Calling this *drains*: what it returns is not offered again. The caller
+    /// must therefore only ask when something is listening, or the update is
+    /// lost. See [`Self::full_accessibility_tree`] for the way back.
+    pub fn accessibility_update(&mut self) -> Option<accesskit::TreeUpdate> {
+        let window = self.window;
+        self.host.accessibility_update(window)
+    }
+
+    /// The whole tree, as the platform requires on first activation.
+    ///
+    /// An adapter that has just attached knows nothing, so an incremental
+    /// update would describe changes to a tree it does not have.
+    pub fn full_accessibility_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        let window = self.window;
+        self.host.reset_accessibility(window);
+        self.host.accessibility_update(window)
     }
 
     /// Asks the runtime to cancel one in-flight operation.
