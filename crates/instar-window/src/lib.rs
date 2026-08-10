@@ -217,6 +217,12 @@ pub struct RawKeyEvent {
     /// button held with Space is pressed-looking for as long as it is held.
     pub pressed: bool,
     pub shift: bool,
+    /// Whether the platform is autorepeating a held key.
+    ///
+    /// Carried rather than filtered here, because what a repeat *means* is a
+    /// UI question: it should re-activate a scroll step and must not
+    /// re-activate a button.
+    pub repeat: bool,
 }
 
 /// The window's geometry changed: resized, moved between monitors, or the

@@ -610,6 +610,10 @@ impl Host {
             // still reach it? A generational key makes a reused id answer no
             // without a rule saying so.
             window.focus.retire(tree);
+            // And a Space held on a node that commit disabled, hid, removed,
+            // or replaced at a new generation.
+            let focused = window.focus.focused();
+            window.interaction.retire_keyboard_press(tree, focused);
         }
         // Only when something that can move a rectangle changed. A paint-only
         // commit -- a colour, a border, a corner radius -- keeps the geometry
@@ -987,7 +991,7 @@ impl Host {
     /// branch here that can reach the guest.
     fn on_key(&mut self, event: instar_window::RawKeyEvent) -> Vec<HostEffect> {
         if !event.pressed {
-            return Vec::new();
+            return self.on_key_release(event);
         }
         let Some(window) = self.windows.get_mut(&event.window_id) else {
             return Vec::new();
@@ -999,28 +1003,94 @@ impl Host {
             return Vec::new();
         };
 
-        let moved = match event.key {
+        let focused = window.focus.focused();
+        let mut action = None;
+        let changed = match event.key {
             instar_window::Key::Tab => {
+                // Autorepeat is *wanted* here: holding Tab walks the form.
                 let direction = if event.shift {
                     FocusMove::Previous
                 } else {
                     FocusMove::Next
                 };
-                window.focus.traverse(tree, direction)
+                let moved = window.focus.traverse(tree, direction);
+                // Moving focus abandons a Space the user is still holding on
+                // the control they moved away from.
+                let cancelled = window
+                    .interaction
+                    .retire_keyboard_press(tree, window.focus.focused());
+                moved || cancelled
+            }
+            // Activates outright, with nothing held and therefore nothing to
+            // show. Autorepeat is refused: holding Enter on a button is one
+            // activation, not forty.
+            instar_window::Key::Enter if !event.repeat => {
+                action = window.interaction.on_enter(tree, focused);
+                false
+            }
+            // Captures, so the release completes against *this* node rather
+            // than whatever is focused by then. A repeat while already held
+            // changes nothing.
+            instar_window::Key::Space if !event.repeat => {
+                window.interaction.on_keyboard_press(tree, focused)
             }
             _ => false,
         };
-        if !moved {
+
+        let mut effects = Vec::new();
+        if let Some(action) = action {
+            effects.push(HostEffect::SendToGuest(action.encode()));
+        }
+        if !changed && effects.is_empty() {
             return Vec::new();
         }
 
-        // Focus is drawn, so moving it is a visual change -- and *only* a
-        // visual one. The scene is re-lowered; layout and shaping are not
-        // touched, which is the structural invariant E1 asserts.
+        // Focus and pressed state are both drawn, so either moving is a visual
+        // change -- and *only* a visual one. The scene is re-lowered; layout
+        // and shaping are not touched, which is the structural invariant E1
+        // asserts and E2 inherits.
         self.rebuild_scene(event.window_id);
-        vec![HostEffect::Render {
+        effects.push(HostEffect::Render {
             window: event.window_id,
-        }]
+        });
+        effects
+    }
+
+    /// A key coming up. Only Space means anything so far.
+    fn on_key_release(&mut self, event: instar_window::RawKeyEvent) -> Vec<HostEffect> {
+        if event.key != instar_window::Key::Space {
+            return Vec::new();
+        }
+        let Some(window) = self.windows.get_mut(&event.window_id) else {
+            return Vec::new();
+        };
+        if window.metrics.usable().is_none() {
+            return Vec::new();
+        }
+        let Some(tree) = window.tree.as_ref() else {
+            return Vec::new();
+        };
+        if window.interaction.press().is_none() {
+            // A release with nothing held: a Space that began before this
+            // window had focus, or after its capture was retired.
+            return Vec::new();
+        }
+
+        let focused = window.focus.focused();
+        let action = window.interaction.on_keyboard_release(tree, focused);
+
+        // The chrome clears whether or not it activated, because the key is up
+        // either way -- and it clears now, not when the guest gets round to
+        // the activation.
+        self.rebuild_scene(event.window_id);
+        let mut effects = Vec::new();
+        if let Some(action) = action {
+            effects.push(HostEffect::SendToGuest(action.encode()));
+        }
+        effects.push(HostEffect::Render {
+            window: event.window_id,
+        });
+        effects
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -1713,6 +1783,7 @@ mod tests {
             key: k,
             pressed: true,
             shift,
+            repeat: false,
         })
     }
 
@@ -1913,6 +1984,274 @@ mod tests {
             None,
             "a button that happens to reuse id 93 must not inherit the \
              keyboard from the one that had it"
+        );
+    }
+
+    // --- E2: keyboard activation. ---
+
+    fn key_event(k: instar_window::Key, pressed: bool, repeat: bool) -> WindowOutput {
+        WindowOutput::Key(instar_window::RawKeyEvent {
+            window_id: WINDOW,
+            key: k,
+            pressed,
+            shift: false,
+            repeat,
+        })
+    }
+
+    fn activations(effects: &[HostEffect]) -> Vec<Vec<u8>> {
+        to_guest(effects).into_iter().cloned().collect()
+    }
+
+    /// Focus already on button 91.
+    fn keyboard_host() -> Host {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        host.handle(key(instar_window::Key::Tab, false));
+        host
+    }
+
+    #[test]
+    fn enter_activates_the_focused_button_exactly_once() {
+        let mut host = keyboard_host();
+        let effects = host.handle(key_event(instar_window::Key::Enter, true, false));
+        assert_eq!(
+            activations(&effects),
+            vec![UiAction::ButtonActivated(NodeKey::first(91)).encode()],
+            "Enter produces the same semantic event a click does"
+        );
+    }
+
+    #[test]
+    fn enter_autorepeat_does_not_multiply_activation() {
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Enter, true, false));
+        let repeated = host.handle(key_event(instar_window::Key::Enter, true, true));
+        assert!(
+            activations(&repeated).is_empty(),
+            "holding Enter on a button is one activation, not forty"
+        );
+    }
+
+    #[test]
+    fn space_presses_on_the_way_down_and_activates_on_the_way_up() {
+        let mut host = keyboard_host();
+
+        let down = host.handle(key_event(instar_window::Key::Space, true, false));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91)),
+            "the button is held"
+        );
+        assert!(
+            activations(&down).is_empty(),
+            "and the guest hears nothing yet"
+        );
+        assert!(
+            down.iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "pressed chrome is drawn immediately"
+        );
+
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert_eq!(
+            activations(&up),
+            vec![UiAction::ButtonActivated(NodeKey::first(91)).encode()]
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "and the hold is released"
+        );
+    }
+
+    #[test]
+    fn space_repeat_while_held_changes_nothing() {
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        let repeated = host.handle(key_event(instar_window::Key::Space, true, true));
+        assert!(
+            repeated.is_empty(),
+            "a repeat of an already-held Space is not a new press and not a \
+             frame: {repeated:?}"
+        );
+    }
+
+    #[test]
+    fn space_up_without_space_down_does_nothing() {
+        let mut host = keyboard_host();
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(up.is_empty(), "nothing was held, so nothing is released");
+    }
+
+    /// Space captures, exactly as a pointer press does. Release must not
+    /// activate whatever happens to be focused by then.
+    #[test]
+    fn moving_focus_between_space_down_and_up_activates_nothing() {
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::first(92)));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "moving away abandons the hold"
+        );
+
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(
+            activations(&up).is_empty(),
+            "neither the button that was held nor the one now focused activates"
+        );
+    }
+
+    #[test]
+    fn disabling_the_held_button_before_release_activates_nothing() {
+        use instar_ui::Node;
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Space, true, false));
+
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::text(90, "label"),
+                    Node::button(91, "first").disabled(),
+                    Node::button(92, "second"),
+                ],
+            )),
+        )
+        .expect("valid");
+
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(activations(&up).is_empty());
+    }
+
+    /// The generational case, for the keyboard capture rather than for focus.
+    #[test]
+    fn a_reused_id_cannot_be_activated_by_a_space_held_on_its_predecessor() {
+        use instar_ui::{Node, NodeKind, WireLayout};
+        let with_generation = |generation: u32| {
+            Tree::new(Node::root(
+                0,
+                vec![Node {
+                    key: NodeKey::new(93, generation),
+                    kind: NodeKind::Button {
+                        label: "reused".into(),
+                        enabled: true,
+                    },
+                    layout: WireLayout::default(),
+                    style: Default::default(),
+                    children: Vec::new(),
+                }],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        host.handle(key(instar_window::Key::Tab, false));
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::new(93, 0))
+        );
+
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(94, "gap")])),
+        )
+        .expect("valid");
+        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(
+            activations(&up).is_empty(),
+            "generation 1 never activates from a Space held on generation 0"
+        );
+    }
+
+    /// One capture slot shared by two input paths would let each complete the
+    /// other's press.
+    #[test]
+    fn pointer_and_keyboard_presses_cannot_complete_each_other() {
+        let mut host = keyboard_host();
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(91)))
+            .unwrap();
+        let (x, y) = (f64::from(rect.x + 1), f64::from(rect.y + 1));
+
+        // Space down, then a pointer release over the same button.
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        let released = host.handle(pointer(PointerState::Released, x, y));
+        assert!(
+            activations(&released).is_empty(),
+            "a pointer release must not complete a press the keyboard started"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91)),
+            "and must not steal the capture either"
+        );
+
+        // The other direction.
+        let mut host = keyboard_host();
+        host.handle(pointer(PointerState::Pressed, x, y));
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(
+            activations(&up).is_empty(),
+            "a Space release must not complete a press the mouse started"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91)),
+            "the pointer still holds it"
+        );
+    }
+
+    /// The keyboard counterpart of D's drag test, splitting the two properties
+    /// that have different answers.
+    #[test]
+    fn a_held_space_paints_immediately_while_the_guest_is_blocked() {
+        let mut host = keyboard_host();
+        let stalled_until = Instant::now() + Duration::from_millis(100);
+
+        let down = host.handle(key_event(instar_window::Key::Space, true, false));
+        assert!(
+            Instant::now() < stalled_until,
+            "the press was handled inside the stall window, so the guest \
+             could not have participated"
+        );
+        assert!(
+            activations(&down).is_empty(),
+            "interaction feedback does not consult the guest"
+        );
+
+        // Property one: presentation changed, now.
+        let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+        let pressed_face = host.theme().pressed_face;
+        assert!(
+            scene.commands.iter().any(|command| matches!(
+                command,
+                instar_paint::PaintCommand::FillRect { color, .. } if *color == pressed_face
+            )),
+            "the button is drawn pressed before the guest could run"
+        );
+
+        // Property two: the consequence is queued, and is allowed to wait.
+        let up = host.handle(key_event(instar_window::Key::Space, false, false));
+        assert!(Instant::now() < stalled_until, "and so was the release");
+        assert_eq!(
+            activations(&up),
+            vec![UiAction::ButtonActivated(NodeKey::first(91)).encode()],
+            "exactly one activation, carrying the captured generational key"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "and the chrome cleared without waiting for the guest to act on it"
         );
     }
 

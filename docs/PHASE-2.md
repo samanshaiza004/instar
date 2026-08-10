@@ -882,6 +882,66 @@ pointer click                      ->  focus may move, focus_visible = false
 That keeps a keyboard-style ring off the screen after every mouse click without
 the guest tracking input modality.
 
+#### E2 — keyboard activation
+
+> Keyboard interaction has the same semantic outcome as pointer interaction,
+> while transient pressed presentation stays entirely host-local.
+
+```text
+Enter down    activate the focused button; ignore autorepeat
+Space down    capture the focused button as keyboard-pressed
+              show pressed chrome immediately; no guest event yet
+Space up      activate only if the *captured* key is still focused,
+              enabled and interactive; always clear the capture
+Space repeat  ignored
+```
+
+**Space captures, exactly as a pointer press does.** Release must not activate
+"whatever is focused now":
+
+```text
+Space down on (7,0)  ->  focus moves to (8,0)  ->  Space up  ->  nothing
+```
+
+The capture is cancelled by everything that makes the captured key ineligible —
+removal, hiding, disabling, focus moving away, the window losing OS focus, a
+commit that replaces the generation. Which is the general form of a rule this
+stage keeps rediscovering:
+
+> Any transient interaction naming a `NodeKey` is retired when that key stops
+> being eligible.
+
+**A press needs to know its source.** One `pressed: Option<NodeKey>` would let
+a pointer release complete a Space press, and a Space release complete a
+pointer press — two input paths quietly sharing one capture slot. The press
+records where it came from and only the matching release completes it.
+
+**No new guest events.** Ordinary buttons produce the same semantic outcome
+whatever activated them:
+
+```text
+pointer ──┐
+Enter ────┼──>  host activation policy  ──>  ButtonActivated { key }
+Space ────┘
+```
+
+That convergence is what makes F small: AccessKit joins the same arrow rather
+than forking a second activation path.
+
+The hostile test splits the two properties that matter, because they have
+different answers:
+
+```text
+guest blocked 100 ms
+  Space down  ->  pressed chrome changes before the guest could run
+  Space up    ->  chrome clears immediately, activation is queued
+after the stall
+              ->  exactly one ButtonActivated, carrying the captured
+                  generational key
+```
+
+Application consequence may wait for Wasm. Interaction feedback may not.
+
 #### The structural invariant, modelled on C5
 
 > Moving focus without changing the guest tree must not enter layout or
