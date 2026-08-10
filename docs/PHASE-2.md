@@ -1266,6 +1266,13 @@ activation takes a separate path: `reset_accessibility` then a full projection,
 via `HostBridge::full_accessibility_tree`. An incremental update on that path
 would describe changes to a tree the platform does not have.
 
+What was actually observed, beyond compiling: the shell was launched on macOS
+with the counter guest and ran — window created invisible, adapter constructed,
+window shown, guest committed, frames presented, no panic. That establishes the
+lifecycle ordering `accesskit_winit` requires, since `with_direct_handlers`
+panics outright if the window is already visible. It establishes nothing about
+VoiceOver, which is F4.
+
 Eleven faults injected across the two crates, all caught: the metrics barrier
 dropped, the projection always reset, `ScrollIntoView` misrouted to `Focus`,
 unsupported actions falling through to `Activate`, the generation half of a
