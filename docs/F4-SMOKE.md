@@ -8,10 +8,34 @@ Three platforms, three separate native adapters underneath AccessKit. Passing on
 one says nothing about the others, so each is its own gate.
 
 ```text
-macOS     VoiceOver   PENDING
+macOS     VoiceOver   PENDING -- see below
 Windows   Narrator    PENDING
 Linux     Orca        PENDING
 ```
+
+macOS is a more specific state than the other two, and worth stating precisely
+rather than rounding to either word:
+
+```text
+macOS F4:
+  platform integration          observed working
+  defects found via VoiceOver   fixed + regression-tested
+  formal checklist              PENDING
+```
+
+Three defects were found by pointing VoiceOver at the Gallery, and all three
+are fixed with regressions: accessibility bounds were logical where AccessKit
+documents physical, a scrolled viewport reported its contents at their resting
+positions, and the focus ring was painted and then covered. VoiceOver was then
+observed working. **That is not the same claim as "the acceptance procedure
+passed."**
+
+The gap is not pedantry. VoiceOver's cursor and keyboard focus are distinct
+states with explicit commands to synchronize them, and Tab behaviour varies
+with VoiceOver's navigation configuration — so an informal pass can look
+correct while resting on exactly the assumption the checklist is written to
+break. `PASS` should mean the procedure below was followed deliberately, once,
+against a named build. Until then it says `PENDING`.
 
 Phase 2 does not close until all three are recorded here. None of them blocks
 package G — the architectural uncertainty they resolve is small, and withholding
@@ -153,6 +177,10 @@ loop is the last mile no automated test here can cover.
 7  Enter there activates it; the readout changes
 ```
 
+VoiceOver **off** for all seven, deliberately. Its navigation configuration can
+change what Tab does, so running this pass with it on would test the two
+together and reveal which was at fault only by luck.
+
 Step 5's "while held" is worth watching rather than glancing at: pressed
 presentation is host-owned, and a release that does not arrive would leave a
 button looking stuck.
@@ -192,8 +220,17 @@ containing scrollable regions — which lines up almost exactly with Instar's
 `reveal`, and Instar reveals innermost-outwards, recomputing between steps.
 Whether the platform agrees is the open question.
 
-Step 10 is the corrected expectation. Do **not** expect steps 2 or 7 to move
-Instar's focus.
+Step 8 is worth watching closely rather than accepting: check that VoiceOver's
+highlight lands on the same pixels the control actually occupies. That is the
+bug the first run found — bounds in the wrong coordinate space put the
+highlight at half size and half offset — and a highlight that is merely *near*
+the right place still means the transform chain is wrong.
+
+Step 10 is the corrected expectation, and the most important line in this
+document. Do **not** expect steps 2 or 7 to move Instar's focus: `VO-Left` and
+`VO-Right` move the VoiceOver cursor, which macOS keeps separate from keyboard
+focus. Step 10 synchronizes them explicitly and *then* checks Instar. Judging
+steps 2 or 7 by the focus ring would fail a correctly-behaving application.
 
 ### Deactivation and reattachment
 
@@ -225,10 +262,26 @@ feature choice on `accesskit_winit`; Instar takes the default (`async-io`).
 
 ## Recording a result
 
-Replace the `PENDING` line with the date, the OS and screen reader versions, and
-the highest step reached in each pass. A partial result is a useful result:
-"pass 1 clean, pass 2 reached step 6, activation did not fire" is a bug report.
-"PENDING" is not.
+A `PASS` has to be reproducible, which means naming what was tested. Fill this
+in and replace the platform's status line with it.
+
+```text
+macOS F4: PASS
+  macOS          26.5.2 (25F84)
+  commit         2129e58
+  date
+  pass 1         steps 1-7
+  pass 2         steps 1-11
+  detach/attach  steps 12-13
+  notes
+```
+
+Windows and Linux are separate rows. A clean macOS run marks macOS `PASS` and
+nothing else — it neither waits on the other two nor holds up package G.
+
+A partial result is a useful result and should be recorded as one: "pass 1
+clean, pass 2 reached step 6, activation did not fire" is a bug report.
+`PENDING` is not.
 
 Paste the `--debug` a11y lines alongside it. What a platform actually asks for
 is the most reusable thing this exercise produces, and it is worth having on
