@@ -471,9 +471,20 @@ fn catalog() -> Vec<El> {
         ),
         // The open question from the ledger, as a pair of specimens rather
         // than an argument. Both viewports overflow, so both grow a bar.
+        // The ledger's question, answered. Styling *can* make a nested
+        // viewport obviously distinct -- the delineated specimen reads as its
+        // own region immediately -- and two overlay bars are still
+        // indistinguishable once it does. So the boundary was never the root
+        // problem, and `Scroll` needs no default chrome.
+        //
+        // What differs between runs is the host's scrollbar policy, not
+        // anything here: run with and without `--inset-scrollbars` and compare
+        // these same two specimens. It is two runs rather than a side-by-side
+        // because the policy is one choice for the application, which is the
+        // price of keeping it off the wire.
         section(
             210,
-            "Nested Scroll: the ledger's open question",
+            "Nested Scroll: run with and without --inset-scrollbars",
             vec![
                 caption(212, "plain: no boundary of its own"),
                 nested_specimen(220, None),

@@ -69,6 +69,49 @@ impl ScrollOffset {
 /// Thickness of a scrollbar, in logical pixels. Host policy.
 pub const SCROLLBAR_THICKNESS: i32 = 12;
 
+/// Where a scrollbar lives relative to the content it scrolls.
+///
+/// Host presentation policy, not `Scroll` semantics and not a guest concern.
+/// Scroll offsets, extents, interaction and the retirement rules are identical
+/// under both; the only difference is whether the chrome shares the viewport's
+/// last [`SCROLLBAR_THICKNESS`] logical pixels with the content or is given
+/// them.
+///
+/// It exists because the Gallery's nested-viewport experiment produced a clear
+/// answer. Styling *can* make a nested scroll region obviously distinct — a
+/// background, a border and a radius were enough, so `Scroll` needs no default
+/// chrome. But even with the boundary unmistakable, two overlay bars still
+/// land in the same right-edge band and cannot be told apart. Viewport
+/// legibility was not the root problem.
+///
+/// Treating this as policy rather than as scrolling semantics has strong
+/// precedent: AppKit supports overlay and legacy scrollers and picks between
+/// them from a *user preference*, GTK has an explicit overlay-scrolling
+/// setting, and Qt's classic scroll area reserves viewport space for a bar.
+/// Three toolkits, one axis, and none of them makes it intrinsic to the widget.
+///
+/// The invariant that survives both: a bar belongs on the edge of the viewport
+/// it scrolls. `Inset` changes how wide the usable content rectangle is; it
+/// never moves a nested bar sideways because another bar happens to exist
+/// nearby, and nesting depth never enters the geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarStyle {
+    /// The bar paints over the viewport's edge. Content keeps the full width,
+    /// and whatever is under the bar is covered by it.
+    #[default]
+    Overlay,
+    /// The bar gets its own strip. The content rectangle is narrower by
+    /// [`SCROLLBAR_THICKNESS`], and nothing is ever hidden beneath chrome.
+    ///
+    /// The strip is reserved whether or not the content currently overflows.
+    /// Reserving only when a bar appears — as Qt's classic scroll area does —
+    /// makes the content reflow at the moment it crosses the threshold, and
+    /// for a viewport whose content is near its own height that oscillates.
+    /// CSS calls the stable version `scrollbar-gutter: stable`, and it is the
+    /// same trade: a little space always, or a reflow sometimes.
+    Inset,
+}
+
 /// The shortest a thumb is allowed to get, in logical pixels.
 ///
 /// Host policy, and the reason thumb position is not simply proportional: in a

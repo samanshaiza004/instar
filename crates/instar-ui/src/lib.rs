@@ -46,7 +46,7 @@ pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
 pub use scroll::{
     MIN_THUMB_LENGTH, SCROLLBAR_THICKNESS, ScrollDeltaPixels, ScrollOffset, ScrollOutcome,
-    ScrollState, Scrollbar, ScrollbarPart, ThumbDrag,
+    ScrollState, Scrollbar, ScrollbarPart, ScrollbarStyle, ThumbDrag,
 };
 pub use text::{
     Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
@@ -439,7 +439,22 @@ impl Tree {
     /// The host owns geometry entirely: this is the only source of a
     /// [`LayoutSnapshot`], and a guest cannot supply one.
     pub fn layout(&self, text: &mut TextContext, viewport: Viewport) -> LayoutSnapshot {
-        layout::compute(text, self, viewport)
+        self.layout_with(text, viewport, ScrollbarStyle::default())
+    }
+
+    /// Layout under an explicit scrollbar presentation policy.
+    ///
+    /// [`ScrollbarStyle::Inset`] narrows a viewport's content rectangle to
+    /// make room for its chrome, which is a layout fact and therefore has to
+    /// be decided here rather than at paint time. The policy is the host's to
+    /// choose; the type lives here because layout is what has to honour it.
+    pub fn layout_with(
+        &self,
+        text: &mut TextContext,
+        viewport: Viewport,
+        scrollbars: ScrollbarStyle,
+    ) -> LayoutSnapshot {
+        layout::compute(text, self, viewport, scrollbars)
     }
 
     /// Finds the innermost interactive node containing `(x, y)`.

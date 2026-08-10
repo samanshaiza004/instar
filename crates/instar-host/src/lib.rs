@@ -54,7 +54,7 @@ use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
 use instar_ui::{
     FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart,
-    TextContext, TreeError, UiAction, Viewport,
+    ScrollbarStyle, TextContext, TreeError, UiAction, Viewport,
 };
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
@@ -269,7 +269,7 @@ impl HostWindow {
     ///
     /// Does nothing while blocked, which is the barrier's "no layout" rule
     /// enforced at the only place layout is produced.
-    fn recompute_layout(&mut self, text: &mut TextContext) {
+    fn recompute_layout(&mut self, text: &mut TextContext, scrollbars: ScrollbarStyle) {
         let (Some(metrics), Some(tree)) = (self.metrics.usable(), self.tree.as_ref()) else {
             return;
         };
@@ -277,7 +277,7 @@ impl HostWindow {
             metrics.logical_size.width as f32,
             metrics.logical_size.height as f32,
         );
-        self.layout = Some(tree.layout(text, viewport));
+        self.layout = Some(tree.layout_with(text, viewport, scrollbars));
     }
 
     /// Confines every retained offset to what the current layout leaves
@@ -388,6 +388,12 @@ pub struct InteractionStats {
 #[derive(Debug)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
+    /// Where scrollbars live relative to the content they scroll.
+    ///
+    /// Host policy, one choice for the whole application, and deliberately not
+    /// on the wire: a guest describes *that* something scrolls, never how the
+    /// chrome for it is presented. See [`instar_ui::ScrollbarStyle`].
+    scrollbars: ScrollbarStyle,
     /// What the window is showing — the guest's interface, or the host's own
     /// account of why it no longer can. Not per-window: Phase 1 is one guest
     /// and one window, and a dead guest is a fact about the runtime rather
@@ -411,6 +417,7 @@ impl Host {
     pub fn new() -> Self {
         Self {
             windows: HashMap::new(),
+            scrollbars: ScrollbarStyle::default(),
             presentation: PresentationState::default(),
             interaction_stats: InteractionStats::default(),
             scenes: SceneBuilder::new(),
@@ -566,6 +573,32 @@ impl Host {
             window.redraw_pending = true;
             Vec::new()
         }
+    }
+
+    /// Chooses where scrollbars sit relative to the content they scroll.
+    ///
+    /// Host policy: one choice for the application, not a per-viewport or
+    /// per-guest setting. [`ScrollbarStyle::Inset`] narrows every viewport's
+    /// content rectangle, so this is a layout change and every window is
+    /// recomputed — which also means it is correct to call after a tree
+    /// exists, not only at startup.
+    pub fn set_scrollbar_style(&mut self, scrollbars: ScrollbarStyle) {
+        if self.scrollbars == scrollbars {
+            return;
+        }
+        self.scrollbars = scrollbars;
+        let ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for window_id in ids {
+            if let Some(window) = self.windows.get_mut(&window_id) {
+                window.recompute_layout(&mut self.text, scrollbars);
+                window.clamp_scroll();
+            }
+            self.rebuild_scene(window_id);
+        }
+    }
+
+    pub fn scrollbar_style(&self) -> ScrollbarStyle {
+        self.scrollbars
     }
 
     pub fn interaction_stats(&self) -> InteractionStats {
@@ -885,7 +918,7 @@ impl Host {
         // is a property of the cache's internals rather than of this path.
         // Not entering it at all cannot regress.
         if changes.needs_layout() {
-            window.recompute_layout(&mut self.text);
+            window.recompute_layout(&mut self.text, self.scrollbars);
         }
         // After layout, because the scrollable extent is a layout answer, and
         // before the scene is lowered and the commit is acknowledged, because
@@ -917,7 +950,7 @@ impl Host {
         // Order matters and is the barrier's exit rule: layout first, then the
         // snapshot is replaced, then the scene is lowered against it, and only
         // then may anything be rendered.
-        window.recompute_layout(&mut self.text);
+        window.recompute_layout(&mut self.text, self.scrollbars);
         let wanted = window.redraw_pending || window.layout.is_some();
         self.rebuild_scene(window_id);
 

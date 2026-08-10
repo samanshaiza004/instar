@@ -41,6 +41,7 @@ use std::time::Instant;
 use instar_host::HostEffect;
 use instar_host::bridge::{HostBridge, Wake};
 use instar_shell::{Presenter, default_font};
+use instar_ui::ScrollbarStyle;
 use instar_window::{WindowOutput, WindowState, winit_adapter};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -142,6 +143,15 @@ fn main() -> std::process::ExitCode {
 struct Args {
     component: PathBuf,
     debug: bool,
+    /// Where scrollbars sit relative to content. Host policy, so it is a shell
+    /// flag rather than anything a guest can say.
+    ///
+    /// A flag rather than a per-viewport setting because the policy is one
+    /// choice for the whole application — which means comparing the two is
+    /// two runs, not a side-by-side. That is a real cost of keeping it off the
+    /// wire, and the right cost to pay until an application shows it needs to
+    /// override the host.
+    scrollbars: ScrollbarStyle,
 }
 
 impl Args {
@@ -151,12 +161,14 @@ impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut component: Option<PathBuf> = None;
         let mut debug = false;
+        let mut scrollbars = ScrollbarStyle::default();
         let mut command: Option<String> = None;
 
         for arg in args {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
                 "--debug" => debug = true,
+                "--inset-scrollbars" => scrollbars = ScrollbarStyle::Inset,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other:?}"));
                 }
@@ -169,7 +181,11 @@ impl Args {
         match command.as_deref() {
             None => Err("no command given".to_string()),
             Some("run") => match component {
-                Some(component) => Ok(Some(Self { component, debug })),
+                Some(component) => Ok(Some(Self {
+                    component,
+                    debug,
+                    scrollbars,
+                })),
                 None => Err("run needs the path to a component".to_string()),
             },
             // Named rather than lumped in with a typo: someone typing
@@ -204,7 +220,12 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|error| format!("could not start an event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut shell = Shell::new(event_loop.create_proxy(), component, args.debug);
+    let mut shell = Shell::new(
+        event_loop.create_proxy(),
+        component,
+        args.debug,
+        args.scrollbars,
+    );
     let result = event_loop
         .run_app(&mut shell)
         .map_err(|error| format!("the event loop failed: {error}"));
@@ -237,6 +258,7 @@ struct Shell {
     proxy: EventLoopProxy<ShellEvent>,
     component: Vec<u8>,
     debug: bool,
+    scrollbars: ScrollbarStyle,
     /// Set when startup fails inside `resumed`, where there is nothing to
     /// return an error *to*. Reported after the loop ends, so a shell that
     /// could not start exits non-zero rather than looking like a clean run.
@@ -251,11 +273,17 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(proxy: EventLoopProxy<ShellEvent>, component: Vec<u8>, debug: bool) -> Self {
+    fn new(
+        proxy: EventLoopProxy<ShellEvent>,
+        component: Vec<u8>,
+        debug: bool,
+        scrollbars: ScrollbarStyle,
+    ) -> Self {
         Self {
             proxy,
             component,
             debug,
+            scrollbars,
             startup_error: None,
             native: None,
             surface: None,
@@ -560,8 +588,13 @@ impl ApplicationHandler<ShellEvent> for Shell {
                 );
             }
         };
+        bridge.set_scrollbar_style(self.scrollbars);
         if self.debug {
-            eprintln!("instar: {} started", bridge.generation());
+            eprintln!(
+                "instar: {} started, scrollbars {:?}",
+                bridge.generation(),
+                self.scrollbars
+            );
         }
 
         match softbuffer::Context::new(Arc::clone(&window))

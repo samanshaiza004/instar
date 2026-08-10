@@ -101,14 +101,20 @@ answer often enough to be mistaken for it.
 **Calculator likely needs it.** Almost certainly. A right-aligned display is
 close to universal for calculators.
 
-**Decision.** Record, and expect to implement. This is the strongest candidate
-in the ledger, but it belongs to the text architecture rather than to G — Phase
-3 owns shaping, and alignment is a shaping property. Hold until the Calculator
-confirms it, then decide whether it is a Phase 2 addition or waits for Phase 3.
+**Decision.** Record, and expect to implement. The strongest candidate in the
+ledger.
+
+Alignment is implemented in the shaping layer, but it is not therefore a
+*Phase 3 feature*: it is not an editing capability, it is an ordinary UI
+requirement that happens to be satisfied by shaping. If the Calculator
+independently needs a right-aligned display — which is close to universal for
+calculators — that is precisely the second-application evidence Phase 2's
+freeze criterion asks for, and it should be promoted to an ordinary Phase 2
+addition rather than deferred by where its implementation lands.
 
 ---
 
-## 4. Nested viewports put their scrollbars in the same place
+## 4. Nested viewports put their scrollbars in the same place — CLOSED
 
 **Missing capability.** Any way to tell two overlapping scroll regions apart.
 
@@ -131,49 +137,64 @@ thing a viewer found confusing.
 **Calculator likely needs it.** No — a calculator has one scroll region at
 most.
 
-**Decision.** Unresolved on purpose, and the visual catalog is what resolves
-it. Neither answer is inherently correct: AppKit supports both overlay and
-legacy scroller styles, and derives the preferred one from a *user preference*
-rather than from the widget — non-overlay scrollers inset content, overlay ones
-sit over it. That is strong evidence this is a presentation-policy axis, not
-something `Scroll` should silently decide for all time.
+**Decision.** **Resolved by the catalog, and closed as a host policy.** The
+two specimens answered both questions.
 
-So Instar does not change from overlay to reserved-space bars on the strength
-of one fixture. Nor does it give every `Scroll` default background or border
-chrome: plenty of legitimate scroll regions should disappear into the surface
-around them, and forcing a box on each one would make ordinary lists need to
-undo host styling.
+*Can existing styling make a nested region visually distinct?* **Yes.** A
+background, a border and a radius were enough — the delineated specimen reads
+as its own viewport immediately. So `Scroll` gets no default chrome, and an
+application expresses a boundary when it wants one. Plenty of legitimate scroll
+regions should disappear into the surface around them.
 
-The catalog carries the question as a pair of fixtures:
+*Once distinct, are coincident overlay bars still confusing?* **Yes.** With the
+boundary unmistakable, both bars still land in the same right-edge band and
+neither can be attributed to its viewport. Viewport legibility was never the
+root problem, which is exactly what the pair of specimens was built to
+separate.
+
+So `instar_ui::ScrollbarStyle { Overlay, Inset }` exists, chosen by the host:
 
 ```text
-Nested Scroll -- plain
-Outer Scroll
-└── Inner Scroll
-
-Nested Scroll -- delineated
-Outer Scroll
-└── Inner Scroll
-    background, border, radius, spacing
+Overlay   viewport rect unchanged; the bar paints over the content edge
+Inset     the bar gets its own strip; the content rectangle is narrower
+          by SCROLLBAR_THICKNESS; the bar stays on the viewport edge
 ```
 
-and answers two questions with them:
+Treating this as policy has strong precedent. AppKit supports overlay and
+legacy scrollers and selects between them from a *user preference*; GTK has an
+explicit overlay-scrolling setting; Qt's classic scroll area reserves viewport
+space when a bar appears. Three toolkits, one axis, and none of them makes it
+intrinsic to the widget.
 
-1. Can the existing style and layout primitives make a nested region visually
-   obvious, with no new runtime semantics?
-2. Once it is visually separated, are the coincident overlay bars still
-   genuinely confusing?
+What was deliberately **not** done, per the same reasoning:
 
-If (1) is yes and (2) becomes acceptable, this entry closes as application
-presentation responsibility. If the bars stay unusable even with an obvious
-viewport boundary, that is evidence for a host-level scrollbar policy —
-something like `Overlay | Inset`, decided by host or platform rather than by
-guest micromanagement.
+- no default background, border or separator on `Scroll`
+- no moving a nested bar inward because it is nested
+- no nesting depth anywhere in scrollbar geometry
+- no change to `Scroll` semantics: offsets, extents, bubbling, retirement and
+  interaction are identical under both policies
+- **not on the wire.** A guest says *that* something scrolls, never how its
+  chrome is presented. It goes on the wire only if an application shows it
+  genuinely needs to override the host, and neither the Gallery nor the
+  Calculator has yet.
 
-One thing that should *not* happen either way: an inner scrollbar moving inward
-merely because it is nested. That makes geometry depend on hierarchy depth, has
-no obvious answer at three levels, and stops a scrollbar corresponding to the
-edge of the viewport it scrolls.
+`Inset` reserves the strip whether or not the content currently overflows.
+Reserving only when a bar appears — Qt's classic behaviour — reflows content at
+the moment it crosses the threshold, and oscillates for a viewport whose
+content sits near its own height. CSS calls the stable version
+`scrollbar-gutter: stable`; it is the same trade, and stability is worth more
+than the twelve pixels.
+
+Compare them with the Gallery's own specimens:
+
+```bash
+./target/release/instar run guests/gallery/target/wasm32-wasip2/debug/gallery.wasm
+./target/release/instar run guests/gallery/target/wasm32-wasip2/debug/gallery.wasm --inset-scrollbars
+```
+
+Two runs rather than a side-by-side, because the policy is one choice for the
+application. That is the price of keeping it off the wire, and it is the right
+price until something demonstrates otherwise.
 
 ---
 

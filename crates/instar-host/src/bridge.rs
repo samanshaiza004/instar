@@ -699,6 +699,11 @@ impl HostBridge {
             .collect()
     }
 
+    /// Chooses where scrollbars sit. See [`Host::set_scrollbar_style`].
+    pub fn set_scrollbar_style(&mut self, scrollbars: instar_ui::ScrollbarStyle) {
+        self.host.set_scrollbar_style(scrollbars);
+    }
+
     /// Routes one accessibility action, on the main thread.
     ///
     /// Filters [`HostEffect::SendToGuest`] exactly as

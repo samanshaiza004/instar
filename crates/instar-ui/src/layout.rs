@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use instar_ui_protocol::{NodeKey, WireAlign, WireDisplay, WireJustify, WireSize};
 use taffy::prelude::*;
 
+use crate::scroll::{SCROLLBAR_THICKNESS, ScrollbarStyle};
 use crate::text::{self, FontRole, ShapedText, ShapingStyle, TextContext};
 use crate::{Node, NodeKind, Tree};
 
@@ -205,7 +206,7 @@ enum ChildOf {
     ScrollContent,
 }
 
-fn style(node: &Node, parent: ChildOf) -> Style {
+fn style(node: &Node, parent: ChildOf, scrollbars: ScrollbarStyle) -> Style {
     let layout = node.layout;
     let (display, flex_direction, gap) = match &node.kind {
         NodeKind::Stack => (
@@ -297,7 +298,21 @@ fn style(node: &Node, parent: ChildOf) -> Style {
         align_items: Some(align(layout.align_items)),
         justify_content: Some(justify(layout.justify_content)),
         justify_self: (parent == ChildOf::StackCell).then_some(AlignItems::START),
-        padding: taffy::Rect::length(f32::from(layout.padding)),
+        padding: {
+            let mut padding = taffy::Rect::length(f32::from(layout.padding));
+            // `Inset` gives the bar its own strip by narrowing the content
+            // rectangle. The viewport rect itself is untouched, so
+            // `Scrollbar::for_viewport` still puts the bar on the viewport's
+            // edge -- it now lands on reserved space rather than over content.
+            // One place decides this, and hit testing and painting both read
+            // the same geometry afterwards.
+            if matches!(node.kind, NodeKind::Scroll) && scrollbars == ScrollbarStyle::Inset {
+                padding.right = LengthPercentage::length(
+                    f32::from(layout.padding) + SCROLLBAR_THICKNESS as f32,
+                );
+            }
+            padding
+        },
         gap,
         grid_template_rows: if matches!(node.kind, NodeKind::Stack) {
             vec![auto()]
@@ -327,11 +342,16 @@ fn style(node: &Node, parent: ChildOf) -> Style {
 ///
 /// Deterministic: the same tree and viewport always produce the same snapshot,
 /// which is what makes hit-testing reproducible and these tests meaningful.
-pub fn compute(text: &mut TextContext, tree: &Tree, viewport: Viewport) -> LayoutSnapshot {
+pub fn compute(
+    text: &mut TextContext,
+    tree: &Tree,
+    viewport: Viewport,
+    scrollbars: ScrollbarStyle,
+) -> LayoutSnapshot {
     let mut taffy: TaffyTree<MeasureContext> = TaffyTree::new();
     let mut keys: Vec<(taffy::NodeId, NodeKey)> = Vec::new();
 
-    let root = build(&mut taffy, &tree.root, &mut keys);
+    let root = build(&mut taffy, &tree.root, &mut keys, scrollbars);
     let key_by_id: HashMap<taffy::NodeId, NodeKey> = keys.iter().copied().collect();
     let id_by_key: HashMap<NodeKey, taffy::NodeId> =
         keys.iter().map(|(id, key)| (*key, *id)).collect();
@@ -462,10 +482,11 @@ fn build(
     taffy: &mut TaffyTree<MeasureContext>,
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
+    scrollbars: ScrollbarStyle,
 ) -> taffy::NodeId {
     // The root's style is replaced wholesale in `compute`, and the root is
     // never anyone's special child.
-    build_with(taffy, node, keys, ChildOf::Normal)
+    build_with(taffy, node, keys, ChildOf::Normal, scrollbars)
 }
 
 fn build_with(
@@ -473,6 +494,7 @@ fn build_with(
     node: &Node,
     keys: &mut Vec<(taffy::NodeId, NodeKey)>,
     parent: ChildOf,
+    scrollbars: ScrollbarStyle,
 ) -> taffy::NodeId {
     let context = match &node.kind {
         NodeKind::Text { text } => Some(MeasureContext {
@@ -509,17 +531,19 @@ fn build_with(
     let id = if children.is_empty() {
         match context {
             Some(context) => taffy
-                .new_leaf_with_context(style(node, parent), context)
+                .new_leaf_with_context(style(node, parent, scrollbars), context)
                 .expect("taffy leaf"),
-            None => taffy.new_leaf(style(node, parent)).expect("taffy leaf"),
+            None => taffy
+                .new_leaf(style(node, parent, scrollbars))
+                .expect("taffy leaf"),
         }
     } else {
         let ids: Vec<taffy::NodeId> = children
             .iter()
-            .map(|child| build_with(taffy, child, keys, child_context))
+            .map(|child| build_with(taffy, child, keys, child_context, scrollbars))
             .collect();
         taffy
-            .new_with_children(style(node, parent), &ids)
+            .new_with_children(style(node, parent, scrollbars), &ids)
             .expect("taffy branch")
     };
 
@@ -604,7 +628,12 @@ mod intrinsic_sizing {
             ],
         ));
         let mut text = TextContext::new();
-        let snapshot = compute(&mut text, &tree, Viewport::new(480.0, 320.0));
+        let snapshot = compute(
+            &mut text,
+            &tree,
+            Viewport::new(480.0, 320.0),
+            ScrollbarStyle::Overlay,
+        );
 
         let header = snapshot.get(NodeKey::first(3)).expect("the header");
         let viewport = snapshot.get(NodeKey::first(1)).expect("the scroll");
@@ -626,6 +655,137 @@ mod intrinsic_sizing {
             "and the content keeps its own height -- squeezing it to the \
              viewport would leave nothing to scroll"
         );
+    }
+
+    /// `Inset` reserves the bar its own strip; `Overlay` does not.
+    ///
+    /// The Gallery's nested experiment showed that styling can make a nested
+    /// viewport obviously distinct, and that two overlay bars are *still*
+    /// indistinguishable once it is. So the fix is not viewport chrome, it is
+    /// where the bar lives.
+    #[test]
+    fn inset_narrows_the_content_rectangle_and_overlay_does_not() {
+        use crate::{ScrollbarStyle, WireAlign, WireLayout, WireSize};
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![Node::text(12, "tall").with_layout(WireLayout {
+                            height: WireSize::Fixed(600),
+                            ..WireLayout::default()
+                        })],
+                    )
+                    .with_layout(WireLayout {
+                        align_self: Some(WireAlign::Stretch),
+                        ..WireLayout::default()
+                    }),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+
+        let mut text = TextContext::new();
+        let overlay = tree.layout_with(
+            &mut text,
+            Viewport::new(400.0, 300.0),
+            ScrollbarStyle::Overlay,
+        );
+        let inset = tree.layout_with(
+            &mut text,
+            Viewport::new(400.0, 300.0),
+            ScrollbarStyle::Inset,
+        );
+
+        let viewport = NodeKey::first(10);
+        let content = NodeKey::first(11);
+
+        assert_eq!(
+            overlay.get(viewport).unwrap(),
+            inset.get(viewport).unwrap(),
+            "the viewport itself is the same rectangle under both -- the bar \
+             sits on its edge either way, and only the room left for content \
+             differs"
+        );
+        assert_eq!(
+            overlay.get(content).unwrap().width,
+            400,
+            "overlay lets content have the whole width, and paints over it"
+        );
+        assert_eq!(
+            inset.get(content).unwrap().width,
+            400 - SCROLLBAR_THICKNESS,
+            "inset gives the bar its own strip, so nothing is hidden beneath \
+             chrome"
+        );
+    }
+
+    /// The invariant that survives the policy: a bar is on the edge of the
+    /// viewport it scrolls, at any nesting depth.
+    ///
+    /// `Inset` changes how wide the usable content rectangle is. It must never
+    /// shove a nested bar sideways because an outer bar happens to exist, and
+    /// nesting depth must not enter the geometry at all — that would leave no
+    /// obvious answer at three levels and stop a bar corresponding to the
+    /// thing it scrolls.
+    #[test]
+    fn a_nested_bar_stays_on_its_own_viewports_edge_under_both_policies() {
+        use crate::{ScrollbarStyle, WireAlign, WireLayout, WireSize};
+        let bounded = |height: u16| WireLayout {
+            height: WireSize::Fixed(height),
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let tall = |id: u32, height: u16| {
+            Node::text(id, "tall").with_layout(WireLayout {
+                height: WireSize::Fixed(height),
+                ..WireLayout::default()
+            })
+        };
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![
+                            Node::scroll(20, Node::column(21, vec![tall(22, 400)]))
+                                .with_layout(bounded(80)),
+                            tall(13, 600),
+                        ],
+                    )
+                    .with_layout(WireLayout {
+                        align_self: Some(WireAlign::Stretch),
+                        ..WireLayout::default()
+                    }),
+                )
+                .with_layout(bounded(150)),
+            ],
+        ));
+
+        let mut text = TextContext::new();
+        for scrollbars in [ScrollbarStyle::Overlay, ScrollbarStyle::Inset] {
+            let snapshot = tree.layout_with(&mut text, Viewport::new(400.0, 300.0), scrollbars);
+            for (viewport, content_height) in [(NodeKey::first(10), 600), (NodeKey::first(20), 400)]
+            {
+                let rect = snapshot.get(viewport).expect("a viewport");
+                let bar = crate::Scrollbar::for_viewport(rect, content_height, 0)
+                    .expect("both viewports overflow");
+                assert_eq!(
+                    bar.track.x + bar.track.width,
+                    rect.x + rect.width,
+                    "{scrollbars:?}: {viewport:?}'s bar must sit on its own \
+                     right edge, whatever encloses it"
+                );
+            }
+        }
     }
 
     /// A node sized from its own text is never narrower than that text.
@@ -666,7 +826,12 @@ mod intrinsic_sizing {
         let mut text = TextContext::new();
         // Far more room than any of these needs, so a wrap can only come from
         // the node being sized short of its own measurement.
-        let snapshot = compute(&mut text, &tree, Viewport::new(2000.0, 2000.0));
+        let snapshot = compute(
+            &mut text,
+            &tree,
+            Viewport::new(2000.0, 2000.0),
+            ScrollbarStyle::Overlay,
+        );
 
         for (i, label) in labels.iter().enumerate() {
             let key = NodeKey::first(i as u32 + 1);
