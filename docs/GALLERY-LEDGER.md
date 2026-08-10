@@ -108,23 +108,6 @@ confirms it, then decide whether it is a Phase 2 addition or waits for Phase 3.
 
 ---
 
-## Not in this ledger
-
-Things the Gallery could not do that turned out to be **defects**, not missing
-primitives, are fixed rather than recorded. Five so far, all found by running
-an application that was not the counter:
-
-- labels wrapped according to their own fractional widths
-- no wheel event ever reached the scroll subsystem
-- a viewport could not be bounded by its parent
-- the scrollbar thumb took a press and never moved
-- Tab did not move focus
-
-The distinction matters. A missing primitive is a design question deferred; a
-defect is a promise the toolkit already made and did not keep.
-
----
-
 ## 4. Nested viewports put their scrollbars in the same place
 
 **Missing capability.** Any way to tell two overlapping scroll regions apart.
@@ -160,3 +143,24 @@ data point:
 
 The Gallery should first try expressing it with what exists, and the visual
 catalog is the place to do that.
+
+---
+
+## Not in this ledger
+
+Things the Gallery could not do that turned out to be **defects**, not missing
+primitives, are fixed rather than recorded. Eight so far, all found by running
+an application that was not the counter, and the last three by pointing a real
+screen reader at it:
+
+- labels wrapped according to their own fractional widths
+- no wheel event ever reached the scroll subsystem
+- a viewport could not be bounded by its parent
+- the scrollbar thumb took a press and never moved
+- Tab did not move focus
+- accessibility bounds were logical where AccessKit wants physical
+- a scrolled viewport reported its contents at their resting positions
+- the focus ring was painted and then covered by the button's own face
+
+The distinction matters. A missing primitive is a design question deferred; a
+defect is a promise the toolkit already made and did not keep.
