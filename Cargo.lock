@@ -1313,6 +1313,7 @@ version = "0.0.2"
 name = "instar-host"
 version = "0.0.2"
 dependencies = [
+ "accesskit",
  "instar-guest-build",
  "instar-kernel",
  "instar-paint",
