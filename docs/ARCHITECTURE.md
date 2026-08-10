@@ -512,6 +512,19 @@ exact; the *fixture* had no entropy left for the two answers to differ in. When
 a fault injection comes back green, the fixture is the second thing to suspect
 after the injection itself.
 
+Put together, the three failure modes give one formulation:
+
+> **Green is evidence only when the mutation occurred, the intended test
+> executed, and the fixture permitted correct and faulty implementations to
+> diverge.**
+
+All three have been hit here. A substitution that silently matched nothing
+after `cargo fmt` reflowed its target. A fixture whose outer viewport clamped
+both answers into the same state. A `cargo test` filter written as a regex,
+which that tool treats as a literal substring — it selected no tests and
+reported `ok`. Each produced a green run that proved nothing, and `0 passed` is
+the tell for the third.
+
 The corollary is a habit, not a rule:
 
 > A test that stays green under the fault it was written to catch is evidence

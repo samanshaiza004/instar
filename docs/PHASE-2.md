@@ -1150,6 +1150,23 @@ manufacture a `ButtonActivated` directly: the application-visible result is
 identical, so only a test watching the *path* can fail. If it passes, F has
 quietly forked a second interaction system and the architectural claim is gone.
 
+The route counters are **instrumentation, not behaviour**. The seam exists
+because it centralizes the operation; the counter only observes entry into it.
+The shape to preserve is
+
+```text
+adapter -> canonical operation -> eligibility, transition, effect, observer
+```
+
+and not
+
+```text
+adapter -> increment the counter -> some other implementation
+```
+
+Otherwise a later change could keep the counter satisfied while bypassing part
+of the policy, and the test would go on passing.
+
 > **Advertise an action only if Instar can honour it correctly.** AccessKit's
 > vocabulary is far larger than Instar's — `SetValue`, `SetTextSelection`,
 > direct scroll-offset actions. Advertising one because the enum has it is
@@ -1159,6 +1176,29 @@ quietly forked a second interaction system and the architectural claim is gone.
 For `Scroll`, semantic actions only. Exposing raw offset actions would widen
 Instar's public conceptual model to match a platform schema, which is the
 reverse of the direction everything else here has taken.
+
+#### Status
+
+```text
+F1  projection             DONE
+F2  incremental updates    DONE
+F3  action convergence     DONE
+
+F0  platform adapter       NOT YET VERIFIED
+F4  AT / platform smoke    NOT YET VERIFIED
+
+F semantic core            COMPLETE
+F accessibility support    NOT COMPLETE
+```
+
+Both halves of that distinction matter. F1–F3 are a subsystem in their own
+right — AccessKit itself separates the toolkit-side tree and actions from the
+platform adapters — so they merge on their own evidence. And compiling the
+cross-platform code is not evidence that macOS, UIA and AT-SPI behave, because
+those are three separate native adapters underneath.
+
+So: neither "F is done, the hard part is proven" nor "F1–F3 cannot land until
+VoiceOver has been run".
 
 #### Order, and what cannot be verified here
 
