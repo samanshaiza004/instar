@@ -19,6 +19,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
+name = "accesskit"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,6 +1313,7 @@ version = "0.0.2"
 name = "instar-host"
 version = "0.0.2"
 dependencies = [
+ "accesskit",
  "instar-guest-build",
  "instar-kernel",
  "instar-paint",
@@ -1357,6 +1367,7 @@ dependencies = [
 name = "instar-ui"
 version = "0.0.2"
 dependencies = [
+ "accesskit",
  "instar-guest-build",
  "instar-kernel",
  "instar-ui-protocol",

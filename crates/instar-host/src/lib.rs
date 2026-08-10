@@ -320,6 +320,51 @@ fn scroll_extents(
     extents
 }
 
+/// A semantic thing to do to a node, independent of what asked for it.
+///
+/// Pointer, keyboard and accessibility are three *input adapters*, not three
+/// implementations of interaction. Everything they can ask for is expressible
+/// here, and [`Host::dispatch`] is the only place any of it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionIntent {
+    Activate(NodeKey),
+    Focus(NodeKey),
+    /// Clears focus, but only if this node is the one holding it. An
+    /// unconditional clear would let a stale accessibility blur take focus
+    /// away from an unrelated control.
+    Blur(NodeKey),
+    Reveal(NodeKey, instar_ui::RevealAlignment),
+}
+
+/// Which adapter asked. **Diagnostic, never semantic.**
+///
+/// It decides one thing — whether focus is drawn, since a mouse click should
+/// not paint a keyboard ring — and is otherwise there so a test can prove all
+/// three routes entered the same seam. If this ever starts changing what an
+/// activation *means*, the convergence it exists to demonstrate has already
+/// been lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionSource {
+    Pointer,
+    Keyboard,
+    Accessibility,
+}
+
+/// How many times each intent has been dispatched.
+///
+/// The instrument F3 asserts on. Convergence cannot be inferred from the guest
+/// receiving the right event — an accessibility handler that constructed
+/// `ButtonActivated` itself would produce an identical guest-visible result
+/// while having forked a second interaction system. Only counting entries into
+/// the seam can tell those apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InteractionStats {
+    pub activate: u64,
+    pub focus: u64,
+    pub blur: u64,
+    pub reveal: u64,
+}
+
 /// Orchestrates windows, the UI layer, and the guest runtime.
 #[derive(Debug)]
 pub struct Host {
@@ -330,6 +375,8 @@ pub struct Host {
     /// than about a surface.
     presentation: PresentationState,
     scenes: SceneBuilder,
+    /// Entries into the interaction seam, by intent. Diagnostics and F3.
+    interaction_stats: InteractionStats,
     /// The long-lived Parley shaping cache. Created once and reused for every
     /// layout pass; see `instar_ui::TextContext`.
     text: TextContext,
@@ -346,6 +393,7 @@ impl Host {
         Self {
             windows: HashMap::new(),
             presentation: PresentationState::default(),
+            interaction_stats: InteractionStats::default(),
             scenes: SceneBuilder::new(),
             text: TextContext::new(),
         }
@@ -499,6 +547,158 @@ impl Host {
             window.redraw_pending = true;
             Vec::new()
         }
+    }
+
+    pub fn interaction_stats(&self) -> InteractionStats {
+        self.interaction_stats
+    }
+
+    pub fn reset_interaction_stats(&mut self) {
+        self.interaction_stats = InteractionStats::default();
+    }
+
+    /// The one place an interaction happens.
+    ///
+    /// Every adapter funnels here, so the eligibility rules, the generational
+    /// checks and the guest event are written once. An adapter that shortcut
+    /// this would produce the same visible outcome and a second set of rules
+    /// to keep in step — which is the failure this seam exists to make
+    /// impossible rather than merely discouraged.
+    pub fn dispatch(
+        &mut self,
+        window_id: WindowId,
+        intent: InteractionIntent,
+        source: InteractionSource,
+    ) -> Vec<HostEffect> {
+        match intent {
+            InteractionIntent::Activate(key) => {
+                self.interaction_stats.activate += 1;
+                let Some(window) = self.windows.get(&window_id) else {
+                    return Vec::new();
+                };
+                let Some(tree) = window.tree.as_ref() else {
+                    return Vec::new();
+                };
+                // One eligibility predicate for all three adapters. A stale
+                // generational key fails here whether it arrived from a queued
+                // pointer event or from an assistive technology holding an old
+                // NodeId.
+                if !tree
+                    .find(key)
+                    .is_some_and(|node| node.kind.is_interactive())
+                    || !instar_ui::focusable_order(tree).contains(&key)
+                {
+                    return Vec::new();
+                }
+                vec![HostEffect::SendToGuest(
+                    UiAction::ButtonActivated(key).encode(),
+                )]
+            }
+            InteractionIntent::Focus(key) => {
+                self.interaction_stats.focus += 1;
+                let Some(window) = self.windows.get_mut(&window_id) else {
+                    return Vec::new();
+                };
+                let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref())
+                else {
+                    return Vec::new();
+                };
+                if !instar_ui::focusable_order(tree).contains(&key) {
+                    return Vec::new();
+                }
+                let changed = match source {
+                    // A click focuses without painting a keyboard ring.
+                    InteractionSource::Pointer => window.focus.focus_by_pointer(Some(key)),
+                    InteractionSource::Keyboard | InteractionSource::Accessibility => {
+                        window.focus.focus_by_keyboard(Some(key))
+                    }
+                };
+                let extents = scroll_extents(tree, layout);
+                instar_ui::reveal(
+                    tree,
+                    layout,
+                    &mut window.scroll,
+                    &|k| extents.get(&k).copied(),
+                    key,
+                    instar_ui::RevealAlignment::Nearest,
+                );
+                if !changed {
+                    return Vec::new();
+                }
+                self.rebuild_scene(window_id);
+                vec![HostEffect::Render { window: window_id }]
+            }
+            InteractionIntent::Blur(key) => {
+                self.interaction_stats.blur += 1;
+                let Some(window) = self.windows.get_mut(&window_id) else {
+                    return Vec::new();
+                };
+                // Conditional on purpose. An unconditional clear would let a
+                // stale blur for one control take focus away from another.
+                if window.focus.focused() != Some(key) {
+                    return Vec::new();
+                }
+                window.focus.focus_by_keyboard(None);
+                self.rebuild_scene(window_id);
+                vec![HostEffect::Render { window: window_id }]
+            }
+            InteractionIntent::Reveal(key, alignment) => {
+                self.interaction_stats.reveal += 1;
+                let Some(window) = self.windows.get_mut(&window_id) else {
+                    return Vec::new();
+                };
+                let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref())
+                else {
+                    return Vec::new();
+                };
+                let extents = scroll_extents(tree, layout);
+                let moved = instar_ui::reveal(
+                    tree,
+                    layout,
+                    &mut window.scroll,
+                    &|k| extents.get(&k).copied(),
+                    key,
+                    alignment,
+                );
+                if !moved {
+                    return Vec::new();
+                }
+                self.rebuild_scene(window_id);
+                vec![HostEffect::Render { window: window_id }]
+            }
+        }
+    }
+
+    /// An action requested by assistive technology.
+    ///
+    /// Translates and hands over. Every supported action maps onto an intent
+    /// the other adapters already use; unsupported ones do nothing, which is
+    /// what AccessKit requires and is better than a placeholder that pretends.
+    ///
+    /// Runs on the main thread. AccessKit's own handler may be called on a
+    /// platform-dependent thread, so F0 will proxy requests here rather than
+    /// letting a callback touch host state.
+    pub fn on_accessibility_action(
+        &mut self,
+        window_id: WindowId,
+        action: accesskit::Action,
+        target: accesskit::NodeId,
+    ) -> Vec<HostEffect> {
+        // The whole packed id, generation included. Reverse-mapping only the
+        // numeric half would let an assistive technology holding a stale
+        // NodeId reach the node that replaced it -- the ABA case the
+        // generation exists to prevent, bypassed at an integration boundary.
+        let key = NodeKey::from_accesskit_id(target.0);
+        let intent = match action {
+            accesskit::Action::Click => InteractionIntent::Activate(key),
+            accesskit::Action::Focus => InteractionIntent::Focus(key),
+            accesskit::Action::Blur => InteractionIntent::Blur(key),
+            accesskit::Action::ScrollIntoView => {
+                InteractionIntent::Reveal(key, instar_ui::RevealAlignment::Nearest)
+            }
+            _ => return Vec::new(),
+        };
+        self.dispatch(window_id, intent, InteractionSource::Accessibility)
     }
 
     /// Routes one window event, returning what should happen as a result.
@@ -733,7 +933,7 @@ impl Host {
         };
         let held = window.interaction.pressed();
         let scroll = &window.scroll;
-        let mut effects = match event.state {
+        let activated = match event.state {
             PointerState::Pressed => {
                 window.interaction.on_press(tree, layout, scroll, x, y);
                 // A click moves focus to whatever it landed on, or clears it.
@@ -744,13 +944,23 @@ impl Host {
                     .hit_test_scrolled(layout, scroll, x, y)
                     .map(|node| node.key);
                 window.focus.focus_by_pointer(hit);
-                Vec::new()
+                None
             }
             PointerState::Released => window
                 .interaction
                 .on_release(tree, layout, scroll, x, y)
-                .map(|action: UiAction| vec![HostEffect::SendToGuest(action.encode())])
-                .unwrap_or_default(),
+                .map(|UiAction::ButtonActivated(key)| key),
+        };
+
+        // Through the seam, like every other adapter. The pointer has no
+        // private route to the guest.
+        let mut effects = match activated {
+            Some(key) => self.dispatch(
+                event.window_id,
+                InteractionIntent::Activate(key),
+                InteractionSource::Pointer,
+            ),
+            None => Vec::new(),
         };
 
         // Press state is drawn, so changing it is a visual change, and it is
@@ -1058,13 +1268,21 @@ impl Host {
             _ => false,
         };
 
-        let mut effects = Vec::new();
-        if let Some(action) = action {
-            effects.push(HostEffect::SendToGuest(action.encode()));
-        }
+        let mut effects = match action {
+            Some(UiAction::ButtonActivated(key)) => self.dispatch(
+                event.window_id,
+                InteractionIntent::Activate(key),
+                InteractionSource::Keyboard,
+            ),
+            None => Vec::new(),
+        };
         if !changed && effects.is_empty() {
             return Vec::new();
         }
+        let Some(window) = self.windows.get_mut(&event.window_id) else {
+            return effects;
+        };
+        let _ = &window;
 
         // Focus and pressed state are both drawn, so either moving is a visual
         // change -- and *only* a visual one. The scene is re-lowered; layout
@@ -1104,10 +1322,14 @@ impl Host {
         // either way -- and it clears now, not when the guest gets round to
         // the activation.
         self.rebuild_scene(event.window_id);
-        let mut effects = Vec::new();
-        if let Some(action) = action {
-            effects.push(HostEffect::SendToGuest(action.encode()));
-        }
+        let mut effects = match action {
+            Some(UiAction::ButtonActivated(key)) => self.dispatch(
+                event.window_id,
+                InteractionIntent::Activate(key),
+                InteractionSource::Keyboard,
+            ),
+            None => Vec::new(),
+        };
         effects.push(HostEffect::Render {
             window: event.window_id,
         });
@@ -2280,6 +2502,218 @@ mod tests {
         assert_eq!(window.focus.focused(), Some(NodeKey::first(103)));
         assert!(window.focus.focus_visible());
         assert!(window.scroll.get(NodeKey::first(100)).y > 0);
+    }
+
+    // --- F3: three adapters, one interaction system. ---
+
+    fn ak(key: NodeKey) -> accesskit::NodeId {
+        accesskit::NodeId(key.to_accesskit_id())
+    }
+
+    /// All three adapters reach the same seam, and are counted doing it.
+    ///
+    /// Convergence cannot be inferred from the guest receiving the right
+    /// event: an accessibility handler that built `ButtonActivated` itself
+    /// would produce an identical guest-visible result. Only counting entries
+    /// into `dispatch` distinguishes one interaction system from three.
+    #[test]
+    fn pointer_keyboard_and_accessibility_all_enter_the_same_seam() {
+        let expected = vec![UiAction::ButtonActivated(NodeKey::first(91)).encode()];
+
+        // Pointer.
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(91)))
+            .unwrap();
+        let (x, y) = (f64::from(rect.x + 1), f64::from(rect.y + 1));
+        host.reset_interaction_stats();
+        host.handle(pointer(PointerState::Pressed, x, y));
+        let clicked = host.handle(pointer(PointerState::Released, x, y));
+        assert_eq!(activations(&clicked), expected);
+        assert_eq!(
+            host.interaction_stats().activate,
+            1,
+            "the pointer entered the seam exactly once"
+        );
+
+        // Keyboard.
+        let mut host = keyboard_host();
+        host.reset_interaction_stats();
+        let pressed = host.handle(key_event(instar_window::Key::Enter, true, false));
+        assert_eq!(activations(&pressed), expected);
+        assert_eq!(host.interaction_stats().activate, 1);
+
+        // Accessibility.
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        host.reset_interaction_stats();
+        let invoked =
+            host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::first(91)));
+        assert_eq!(
+            activations(&invoked),
+            expected,
+            "assistive technology produces the same event as a click"
+        );
+        assert_eq!(
+            host.interaction_stats().activate,
+            1,
+            "and reached it by the same route"
+        );
+    }
+
+    #[test]
+    fn an_accessibility_focus_uses_the_same_focus_machinery() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, offscreen_focus_fixture())
+            .expect("valid");
+        host.reset_interaction_stats();
+
+        let effects =
+            host.on_accessibility_action(WINDOW, accesskit::Action::Focus, ak(NodeKey::first(103)));
+
+        assert_eq!(host.interaction_stats().focus, 1, "through the seam");
+        assert!(to_guest(&effects).is_empty(), "focus is not a guest event");
+
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(window.focus.focused(), Some(NodeKey::first(103)));
+        assert!(
+            window.focus.focus_visible(),
+            "accessibility focus is deliberate, so it draws"
+        );
+        assert!(
+            window.scroll.get(NodeKey::first(100)).y > 0,
+            "and it reveals, using the same nested walk Tab does"
+        );
+    }
+
+    #[test]
+    fn an_accessibility_blur_only_clears_its_own_target() {
+        let mut host = keyboard_host();
+        assert_eq!(focused(&host), Some(NodeKey::first(91)));
+
+        host.on_accessibility_action(WINDOW, accesskit::Action::Blur, ak(NodeKey::first(92)));
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(91)),
+            "a blur naming a different control must not take focus from this one"
+        );
+
+        host.on_accessibility_action(WINDOW, accesskit::Action::Blur, ak(NodeKey::first(91)));
+        assert_eq!(focused(&host), None, "its own target does clear");
+    }
+
+    #[test]
+    fn scroll_into_view_routes_into_the_reveal_primitive() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, offscreen_focus_fixture())
+            .expect("valid");
+        host.reset_interaction_stats();
+
+        host.on_accessibility_action(
+            WINDOW,
+            accesskit::Action::ScrollIntoView,
+            ak(NodeKey::first(103)),
+        );
+
+        assert_eq!(host.interaction_stats().reveal, 1);
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(100))
+                .y,
+            240,
+            "the same minimum movement Tab produces -- not a second \
+             nested-scroll implementation living in the accessibility layer"
+        );
+    }
+
+    /// A stale NodeId from assistive technology must not reach the node that
+    /// replaced it. The generation is in the packed id, and the reverse
+    /// mapping must not discard it.
+    #[test]
+    fn a_stale_accessibility_node_id_activates_nothing() {
+        use instar_ui::{Node, NodeKind, WireLayout};
+        let with_generation = |generation: u32| {
+            Tree::new(Node::root(
+                0,
+                vec![Node {
+                    key: NodeKey::new(95, generation),
+                    kind: NodeKind::Button {
+                        label: "reused".into(),
+                        enabled: true,
+                    },
+                    layout: WireLayout::default(),
+                    style: Default::default(),
+                    children: Vec::new(),
+                }],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        // Gone, then back at a new generation.
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(96, "gap")])),
+        )
+        .expect("valid");
+        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+
+        let stale =
+            host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::new(95, 0)));
+        assert!(
+            activations(&stale).is_empty(),
+            "an assistive technology holding the old NodeId must not reach \
+             the button that replaced it"
+        );
+
+        let current =
+            host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::new(95, 1)));
+        assert_eq!(
+            activations(&current).len(),
+            1,
+            "the current generation still works"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_accessibility_action_does_nothing() {
+        let mut host = keyboard_host();
+        host.reset_interaction_stats();
+        let effects = host.on_accessibility_action(
+            WINDOW,
+            accesskit::Action::SetValue,
+            ak(NodeKey::first(91)),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            host.interaction_stats(),
+            InteractionStats::default(),
+            "an action Instar cannot honour is ignored rather than \
+             half-implemented"
+        );
+    }
+
+    #[test]
+    fn a_disabled_button_refuses_every_adapter_equally() {
+        use instar_ui::Node;
+        let mut host = ready_host();
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::button(97, "off").disabled()])),
+        )
+        .expect("valid");
+
+        let clicked =
+            host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::first(97)));
+        assert!(
+            activations(&clicked).is_empty(),
+            "the seam's eligibility check is the same one the pointer meets"
+        );
     }
 
     // --- E2: keyboard activation. ---

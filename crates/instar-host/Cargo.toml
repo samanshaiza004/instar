@@ -24,6 +24,7 @@ tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 # Surfaced only in the runtime thread's guest-outcome types, which are
 # Wasmtime's own results.
 wasmtime = "47.0.3"
+accesskit = "0.24.1"
 
 [dev-dependencies]
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
