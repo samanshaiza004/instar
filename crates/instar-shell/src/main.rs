@@ -45,6 +45,56 @@ use instar_window::{WindowOutput, WindowState, winit_adapter};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+
+mod accessibility;
+use accessibility::{Accessibility, Request as A11yRequest, UpdateSink};
+
+/// Everything that reaches the loop from somewhere other than the window.
+///
+/// Two senders, one queue. The runtime thread's variant carries nothing -- the
+/// bridge's channel carries the payload -- while AccessKit's carries the
+/// request it wants answered on this thread.
+#[derive(Debug)]
+enum ShellEvent {
+    /// The guest queued something. Look at the bridge.
+    Runtime,
+    /// A platform accessibility request, forwarded off whatever thread the
+    /// platform adapter raised it on.
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for ShellEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Accessibility(event)
+    }
+}
+
+/// A native window and the one accessibility adapter that describes it.
+///
+/// One field rather than two `Option`s, because the requirement is that
+/// exactly one adapter exists per native window and never outlives it. Two
+/// options can drift apart -- one cleared, one not, or one set a few lines
+/// before the other and a fallible step in between. This cannot: there is no
+/// state in which a window exists without its adapter, and dropping the pair
+/// drops both.
+struct NativeWindow {
+    /// `Arc` because softbuffer's surface holds the window too, and winit's
+    /// `Window` is not `Clone`.
+    window: Arc<Window>,
+    adapter: accesskit_winit::Adapter,
+}
+
+/// The real sink: one `update_if_active` call, and nothing else.
+///
+/// This is the smallest thing that cannot be tested without a desktop and an
+/// assistive technology attached, which is why it is the only thing here.
+struct AdapterSink<'a>(&'a mut accesskit_winit::Adapter);
+
+impl UpdateSink for AdapterSink<'_> {
+    fn send(&mut self, update: accesskit::TreeUpdate) {
+        self.0.update_if_active(|| update);
+    }
+}
 use winit::window::{Window, WindowAttributes};
 
 const USAGE: &str = "\
@@ -149,7 +199,7 @@ fn run(args: Args) -> Result<(), String> {
     // `with_user_event` is what makes the proxy able to wake a loop parked in
     // `Wait`. Without it the runtime thread could queue a commit and the
     // window would sit there until the user happened to move the mouse.
-    let event_loop = EventLoop::<()>::with_user_event()
+    let event_loop = EventLoop::<ShellEvent>::with_user_event()
         .build()
         .map_err(|error| format!("could not start an event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -184,31 +234,32 @@ fn load(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 struct Shell {
-    proxy: EventLoopProxy<()>,
+    proxy: EventLoopProxy<ShellEvent>,
     component: Vec<u8>,
     debug: bool,
     /// Set when startup fails inside `resumed`, where there is nothing to
     /// return an error *to*. Reported after the loop ends, so a shell that
     /// could not start exits non-zero rather than looking like a clean run.
     startup_error: Option<String>,
-    /// `Arc` because softbuffer's surface holds the window too, and winit's
-    /// `Window` is not `Clone`.
-    window: Option<Arc<Window>>,
+    native: Option<NativeWindow>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Whether anything is listening, and the rules that follow from it.
+    a11y: Accessibility,
     state: Option<WindowState>,
     bridge: Option<HostBridge>,
     presenter: Option<Presenter>,
 }
 
 impl Shell {
-    fn new(proxy: EventLoopProxy<()>, component: Vec<u8>, debug: bool) -> Self {
+    fn new(proxy: EventLoopProxy<ShellEvent>, component: Vec<u8>, debug: bool) -> Self {
         Self {
             proxy,
             component,
             debug,
             startup_error: None,
-            window: None,
+            native: None,
             surface: None,
+            a11y: Accessibility::default(),
             state: None,
             bridge: None,
             presenter: None,
@@ -238,8 +289,8 @@ impl Shell {
                     // times for one logical change — a click alone produces a
                     // press frame, a release frame, and a commit frame — and
                     // the compositor only ever shows the last.
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
+                    if let Some(native) = self.native.as_ref() {
+                        native.window.request_redraw();
                     }
                 }
                 HostEffect::GuestGone { generation, error } => match error {
@@ -260,6 +311,51 @@ impl Shell {
                 // Consumed by the bridge on its way to the runtime thread.
                 HostEffect::SendToGuest(_) => {}
             }
+        }
+        self.flush_accessibility();
+    }
+
+    /// Tells the platform what changed, if anything, and if anyone is asking.
+    ///
+    /// Every path that touches host state ends in `apply`, so this is the one
+    /// place the question has to be asked. `Accessibility::flush` decides
+    /// whether to ask the bridge at all; see that module for why the order
+    /// matters.
+    fn flush_accessibility(&mut self) {
+        let (Some(native), Some(bridge)) = (self.native.as_mut(), self.bridge.as_mut()) else {
+            return;
+        };
+        self.a11y.flush(
+            || bridge.accessibility_update(),
+            &mut AdapterSink(&mut native.adapter),
+        );
+    }
+
+    /// A platform accessibility request, now safely on the main thread.
+    fn on_accessibility(&mut self, event: accesskit_winit::Event, event_loop: &ActiveEventLoop) {
+        match self.a11y.classify(event.window_event) {
+            A11yRequest::SendFullTree => {
+                let (Some(native), Some(bridge)) = (self.native.as_mut(), self.bridge.as_mut())
+                else {
+                    return;
+                };
+                // Not `flush_accessibility`: an adapter that has just attached
+                // holds nothing, so a diff would describe changes to a tree it
+                // does not have.
+                if let Some(update) = bridge.full_accessibility_tree() {
+                    AdapterSink(&mut native.adapter).send(update);
+                }
+            }
+            A11yRequest::Forward { action, target } => {
+                let Some(bridge) = self.bridge.as_mut() else {
+                    return;
+                };
+                let effects = bridge.on_accessibility_action(action, target);
+                // Through `apply` like everything else, which is also what
+                // flushes whatever the action just changed back out.
+                self.apply(effects, event_loop);
+            }
+            A11yRequest::Nothing => {}
         }
     }
 
@@ -348,14 +444,17 @@ impl Shell {
     }
 }
 
-impl ApplicationHandler<()> for Shell {
+impl ApplicationHandler<ShellEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.native.is_some() {
             return;
         }
 
+        // Invisible to begin with: `accesskit_winit` requires the adapter to
+        // exist before the window is first shown, and panics otherwise.
         let attributes = WindowAttributes::default()
             .with_title("Instar")
+            .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(480.0, 320.0));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
@@ -363,6 +462,28 @@ impl ApplicationHandler<()> for Shell {
                 return self.fail(format!("could not create a window: {error}"), event_loop);
             }
         };
+
+        // One adapter, this window, before it is shown. `with_event_loop_proxy`
+        // rather than `with_mixed_handlers`: the mixed constructor wants an
+        // activation handler that is `Send` and may be called on any thread,
+        // and answering it means reading the retained tree. Routing activation
+        // through the proxy costs a placeholder tree for one frame and buys the
+        // rule that no platform callback ever touches host state.
+        let adapter = accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
+        );
+        // The pair is built here, in one step, and only shown once both exist.
+        // Nothing fallible runs between the adapter and the window becoming
+        // visible, so there is no path on which a visible window lacks one.
+        let native = NativeWindow {
+            window: Arc::new(window),
+            adapter,
+        };
+        native.window.set_visible(true);
+        let window = Arc::clone(&native.window);
+        self.native = Some(native);
 
         let physical: instar_window::PhysicalSize = window.inner_size().into();
         let state = WindowState::new(window.id().into(), window.scale_factor(), physical);
@@ -374,7 +495,7 @@ impl ApplicationHandler<()> for Shell {
         // to make the loop wake up.
         let proxy = self.proxy.clone();
         let wake: Wake = Arc::new(move || {
-            let _ = proxy.send_event(());
+            let _ = proxy.send_event(ShellEvent::Runtime);
         });
 
         let component = self.component.clone();
@@ -401,7 +522,6 @@ impl ApplicationHandler<()> for Shell {
             eprintln!("instar: {} started", bridge.generation());
         }
 
-        let window = Arc::new(window);
         match softbuffer::Context::new(Arc::clone(&window))
             .and_then(|context| softbuffer::Surface::new(&context, Arc::clone(&window)))
         {
@@ -430,14 +550,16 @@ impl ApplicationHandler<()> for Shell {
 
         self.bridge = Some(bridge);
         self.state = Some(state);
-        self.window = Some(window);
         self.apply(effects, event_loop);
     }
 
-    /// The runtime thread queued something. The event carries no payload —
-    /// the bridge's channel does — so this just means "look".
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
-        self.pump(event_loop);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ShellEvent) {
+        match event {
+            // The runtime thread queued something. The event carries no
+            // payload — the bridge's channel does — so this just means "look".
+            ShellEvent::Runtime => self.pump(event_loop),
+            ShellEvent::Accessibility(event) => self.on_accessibility(event, event_loop),
+        }
     }
 
     fn window_event(
@@ -446,6 +568,12 @@ impl ApplicationHandler<()> for Shell {
         id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // Before anything else, as `accesskit_winit` requires: the adapter
+        // tracks focus and geometry from the raw stream.
+        if let Some(native) = self.native.as_mut() {
+            native.adapter.process_event(&native.window, &event);
+        }
+
         if matches!(event, WindowEvent::RedrawRequested) {
             self.redraw();
             return;
@@ -480,14 +608,14 @@ impl ApplicationHandler<()> for Shell {
     /// change. This is what closes the metrics barrier on platforms that send
     /// no separate `Resized`.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(state), Some(window), Some(bridge)) = (
+        let (Some(state), Some(native), Some(bridge)) = (
             self.state.as_mut(),
-            self.window.as_ref(),
+            self.native.as_ref(),
             self.bridge.as_mut(),
         ) else {
             return;
         };
-        let Some(metrics) = state.take_pending_metrics(window.inner_size().into()) else {
+        let Some(metrics) = state.take_pending_metrics(native.window.inner_size().into()) else {
             return;
         };
         let effects = bridge.on_window_event(WindowOutput::MetricsChanged(metrics));

@@ -29,5 +29,11 @@ instar-render-vello-cpu = { path = "../instar-render-vello-cpu", features = ["gl
 softbuffer = "0.4.8"
 winit = "=0.30.13"
 
+# Accessibility. `instar-ui` builds the TreeUpdate and `instar-host` decides
+# when there is one; this crate is the only one that touches a platform
+# adapter, because the adapter belongs to a native window.
+accesskit = "0.24.1"
+accesskit_winit = "0.33.2"
+
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }

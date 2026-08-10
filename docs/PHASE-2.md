@@ -1180,15 +1180,14 @@ reverse of the direction everything else here has taken.
 #### Status
 
 ```text
-F1  projection             DONE
-F2  incremental updates    DONE
-F3  action convergence     DONE
+F1  semantic projection       DONE
+F2  incremental updates       DONE
+F3  action convergence        DONE
+F0  shell adapter plumbing    DONE / structurally verified
+F4  native AT behavior        PENDING
 
-F0  platform adapter       NOT YET VERIFIED
-F4  AT / platform smoke    NOT YET VERIFIED
-
-F semantic core            COMPLETE
-F accessibility support    NOT COMPLETE
+Accessibility semantics       COMPLETE
+Platform accessibility        NOT YET VERIFIED
 ```
 
 Both halves of that distinction matter. F1–F3 are a subsystem in their own
@@ -1216,17 +1215,84 @@ F0 is its own package because `accesskit_winit::Adapter` must be constructed
 adapter, then show it. That changes `instar-shell`'s startup order, which is
 the kind of thing that works on one machine and fails on another platform.
 
-`with_mixed_handlers` is the constructor that fits: the activation handler runs
-directly so an initial tree is returned synchronously — avoiding a placeholder
-tree on some platform adapters — while actions travel the `EventLoopProxy` to
-the main thread. **Nothing mutates `FocusState`, `ScrollState` or the tree from
-an AccessKit callback thread**; those may run on platform-dependent threads,
-and the main thread already owns all of it.
+The plan named `with_mixed_handlers`, and implementation rejected it.
+Its attraction is a synchronous initial tree, avoiding a placeholder on some
+platform adapters. Its price is that the activation handler must be `Send` and
+"may be called on any thread, depending on the underlying platform adapter" —
+and answering it means reading the retained tree. That is exactly the rule this
+package exists to keep, so the cheaper-looking constructor is the one that
+breaks it.
+
+`with_event_loop_proxy` forwards *every* request — activation, actions,
+deactivation — through the proxy to the main thread. **Nothing mutates
+`FocusState`, `ScrollState` or the tree from an AccessKit callback thread**,
+because no AccessKit callback does anything but post an event. The cost is one
+frame of placeholder tree on activation, paid once per attach.
 
 F4 is not verifiable on one developer machine, and neither is F0's real
 behaviour — both need a display server and a live assistive technology. Same
 honesty as the compositor: the automated suite proves the projection and the
 action routing, and platform behaviour is a manual smoke test.
+
+#### F0, as built
+
+**Everything F0 claims is verified; what is unverified is specifically the
+native AT ↔ AccessKit boundary.** Build and lint coverage, proxy event
+conversion, the update seam, lifecycle ordering on a real macOS window, and the
+failure behaviour around the visibility requirement — all of these are checked.
+Nothing below was observed working with an assistive technology, and that is
+F4, not F0.
+
+One adapter, one window — as one field, not two `Option`s. `NativeWindow`
+holds the `Arc<Window>` and its adapter together, constructed in a single step
+with nothing fallible between the adapter and `set_visible(true)`. Two options
+could drift; there is no state in which a visible window lacks its adapter, and
+dropping the pair drops both. `Adapter::process_event` is the first statement
+in `window_event`, ahead of every early return, and `window_event` is the sole
+entry point for winit window events — so the "before the application handles
+it, for every event" requirement holds structurally rather than by discipline. `ShellEvent` is the loop's user-event type, with
+two variants — the runtime thread's payload-free wake, and
+`accesskit_winit::Event` — because a single queue is what puts platform
+requests on the main thread.
+
+The seam is `instar_shell::accessibility`. `Adapter::update_if_active` sits
+behind a one-method `UpdateSink`, and it is the *only* thing there that a test
+cannot reach; every decision about whether and how often to call it is on this
+side of the trait. Request conversion is a pure function into a three-case
+`Request`, so transport is checked without a window, an adapter or a guest.
+
+Two rules emerged from the AccessKit API that the plan did not anticipate.
+
+`Host::accessibility_update` **drains** — what it returns is not offered twice.
+So the shell must not ask while nothing is attached, or the change is discarded
+and never reaches the assistive technology that attaches next. `Accessibility`
+tracks attachment and does not call the producer at all when detached. This is
+a correctness rule, not an optimization, and it has its own test.
+
+An adapter that has just attached **holds nothing to diff against**, so
+activation takes a separate path: `reset_accessibility` then a full projection,
+via `HostBridge::full_accessibility_tree`. An incremental update on that path
+would describe changes to a tree the platform does not have.
+
+What was actually observed, beyond compiling: the shell was launched on macOS
+with the counter guest and ran — window created invisible, adapter constructed,
+window shown, guest committed, frames presented, no panic. That establishes the
+lifecycle ordering `accesskit_winit` requires, since `with_direct_handlers`
+panics outright if the window is already visible. It establishes nothing about
+VoiceOver, which is F4.
+
+Eleven faults injected across the two crates, all caught: the metrics barrier
+dropped, the projection always reset, `ScrollIntoView` misrouted to `Focus`,
+unsupported actions falling through to `Activate`, the generation half of a
+`NodeId` discarded in transport, the host asked while detached, deactivation
+failing to detach, an empty update sent anyway, deactivation mistaken for
+activation, transport filtering actions the host should decide about, and
+activation sending a diff instead of a full tree.
+
+One methodological note, recorded because it cost the work twice over: using
+`git checkout --` to undo a fault injection destroys uncommitted work, and the
+baseline here was uncommitted. Fault injection must restore from a file copy,
+or run against a committed tree.
 
 Deferring accessibility until an application needs it is how it becomes
 scaffolding. By E there is retained semantics, stable generational identity,

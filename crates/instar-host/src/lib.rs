@@ -193,6 +193,8 @@ pub struct HostWindow {
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
     last_pointer: Option<LogicalPoint>,
+    /// What the platform accessibility adapter has already been told.
+    a11y: instar_ui::A11yProjection,
 }
 
 impl HostWindow {
@@ -678,6 +680,35 @@ impl Host {
     /// Runs on the main thread. AccessKit's own handler may be called on a
     /// platform-dependent thread, so F0 will proxy requests here rather than
     /// letting a callback touch host state.
+    /// Forgets what the adapter was told, so the next update is the whole
+    /// tree.
+    ///
+    /// The platform requires this on activation: an adapter that has just
+    /// attached holds nothing for an incremental update to be relative to.
+    pub fn reset_accessibility(&mut self, window_id: WindowId) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.a11y.reset();
+        }
+    }
+
+    /// What the platform accessibility adapter has not yet been told.
+    ///
+    /// `None` means there is nothing to send -- the shell must then not call
+    /// the adapter at all, which is what keeps a repaint from reaching an
+    /// assistive technology.
+    pub fn accessibility_update(&mut self, window_id: WindowId) -> Option<accesskit::TreeUpdate> {
+        let window = self.windows.get_mut(&window_id)?;
+        // The metrics barrier applies here too: a projection built from
+        // geometry computed for a scale that has since changed would hand an
+        // assistive technology rectangles that do not describe the window.
+        window.metrics.usable()?;
+        let tree = window.tree.as_ref()?;
+        let layout = window.layout.as_ref()?;
+        window
+            .a11y
+            .update(tree, layout, &window.focus, &window.scroll)
+    }
+
     pub fn on_accessibility_action(
         &mut self,
         window_id: WindowId,
@@ -2502,6 +2533,177 @@ mod tests {
         assert_eq!(window.focus.focused(), Some(NodeKey::first(103)));
         assert!(window.focus.focus_visible());
         assert!(window.scroll.get(NodeKey::first(100)).y > 0);
+    }
+
+    // --- F0: the transport seam, minus the platform adapter. ---
+
+    fn host_for_actions() -> Host {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, offscreen_focus_fixture())
+            .expect("valid");
+        host
+    }
+
+    /// Nothing is lost or altered carrying an action across the boundary.
+    ///
+    /// F3 proved the semantics; this proves the transport. Every action the
+    /// shell forwards enters the intent it should and no other, and the two
+    /// kinds of request that must produce nothing produce nothing.
+    #[test]
+    fn every_forwarded_action_reaches_its_intent_and_no_other() {
+        let target = ak(NodeKey::first(103));
+
+        for (action, want) in [
+            (accesskit::Action::Click, (1, 0, 0, 0)),
+            (accesskit::Action::Focus, (0, 1, 0, 0)),
+            (accesskit::Action::ScrollIntoView, (0, 0, 0, 1)),
+        ] {
+            let mut host = host_for_actions();
+            host.reset_interaction_stats();
+            host.on_accessibility_action(WINDOW, action, target);
+            let s = host.interaction_stats();
+            assert_eq!(
+                (s.activate, s.focus, s.blur, s.reveal),
+                want,
+                "{action:?} entered the wrong intent"
+            );
+        }
+
+        // Blur needs focus on the target first, or it is correctly a no-op --
+        // so the conditionality is part of what transport must not disturb.
+        let mut host = host_for_actions();
+        host.dispatch(
+            WINDOW,
+            InteractionIntent::Focus(NodeKey::first(103)),
+            InteractionSource::Accessibility,
+        );
+        host.reset_interaction_stats();
+        host.on_accessibility_action(WINDOW, accesskit::Action::Blur, target);
+        assert_eq!(host.interaction_stats().blur, 1);
+        assert_eq!(focused(&host), None, "blur on the focused node clears it");
+
+        // An action Instar does not implement dies at the boundary rather
+        // than falling through to whatever the match arm below it happens
+        // to be.
+        let mut host = host_for_actions();
+        host.reset_interaction_stats();
+        host.on_accessibility_action(WINDOW, accesskit::Action::SetValue, target);
+        assert_eq!(
+            host.interaction_stats(),
+            InteractionStats::default(),
+            "an unsupported action is ignored, not half-handled"
+        );
+
+        // A stale id reaches the seam -- eligibility is decided there, not in
+        // transport -- and is then refused, which is the ABA case the
+        // generation exists to prevent.
+        let mut host = host_for_actions();
+        host.on_accessibility_action(
+            WINDOW,
+            accesskit::Action::Focus,
+            accesskit::NodeId(NodeKey::new(103, 99).to_accesskit_id()),
+        );
+        assert_eq!(
+            focused(&host),
+            None,
+            "a superseded generation must not reach the node that replaced it"
+        );
+    }
+
+    /// The reverse direction: the host offers an update exactly when there is
+    /// one, so the shell knows when *not* to call the adapter.
+    #[test]
+    fn the_host_offers_an_accessibility_update_only_when_something_changed() {
+        use instar_ui::{Node, WireColor};
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+
+        assert!(
+            host.accessibility_update(WINDOW).is_some(),
+            "the first call is the whole tree"
+        );
+        assert!(
+            host.accessibility_update(WINDOW).is_none(),
+            "and calling again with nothing changed offers nothing"
+        );
+
+        // Paint-only, carried all the way out to the boundary.
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::text(90, "label"),
+                    Node::button(91, "first").with_foreground(WireColor::opaque(255, 0, 0)),
+                    Node::button(92, "second"),
+                ],
+            )),
+        )
+        .expect("valid");
+        assert!(
+            host.accessibility_update(WINDOW).is_none(),
+            "a recolour must not reach the platform adapter at all"
+        );
+
+        // Focus is accessibility-observable, so it must.
+        host.handle(key(instar_window::Key::Tab, false));
+        let update = host
+            .accessibility_update(WINDOW)
+            .expect("focus moved, so the adapter must hear about it");
+        assert_eq!(update.focus, ak(NodeKey::first(91)));
+        assert!(
+            host.accessibility_update(WINDOW).is_none(),
+            "and exactly once -- the seam is not called twice for one change"
+        );
+    }
+
+    /// While the metrics barrier is up there is no coherent geometry, so
+    /// there is nothing honest to tell an assistive technology.
+    ///
+    /// The pending change is banked *before* the barrier goes up. Invalidate
+    /// first and the input that would have changed anything is refused
+    /// upstream, and the test passes whether or not the barrier is checked
+    /// here at all.
+    #[test]
+    fn no_accessibility_update_is_offered_while_geometry_is_invalid() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        host.accessibility_update(WINDOW).expect("the initial tree");
+
+        host.handle(key(instar_window::Key::Tab, false));
+        host.handle(WindowOutput::MetricsInvalidated { window_id: WINDOW });
+
+        assert!(
+            host.accessibility_update(WINDOW).is_none(),
+            "rectangles computed for a window that has since changed size or \
+             scale are worse than none"
+        );
+    }
+
+    /// An assistive technology that attaches after the tree has been sitting
+    /// there must be given the whole thing, not a diff against nothing.
+    #[test]
+    fn activation_resends_the_whole_tree_even_though_nothing_changed() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        let first = host.accessibility_update(WINDOW).expect("the initial tree");
+        assert!(!first.nodes.is_empty());
+        assert!(host.accessibility_update(WINDOW).is_none(), "drained");
+
+        // Nothing about the interface has changed -- only who is listening.
+        host.reset_accessibility(WINDOW);
+        let again = host
+            .accessibility_update(WINDOW)
+            .expect("a newly attached adapter holds nothing to diff against");
+        assert_eq!(
+            again.nodes.len(),
+            first.nodes.len(),
+            "the second listener is told exactly as much as the first"
+        );
+        assert!(
+            again.tree.is_some(),
+            "including the tree declaration itself"
+        );
     }
 
     // --- F3: three adapters, one interaction system. ---
