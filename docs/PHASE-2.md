@@ -1082,6 +1082,112 @@ reason the offset is host-owned at all.
 
 ### F — AccessKit, and not later
 
+Verified against the crates that actually resolve here, not against
+recollection: `accesskit` 0.24.1, `accesskit_winit` 0.33.2, and — the detail
+that decides whether F is cheap — **`accesskit_winit` 0.33.2 resolves against
+winit 0.30.13, which is already in the tree.** No winit upgrade hiding inside
+this package. `NodeIdContent` is `u64`, so the existing packing fits exactly;
+`Role::{Window, GenericContainer, Label, Button, ScrollView}` and
+`Action::{Click, Focus, Blur, ScrollIntoView}` all exist today.
+
+```text
+retained tree + LayoutSnapshot + FocusState + ScrollState
+        ->  AccessKit projection  ->  platform APIs
+
+ActionRequest  ->  NodeId back to a generational NodeKey
+               ->  the interaction policy that already exists
+```
+
+#### The projection is a read, not a second model
+
+```text
+Root              -> Role::Window
+Row/Stack/Column  -> Role::GenericContainer
+Text              -> Role::Label
+Button            -> Role::Button
+Scroll            -> Role::ScrollView
+```
+
+`GenericContainer` is documented as presentational and normally filtered out by
+assistive technology, which is exactly right for layout-only containers —
+better than inventing a semantic role for a node whose whole meaning is "these
+things are stacked".
+
+Only what Instar already knows: children, bounds, label, disabled, focus,
+scroll position and range, clipping. **No accessibility concept enters the
+guest wire.** A guest that has never heard of AccessKit is already fully
+described, because everything AccessKit wants is host state.
+
+Focus has exactly one source of truth. `TreeUpdate` wants the focused `NodeId`
+on every update, and the root when nothing is focused — which is `FocusState`:
+
+```text
+FocusState = Some(key)  ->  TreeUpdate.focus = accesskit_id(key)
+FocusState = None       ->  TreeUpdate.focus = root
+```
+
+#### Actions converge, or F has failed
+
+```text
+mouse click ────┐
+Enter / Space ──┼──>  activate(key)  ->  ButtonActivated
+AccessKit Click ┘
+```
+
+```text
+Action::Click          -> the existing activation, generational checks and all
+Action::Focus          -> the existing FocusState, reveal and ring
+Action::Blur           -> the existing focus retirement
+Action::ScrollIntoView -> the existing reveal_node
+```
+
+AccessKit defines `ScrollIntoView` as scrolling whatever containers are needed
+to expose a node, which is E3's primitive under another name. That it already
+exists is evidence the convergence is real rather than arranged.
+
+**This gets an aggressive fault injection.** Bypass `activate()` and
+manufacture a `ButtonActivated` directly: the application-visible result is
+identical, so only a test watching the *path* can fail. If it passes, F has
+quietly forked a second interaction system and the architectural claim is gone.
+
+> **Advertise an action only if Instar can honour it correctly.** AccessKit's
+> vocabulary is far larger than Instar's — `SetValue`, `SetTextSelection`,
+> direct scroll-offset actions. Advertising one because the enum has it is
+> promising behaviour that does not exist. Those become real when Phase 3's
+> `TextView` arrives.
+
+For `Scroll`, semantic actions only. Exposing raw offset actions would widen
+Instar's public conceptual model to match a platform schema, which is the
+reverse of the direction everything else here has taken.
+
+#### Order, and what cannot be verified here
+
+```text
+F0  adapter lifecycle: invisible window -> adapter -> visible window,
+    with action events reaching the main thread
+F1  projection: retained state -> TreeUpdate, stable generational ids
+F2  incremental updates, entering neither Taffy nor Parley needlessly
+F3  action convergence, fault-injected
+F4  platform smoke on Windows, macOS and Linux
+```
+
+F0 is its own package because `accesskit_winit::Adapter` must be constructed
+**before the window is first shown** — create the window invisible, build the
+adapter, then show it. That changes `instar-shell`'s startup order, which is
+the kind of thing that works on one machine and fails on another platform.
+
+`with_mixed_handlers` is the constructor that fits: the activation handler runs
+directly so an initial tree is returned synchronously — avoiding a placeholder
+tree on some platform adapters — while actions travel the `EventLoopProxy` to
+the main thread. **Nothing mutates `FocusState`, `ScrollState` or the tree from
+an AccessKit callback thread**; those may run on platform-dependent threads,
+and the main thread already owns all of it.
+
+F4 is not verifiable on one developer machine, and neither is F0's real
+behaviour — both need a display server and a live assistive technology. Same
+honesty as the compositor: the automated suite proves the projection and the
+action routing, and platform behaviour is a manual smoke test.
+
 Deferring accessibility until an application needs it is how it becomes
 scaffolding. By E there is retained semantics, stable generational identity,
 layout, visibility, clipping, scroll, focus, keyboard activation, and style —
