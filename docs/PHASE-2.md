@@ -942,6 +942,90 @@ after the stall
 
 Application consequence may wait for Wasm. Interaction feedback may not.
 
+#### E3 — focus presentation, and semantic reveal
+
+The ring is host-generated chrome with no `NodeKey`, exactly as the scrollbar
+is:
+
+```text
+guest tree      host presentation
+
+Button          Button
+                └── focus ring
+```
+
+```text
+keyboard focus        focused = key, focus_visible = true
+pointer focus         focused = key, focus_visible = false
+focus retired         focus_visible = false
+OS window blur        the focused key is *retained*; this is not retirement
+```
+
+Losing OS focus is not a node becoming ineligible. The window will come back,
+and the user's place with it — treating it as retirement would clear focus
+every time someone alt-tabbed to check something.
+
+**The ring obeys the same clip stack as the node it surrounds.** Host-generated
+chrome escaping a `Scroll` or an `Overflow::Clip` would be the "two answers to
+where the node is" problem again, this time between a node's presentation and
+its focus presentation — a ring floating over content the node itself is
+clipped out of.
+
+##### One reveal primitive
+
+```rust
+enum RevealAlignment { Nearest, Start, Center, End }
+
+reveal_node(node, alignment)
+ensure_visible(node) == reveal_node(node, Nearest)
+```
+
+`Nearest` is the default for Tab because it moves the least. A partially
+visible node moves just enough to expose it, never centred gratuitously.
+
+##### Nested viewports: recompute between every step
+
+```text
+target's laid-out rect
+  ↓
+find the Scroll ancestors containing it
+  ↓
+innermost -> outermost, and for each:
+    transform the target into that viewport's content space
+    adjust the offset minimally for the alignment
+    clamp
+    recompute where the target now presents
+  ↓
+continue outward
+```
+
+The recompute is the part that is easy to omit and wrong to omit. Moving an
+inner viewport changes where the target sits relative to the outer one, so
+computing every offset from the original geometry gives the outer viewport a
+stale answer. Nested reveal fails in exactly that case and nowhere else, which
+is why it gets its own test.
+
+##### Authority, and refusals
+
+```text
+guest    reveal_node(button_7, Center)
+host     chooses the actual offsets, and never reports them back
+```
+
+```text
+unknown or stale NodeKey     no-op
+Display::None                not revealable
+Visibility::Hidden           not revealable
+no layout geometry           not revealable
+already visible + Nearest    no offset change, no redraw
+reveal moves something       host-local offsets, a redraw, zero SendToGuest
+```
+
+`reveal_range` and `select_range` are deliberately absent. They belong to
+Phase 3's `TextView`, which needs a range vocabulary this package has no reason
+to invent. What E3 freezes is the *principle* — navigation is semantic intent,
+never an offset a guest computed from geometry it does not own.
+
 #### The structural invariant, modelled on C5
 
 > Moving focus without changing the guest tree must not enter layout or

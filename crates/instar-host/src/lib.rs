@@ -412,12 +412,19 @@ impl Host {
                 .scenes
                 .crash_scene(&mut self.text, *generation, message, metrics),
             PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
-                (Some(tree), Some(layout)) => self.scenes.app_scene(
+                (Some(tree), Some(layout)) => self.scenes.app_scene_focused(
                     tree,
                     layout,
                     &window.scroll,
                     metrics,
                     window.interaction.pressed(),
+                    // `focus_visible` gates the ring, not `focused`: a control
+                    // reached by clicking is focused without being ringed.
+                    window
+                        .focus
+                        .focus_visible()
+                        .then(|| window.focus.focused())
+                        .flatten(),
                 ),
                 // Ready, but the guest has not committed anything yet. An
                 // empty background beats an unpainted buffer, which on most
@@ -999,7 +1006,7 @@ impl Host {
         if window.metrics.usable().is_none() {
             return Vec::new();
         }
-        let Some(tree) = window.tree.as_ref() else {
+        let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref()) else {
             return Vec::new();
         };
 
@@ -1014,6 +1021,20 @@ impl Host {
                     FocusMove::Next
                 };
                 let moved = window.focus.traverse(tree, direction);
+                // Traversal brings the newly focused control into view. The
+                // guest never has to pair a focus request with a scroll, which
+                // is the whole point of navigation being semantic.
+                if moved && let Some(key) = window.focus.focused() {
+                    let extents = scroll_extents(tree, layout);
+                    instar_ui::reveal(
+                        tree,
+                        layout,
+                        &mut window.scroll,
+                        &|k| extents.get(&k).copied(),
+                        key,
+                        instar_ui::RevealAlignment::Nearest,
+                    );
+                }
                 // Moving focus abandons a Space the user is still holding on
                 // the control they moved away from.
                 let cancelled = window
@@ -1985,6 +2006,280 @@ mod tests {
             "a button that happens to reuse id 93 must not inherit the \
              keyboard from the one that had it"
         );
+    }
+
+    // --- E3: focus presentation and semantic reveal. ---
+
+    /// A viewport 100 tall over 400 of content, with a button below the fold.
+    fn offscreen_focus_fixture() -> Tree {
+        use instar_ui::{Node, WireAlign, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    100,
+                    Node::column(
+                        101,
+                        vec![
+                            Node::text(102, "spacer").with_layout(WireLayout {
+                                height: WireSize::Fixed(300),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(103, "below the fold").with_layout(WireLayout {
+                                height: WireSize::Fixed(40),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(104, "tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(60),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    /// Tab onto something offscreen brings it into view, without the guest.
+    #[test]
+    fn traversal_reveals_an_offscreen_control() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, offscreen_focus_fixture())
+            .expect("valid");
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(100))
+                .y,
+            0,
+            "nothing is scrolled yet"
+        );
+
+        let effects = host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::first(103)));
+        assert!(
+            to_guest(&effects).is_empty(),
+            "reveal is host-local: {effects:?}"
+        );
+
+        let window = host.window(WINDOW).unwrap();
+        let offset = window.scroll.get(NodeKey::first(100)).y;
+        assert!(offset > 0, "the viewport scrolled to expose it");
+
+        // Nearest moves the minimum: the button's bottom edge reaches the
+        // viewport's bottom edge and no further.
+        assert_eq!(
+            offset, 240,
+            "content y 300..340 in a 100-tall viewport needs exactly 240, not \
+             a gratuitous centring"
+        );
+        assert!(
+            window.focus.focus_visible(),
+            "and keyboard traversal shows the ring"
+        );
+    }
+
+    #[test]
+    fn revealing_something_already_visible_changes_nothing() {
+        use instar_ui::Node;
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        let _ = Node::text(0, "");
+
+        host.handle(key(instar_window::Key::Tab, false));
+        let effects = host.handle(key(instar_window::Key::Tab, false));
+        // Focus moved, so there is a frame -- but no viewport moved, because
+        // nothing needed to.
+        assert!(host.window(WINDOW).unwrap().scroll.is_empty());
+        assert!(to_guest(&effects).is_empty());
+    }
+
+    /// The nested case, which is the only one where recomputing between steps
+    /// matters. Computing both offsets from the original geometry leaves the
+    /// outer viewport working from a position the inner one has already moved.
+    #[test]
+    fn nested_viewports_each_adjust_using_the_updated_position() {
+        use instar_ui::{Node, WireAlign, WireLayout, WireSize};
+        let stretch = |height: u16| WireLayout {
+            height: WireSize::Fixed(height),
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+
+        // Outer viewport 100 tall; inner sits 200 down inside it and is itself
+        // 80 tall over 300 of content, with the target at the bottom.
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    110,
+                    Node::column(
+                        111,
+                        vec![
+                            Node::text(112, "outer spacer").with_layout(stretch(200)),
+                            Node::scroll(
+                                113,
+                                Node::column(
+                                    114,
+                                    vec![
+                                        Node::text(115, "inner spacer").with_layout(stretch(220)),
+                                        Node::button(116, "target").with_layout(stretch(40)),
+                                    ],
+                                ),
+                            )
+                            .with_layout(stretch(80)),
+                            // A long tail, so the outer viewport has far more
+                            // scrollable extent than it needs. Without it the
+                            // outer offset clamps to its maximum whether the
+                            // arithmetic was right or not, and the test cannot
+                            // tell a recomputed answer from a stale one.
+                            Node::text(117, "outer tail").with_layout(stretch(500)),
+                        ],
+                    ),
+                )
+                .with_layout(stretch(100)),
+            ],
+        ));
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, tree).expect("valid");
+        host.handle(key(instar_window::Key::Tab, false));
+
+        let window = host.window(WINDOW).unwrap();
+        let inner = window.scroll.get(NodeKey::first(113)).y;
+        let outer = window.scroll.get(NodeKey::first(110)).y;
+        assert!(inner > 0, "the inner viewport scrolled to its target");
+        assert!(outer > 0, "and the outer one scrolled to expose the inner");
+
+        // The proof: the target ends up inside both viewports at once.
+        let layout = window.layout().unwrap();
+        let target = layout.get(NodeKey::first(116)).unwrap();
+        let inner_rect = layout.get(NodeKey::first(113)).unwrap();
+        let outer_rect = layout.get(NodeKey::first(110)).unwrap();
+
+        let presented_top = target.y - inner - outer;
+        let inner_top = inner_rect.y - outer;
+        assert!(
+            presented_top >= inner_top && presented_top < inner_top + inner_rect.height,
+            "the target sits within the inner viewport once both have moved: \
+             target {presented_top}, inner {inner_top}..{}",
+            inner_top + inner_rect.height
+        );
+        assert!(
+            inner_top >= outer_rect.y && inner_top < outer_rect.y + outer_rect.height,
+            "and the inner viewport sits within the outer one"
+        );
+    }
+
+    #[test]
+    fn a_hidden_target_is_not_revealable() {
+        use instar_ui::{Node, WireAlign, WireLayout, WireSize};
+        let mut host = ready_host();
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        120,
+                        Node::column(
+                            121,
+                            vec![
+                                Node::text(122, "spacer").with_layout(WireLayout {
+                                    height: WireSize::Fixed(300),
+                                    ..WireLayout::default()
+                                }),
+                                Node::button(123, "hidden").hidden(),
+                            ],
+                        ),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        align_self: Some(WireAlign::Stretch),
+                        ..WireLayout::default()
+                    }),
+                ],
+            )),
+        )
+        .expect("valid");
+
+        host.handle(key(instar_window::Key::Tab, false));
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            window.focus.focused(),
+            None,
+            "a hidden control is not focusable in the first place"
+        );
+        assert_eq!(
+            window.scroll.get(NodeKey::first(120)).y,
+            0,
+            "and nothing scrolled looking for it"
+        );
+    }
+
+    #[test]
+    fn the_focus_ring_is_drawn_only_when_focus_is_visible() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        let ring = host.theme().focus_ring;
+        let has_ring =
+            |host: &Host| {
+                host.window(WINDOW)
+                    .and_then(HostWindow::scene)
+                    .is_some_and(|scene| {
+                        scene.commands.iter().any(|command| matches!(
+                        command,
+                        instar_paint::PaintCommand::StrokeRect { color, .. } if *color == ring
+                    ))
+                    })
+            };
+        assert!(!has_ring(&host), "nothing focused yet");
+
+        host.handle(key(instar_window::Key::Tab, false));
+        assert!(has_ring(&host), "keyboard traversal draws it");
+
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(92)))
+            .unwrap();
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(rect.x + 1),
+            f64::from(rect.y + 1),
+        ));
+        assert!(
+            !has_ring(&host),
+            "a click focuses without painting a keyboard ring"
+        );
+    }
+
+    /// The keyboard equivalent of D's drag proof, for navigation.
+    #[test]
+    fn tab_focus_and_reveal_complete_while_the_guest_is_blocked() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, offscreen_focus_fixture())
+            .expect("valid");
+
+        let stalled_until = Instant::now() + Duration::from_millis(100);
+        let effects = host.handle(key(instar_window::Key::Tab, false));
+
+        assert!(
+            Instant::now() < stalled_until,
+            "focus, reveal and ring presentation all completed inside the \
+             stall window, so the guest could not have participated"
+        );
+        assert!(to_guest(&effects).is_empty());
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(window.focus.focused(), Some(NodeKey::first(103)));
+        assert!(window.focus.focus_visible());
+        assert!(window.scroll.get(NodeKey::first(100)).y > 0);
     }
 
     // --- E2: keyboard activation. ---

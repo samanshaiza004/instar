@@ -96,6 +96,7 @@ pub struct Theme {
     pub scrollbar_thumb: Color,
     pub scrollbar_thumb_hover: Color,
     pub scrollbar_thumb_active: Color,
+    pub focus_ring: Color,
     pub crash_background: Color,
     pub crash_text: Color,
 }
@@ -120,6 +121,7 @@ impl Default for Theme {
             scrollbar_thumb: Color::opaque(0x5a, 0x5a, 0x66),
             scrollbar_thumb_hover: Color::opaque(0x74, 0x74, 0x82),
             scrollbar_thumb_active: Color::opaque(0x8e, 0x8e, 0x9c),
+            focus_ring: Color::opaque(0x6c, 0xa8, 0xff),
             // Deliberately unlike anything the app palette can produce. A
             // crash screen that could be mistaken for a running app is a
             // crash screen that gets ignored.
@@ -259,6 +261,23 @@ impl SceneBuilder {
         metrics: &WindowMetricsChanged,
         pressed: Option<instar_ui::NodeKey>,
     ) -> PaintScene {
+        self.app_scene_focused(tree, layout, scroll, metrics, pressed, None)
+    }
+
+    /// The same, with a focus ring around `focus_ring` if it is `Some`.
+    ///
+    /// `None` covers both "nothing focused" and "focused but not visibly so",
+    /// which is `FocusState`'s distinction to make rather than this one's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_scene_focused(
+        &self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        metrics: &WindowMetricsChanged,
+        pressed: Option<instar_ui::NodeKey>,
+        focus_ring: Option<instar_ui::NodeKey>,
+    ) -> PaintScene {
         let scale = metrics.scale_factor as f32;
         let mut commands = vec![PaintCommand::Clear {
             color: self.theme.background,
@@ -271,6 +290,7 @@ impl SceneBuilder {
             scroll,
             ScrollOffset::ZERO,
             pressed,
+            focus_ring,
             scale,
             &mut commands,
             &mut fonts,
@@ -301,6 +321,7 @@ impl SceneBuilder {
         scroll: &ScrollState,
         translation: ScrollOffset,
         pressed: Option<instar_ui::NodeKey>,
+        focus_ring: Option<instar_ui::NodeKey>,
         scale: f32,
         commands: &mut Vec<PaintCommand>,
         fonts: &mut Vec<FontResource>,
@@ -354,6 +375,19 @@ impl SceneBuilder {
         // container that asked for a background now gets one, which is what
         // makes a panel or a card expressible without a spurious node.
         self.paint_surface(&node.style.paint, rect, scale, commands);
+
+        // Inside the node's own clip bracket, so the ring obeys exactly the
+        // clip stack the node does. Chrome that escaped a Scroll would put a
+        // ring over content the node itself is clipped out of -- the same "two
+        // answers to where the node is" problem the clip ordering already
+        // solves once.
+        if focus_ring == Some(node.key) {
+            commands.push(PaintCommand::StrokeRect {
+                rect: physical(rect, scale),
+                width: 2.0 * scale,
+                color: self.theme.focus_ring,
+            });
+        }
 
         match &node.kind {
             // Structure only, beyond whatever surface the guest asked for
@@ -449,6 +483,7 @@ impl SceneBuilder {
                 scroll,
                 child_translation,
                 pressed,
+                focus_ring,
                 scale,
                 commands,
                 fonts,
