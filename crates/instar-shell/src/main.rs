@@ -332,9 +332,20 @@ impl Shell {
     }
 
     /// A platform accessibility request, now safely on the main thread.
+    /// A platform accessibility request, now safely on the main thread.
+    ///
+    /// Under `--debug` this narrates what the platform actually asked for. It
+    /// exists for the F4 manual pass: AccessKit defines a broad cross-platform
+    /// action vocabulary, but which requests a given screen reader generates
+    /// for a given gesture is the *native adapter's* business, and guessing at
+    /// it is how a smoke test comes to demand a sequence no platform produces.
+    /// So observe first. See `docs/F4-SMOKE.md`.
     fn on_accessibility(&mut self, event: accesskit_winit::Event, event_loop: &ActiveEventLoop) {
         match self.a11y.classify(event.window_event) {
             A11yRequest::SendFullTree => {
+                if self.debug {
+                    eprintln!("instar: a11y attached, sending the whole tree");
+                }
                 let (Some(native), Some(bridge)) = (self.native.as_mut(), self.bridge.as_mut())
                 else {
                     return;
@@ -347,15 +358,46 @@ impl Shell {
                 }
             }
             A11yRequest::Forward { action, target } => {
+                let debug = self.debug;
                 let Some(bridge) = self.bridge.as_mut() else {
                     return;
                 };
+                let before = bridge.host().interaction_stats();
                 let effects = bridge.on_accessibility_action(action, target);
+
+                if debug {
+                    // Which canonical operation this entered, read from the
+                    // F3 counters. Instrumentation, not behaviour: the
+                    // counters describe what happened, and nothing branches
+                    // on them.
+                    let after = bridge.host().interaction_stats();
+                    let entered = if after.activate > before.activate {
+                        "Activate"
+                    } else if after.focus > before.focus {
+                        "Focus"
+                    } else if after.blur > before.blur {
+                        "Blur"
+                    } else if after.reveal > before.reveal {
+                        "Reveal"
+                    } else {
+                        "nothing"
+                    };
+                    let key = instar_ui::NodeKey::from_accesskit_id(target.0);
+                    eprintln!(
+                        "instar: a11y {action:?} node {} -> id {} gen {} -> entered {entered}",
+                        target.0, key.id, key.generation,
+                    );
+                }
+
                 // Through `apply` like everything else, which is also what
                 // flushes whatever the action just changed back out.
                 self.apply(effects, event_loop);
             }
-            A11yRequest::Nothing => {}
+            A11yRequest::Nothing => {
+                if self.debug {
+                    eprintln!("instar: a11y detached");
+                }
+            }
         }
     }
 
