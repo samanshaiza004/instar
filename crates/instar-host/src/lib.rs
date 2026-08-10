@@ -53,8 +53,8 @@ use std::sync::Arc;
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
 use instar_ui::{
-    Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart, TextContext, TreeError,
-    UiAction, Viewport,
+    FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart,
+    TextContext, TreeError, UiAction, Viewport,
 };
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
@@ -183,6 +183,9 @@ pub struct HostWindow {
     interaction: Interaction,
     /// The id lifecycle for the guest currently owning this window.
     ledger: KeyLedger,
+    /// What the keyboard is pointed at. Host-owned, like every other
+    /// transient interaction state.
+    focus: FocusState,
     /// Where each retained viewport is scrolled to. Host-owned: no guest sets
     /// one, and none can read one.
     scroll: ScrollState,
@@ -500,6 +503,7 @@ impl Host {
             }
             WindowOutput::Pointer(event) => self.on_pointer(event),
             WindowOutput::Scroll(event) => self.on_scroll(event),
+            WindowOutput::Key(event) => self.on_key(event),
             WindowOutput::RedrawRequested { window_id } => self.on_redraw_requested(window_id),
             // Close policy lives here, not in the window layer. A host with a
             // guest to consult could ask it first; this one exits.
@@ -601,6 +605,11 @@ impl Host {
         // property that matters. See `Interaction::retire_hidden`.
         if let Some(tree) = window.tree.as_ref() {
             window.interaction.retire_hidden(tree);
+            // Focus joins the same site, and covers removal, hiding,
+            // Display::None and disabling with one question: can the keyboard
+            // still reach it? A generational key makes a reused id answer no
+            // without a rule saying so.
+            window.focus.retire(tree);
         }
         // Only when something that can move a rectangle changed. A paint-only
         // commit -- a colour, a border, a corner radius -- keeps the geometry
@@ -716,6 +725,14 @@ impl Host {
         let mut effects = match event.state {
             PointerState::Pressed => {
                 window.interaction.on_press(tree, layout, scroll, x, y);
+                // A click moves focus to whatever it landed on, or clears it.
+                // `focus_visible` stays false: a keyboard-style ring after
+                // every mouse click is noise, and deciding that here keeps the
+                // guest from having to track input modality.
+                let hit = tree
+                    .hit_test_scrolled(layout, scroll, x, y)
+                    .map(|node| node.key);
+                window.focus.focus_by_pointer(hit);
                 Vec::new()
             }
             PointerState::Released => window
@@ -958,6 +975,52 @@ impl Host {
         }
         self.rebuild_scene(window_id);
         vec![HostEffect::Render { window: window_id }]
+    }
+
+    /// A key went down or came up.
+    ///
+    /// E1 handles traversal only. Activation is E2, and character input is
+    /// Phase 3's — this deliberately does not grow an opinion about any key it
+    /// has not been given a retained-UI meaning for.
+    ///
+    /// Entirely host-local: moving focus is presentation, and there is no
+    /// branch here that can reach the guest.
+    fn on_key(&mut self, event: instar_window::RawKeyEvent) -> Vec<HostEffect> {
+        if !event.pressed {
+            return Vec::new();
+        }
+        let Some(window) = self.windows.get_mut(&event.window_id) else {
+            return Vec::new();
+        };
+        if window.metrics.usable().is_none() {
+            return Vec::new();
+        }
+        let Some(tree) = window.tree.as_ref() else {
+            return Vec::new();
+        };
+
+        let moved = match event.key {
+            instar_window::Key::Tab => {
+                let direction = if event.shift {
+                    FocusMove::Previous
+                } else {
+                    FocusMove::Next
+                };
+                window.focus.traverse(tree, direction)
+            }
+            _ => false,
+        };
+        if !moved {
+            return Vec::new();
+        }
+
+        // Focus is drawn, so moving it is a visual change -- and *only* a
+        // visual one. The scene is re-lowered; layout and shaping are not
+        // touched, which is the structural invariant E1 asserts.
+        self.rebuild_scene(event.window_id);
+        vec![HostEffect::Render {
+            window: event.window_id,
+        }]
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -1639,6 +1702,217 @@ mod tests {
             "the press belonged to a node that no longer exists; completing it \
              against whatever reused the id would activate a control the user \
              never touched"
+        );
+    }
+
+    // --- E1: focus lifecycle and traversal. ---
+
+    fn key(k: instar_window::Key, shift: bool) -> WindowOutput {
+        WindowOutput::Key(instar_window::RawKeyEvent {
+            window_id: WINDOW,
+            key: k,
+            pressed: true,
+            shift,
+        })
+    }
+
+    fn focus_fixture() -> Tree {
+        use instar_ui::Node;
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(90, "label"),
+                Node::button(91, "first"),
+                Node::button(92, "second"),
+            ],
+        ))
+    }
+
+    fn focused(host: &Host) -> Option<NodeKey> {
+        host.window(WINDOW).and_then(|w| w.focus.focused())
+    }
+
+    #[test]
+    fn tab_moves_focus_and_tells_the_guest_nothing() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+
+        let effects = host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::first(91)));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "focus is drawn, so moving it asks for a frame"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "traversal is presentation and must not reach the guest: {effects:?}"
+        );
+
+        host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::first(92)));
+        host.handle(key(instar_window::Key::Tab, true));
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(91)),
+            "Shift+Tab goes back"
+        );
+    }
+
+    /// The E1 structural invariant, modelled on C5: focus movement is paint.
+    ///
+    /// `reused` is in the tuple for the same reason it is there — the other
+    /// three counters stay at zero even when layout re-runs and the cache
+    /// hits, so only `reused` distinguishes "nothing asked the text system a
+    /// question" from "it answered cheaply".
+    #[test]
+    fn moving_focus_enters_neither_layout_nor_shaping() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        let before = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(91)));
+
+        host.reset_text_stats();
+        host.handle(key(instar_window::Key::Tab, false));
+        host.handle(key(instar_window::Key::Tab, false));
+
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.extracted,
+                stats.reused
+            ),
+            (0, 0, 0, 0),
+            "a focus ring is paint; if traversal starts running Parley or \
+             Taffy that is architectural, not slow: {stats:?}"
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|l| l.get(NodeKey::first(91))),
+            before,
+            "and nothing moved"
+        );
+    }
+
+    #[test]
+    fn a_click_moves_focus_without_showing_the_keyboard_ring() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        host.handle(key(instar_window::Key::Tab, false));
+        assert!(host.window(WINDOW).unwrap().focus.focus_visible());
+
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|l| l.get(NodeKey::first(92)))
+            .unwrap();
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(rect.x + 1),
+            f64::from(rect.y + 1),
+        ));
+
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(92)),
+            "the click focused it"
+        );
+        assert!(
+            !host.window(WINDOW).unwrap().focus.focus_visible(),
+            "but a keyboard-style ring after every mouse click is noise"
+        );
+    }
+
+    #[test]
+    fn focus_is_retired_when_its_node_stops_being_reachable() {
+        use instar_ui::Node;
+        for (what, tree) in [
+            (
+                "removed",
+                Tree::new(Node::root(0, vec![Node::button(92, "second")])),
+            ),
+            (
+                "disabled",
+                Tree::new(Node::root(
+                    0,
+                    vec![
+                        Node::button(91, "first").disabled(),
+                        Node::button(92, "second"),
+                    ],
+                )),
+            ),
+            (
+                "hidden",
+                Tree::new(Node::root(
+                    0,
+                    vec![
+                        Node::button(91, "first").hidden(),
+                        Node::button(92, "second"),
+                    ],
+                )),
+            ),
+        ] {
+            let mut host = ready_host();
+            host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+            host.handle(key(instar_window::Key::Tab, false));
+            assert_eq!(focused(&host), Some(NodeKey::first(91)));
+
+            host.apply_tree(WINDOW, tree).expect("valid");
+            assert_eq!(
+                focused(&host),
+                None,
+                "{what}: focus must not survive on a node the keyboard cannot \
+                 reach"
+            );
+        }
+    }
+
+    /// The regression generational keys exist for, end to end through a
+    /// commit rather than against `FocusState` directly.
+    #[test]
+    fn a_reused_id_does_not_inherit_focus_through_a_commit() {
+        use instar_ui::{Node, NodeKind, WireLayout};
+
+        let with_generation = |generation: u32| {
+            Tree::new(Node::root(
+                0,
+                vec![Node {
+                    key: NodeKey::new(93, generation),
+                    kind: NodeKind::Button {
+                        label: "reused".into(),
+                        enabled: true,
+                    },
+                    layout: WireLayout::default(),
+                    style: Default::default(),
+                    children: Vec::new(),
+                }],
+            ))
+        };
+
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::new(93, 0)));
+
+        // Gone, then back at a new generation.
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(94, "gap")])),
+        )
+        .expect("valid");
+        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+
+        assert_eq!(
+            focused(&host),
+            None,
+            "a button that happens to reuse id 93 must not inherit the \
+             keyboard from the one that had it"
         );
     }
 

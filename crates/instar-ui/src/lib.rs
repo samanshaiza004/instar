@@ -26,12 +26,14 @@
 //! two are separate types.
 
 pub mod diff;
+pub mod focus;
 pub mod layout;
 pub mod ledger;
 pub mod scroll;
 pub mod text;
 
 pub use diff::{ChangeSet, diff};
+pub use focus::{FocusMove, FocusState, focusable_order};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
     NodeKey, ProtocolError, WireAlign, WireBorder, WireColor, WireCursor, WireDisplay,

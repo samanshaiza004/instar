@@ -827,6 +827,78 @@ a node that no longer exists, and it gets the same answer.
 
 ### E — focus and keyboard
 
+Three packages, each from a green checkpoint: **E1** focus lifecycle and
+traversal, **E2** keyboard activation, **E3** focus presentation and reveal.
+
+> Focus is host-owned transient interaction state keyed by generational
+> `NodeKey`. A guest may request focus semantically; ordinary focus movement
+> and keyboard interaction need no Wasm round trip.
+
+#### E1 — the lifecycle
+
+```text
+FocusState
+├── focused: Option<NodeKey>
+└── focus_visible: bool
+
+Tab        -> next focusable in retained tree order
+Shift+Tab  -> previous
+
+focusable  = interactive and enabled and presented,
+             with every ancestor presented
+
+Display::None / Visibility::Hidden / disabled  -> cannot receive focus
+the focused node becomes any of those, or is removed
+           -> focus is retired before the new tree becomes interactive
+```
+
+**Retirement clears focus outright.** The next `Tab` restarts from the top
+rather than resuming where the retired node was. Remembering the position is
+better for a form that disables a field mid-edit, and it costs a second piece
+of transient state keyed by `NodeKey` — which needs its own retirement rules,
+and is exactly the kind of thing that later turns out to reference a node that
+no longer exists. Clearing is the rule that cannot be subtly wrong.
+
+The generational regression is mandatory, and is where `NodeKey`'s generation
+earns its place a second time:
+
+```text
+focus Button (7, 0)  ->  remove it  ->  create Button (7, 1)
+                     ->  the new button is NOT focused
+```
+
+Focus is precisely the kind of long-lived reference that outlives the node it
+names. Without the generation this is a rule someone has to remember; with it,
+the stale key simply does not match.
+
+`focus_visible` is deterministic host policy, not a `:focus-visible`
+heuristic:
+
+```text
+keyboard traversal, accessibility  ->  focus_visible = true
+pointer click                      ->  focus may move, focus_visible = false
+```
+
+That keeps a keyboard-style ring off the screen after every mouse click without
+the guest tracking input modality.
+
+#### The structural invariant, modelled on C5
+
+> Moving focus without changing the guest tree must not enter layout or
+> shaping.
+
+A focus ring is paint. If focus movement ever starts running Taffy or Parley,
+that is an architectural regression to catch now rather than when it becomes
+slow — and, per the rule this file already records, the test observes *entry*
+into that work rather than its cost.
+
+#### What E is not
+
+Character input, caret navigation, editing shortcuts and IME are Phase 3's
+`TextView`. `Button` activation and focus traversal are ordinary retained-UI
+behaviour; letting E acquire the rest would make it half an editor with none of
+the contract that makes an editor correct.
+
 The same ownership split that already governs pressed-state and scrolling:
 **transient interaction belongs to the host; the guest receives semantic
 outcomes.**
