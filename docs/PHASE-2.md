@@ -1453,16 +1453,49 @@ the Gallery and deleted: a fixture nothing else runs is a fixture that drifts
 from what it represents, and the Gallery is exercised on every test run. See
 `docs/F4-SMOKE.md`.
 
-#### What the catalog still owes
+#### The catalog
 
-The visual half — Row/Stack, grow/shrink/min/max, hidden and display-none,
-clipping, text weights and sizes, backgrounds, borders and radii, disabled
-state, scrollbars — proves every primitive works. It comes after the Lab
-because it probes the layer that already has the most tests.
+Seven sections below the Lab, inside the same viewport so scrolling reaches all
+of it and the Lab's focus order is unchanged: Row and Stack; grow/shrink/min/max;
+`visibility: hidden` against `display: none`; clipping; text weights, sizes and
+the monospace role; backgrounds, borders, radii and disabled state; and the
+nested-`Scroll` pair.
 
-Missing primitives go in `docs/GALLERY-LEDGER.md` rather than into the wire.
-The rule is unchanged: the Gallery discovers missing primitives; it does not
-automatically justify implementing them.
+The last is not decoration. `docs/GALLERY-LEDGER.md` entry 4 records that two
+nested viewports put their scrollbars at the same x, and leaves the question
+open rather than picking overlay or inset on one data point — AppKit supports
+both and chooses between them from a *user preference*, which is good evidence
+this is presentation policy rather than intrinsic `Scroll` semantics. The
+catalog therefore carries two specimens differing only in style, and answers
+two questions by being looked at:
+
+1. can existing style and layout primitives make a nested region obvious,
+   with no new runtime semantics?
+2. once separated, are the coincident overlay bars still confusing?
+
+Missing primitives go in the ledger rather than into the wire. The rule is
+unchanged: the Gallery discovers missing primitives; it does not automatically
+justify implementing them.
+
+#### One structural change the catalog forced
+
+Sixty nodes cannot have their child counts written by hand. `BatchEncoder`
+emits a flat depth-first stream in which every node declares how many children
+follow, and getting that wrong desynchronizes the stream so the *next* node
+decodes as a section opcode — which is exactly what happened at fifteen nodes,
+when a column declared four children and had five.
+
+So the Gallery builds an `El` tree and emits it recursively, taking each count
+from the vector rather than from the author. This is **not** an SDK and is not
+trying to become one; it is one guest keeping one hazard out of its own source.
+Whether the same shape belongs in `instar-sdk` is H's question, and the answer
+should come from the Calculator rather than from here.
+
+Worth recording that the host caught the one mistake the builder does not
+prevent — a helper that consumes four ids called with a gap of three, so a
+caption landed on a specimen's spacer — immediately and by name:
+`duplicate node key node216#0`. Node identity is validated at the wire, and a
+guest cannot silently produce an ambiguous tree.
 
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
