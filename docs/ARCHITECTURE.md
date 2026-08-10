@@ -495,6 +495,23 @@ grows an effective cache, timings and downstream counters will look fine again
 while the architecture has regressed. The question to test is always "did
 anything enter this path", never "was entering it expensive".
 
+A second rule, learned the same way:
+
+> **A regression fixture must give the correct and faulty implementations room
+> to produce different observable states.**
+
+E3's nested-reveal test asserted the right property and proved nothing, because
+the outer viewport in its fixture clamped to the same maximum whether the
+arithmetic was right or wrong. Both implementations ended in identical state,
+so no assertion over that state could separate them. Lengthening the content
+until the outer viewport had room to spare made the faulty version overshoot by
+180px and the test fail.
+
+That is a different failure from an assertion being too weak. The assertion was
+exact; the *fixture* had no entropy left for the two answers to differ in. When
+a fault injection comes back green, the fixture is the second thing to suspect
+after the injection itself.
+
 The corollary is a habit, not a rule:
 
 > A test that stays green under the fault it was written to catch is evidence

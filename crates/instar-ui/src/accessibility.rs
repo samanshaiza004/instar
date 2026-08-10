@@ -163,10 +163,149 @@ fn role_of(kind: &NodeKind) -> Role {
     }
 }
 
+/// What an accessibility object looks like, reduced to what can change it.
+///
+/// The point of hashing rather than keeping a second `Node` is that a node can
+/// change all day without its *accessible* projection changing: a foreground,
+/// a border, a corner radius, a hover, a pressed face. Comparing projections
+/// answers "did the accessible object change?", which is the question, rather
+/// than "did the Instar node change?", which is not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Fingerprint {
+    role: Role,
+    name: u64,
+    children: u64,
+    bounds: Option<crate::Rect>,
+    disabled: bool,
+    scroll: Option<(i32, i32)>,
+}
+
+fn hash_of(value: impl std::hash::Hash) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Tracks what the platform has already been told, so each update carries only
+/// what changed.
+///
+/// # An update happens if and only if something accessible changed
+///
+/// > An Instar change produces an AccessKit update iff it changes
+/// > accessibility-observable state.
+///
+/// Not "produces an empty update". AccessKit documents that even unchanged
+/// nodes in a `TreeUpdate` cost processing and replacement, and the whole
+/// point of C's invalidation split was that a colour change costs nothing —
+/// letting it cost an accessibility round trip would put the expense back
+/// through a different door.
+///
+/// Dirtiness comes from three places, not one: a guest commit, a layout
+/// result, and host-local state like focus and scroll. Tying accessibility to
+/// guest commits alone would leave a screen reader with stale geometry after
+/// every wheel event.
+#[derive(Debug, Default)]
+pub struct A11yProjection {
+    entries: std::collections::HashMap<crate::NodeKey, Fingerprint>,
+    focus: Option<NodeId>,
+    started: bool,
+}
+
+impl A11yProjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The incremental update for the current state, or `None` when nothing
+    /// an assistive technology can observe has changed.
+    pub fn update(
+        &mut self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        focus: &FocusState,
+        scroll: &ScrollState,
+    ) -> Option<TreeUpdate> {
+        if !is_presented(&tree.root) {
+            return None;
+        }
+        let root_id = ak_id(tree.root.key);
+        let focus_id = focus.focused().map_or(root_id, ak_id);
+
+        let mut current = Vec::new();
+        build(&tree.root, layout, scroll, &mut current);
+
+        let mut nodes = Vec::new();
+        let mut seen = std::collections::HashSet::with_capacity(current.len());
+        for (id, node) in current {
+            let key = crate::NodeKey::from_accesskit_id(id.0);
+            seen.insert(key);
+            let fingerprint = fingerprint_of(&node);
+            if self.entries.get(&key) != Some(&fingerprint) {
+                self.entries.insert(key, fingerprint);
+                nodes.push((id, node));
+            }
+        }
+
+        // Removed nodes are dropped from the record but never *emitted*: their
+        // surviving parent's child list changed, so the parent is already in
+        // `nodes`, and AccessKit treats a node that is neither the root nor a
+        // child of another node as an error.
+        self.entries.retain(|key, _| seen.contains(key));
+
+        let focus_changed = self.focus != Some(focus_id);
+        let first = !self.started;
+        if nodes.is_empty() && !focus_changed && !first {
+            return None;
+        }
+        self.focus = Some(focus_id);
+        self.started = true;
+
+        Some(TreeUpdate {
+            nodes,
+            // The tree descriptor accompanies the first update; afterwards the
+            // adapter already holds it.
+            tree: first.then(|| AccessTree::new(root_id)),
+            tree_id: accesskit::TreeId::ROOT,
+            // Carried on every update, related to the changed nodes or not:
+            // AccessKit asks for it each time, and for the root when nothing
+            // in particular is focused.
+            focus: focus_id,
+        })
+    }
+
+    /// Forgets everything, so the next update is a complete tree again.
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.focus = None;
+        self.started = false;
+    }
+}
+
+fn fingerprint_of(node: &AccessNode) -> Fingerprint {
+    Fingerprint {
+        role: node.role(),
+        name: hash_of(node.label()),
+        children: hash_of(node.children().iter().map(|id| id.0).collect::<Vec<_>>()),
+        bounds: node.bounds().map(|rect| {
+            crate::Rect::new(
+                rect.x0 as i32,
+                rect.y0 as i32,
+                (rect.x1 - rect.x0) as i32,
+                (rect.y1 - rect.y0) as i32,
+            )
+        }),
+        disabled: node.is_disabled(),
+        scroll: node
+            .scroll_y()
+            .map(|y| (y as i32, node.scroll_y_max().unwrap_or_default() as i32)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeKey, TextContext, Viewport, WireAlign, WireLayout, WireSize};
+    use crate::{NodeKey, TextContext, Viewport, WireAlign, WireColor, WireLayout, WireSize};
 
     fn projected(tree: &Tree) -> (TreeUpdate, LayoutSnapshot) {
         let mut text = TextContext::new();
@@ -182,6 +321,295 @@ mod tests {
             .iter()
             .find(|(id, _)| *id == ak_id(key))
             .map(|(_, node)| node.role())
+    }
+
+    // --- F2: incremental updates. ---
+
+    /// Drives a projection across successive states, like the host would.
+    struct Session {
+        projection: A11yProjection,
+        text: TextContext,
+        focus: FocusState,
+        scroll: ScrollState,
+    }
+
+    impl Session {
+        fn new() -> Self {
+            Self {
+                projection: A11yProjection::new(),
+                text: TextContext::new(),
+                focus: FocusState::new(),
+                scroll: ScrollState::new(),
+            }
+        }
+
+        fn commit(&mut self, tree: &Tree) -> Option<TreeUpdate> {
+            let layout = tree.layout(&mut self.text, Viewport::new(400.0, 300.0));
+            self.projection
+                .update(tree, &layout, &self.focus, &self.scroll)
+        }
+    }
+
+    fn changed(update: &Option<TreeUpdate>) -> Vec<NodeId> {
+        update
+            .as_ref()
+            .map(|u| u.nodes.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default()
+    }
+
+    fn styled_tree(color: Option<WireColor>) -> Tree {
+        let mut button = Node::button(2, "press");
+        if let Some(color) = color {
+            button = button
+                .with_foreground(color)
+                .with_background(color)
+                .with_border(3, color)
+                .with_corner_radius(4);
+        }
+        Tree::new(Node::root(0, vec![Node::text(1, "steady"), button]))
+    }
+
+    /// The structural invariant: paint-only produces *no update at all*, not
+    /// an empty one. AccessKit charges for unchanged nodes in an update, so an
+    /// empty round trip would put C's cost back through a different door.
+    #[test]
+    fn a_paint_only_change_produces_no_accessibility_update() {
+        let mut session = Session::new();
+        assert!(
+            session.commit(&styled_tree(None)).is_some(),
+            "the first update is the whole tree"
+        );
+
+        let repainted = session.commit(&styled_tree(Some(WireColor::opaque(255, 0, 0))));
+        assert!(
+            repainted.is_none(),
+            "foreground, background, border and radius are invisible to \
+             assistive technology: {:?}",
+            changed(&repainted)
+        );
+    }
+
+    /// A repaint of the *focused* node is still a repaint. Being focused does
+    /// not make every pixel change accessibility-relevant.
+    #[test]
+    fn a_paint_only_change_to_the_focused_node_is_also_silent() {
+        let mut session = Session::new();
+        session.focus.focus_by_keyboard(Some(NodeKey::first(2)));
+        session.commit(&styled_tree(None));
+
+        assert!(
+            session
+                .commit(&styled_tree(Some(WireColor::opaque(0, 255, 0))))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_identical_commit_produces_nothing() {
+        let mut session = Session::new();
+        session.commit(&styled_tree(None));
+        assert!(session.commit(&styled_tree(None)).is_none());
+    }
+
+    #[test]
+    fn changing_text_updates_only_that_node() {
+        let mut session = Session::new();
+        session.commit(&styled_tree(None));
+
+        let renamed = Tree::new(Node::root(
+            0,
+            vec![Node::text(1, "different"), Node::button(2, "press")],
+        ));
+        assert_eq!(
+            changed(&session.commit(&renamed)),
+            vec![ak_id(NodeKey::first(1))],
+            "the label changed and nothing else did"
+        );
+    }
+
+    #[test]
+    fn disabling_a_button_updates_only_that_node() {
+        let mut session = Session::new();
+        session.commit(&styled_tree(None));
+
+        let disabled = Tree::new(Node::root(
+            0,
+            vec![Node::text(1, "steady"), Node::button(2, "press").disabled()],
+        ));
+        assert_eq!(
+            changed(&session.commit(&disabled)),
+            vec![ak_id(NodeKey::first(2))]
+        );
+    }
+
+    /// AccessKit's parent/child contract: adding a child emits the child *and*
+    /// the parent whose list changed.
+    #[test]
+    fn adding_a_child_emits_the_child_and_its_parent() {
+        let mut session = Session::new();
+        session.commit(&styled_tree(None));
+
+        let grown = Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(1, "steady"),
+                Node::button(2, "press"),
+                Node::button(3, "new"),
+            ],
+        ));
+        let ids = changed(&session.commit(&grown));
+        assert!(ids.contains(&ak_id(NodeKey::first(3))), "the new child");
+        assert!(
+            ids.contains(&ak_id(NodeKey::first(0))),
+            "and the parent, whose child list is now different -- without it \
+             the platform holds a tree that does not mention the new node"
+        );
+        assert_eq!(ids.len(), 2, "and nothing else: {ids:?}");
+    }
+
+    /// Removal emits the surviving parent and *not* the departed subtree: a
+    /// node that is neither root nor anyone's child is an error in AccessKit's
+    /// model.
+    #[test]
+    fn removing_a_subtree_emits_the_parent_and_not_the_departed() {
+        let mut session = Session::new();
+        let full = Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(1, "steady"),
+                Node::column(2, vec![Node::button(3, "inside")]),
+            ],
+        ));
+        session.commit(&full);
+
+        let pruned = Tree::new(Node::root(0, vec![Node::text(1, "steady")]));
+        let ids = changed(&session.commit(&pruned));
+        assert_eq!(ids, vec![ak_id(NodeKey::first(0))]);
+        for gone in [2u32, 3] {
+            assert!(
+                !ids.contains(&ak_id(NodeKey::first(gone))),
+                "node {gone} left the tree and must not be emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn hiding_an_ancestor_removes_its_whole_subtree() {
+        let mut session = Session::new();
+        let visible = Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(1, "steady"),
+                Node::column(2, vec![Node::button(3, "inside")]),
+            ],
+        ));
+        session.commit(&visible);
+
+        let hidden = Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(1, "steady"),
+                Node::column(2, vec![Node::button(3, "inside")]).hidden(),
+            ],
+        ));
+        let ids = changed(&session.commit(&hidden));
+        assert_eq!(
+            ids,
+            vec![ak_id(NodeKey::first(0))],
+            "only the surviving parent, with a shorter child list"
+        );
+    }
+
+    /// Bounds are accessibility state even though they are not application
+    /// state. A moved control that keeps stale geometry is a screen reader
+    /// pointing at the wrong place.
+    #[test]
+    fn moving_a_node_updates_its_bounds() {
+        let mut session = Session::new();
+        let with_spacer = |height: u16| {
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::text(1, "spacer").with_layout(WireLayout {
+                        height: WireSize::Fixed(height),
+                        ..WireLayout::default()
+                    }),
+                    Node::button(2, "moves"),
+                ],
+            ))
+        };
+        session.commit(&with_spacer(20));
+
+        let ids = changed(&session.commit(&with_spacer(60)));
+        assert!(
+            ids.contains(&ak_id(NodeKey::first(2))),
+            "the button did not change semantically but it did move: {ids:?}"
+        );
+    }
+
+    /// Host-local scrolling produces accessibility updates with no guest
+    /// involved -- accessibility dirtiness is not tied to guest commits.
+    #[test]
+    fn a_host_local_scroll_updates_the_viewport_without_a_commit() {
+        let stretch = |height: u16| WireLayout {
+            height: WireSize::Fixed(height),
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(1, Node::text(2, "content").with_layout(stretch(400)))
+                    .with_layout(stretch(100)),
+            ],
+        ));
+
+        let mut session = Session::new();
+        session.commit(&tree);
+        assert!(session.commit(&tree).is_none(), "nothing changed yet");
+
+        // No new tree: only host state moved.
+        session
+            .scroll
+            .set(NodeKey::first(1), crate::ScrollOffset::new(0, 150));
+        let ids = changed(&session.commit(&tree));
+        assert!(
+            ids.contains(&ak_id(NodeKey::first(1))),
+            "the viewport's reported offset changed: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_focus_only_change_carries_focus_and_no_nodes() {
+        let mut session = Session::new();
+        session.commit(&styled_tree(None));
+
+        session.focus.focus_by_keyboard(Some(NodeKey::first(2)));
+        let update = session.commit(&styled_tree(None)).expect("focus moved");
+        assert!(
+            update.nodes.is_empty(),
+            "no node's own properties changed: {:?}",
+            changed(&Some(update.clone()))
+        );
+        assert_eq!(update.focus, ak_id(NodeKey::first(2)));
+    }
+
+    /// The first update carries the tree descriptor; later ones do not.
+    #[test]
+    fn only_the_first_update_describes_the_tree() {
+        let mut session = Session::new();
+        let first = session.commit(&styled_tree(None)).expect("first");
+        assert!(first.tree.is_some());
+
+        let renamed = Tree::new(Node::root(
+            0,
+            vec![Node::text(1, "different"), Node::button(2, "press")],
+        ));
+        let second = session.commit(&renamed).expect("changed");
+        assert!(
+            second.tree.is_none(),
+            "the adapter already holds the tree descriptor"
+        );
     }
 
     /// The C5-style invariant, for accessibility.

@@ -33,7 +33,7 @@ pub mod ledger;
 pub mod scroll;
 pub mod text;
 
-pub use accessibility::project as project_accessibility;
+pub use accessibility::{A11yProjection, project as project_accessibility};
 pub use diff::{ChangeSet, diff};
 pub use focus::{FocusMove, FocusState, RevealAlignment, focusable_order, reveal};
 pub use instar_ui_protocol as protocol;
