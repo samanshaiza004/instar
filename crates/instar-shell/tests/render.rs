@@ -408,3 +408,39 @@ fn the_crash_screen_renders_at_any_scale() {
         );
     }
 }
+
+/// The focus ring has to survive being painted.
+///
+/// `the_focus_ring_is_drawn_only_when_focus_is_visible` asserts the host emits
+/// a `StrokeRect` in the ring's colour, and it passed throughout — while the
+/// running application showed no ring at all. The stroke was pushed *before*
+/// the button's own face fill, so every frame drew the ring and then painted
+/// over it.
+///
+/// That is the distinction this file exists for, stated in its own header: a
+/// scene test proves the host asked for the right drawing; only a pixel test
+/// proves the drawing happened.
+#[test]
+fn a_focused_control_actually_shows_a_ring_in_the_pixels() {
+    let mut bridge = ready();
+    let mut presenter = presenter();
+    let ring = bridge.host().theme().focus_ring;
+
+    let before = near(&frame(&bridge, &mut presenter), ring, 24);
+
+    bridge.on_window_event(WindowOutput::Key(instar_window::RawKeyEvent {
+        window_id: WINDOW,
+        key: instar_window::Key::Tab,
+        pressed: true,
+        shift: false,
+        repeat: false,
+    }));
+
+    let after = near(&frame(&bridge, &mut presenter), ring, 24);
+    assert!(
+        after > before + 40,
+        "tabbing to a control must put ring-coloured pixels on screen: {before} \
+         before, {after} after. A ring that exists only in the command stream \
+         is a ring the user cannot see."
+    );
+}

@@ -721,9 +721,10 @@ impl Host {
         window.metrics.usable()?;
         let tree = window.tree.as_ref()?;
         let layout = window.layout.as_ref()?;
+        let scale = window.metrics.usable()?.scale_factor;
         window
             .a11y
-            .update(tree, layout, &window.focus, &window.scroll)
+            .update(tree, layout, &window.focus, &window.scroll, scale)
     }
 
     pub fn on_accessibility_action(

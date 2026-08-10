@@ -48,6 +48,7 @@ pub fn project(
     layout: &LayoutSnapshot,
     focus: &FocusState,
     scroll: &ScrollState,
+    scale: f64,
 ) -> Option<TreeUpdate> {
     if !is_presented(&tree.root) {
         return None;
@@ -55,7 +56,7 @@ pub fn project(
     let root_id = ak_id(tree.root.key);
 
     let mut nodes = Vec::new();
-    build(&tree.root, layout, scroll, &mut nodes);
+    build(&tree.root, layout, scroll, scale, &mut nodes);
 
     Some(TreeUpdate {
         nodes,
@@ -81,9 +82,43 @@ fn build(
     node: &Node,
     layout: &LayoutSnapshot,
     scroll: &ScrollState,
+    scale: f64,
     out: &mut Vec<(NodeId, AccessNode)>,
 ) {
     let mut access = AccessNode::new(role_of(&node.kind));
+
+    // Two transforms carry logical content coordinates into the space
+    // AccessKit documents: "relative to the origin of the tree's container
+    // (e.g. window), in physical pixels, with the y coordinate being
+    // top-down."
+    //
+    // The root scales. Bounds stay logical everywhere -- that is the space
+    // `instar-ui` works in, and pushing physical pixels down into the layout
+    // layer to satisfy a platform would invert the whole dependency
+    // direction -- so exactly one node converts, and it is the one whose
+    // transform every other node inherits.
+    //
+    // A viewport translates by its scroll offset, so its descendants describe
+    // where they *are* rather than where they would be at rest. Without it a
+    // screen reader draws its cursor on the unscrolled position of everything
+    // inside a scrolled region.
+    //
+    // Both were wrong until a real screen reader showed it. At scale 1 with
+    // nothing scrolled, both are the identity, which is why every automated
+    // test agreed.
+    if node.key == crate::NodeKey::first(0) || matches!(node.kind, NodeKind::Root) {
+        if scale != 1.0 {
+            access.set_transform(accesskit::Affine::scale(scale));
+        }
+    } else if matches!(node.kind, NodeKind::Scroll) {
+        let offset = scroll.get(node.key);
+        if offset.x != 0 || offset.y != 0 {
+            access.set_transform(accesskit::Affine::translate((
+                f64::from(-offset.x),
+                f64::from(-offset.y),
+            )));
+        }
+    }
 
     // Bounds are logical, which is the space `instar-ui` works in throughout.
     // A node with no geometry is still projected: it is semantically present,
@@ -145,7 +180,7 @@ fn build(
 
     out.push((ak_id(node.key), access));
     for child in children {
-        build(child, layout, scroll, out);
+        build(child, layout, scroll, scale, out);
     }
 }
 
@@ -178,6 +213,13 @@ struct Fingerprint {
     bounds: Option<crate::Rect>,
     disabled: bool,
     scroll: Option<(i32, i32)>,
+    /// The node's own transform, as the bits of its coefficients.
+    ///
+    /// Bounds alone do not describe where a node is once transforms carry the
+    /// scale and the scroll offset: a DPI change moves every node on screen
+    /// without changing a single logical rectangle, and so would produce no
+    /// update at all.
+    transform: Option<[u64; 6]>,
 }
 
 fn hash_of(value: impl std::hash::Hash) -> u64 {
@@ -225,6 +267,7 @@ impl A11yProjection {
         layout: &LayoutSnapshot,
         focus: &FocusState,
         scroll: &ScrollState,
+        scale: f64,
     ) -> Option<TreeUpdate> {
         if !is_presented(&tree.root) {
             return None;
@@ -233,7 +276,7 @@ impl A11yProjection {
         let focus_id = focus.focused().map_or(root_id, ak_id);
 
         let mut current = Vec::new();
-        build(&tree.root, layout, scroll, &mut current);
+        build(&tree.root, layout, scroll, scale, &mut current);
 
         let mut nodes = Vec::new();
         let mut seen = std::collections::HashSet::with_capacity(current.len());
@@ -299,6 +342,9 @@ fn fingerprint_of(node: &AccessNode) -> Fingerprint {
         scroll: node
             .scroll_y()
             .map(|y| (y as i32, node.scroll_y_max().unwrap_or_default() as i32)),
+        transform: node
+            .transform()
+            .map(|affine| affine.as_coeffs().map(f64::to_bits)),
     }
 }
 
@@ -310,7 +356,7 @@ mod tests {
     fn projected(tree: &Tree) -> (TreeUpdate, LayoutSnapshot) {
         let mut text = TextContext::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
-        let update = project(tree, &layout, &FocusState::new(), &ScrollState::new())
+        let update = project(tree, &layout, &FocusState::new(), &ScrollState::new(), 1.0)
             .expect("a presented root projects");
         (update, layout)
     }
@@ -331,6 +377,9 @@ mod tests {
         text: TextContext,
         focus: FocusState,
         scroll: ScrollState,
+        /// Scale 1 unless a test says otherwise, so the transforms are the
+        /// identity and these tests keep asserting what they were written to.
+        scale: f64,
     }
 
     impl Session {
@@ -340,13 +389,14 @@ mod tests {
                 text: TextContext::new(),
                 focus: FocusState::new(),
                 scroll: ScrollState::new(),
+                scale: 1.0,
             }
         }
 
         fn commit(&mut self, tree: &Tree) -> Option<TreeUpdate> {
             let layout = tree.layout(&mut self.text, Viewport::new(400.0, 300.0));
             self.projection
-                .update(tree, &layout, &self.focus, &self.scroll)
+                .update(tree, &layout, &self.focus, &self.scroll, self.scale)
         }
     }
 
@@ -522,6 +572,117 @@ mod tests {
 
     /// Bounds are accessibility state even though they are not application
     /// state. A moved control that keeps stale geometry is a screen reader
+    /// AccessKit's coordinate contract, which nothing here previously kept.
+    ///
+    /// > AccessKit expects the final transformed coordinates to be relative to
+    /// > the origin of the tree's container (e.g. window), in physical pixels,
+    /// > with the y coordinate being top-down.
+    ///
+    /// Instar reported logical pixels and no transform at all. At scale 1 with
+    /// nothing scrolled those coincide, which is every test written before a
+    /// real screen reader ran: VoiceOver drew its cursor at half size on a
+    /// 2x display, and on the resting position of anything scrolled.
+    #[test]
+    fn the_root_carries_the_scale_and_a_viewport_carries_its_scroll() {
+        use crate::{WireAlign, WireLayout, WireSize};
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    10,
+                    Node::column(
+                        11,
+                        vec![
+                            Node::button(12, "near"),
+                            Node::text(13, "tall").with_layout(WireLayout {
+                                height: WireSize::Fixed(600),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut text = TextContext::new();
+        let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
+
+        let mut scroll = ScrollState::new();
+        scroll.set(NodeKey::first(10), crate::ScrollOffset { x: 0, y: 40 });
+
+        let update = project(&tree, &layout, &FocusState::new(), &scroll, 2.0).unwrap();
+        let node = |key: NodeKey| {
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == ak_id(key))
+                .map(|(_, node)| node.clone())
+                .unwrap_or_else(|| panic!("{key:?} is missing"))
+        };
+
+        assert_eq!(
+            node(NodeKey::first(0))
+                .transform()
+                .map(|affine| affine.as_coeffs()),
+            Some([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]),
+            "the root converts logical to physical, once, for the whole tree"
+        );
+
+        assert_eq!(
+            node(NodeKey::first(10))
+                .transform()
+                .map(|affine| affine.as_coeffs()),
+            Some([1.0, 0.0, 0.0, 1.0, 0.0, -40.0]),
+            "and a scrolled viewport moves its descendants by its offset, so \
+             they describe where they are rather than where they would rest"
+        );
+
+        assert!(
+            node(NodeKey::first(12)).transform().is_none(),
+            "an ordinary node inherits both and states neither"
+        );
+    }
+
+    /// A DPI change moves every node on screen without changing one logical
+    /// rectangle, so bounds alone cannot notice it.
+    #[test]
+    fn a_scale_change_alone_produces_an_update() {
+        let tree = Tree::new(Node::root(0, vec![Node::button(1, "press")]));
+        let mut text = TextContext::new();
+        let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
+        let focus = FocusState::new();
+        let scroll = ScrollState::new();
+
+        let mut projection = A11yProjection::new();
+        assert!(
+            projection
+                .update(&tree, &layout, &focus, &scroll, 1.0)
+                .is_some(),
+            "the first update is the whole tree"
+        );
+        assert!(
+            projection
+                .update(&tree, &layout, &focus, &scroll, 1.0)
+                .is_none(),
+            "and nothing changed"
+        );
+
+        let update = projection
+            .update(&tree, &layout, &focus, &scroll, 2.0)
+            .expect("a scale change is accessibility-observable");
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == ak_id(NodeKey::first(0))),
+            "the root's transform is what changed, so the root must be resent"
+        );
+    }
+
     /// pointing at the wrong place.
     #[test]
     fn moving_a_node_updates_its_bounds() {
@@ -634,7 +795,8 @@ mod tests {
 
         text.reset_stats();
         for _ in 0..5 {
-            project(&tree, &layout, &FocusState::new(), &ScrollState::new()).expect("projects");
+            project(&tree, &layout, &FocusState::new(), &ScrollState::new(), 1.0)
+                .expect("projects");
         }
 
         let stats = text.stats();
@@ -789,7 +951,8 @@ mod tests {
         let mut text = TextContext::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
-        let unfocused = project(&tree, &layout, &FocusState::new(), &ScrollState::new()).unwrap();
+        let unfocused =
+            project(&tree, &layout, &FocusState::new(), &ScrollState::new(), 1.0).unwrap();
         assert_eq!(
             unfocused.focus,
             ak_id(NodeKey::first(0)),
@@ -800,7 +963,7 @@ mod tests {
         // projections apart, which is what makes this a real test.
         let mut focus = FocusState::new();
         focus.focus_by_keyboard(Some(NodeKey::first(2)));
-        let focused = project(&tree, &layout, &focus, &ScrollState::new()).unwrap();
+        let focused = project(&tree, &layout, &focus, &ScrollState::new(), 1.0).unwrap();
         assert_eq!(focused.focus, ak_id(NodeKey::first(2)));
         assert_ne!(focused.focus, unfocused.focus);
     }
@@ -829,7 +992,7 @@ mod tests {
 
         let mut scroll = ScrollState::new();
         scroll.set(NodeKey::first(1), crate::ScrollOffset::new(0, 120));
-        let update = project(&tree, &layout, &FocusState::new(), &scroll).unwrap();
+        let update = project(&tree, &layout, &FocusState::new(), &scroll, 1.0).unwrap();
 
         let viewport = update
             .nodes
@@ -880,7 +1043,7 @@ mod tests {
         let mut scroll = ScrollState::new();
         scroll.set(NodeKey::first(1), crate::ScrollOffset::new(0, 40));
         scroll.set(NodeKey::first(3), crate::ScrollOffset::new(0, 90));
-        let update = project(&tree, &layout, &FocusState::new(), &scroll).unwrap();
+        let update = project(&tree, &layout, &FocusState::new(), &scroll, 1.0).unwrap();
 
         let offset_of = |key: NodeKey| {
             update

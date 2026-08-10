@@ -122,3 +122,41 @@ an application that was not the counter:
 
 The distinction matters. A missing primitive is a design question deferred; a
 defect is a promise the toolkit already made and did not keep.
+
+---
+
+## 4. Nested viewports put their scrollbars in the same place
+
+**Missing capability.** Any way to tell two overlapping scroll regions apart.
+
+**Observed while building.** The Gallery's inner `Scroll` uses
+`align_self: Stretch`, so it spans the outer column's full width — and the
+scrollbar is an *overlay*, drawn inside the viewport's right edge without
+reserving layout space. Both bars therefore land at the same x, one on top of
+the other for the band where they overlap. On screen they read as a single
+broken bar. The nested viewport has no background, no border and no separator,
+so there is nothing to say a scroll region begins there at all.
+
+**Can current primitives express it.** Partly. A guest can give the inner
+`Scroll` a background or a border, or narrow it with `max_width`, and it
+becomes legible. Nothing forces it to.
+
+**Workaround quality.** Adequate for an application author who knows to do it;
+useless as a default. The Gallery hit this immediately and it was the first
+thing a viewer found confusing.
+
+**Calculator likely needs it.** No — a calculator has one scroll region at
+most.
+
+**Decision.** Record only, but note that this is not purely a guest-side
+question. Two candidate host changes exist and neither should be made on one
+data point:
+
+- reserve layout space for a scrollbar instead of overlaying it, so nested
+  viewports inset each other naturally (this changes every existing layout)
+- give a `Scroll` a default chrome — a hairline on the viewport edge — which
+  is the host inventing appearance, and the rule so far has been that it does
+  not
+
+The Gallery should first try expressing it with what exists, and the visual
+catalog is the place to do that.

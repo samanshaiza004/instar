@@ -376,19 +376,6 @@ impl SceneBuilder {
         // makes a panel or a card expressible without a spurious node.
         self.paint_surface(&node.style.paint, rect, scale, commands);
 
-        // Inside the node's own clip bracket, so the ring obeys exactly the
-        // clip stack the node does. Chrome that escaped a Scroll would put a
-        // ring over content the node itself is clipped out of -- the same "two
-        // answers to where the node is" problem the clip ordering already
-        // solves once.
-        if focus_ring == Some(node.key) {
-            commands.push(PaintCommand::StrokeRect {
-                rect: physical(rect, scale),
-                width: 2.0 * scale,
-                color: self.theme.focus_ring,
-            });
-        }
-
         match &node.kind {
             // Structure only, beyond whatever surface the guest asked for
             // above. Drawing something a guest did not ask for would be the
@@ -474,6 +461,26 @@ impl SceneBuilder {
                     );
                 }
             }
+        }
+
+        // After the node's own chrome, and before its children.
+        //
+        // *After*, because a button fills its face in the match above, and a
+        // ring pushed before that fill is drawn and then painted over -- which
+        // is exactly what shipped: the scene contained a ring in every frame
+        // and the window never showed one.
+        //
+        // *Before* the children, and inside this node's clip bracket, so the
+        // ring obeys exactly the clip stack the node does. Chrome that escaped
+        // a Scroll would put a ring over content the node itself is clipped
+        // out of -- the same "two answers to where the node is" problem the
+        // clip ordering already solves once.
+        if focus_ring == Some(node.key) {
+            commands.push(PaintCommand::StrokeRect {
+                rect: physical(rect, scale),
+                width: 2.0 * scale,
+                color: self.theme.focus_ring,
+            });
         }
 
         for child in &node.children {
