@@ -13,7 +13,8 @@
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 use crate::{
-    PhysicalSize, PointerButton, PointerState, ScrollDelta, WindowId, WindowOutput, WindowState,
+    PhysicalSize, PointerButton, PointerState, RawPointerMoved, ScrollDelta, WindowId,
+    WindowOutput, WindowState,
 };
 
 impl From<winit::window::WindowId> for WindowId {
@@ -96,13 +97,18 @@ pub fn translate(
             })
         }
 
+        // A move carries no button, so it is not a `Pointer` event -- but it
+        // is still an event. Hover and a live thumb drag are both continuous,
+        // and both are pure presentation the host owns alone. This arm
+        // returned `None` for the whole of packages B through F, which left
+        // `Host::on_pointer_moved` implemented, tested, and unreachable: the
+        // scrollbar thumb took a press and then never moved.
         WindowEvent::CursorMoved { position, .. } => {
-            state.on_cursor_moved(position.x, position.y);
-            // A move is not itself a pointer *event* in Instar's model: only
-            // presses and releases are. The position is recorded for whichever
-            // button event comes next. Hover and drag arrive with the
-            // interaction state that needs them.
-            None
+            let logical_pos = state.on_cursor_moved(position.x, position.y);
+            Some(WindowOutput::PointerMoved(RawPointerMoved {
+                window_id,
+                logical_pos,
+            }))
         }
 
         WindowEvent::CursorLeft { .. } => {
@@ -192,6 +198,65 @@ mod tests {
             Some(WindowOutput::Scroll(event)) => event,
             other => panic!("a wheel must translate to a scroll, got {other:?}"),
         }
+    }
+
+    fn moved(x: f64, y: f64) -> WindowEvent {
+        WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(x, y),
+        }
+    }
+
+    /// A move is an event, and it carries where it happened.
+    ///
+    /// This arm returned `None` for the whole of packages B through F, which
+    /// left `Host::on_pointer_moved` implemented, tested, and unreachable --
+    /// the scrollbar thumb accepted a press and then never moved.
+    #[test]
+    fn a_cursor_move_is_delivered_in_logical_coordinates() {
+        let mut state = state(2.0);
+        match translate(&mut state, WINDOW, &moved(100.0, 60.0)) {
+            Some(WindowOutput::PointerMoved(event)) => {
+                assert_eq!(event.window_id, WINDOW);
+                assert_eq!(
+                    event.logical_pos,
+                    LogicalPoint { x: 50.0, y: 30.0 },
+                    "physical to logical, like every other distance crossing \
+                     this boundary"
+                );
+            }
+            other => panic!("a cursor move must be delivered, got {other:?}"),
+        }
+    }
+
+    /// A move still updates the position a later button event uses, which is
+    /// what it did back when it was the only thing it did.
+    #[test]
+    fn a_move_still_positions_the_button_event_that_follows_it() {
+        let mut state = state(2.0);
+        translate(&mut state, WINDOW, &moved(80.0, 40.0));
+        match translate(
+            &mut state,
+            WINDOW,
+            &WindowEvent::MouseInput {
+                device_id: DeviceId::dummy(),
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+            },
+        ) {
+            Some(WindowOutput::Pointer(event)) => {
+                assert_eq!(event.logical_pos, LogicalPoint { x: 40.0, y: 20.0 })
+            }
+            other => panic!("expected a press, got {other:?}"),
+        }
+    }
+
+    /// The wrong-window guard applies here too: this window's scale factor
+    /// would otherwise convert another window's coordinates.
+    #[test]
+    fn a_move_for_another_window_is_not_translated() {
+        let mut state = state(2.0);
+        assert!(translate(&mut state, WindowId::from_raw(2), &moved(100.0, 60.0)).is_none());
     }
 
     /// The direction, which is the half of this a test can be silently wrong

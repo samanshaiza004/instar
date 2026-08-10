@@ -740,6 +740,10 @@ impl Host {
                 self.on_metrics_invalidated(window_id)
             }
             WindowOutput::Pointer(event) => self.on_pointer(event),
+            WindowOutput::PointerMoved(event) => {
+                let (x, y) = event.logical_pos.round();
+                self.on_pointer_moved(event.window_id, x, y)
+            }
             WindowOutput::Scroll(event) => self.on_scroll(event),
             WindowOutput::Key(event) => self.on_key(event),
             WindowOutput::RedrawRequested { window_id } => self.on_redraw_requested(window_id),
@@ -1179,9 +1183,16 @@ impl Host {
     /// event, and because both of the things it can do are pure presentation.
     pub fn on_pointer_moved(&mut self, window_id: WindowId, x: i32, y: i32) -> Vec<HostEffect> {
         let bars = self.scrollbars(window_id);
-        let Some(window) = self.windows.get_mut(&window_id) else {
-            return Vec::new();
-        };
+        let window = self.windows.entry(window_id).or_default();
+
+        // Recorded before the barrier is consulted, exactly as a button event
+        // records it: knowing where the pointer is costs nothing and is worth
+        // keeping across a monitor switch. Acting on it is the part that has
+        // to wait.
+        window.last_pointer = Some(LogicalPoint {
+            x: f64::from(x),
+            y: f64::from(y),
+        });
         if window.metrics.usable().is_none() {
             return Vec::new();
         }
@@ -3406,6 +3417,75 @@ mod tests {
             None,
             "a viewport with nothing to scroll gets no chrome, rather than a \
              full-length thumb that cannot move"
+        );
+    }
+
+    fn moved(x: f64, y: f64) -> WindowOutput {
+        WindowOutput::PointerMoved(instar_window::RawPointerMoved {
+            window_id: WINDOW,
+            logical_pos: LogicalPoint::new(x, y),
+        })
+    }
+
+    /// The whole drag, driven only through `WindowOutput`.
+    ///
+    /// Every other drag test calls `on_pointer_moved` directly, which is how
+    /// the arithmetic was proved correct while the thumb still could not be
+    /// dragged in the running application: nothing translated a cursor move
+    /// into that call. This one goes through `handle`, so it fails if the
+    /// vocabulary loses the term again.
+    #[test]
+    fn a_thumb_drag_works_through_the_event_vocabulary_alone() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        let viewport = NodeKey::first(50);
+        let start_y = f64::from(bar.thumb.y + 2);
+
+        assert_eq!(host.window(WINDOW).unwrap().scroll.get(viewport).y, 0);
+
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.thumb.x + 2),
+            start_y,
+        ));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_some(),
+            "the press must start a drag, or there is nothing to continue"
+        );
+
+        let effects = host.handle(moved(f64::from(bar.thumb.x + 2), start_y + 30.0));
+        let offset = host.window(WINDOW).unwrap().scroll.get(viewport).y;
+        assert!(
+            offset > 0,
+            "dragging the thumb down must scroll the content: offset is still \
+             {offset}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "and ask for the frame that shows it"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "while telling the guest nothing -- a drag is presentation"
+        );
+
+        // And it keeps tracking, rather than moving once and sticking.
+        host.handle(moved(f64::from(bar.thumb.x + 2), start_y + 60.0));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.get(viewport).y > offset,
+            "a continued drag keeps scrolling"
+        );
+
+        host.handle(pointer(
+            PointerState::Released,
+            f64::from(bar.thumb.x + 2),
+            start_y + 60.0,
+        ));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_none(),
+            "and the release ends it"
         );
     }
 

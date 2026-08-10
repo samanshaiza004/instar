@@ -150,6 +150,16 @@ pub struct RawPointerEvent {
     pub state: PointerState,
 }
 
+/// A pointer move, already converted to logical coordinates.
+///
+/// No button, because a move has none. What it means depends entirely on the
+/// interaction state the host is already holding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawPointerMoved {
+    pub window_id: WindowId,
+    pub logical_pos: LogicalPoint,
+}
+
 /// How far a wheel or touchpad asked to scroll, and in what units.
 ///
 /// The two are kept apart because they are genuinely different facts. A pixel
@@ -243,6 +253,13 @@ pub struct WindowMetricsChanged {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowOutput {
     Pointer(RawPointerEvent),
+    /// The pointer moved, with no button transition.
+    ///
+    /// Separate from [`WindowOutput::Pointer`] because it is not a button
+    /// event and carries no button: everything it can affect -- hover, and a
+    /// scrollbar thumb already being dragged -- is presentation the host owns
+    /// alone, and neither reaches a guest.
+    PointerMoved(RawPointerMoved),
     Scroll(RawScrollEvent),
     Key(RawKeyEvent),
     MetricsChanged(WindowMetricsChanged),

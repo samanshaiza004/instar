@@ -1177,7 +1177,7 @@ For `Scroll`, semantic actions only. Exposing raw offset actions would widen
 Instar's public conceptual model to match a platform schema, which is the
 reverse of the direction everything else here has taken.
 
-#### Three defects the first non-counter guest found
+#### Four defects the first non-counter guest found
 
 Dogfooding found in one session what the automated suite had not, which is the
 argument for G in miniature. All three were in shipped, tested packages.
@@ -1211,8 +1211,21 @@ a resized window. Declaring `Overflow::Scroll` is what CSS does for the same
 reason: a scroll container's automatic minimum size is zero, because clipping
 is the whole point of it.
 
-The pattern worth naming: the first two are seams, not units. Every part on
-either side was correct and tested.
+**The scrollbar thumb took a press and never moved.** `winit_adapter::translate`
+returned `None` for `CursorMoved`, with a comment explaining that a move is not
+a pointer event in Instar's model and that "hover and drag arrive with the
+interaction state that needs them" — which never happened. `Host::on_pointer_moved`
+was implemented and had six tests, every one of which called it directly.
+`WindowOutput` now has a `PointerMoved` term, and the drag has a test driven
+only through `handle`, so losing the term again fails.
+
+The pattern worth naming: three of these four are **seams, not units**. Every
+part on either side was correct and tested, and each seam was a single missing
+arm in one `match`. Package-level verification cannot see them, because at
+package level nothing is missing.
+
+Two of the three were the same `match`. Worth checking the rest of that
+function's arms against what each layer downstream already implements.
 
 #### Status
 
