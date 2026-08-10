@@ -33,7 +33,7 @@ pub mod scroll;
 pub mod text;
 
 pub use diff::{ChangeSet, diff};
-pub use focus::{FocusMove, FocusState, focusable_order};
+pub use focus::{FocusMove, FocusState, RevealAlignment, focusable_order, reveal};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
     NodeKey, ProtocolError, WireAlign, WireBorder, WireColor, WireCursor, WireDisplay,

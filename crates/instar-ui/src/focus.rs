@@ -129,6 +129,118 @@ impl FocusState {
     }
 }
 
+/// Where a revealed node should sit within its viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RevealAlignment {
+    /// Move as little as possible. A node already visible does not move at
+    /// all, and a partly visible one moves just enough to expose it.
+    #[default]
+    Nearest,
+    Start,
+    Center,
+    End,
+}
+
+/// Brings `key` into view, adjusting every `Scroll` ancestor that needs it.
+///
+/// # Semantic intent, never an offset
+///
+/// A guest asks for a node to be visible. It does not compute where that
+/// leaves the viewport, is not told, and could not act on the answer — the
+/// offset is host state for the same reason geometry is.
+///
+/// # Innermost outward, recomputing between every step
+///
+/// Moving an inner viewport changes where the target sits relative to the
+/// outer one. Computing every offset from the original geometry gives the
+/// outer viewport a stale answer, and that is wrong only in the nested case —
+/// which is exactly the case that goes untested if nobody writes it down.
+///
+/// Returns whether anything moved. Nothing here can reach the guest.
+pub fn reveal(
+    tree: &Tree,
+    layout: &crate::LayoutSnapshot,
+    scroll: &mut crate::ScrollState,
+    extent_of: &dyn Fn(NodeKey) -> Option<crate::ScrollOffset>,
+    key: NodeKey,
+    alignment: RevealAlignment,
+) -> bool {
+    // A node that cannot be seen cannot be revealed, and a key nobody knows is
+    // a no-op rather than an error: a stale key from a queued request names a
+    // node the guest has since replaced.
+    let Some(path) = ancestry(&tree.root, key) else {
+        return false;
+    };
+    if !path.iter().all(|node| is_presented(node)) {
+        return false;
+    }
+    let Some(mut target) = layout.get(key) else {
+        return false;
+    };
+
+    let mut moved = false;
+    // `path` runs root -> target, so reversing walks outward from the node.
+    for node in path.iter().rev() {
+        if !matches!(node.kind, crate::NodeKind::Scroll) {
+            continue;
+        }
+        let (Some(viewport), Some(max)) = (layout.get(node.key), extent_of(node.key)) else {
+            continue;
+        };
+
+        let before = scroll.get(node.key);
+        // The target's position as currently presented, which for an inner
+        // viewport already reflects whatever the step before it did.
+        let relative_top = target.y - viewport.y;
+        let relative_bottom = relative_top + target.height;
+
+        let desired = match alignment {
+            RevealAlignment::Nearest => {
+                if relative_top < 0 {
+                    before.y + relative_top
+                } else if relative_bottom > viewport.height {
+                    before.y + (relative_bottom - viewport.height)
+                } else {
+                    before.y
+                }
+            }
+            RevealAlignment::Start => before.y + relative_top,
+            RevealAlignment::End => before.y + (relative_bottom - viewport.height),
+            RevealAlignment::Center => {
+                before.y + relative_top - (viewport.height - target.height) / 2
+            }
+        };
+
+        let after = crate::ScrollOffset::new(before.x, desired).clamped(max);
+        if after != before {
+            scroll.set(node.key, after);
+            moved = true;
+        }
+        // Recompute before the next viewport outward looks at it.
+        target = crate::Rect::new(
+            target.x,
+            target.y - (after.y - before.y),
+            target.width,
+            target.height,
+        );
+    }
+    moved
+}
+
+/// The chain of nodes from the root down to `key`, inclusive.
+fn ancestry(node: &Node, key: NodeKey) -> Option<Vec<&Node>> {
+    if node.key == key {
+        return Some(vec![node]);
+    }
+    for child in &node.children {
+        if let Some(mut path) = ancestry(child, key) {
+            path.insert(0, node);
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Every node the keyboard can reach, in retained tree order.
 ///
 /// Tree order rather than a guest-stated tab index: the order a guest
