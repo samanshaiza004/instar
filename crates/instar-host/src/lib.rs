@@ -52,7 +52,10 @@ use std::sync::Arc;
 
 use instar_kernel::runtime::GenerationId;
 use instar_paint::PaintScene;
-use instar_ui::{Interaction, KeyLedger, ScrollState, TextContext, TreeError, UiAction, Viewport};
+use instar_ui::{
+    Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart, TextContext, TreeError,
+    UiAction, Viewport,
+};
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
     WindowMetricsChanged, WindowOutput,
@@ -660,6 +663,14 @@ impl Host {
         // A press recorded against the old geometry must not be completable
         // against the new: the node under the pointer may have moved.
         window.interaction.cancel();
+        // A thumb drag is the same argument. Its arithmetic runs from the
+        // pointer position and the track geometry it began against, and a
+        // resize or scale change replaces both -- so the drag is cancelled
+        // before the replacement geometry becomes interactive, exactly as a
+        // press is. Hover goes too: it describes a scrollbar that is about to
+        // be somewhere else.
+        window.scroll.cancel_drag();
+        window.scroll.set_hovered(None);
         // And the lowered scene goes with it, for the same reason: its
         // rectangles are physical, and they were computed for a window that
         // has since changed size or scale.
@@ -678,15 +689,28 @@ impl Host {
         // Not allowed while blocked: acting on it. A position converted with
         // the new scale against a layout computed for the old viewport
         // resolves to the *wrong* node, which is worse than resolving to none.
-        let (Some(_metrics), Some(tree), Some(layout)) = (
+        if window.metrics.usable().is_none() {
+            return Vec::new();
+        }
+
+        let (x, y) = event.logical_pos.round();
+
+        // Scrollbar chrome is consulted before the content, and consumes the
+        // event when it answers. A thumb sits over the viewport it belongs to,
+        // so letting the content see the same press would activate whatever is
+        // underneath the scrollbar.
+        if let Some(effects) = self.on_scrollbar_pointer(event, x, y) {
+            return effects;
+        }
+
+        let window = self.windows.entry(event.window_id).or_default();
+        let (Some(_), Some(tree), Some(layout)) = (
             window.metrics.usable(),
             window.tree.as_ref(),
             window.layout.as_ref(),
         ) else {
             return Vec::new();
         };
-
-        let (x, y) = event.logical_pos.round();
         let held = window.interaction.pressed();
         let scroll = &window.scroll;
         let mut effects = match event.state {
@@ -770,6 +794,170 @@ impl Host {
         vec![HostEffect::Render {
             window: event.window_id,
         }]
+    }
+
+    /// Pointer handling for scrollbar chrome. `None` means "not ours".
+    ///
+    /// Entirely host-local, like the wheel: there is no branch here that can
+    /// reach the guest, which is what makes the zero-`SendToGuest` property
+    /// structural rather than something a test has to keep watch over.
+    fn on_scrollbar_pointer(
+        &mut self,
+        event: RawPointerEvent,
+        x: i32,
+        y: i32,
+    ) -> Option<Vec<HostEffect>> {
+        let bars = self.scrollbars(event.window_id);
+        let window = self.windows.get_mut(&event.window_id)?;
+        window.metrics.usable()?;
+
+        // A drag in progress owns the pointer wherever it goes. Without this,
+        // a fast drag outruns the thumb between events, lands on the track,
+        // and turns into a page-step.
+        if window.scroll.dragging().is_some() {
+            match event.state {
+                PointerState::Released => {
+                    window.scroll.cancel_drag();
+                    // The thumb is drawn differently while held, so letting go
+                    // is a visual change even though nothing moved.
+                    self.rebuild_scene(event.window_id);
+                    return Some(vec![HostEffect::Render {
+                        window: event.window_id,
+                    }]);
+                }
+                PointerState::Pressed => return Some(Vec::new()),
+            }
+        }
+
+        let (viewport, bar, extent) = bars
+            .iter()
+            .rev()
+            .find_map(|(key, bar, extent)| bar.part_at(x, y).map(|_| (*key, *bar, *extent)))?;
+        let part = bar.part_at(x, y)?;
+
+        match event.state {
+            PointerState::Pressed => {
+                let offset = window.scroll.get(viewport);
+                match part {
+                    ScrollbarPart::Thumb => {
+                        window.scroll.begin_drag(instar_ui::ThumbDrag {
+                            viewport,
+                            origin_pointer_y: y,
+                            origin_offset_y: offset.y,
+                        });
+                    }
+                    ScrollbarPart::Track => {
+                        // A page, towards the click. Deterministic rather than
+                        // animated: an animation is a frame loop, and this
+                        // host does not have one.
+                        let viewport_height = bar.track.height;
+                        let step = if y < bar.thumb.y {
+                            -viewport_height
+                        } else {
+                            viewport_height
+                        };
+                        let moved = ScrollOffset::new(offset.x, offset.y + step)
+                            .clamped(ScrollOffset::new(0, extent));
+                        window.scroll.set(viewport, moved);
+                    }
+                }
+                self.rebuild_scene(event.window_id);
+                Some(vec![HostEffect::Render {
+                    window: event.window_id,
+                }])
+            }
+            PointerState::Released => Some(Vec::new()),
+        }
+    }
+
+    /// Every viewport's scrollbar, outermost first, in absolute logical
+    /// coordinates.
+    fn scrollbars(&self, window_id: WindowId) -> Vec<(NodeKey, instar_ui::Scrollbar, i32)> {
+        let Some(window) = self.windows.get(&window_id) else {
+            return Vec::new();
+        };
+        let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref()) else {
+            return Vec::new();
+        };
+        let mut bars = Vec::new();
+        for node in tree.iter() {
+            if !instar_ui::is_presented(node) {
+                continue;
+            }
+            let Some(content) = instar_ui::scroll::content_of(node) else {
+                continue;
+            };
+            let (Some(viewport), Some(content_rect)) =
+                (layout.get(node.key), layout.get(content.key))
+            else {
+                continue;
+            };
+            let extent = (content_rect.height - viewport.height).max(0);
+            if let Some(bar) = instar_ui::Scrollbar::for_viewport(
+                viewport,
+                content_rect.height,
+                window.scroll.get(node.key).y,
+            ) {
+                bars.push((node.key, bar, extent));
+            }
+        }
+        bars
+    }
+
+    /// A pointer move: continues a thumb drag, or updates hover.
+    ///
+    /// Separate from [`Host::on_pointer`] because a move is not a button
+    /// event, and because both of the things it can do are pure presentation.
+    pub fn on_pointer_moved(&mut self, window_id: WindowId, x: i32, y: i32) -> Vec<HostEffect> {
+        let bars = self.scrollbars(window_id);
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return Vec::new();
+        };
+        if window.metrics.usable().is_none() {
+            return Vec::new();
+        }
+
+        if let Some(drag) = window.scroll.dragging() {
+            let Some((_, bar, extent)) = bars.iter().find(|(key, _, _)| *key == drag.viewport)
+            else {
+                // The viewport stopped having a scrollbar underneath a live
+                // drag -- content shrank, or it was hidden. Cancel rather than
+                // keep computing against geometry that is gone.
+                window.scroll.cancel_drag();
+                return Vec::new();
+            };
+            // From the drag's origin, never accumulated from the last event:
+            // accumulating drifts with rounding and lags the pointer after any
+            // clamped movement.
+            let travel = y - drag.origin_pointer_y;
+            let origin_thumb_top = bar.track.y
+                + if *extent > 0 {
+                    ((bar.track.height - bar.thumb.height) as i64 * drag.origin_offset_y as i64
+                        / *extent as i64) as i32
+                } else {
+                    0
+                };
+            let wanted = bar.offset_for_thumb_top(origin_thumb_top + travel, *extent);
+            let before = window.scroll.get(drag.viewport);
+            if before.y == wanted {
+                return Vec::new();
+            }
+            window
+                .scroll
+                .set(drag.viewport, ScrollOffset::new(before.x, wanted));
+            self.rebuild_scene(window_id);
+            return vec![HostEffect::Render { window: window_id }];
+        }
+
+        let hovered = bars
+            .iter()
+            .rev()
+            .find_map(|(key, bar, _)| bar.part_at(x, y).map(|part| (*key, part)));
+        if !window.scroll.set_hovered(hovered) {
+            return Vec::new();
+        }
+        self.rebuild_scene(window_id);
+        vec![HostEffect::Render { window: window_id }]
     }
 
     fn on_redraw_requested(&mut self, window_id: WindowId) -> Vec<HostEffect> {
@@ -1454,6 +1642,421 @@ mod tests {
         );
     }
 
+    // --- D: scrollbar chrome, all of it host-local. ---
+
+    fn scroll_fixture() -> Tree {
+        use instar_ui::{Node, WireLayout, WireSize};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    50,
+                    Node::column(
+                        51,
+                        vec![
+                            Node::text(52, "spacer").with_layout(WireLayout {
+                                height: WireSize::Fixed(300),
+                                ..WireLayout::default()
+                            }),
+                            Node::button(53, "target").with_layout(WireLayout {
+                                height: WireSize::Fixed(40),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(54, "tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(60),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(instar_ui::WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ))
+    }
+
+    fn scrolled_host() -> Host {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, scroll_fixture()).expect("valid");
+        host
+    }
+
+    fn bar_of(host: &Host) -> instar_ui::Scrollbar {
+        let window = host.window(WINDOW).unwrap();
+        let layout = window.layout().unwrap();
+        instar_ui::Scrollbar::for_viewport(
+            layout.get(NodeKey::first(50)).unwrap(),
+            layout.get(NodeKey::first(51)).unwrap().height,
+            window.scroll.get(NodeKey::first(50)).y,
+        )
+        .expect("the fixture overflows and therefore has a scrollbar")
+    }
+
+    #[test]
+    fn a_thumb_is_proportional_and_tracks_the_offset() {
+        let mut host = scrolled_host();
+        let at_top = bar_of(&host);
+
+        // 100 of viewport over 400 of content is a quarter.
+        assert_eq!(at_top.track.height, 100);
+        assert_eq!(at_top.thumb.height, 25);
+        assert_eq!(at_top.thumb.y, at_top.track.y, "at rest it sits at the top");
+
+        host.windows
+            .get_mut(&WINDOW)
+            .unwrap()
+            .scroll
+            .set(NodeKey::first(50), ScrollOffset::new(0, 300));
+        let at_bottom = bar_of(&host);
+        assert_eq!(
+            at_bottom.thumb.y + at_bottom.thumb.height,
+            at_bottom.track.y + at_bottom.track.height,
+            "at maximum offset the thumb is flush with the bottom of the track"
+        );
+    }
+
+    #[test]
+    fn content_that_fits_has_no_scrollbar_at_all() {
+        use instar_ui::{Node, WireLayout, WireSize};
+        let mut host = ready_host();
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(
+                0,
+                vec![
+                    Node::scroll(
+                        60,
+                        Node::text(61, "short").with_layout(WireLayout {
+                            height: WireSize::Fixed(20),
+                            ..WireLayout::default()
+                        }),
+                    )
+                    .with_layout(WireLayout {
+                        height: WireSize::Fixed(100),
+                        ..WireLayout::default()
+                    }),
+                ],
+            )),
+        )
+        .expect("valid");
+
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(
+            instar_ui::Scrollbar::for_viewport(
+                window.layout().unwrap().get(NodeKey::first(60)).unwrap(),
+                20,
+                0
+            ),
+            None,
+            "a viewport with nothing to scroll gets no chrome, rather than a \
+             full-length thumb that cannot move"
+        );
+    }
+
+    #[test]
+    fn hovering_the_thumb_repaints_and_tells_the_guest_nothing() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+
+        let effects = host.on_pointer_moved(WINDOW, bar.thumb.x + 2, bar.thumb.y + 2);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "hover is drawn, so it asks for a frame"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "and says nothing to the guest"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.hovered(),
+            Some((NodeKey::first(50), ScrollbarPart::Thumb))
+        );
+
+        // Moving within the same part changes nothing, so no frame.
+        assert!(
+            host.on_pointer_moved(WINDOW, bar.thumb.x + 3, bar.thumb.y + 3)
+                .is_empty(),
+            "an unchanged hover must not ask for a redraw that changes no pixel"
+        );
+    }
+
+    #[test]
+    fn clicking_the_track_pages_towards_the_click() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+
+        // Below the thumb, which is at the top.
+        let effects = host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.track.x + 2),
+            f64::from(bar.track.y + bar.track.height - 2),
+        ));
+        assert!(to_guest(&effects).is_empty());
+        assert_eq!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(50))
+                .y,
+            100,
+            "one viewport-height page down"
+        );
+    }
+
+    /// The whole architectural claim, stated the way a user would see it.
+    ///
+    /// The guest is blocked for 100 ms across the entire drag. Asserting on
+    /// `ScrollState` would be weaker: this checks the offset moved, the thumb
+    /// moved, the *content* paints somewhere new, and hit-testing follows it —
+    /// all of it while nothing can possibly have reached the guest, because
+    /// the guest is not running.
+    #[test]
+    fn a_thumb_drag_stays_responsive_while_the_guest_is_blocked() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        let target = NodeKey::first(53);
+
+        let painted_y = |host: &Host| {
+            host.window(WINDOW)
+                .and_then(HostWindow::scene)
+                .and_then(|scene| {
+                    scene.commands.iter().find_map(|command| match command {
+                        instar_paint::PaintCommand::FillRect { rect, .. } if rect.height == 40 => {
+                            Some(rect.y)
+                        }
+                        _ => None,
+                    })
+                })
+        };
+
+        // The guest is stalled for the whole gesture. Nothing below touches
+        // it, and the assertions hold regardless of when it wakes.
+        let stalled_until = Instant::now() + Duration::from_millis(100);
+
+        let grab = host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.thumb.x + 2),
+            f64::from(bar.thumb.y + 2),
+        ));
+        assert!(
+            to_guest(&grab).is_empty(),
+            "grabbing says nothing to the guest"
+        );
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_some(),
+            "the thumb is held"
+        );
+
+        // Far enough to reach the end. 75px of thumb travel maps to 300 of
+        // offset, so a 50px drag would leave the target at viewport y = 100 --
+        // painted, but one pixel past the bottom edge and therefore not
+        // hittable. Dragging to the limit puts it at the top instead.
+        let mut effects = Vec::new();
+        for step in 1..=20 {
+            effects.extend(host.on_pointer_moved(
+                WINDOW,
+                bar.thumb.x + 2,
+                bar.thumb.y + 2 + step * 5,
+            ));
+        }
+        assert!(
+            Instant::now() < stalled_until,
+            "the whole drag completed inside the guest's stall window, which \
+             is the point: the guest could not have participated"
+        );
+        assert!(
+            to_guest(&effects).is_empty(),
+            "dragging must never reach the guest: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, HostEffect::Render { .. })),
+            "and must repaint"
+        );
+
+        // What a user sees: the offset moved, the thumb moved, the content
+        // moved, and the button is clickable where it now appears.
+        let window = host.window(WINDOW).unwrap();
+        let offset = window.scroll.get(NodeKey::first(50)).y;
+        assert!(offset > 0, "the drag scrolled something");
+
+        let moved_bar = bar_of(&host);
+        assert!(
+            moved_bar.thumb.y > bar.thumb.y,
+            "the thumb followed the pointer"
+        );
+
+        let content_y = painted_y(&host).expect("the target button is painted");
+        assert!(
+            content_y < 300 - offset + 1 && content_y >= 300 - offset - 1,
+            "the content paints at its scrolled position: {content_y} for an \
+             offset of {offset}"
+        );
+
+        let hit = window
+            .tree()
+            .unwrap()
+            .hit_test_scrolled(window.layout().unwrap(), &window.scroll, 5, content_y + 2)
+            .map(|node| node.key);
+        assert_eq!(hit, Some(target), "and is clickable where it is drawn");
+    }
+
+    #[test]
+    fn a_drag_keeps_the_pointer_even_when_it_leaves_the_scrollbar() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.thumb.x + 2),
+            f64::from(bar.thumb.y + 2),
+        ));
+
+        // Far to the left of the scrollbar, and past the bottom of the window.
+        host.on_pointer_moved(WINDOW, -500, bar.thumb.y + 40);
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_some(),
+            "a drag survives the pointer leaving the thumb -- otherwise a fast \
+             drag drops control the moment the pointer outruns it"
+        );
+        assert!(
+            host.window(WINDOW)
+                .unwrap()
+                .scroll
+                .get(NodeKey::first(50))
+                .y
+                > 0
+        );
+
+        host.handle(pointer(PointerState::Released, -500.0, 0.0));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_none(),
+            "release ends it wherever the pointer is"
+        );
+    }
+
+    /// Direct manipulation of one container. Unlike the wheel, reaching the
+    /// end must not start moving an ancestor.
+    #[test]
+    fn a_thumb_at_its_limit_does_not_scroll_an_ancestor() {
+        use instar_ui::{Node, WireLayout, WireSize};
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::scroll(
+                    70,
+                    Node::column(
+                        71,
+                        vec![
+                            Node::scroll(
+                                72,
+                                Node::text(73, "inner").with_layout(WireLayout {
+                                    height: WireSize::Fixed(200),
+                                    ..WireLayout::default()
+                                }),
+                            )
+                            .with_layout(WireLayout {
+                                height: WireSize::Fixed(50),
+                                align_self: Some(instar_ui::WireAlign::Stretch),
+                                ..WireLayout::default()
+                            }),
+                            Node::text(74, "outer tail").with_layout(WireLayout {
+                                height: WireSize::Fixed(400),
+                                ..WireLayout::default()
+                            }),
+                        ],
+                    ),
+                )
+                .with_layout(WireLayout {
+                    height: WireSize::Fixed(100),
+                    align_self: Some(instar_ui::WireAlign::Stretch),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, tree).expect("valid");
+
+        let window = host.window(WINDOW).unwrap();
+        let layout = window.layout().unwrap();
+        let inner = instar_ui::Scrollbar::for_viewport(
+            layout.get(NodeKey::first(72)).unwrap(),
+            layout.get(NodeKey::first(73)).unwrap().height,
+            0,
+        )
+        .expect("the inner viewport overflows");
+
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(inner.thumb.x + 2),
+            f64::from(inner.thumb.y + 2),
+        ));
+        // Far past the end of the inner track.
+        host.on_pointer_moved(WINDOW, inner.thumb.x + 2, inner.thumb.y + 5_000);
+
+        let window = host.window(WINDOW).unwrap();
+        assert!(
+            window.scroll.get(NodeKey::first(72)).y > 0,
+            "the inner viewport scrolled to its end"
+        );
+        assert_eq!(
+            window.scroll.get(NodeKey::first(70)).y,
+            0,
+            "and the outer one did not move: a thumb is a handle on one \
+             container, and one that scrolled its parent at the end would be \
+             lying about what it controls"
+        );
+    }
+
+    #[test]
+    fn invalidating_geometry_cancels_a_live_drag() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.thumb.x + 2),
+            f64::from(bar.thumb.y + 2),
+        ));
+        assert!(host.window(WINDOW).unwrap().scroll.dragging().is_some());
+
+        host.handle(WindowOutput::MetricsInvalidated { window_id: WINDOW });
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_none(),
+            "the drag's arithmetic depends on geometry that no longer \
+             describes the window"
+        );
+    }
+
+    #[test]
+    fn deleting_a_viewport_destroys_its_drag_and_hover() {
+        use instar_ui::Node;
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        host.on_pointer_moved(WINDOW, bar.thumb.x + 2, bar.thumb.y + 2);
+        host.handle(pointer(
+            PointerState::Pressed,
+            f64::from(bar.thumb.x + 2),
+            f64::from(bar.thumb.y + 2),
+        ));
+        assert!(host.window(WINDOW).unwrap().scroll.dragging().is_some());
+
+        host.apply_tree(
+            WINDOW,
+            Tree::new(Node::root(0, vec![Node::text(80, "gone")])),
+        )
+        .expect("valid");
+
+        let window = host.window(WINDOW).unwrap();
+        assert!(window.scroll.dragging().is_none(), "the drag went with it");
+        assert!(window.scroll.hovered().is_none(), "so did the hover");
+        assert!(window.scroll.is_empty(), "and the offset");
+    }
+
     // --- C5: a paint-only change must not touch the text cache. ---
 
     /// The Stage 1 regression test, made mandatory.
@@ -1885,11 +2488,15 @@ mod tests {
 
         // Painted somewhere new.
         let scene = host.window(WINDOW).and_then(HostWindow::scene).unwrap();
+        // By height, because a scrolled viewport now also fills a scrollbar
+        // track: chrome, not content, and it does not move with the offset.
         let filled: Vec<i32> = scene
             .commands
             .iter()
             .filter_map(|command| match command {
-                instar_paint::PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                instar_paint::PaintCommand::FillRect { rect, .. } if rect.height == 40 => {
+                    Some(rect.y)
+                }
                 _ => None,
             })
             .collect();

@@ -49,7 +49,7 @@ use instar_paint::{
 };
 use instar_ui::{
     Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ScrollOffset, ScrollState,
-    ShapedText, ShapingStyle, TextContext, Tree,
+    ScrollbarPart, ShapedText, ShapingStyle, TextContext, Tree,
 };
 use instar_window::WindowMetricsChanged;
 
@@ -92,6 +92,10 @@ pub struct Theme {
     pub disabled_face: Color,
     pub disabled_label: Color,
     pub pressed_face: Color,
+    pub scrollbar_track: Color,
+    pub scrollbar_thumb: Color,
+    pub scrollbar_thumb_hover: Color,
+    pub scrollbar_thumb_active: Color,
     pub crash_background: Color,
     pub crash_text: Color,
 }
@@ -107,6 +111,15 @@ impl Default for Theme {
             disabled_face: Color::opaque(0x26, 0x26, 0x2c),
             disabled_label: Color::opaque(0x6a, 0x6a, 0x74),
             pressed_face: Color::opaque(0x44, 0x44, 0x52),
+            scrollbar_track: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 40,
+            },
+            scrollbar_thumb: Color::opaque(0x5a, 0x5a, 0x66),
+            scrollbar_thumb_hover: Color::opaque(0x74, 0x74, 0x82),
+            scrollbar_thumb_active: Color::opaque(0x8e, 0x8e, 0x9c),
             // Deliberately unlike anything the app palette can produce. A
             // crash screen that could be mistaken for a running app is a
             // crash screen that gets ignored.
@@ -445,6 +458,45 @@ impl SceneBuilder {
 
         if clipped {
             commands.push(PaintCommand::PopClip);
+        }
+
+        // Chrome last, and outside the clip: it belongs to the viewport rather
+        // than to the content, so it must not scroll with what it scrolls, and
+        // it must sit on top of it. Generated from the `Scroll` node rather
+        // than drawn from tree nodes -- there are no tree nodes for it, on
+        // purpose.
+        if matches!(node.kind, NodeKind::Scroll)
+            && let Some(content) = instar_ui::scroll::content_of(node)
+            && let Some(content_rect) = layout.get(content.key)
+            && let Some(bar) = instar_ui::Scrollbar::for_viewport(
+                rect,
+                content_rect.height,
+                scroll.get(node.key).y,
+            )
+        {
+            let held = scroll
+                .dragging()
+                .is_some_and(|drag| drag.viewport == node.key);
+            let hovered = scroll
+                .hovered()
+                .is_some_and(|(key, part)| key == node.key && part == ScrollbarPart::Thumb);
+            let thumb = match (held, hovered) {
+                (true, _) => self.theme.scrollbar_thumb_active,
+                (false, true) => self.theme.scrollbar_thumb_hover,
+                (false, false) => self.theme.scrollbar_thumb,
+            };
+            commands.push(PaintCommand::FillRect {
+                rect: physical(bar.track, scale),
+                color: self.theme.scrollbar_track,
+            });
+            commands.push(PaintCommand::FillRoundedRect {
+                rect: physical(bar.thumb, scale),
+                radii: instar_paint::CornerRadii::uniform(
+                    (instar_ui::SCROLLBAR_THICKNESS as f32 / 2.0) * scale,
+                )
+                .clamped_to(physical(bar.thumb, scale)),
+                color: thumb,
+            });
         }
     }
 
@@ -1047,18 +1099,21 @@ mod tests {
         scroll.set(NodeKey::first(1), ScrollOffset::new(0, 150));
         let scene = SceneBuilder::new().app_scene(&tree, &layout, &scroll, &metrics, None);
 
+        // The button, by its height -- a scrolled viewport also fills a
+        // scrollbar track, which is chrome rather than content and does not
+        // move with the offset.
         let filled: Vec<i32> = scene
             .commands
             .iter()
             .filter_map(|command| match command {
-                PaintCommand::FillRect { rect, .. } => Some(rect.y),
+                PaintCommand::FillRect { rect, .. } if rect.height == 40 => Some(rect.y),
                 _ => None,
             })
             .collect();
         assert_eq!(
             filled,
             vec![50],
-            "200 minus an offset of 150 is 50, and nothing else is filled"
+            "200 minus an offset of 150 is 50, and nothing else of the content is filled"
         );
     }
 

@@ -40,7 +40,10 @@ pub use instar_ui_protocol::{
 };
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
-pub use scroll::{ScrollDeltaPixels, ScrollOffset, ScrollOutcome, ScrollState};
+pub use scroll::{
+    MIN_THUMB_LENGTH, SCROLLBAR_THICKNESS, ScrollDeltaPixels, ScrollOffset, ScrollOutcome,
+    ScrollState, Scrollbar, ScrollbarPart, ThumbDrag,
+};
 pub use text::{
     Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
     TextStats,

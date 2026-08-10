@@ -770,7 +770,60 @@ deletion            -> ScrollState destroyed
 scrollbar to stay perfectly responsive. Every other assertion here can be
 satisfied by an implementation that merely happens not to call the guest; this
 one fails unless the guest is genuinely absent from the loop. It is the
-clearest possible statement of the claim, so it is the one to make.
+clearest possible statement of the claim, so it is the one to make — and it is
+asserted on what a user would see, not on `ScrollState`: the offset moves, the
+thumb moves, the content paints in its new place, and hit-testing follows it,
+all while the guest is blocked.
+
+#### Chrome is presentation, not semantics
+
+```text
+guest tree            host presentation
+
+Scroll                Scroll viewport
+└── content           ├── content
+                      ├── track
+                      └── thumb
+```
+
+The track and thumb are generated from the `Scroll` node, exactly as a focus
+ring will later be generated from focus state. Putting them in the semantic
+tree would give internal chrome a `NodeKey`, and `NodeKey` identity belongs to
+application semantics — a guest would find nodes it never created, the ledger
+would account for them, and accessibility would have to explain them.
+
+#### Drag does not bubble, and wheel does
+
+```text
+wheel        the deepest viewport takes what it can; the remainder
+             bubbles outward
+thumb drag   direct manipulation of one specific container; reaching
+             the end does nothing to its ancestors
+```
+
+Not an inconsistency. A wheel delta is a quantity with a meaningful leftover,
+so passing the leftover on is what stops an inner viewport swallowing the
+gesture. A thumb is a physical handle on one scroll container; a handle that
+started scrolling its parent when it hit the bottom would be a handle that lies
+about what it controls.
+
+#### Pointer capture, and cancelling it
+
+Once a thumb is grabbed, the drag continues while the pointer moves off the
+thumb, off the scrollbar, and outside the window, until release. Without
+capture, a fast drag intermittently drops control — the pointer outruns the
+thumb between events and lands on the track, which would otherwise be a
+page-step.
+
+Cancellation follows the doctrine already in place for geometry:
+
+> If the geometry a drag began against becomes invalid, the drag is cancelled
+> before the replacement geometry becomes interactive.
+
+A resize, a scale change, deleting the `Scroll`, or hiding it all destroy the
+frame of reference the drag's arithmetic depends on. Completing a drag against
+geometry that no longer exists is the same defect as completing a press against
+a node that no longer exists, and it gets the same answer.
 
 ### E — focus and keyboard
 

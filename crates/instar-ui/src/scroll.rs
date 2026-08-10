@@ -66,10 +66,132 @@ impl ScrollOffset {
     }
 }
 
-/// Every live viewport's offset, keyed by the `Scroll` node that owns it.
+/// Thickness of a scrollbar, in logical pixels. Host policy.
+pub const SCROLLBAR_THICKNESS: i32 = 12;
+
+/// The shortest a thumb is allowed to get, in logical pixels.
+///
+/// Host policy, and the reason thumb position is not simply proportional: in a
+/// very long document the proportional thumb would be a few pixels tall and
+/// impossible to grab. Once the minimum binds, the thumb travels over a
+/// slightly shorter track than the naive arithmetic suggests, which
+/// [`Scrollbar::thumb`] accounts for.
+pub const MIN_THUMB_LENGTH: i32 = 24;
+
+/// Which piece of a scrollbar a pointer is over, or has hold of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarPart {
+    /// The draggable handle.
+    Thumb,
+    /// The groove above or below it. Clicking pages.
+    Track,
+}
+
+/// A viewport's vertical scrollbar, in absolute logical coordinates.
+///
+/// Presentation derived from the `Scroll` node, never a node itself: chrome
+/// with a `NodeKey` would be chrome the guest can see, the ledger accounts
+/// for, and accessibility has to explain.
+///
+/// Vertical only. A horizontal one is the same arithmetic on the other axis,
+/// but the two together need a rule for the corner where they meet and for
+/// whether each steals space from the other — that is a design question this
+/// package does not need to answer to prove the interaction model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollbar {
+    /// The full groove, down the right edge of the viewport.
+    pub track: crate::Rect,
+    /// The handle, somewhere inside the track.
+    pub thumb: crate::Rect,
+}
+
+impl Scrollbar {
+    /// The scrollbar for a viewport, or `None` when the content fits.
+    ///
+    /// Nothing is drawn when there is nothing to scroll, so a viewport that
+    /// happens to be large enough has no chrome rather than a full-length
+    /// thumb that cannot move.
+    pub fn for_viewport(viewport: crate::Rect, content_height: i32, offset_y: i32) -> Option<Self> {
+        let scrollable = content_height - viewport.height;
+        if scrollable <= 0 || viewport.width <= 0 || viewport.height <= 0 {
+            return None;
+        }
+
+        let track = crate::Rect::new(
+            viewport.x + viewport.width - SCROLLBAR_THICKNESS,
+            viewport.y,
+            SCROLLBAR_THICKNESS.min(viewport.width),
+            viewport.height,
+        );
+
+        // Proportional, then floored at the minimum so it stays grabbable.
+        let proportional =
+            (viewport.height as i64 * viewport.height as i64 / content_height as i64) as i32;
+        let length = proportional.clamp(MIN_THUMB_LENGTH.min(viewport.height), viewport.height);
+
+        // Travel is what is left of the track once the thumb occupies part of
+        // it. Dividing by `scrollable` rather than by the content height is
+        // what keeps the thumb flush with the bottom at maximum offset even
+        // when the minimum length bound.
+        let travel = viewport.height - length;
+        let position = if scrollable > 0 {
+            (travel as i64 * offset_y.clamp(0, scrollable) as i64 / scrollable as i64) as i32
+        } else {
+            0
+        };
+
+        Some(Self {
+            track,
+            thumb: crate::Rect::new(track.x, track.y + position, track.width, length),
+        })
+    }
+
+    /// The offset a thumb dragged to `thumb_top` corresponds to.
+    ///
+    /// The inverse of the position arithmetic above. A track with no travel —
+    /// a thumb as long as its track — maps everything to zero rather than
+    /// dividing by it.
+    pub fn offset_for_thumb_top(&self, thumb_top: i32, scrollable: i32) -> i32 {
+        let travel = self.track.height - self.thumb.height;
+        if travel <= 0 {
+            return 0;
+        }
+        let within = (thumb_top - self.track.y).clamp(0, travel);
+        ((within as i64 * scrollable as i64 / travel as i64) as i32).clamp(0, scrollable.max(0))
+    }
+
+    pub fn part_at(&self, x: i32, y: i32) -> Option<ScrollbarPart> {
+        if !crate::rect_contains(self.track, x, y) {
+            return None;
+        }
+        Some(if crate::rect_contains(self.thumb, x, y) {
+            ScrollbarPart::Thumb
+        } else {
+            ScrollbarPart::Track
+        })
+    }
+}
+
+/// A thumb drag in progress.
+///
+/// Both origins are recorded because the offset is computed from where the
+/// drag *started*, not incrementally from the last event. Accumulating deltas
+/// would let rounding drift over a long drag, and would make the thumb lag the
+/// pointer after any clamped movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbDrag {
+    pub viewport: NodeKey,
+    pub origin_pointer_y: i32,
+    pub origin_offset_y: i32,
+}
+
+/// Every live viewport's offset, plus whatever the pointer is doing to a
+/// scrollbar right now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollState {
     offsets: HashMap<NodeKey, ScrollOffset>,
+    hovered: Option<(NodeKey, ScrollbarPart)>,
+    active: Option<ThumbDrag>,
 }
 
 impl ScrollState {
@@ -91,6 +213,36 @@ impl ScrollState {
         self.offsets.insert(key, offset);
     }
 
+    pub fn hovered(&self) -> Option<(NodeKey, ScrollbarPart)> {
+        self.hovered
+    }
+
+    /// Records what the pointer is over. Returns whether it changed, which is
+    /// the caller's cue to repaint and its cue *not* to when nothing moved.
+    pub fn set_hovered(&mut self, hovered: Option<(NodeKey, ScrollbarPart)>) -> bool {
+        let changed = self.hovered != hovered;
+        self.hovered = hovered;
+        changed
+    }
+
+    pub fn dragging(&self) -> Option<ThumbDrag> {
+        self.active
+    }
+
+    pub fn begin_drag(&mut self, drag: ThumbDrag) {
+        self.active = Some(drag);
+    }
+
+    /// Abandons any drag in progress.
+    ///
+    /// Called when the geometry the drag began against stops being valid — a
+    /// resize, a scale change, the viewport being deleted or hidden. Finishing
+    /// a drag against geometry that no longer exists is the same defect as
+    /// completing a press against a node that no longer exists.
+    pub fn cancel_drag(&mut self) {
+        self.active = None;
+    }
+
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
@@ -108,6 +260,15 @@ impl ScrollState {
     pub fn retire(&mut self, removed: &[NodeKey]) {
         for key in removed {
             self.offsets.remove(key);
+        }
+        if self
+            .active
+            .is_some_and(|drag| removed.contains(&drag.viewport))
+        {
+            self.active = None;
+        }
+        if self.hovered.is_some_and(|(key, _)| removed.contains(&key)) {
+            self.hovered = None;
         }
     }
 
