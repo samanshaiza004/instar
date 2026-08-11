@@ -233,3 +233,53 @@ development ergonomics rather than product. `target/debug/build` is down to
 296 MiB after the guest-build fix, so what is left is `deps` — and the
 untested lever there is `[profile.dev] debug = "line-tables-only"` with
 `[profile.dev.package."*"] debug = false`.
+
+## I1: the dev profile is worth 1.5x, and the 8x was a measurement error
+
+Measured at `62df5bf`, rustc 1.97.1, cargo 1.97.1, macOS 26.5.2, arm64.
+
+An earlier reading suggested this lever was worth roughly 8x — 31 GiB down to
+4 GiB. **That number was not real.** The two sides had not built the same
+thing: the large figure was a `target/` that had accumulated dev, release,
+`dist` and doc artifacts across a day's work, and the small one was a single
+dev-profile build. Comparing them measured how much had been built, not what
+debug information costs.
+
+Controlled: same revision, same toolchain, same machine, same command, a fresh
+`CARGO_TARGET_DIR` for each side, run back to back.
+
+```bash
+CARGO_TARGET_DIR=<fresh> cargo test --workspace --no-run
+```
+
+That builds 26 test binaries. It is not the 37 suites `cargo test --workspace`
+reports, and the difference is not a discrepancy: the other 11 are doc-test
+runs, one per library crate, which `--no-run` does not compile. Both sides
+build the same 26.
+
+```text
+                        A: debug = true      B: line-tables-only
+                                                 + deps debug = false
+target/                      5.64 GB              3.79 GB    -33%
+target/debug/deps            4.50 GB              2.75 GB    -39%
+target/debug/incremental     1.34 GB              0.81 GB    -39%
+
+clean build                   260 s                270 s
+no-op rebuild                   1 s                  1 s
+one-line edit, rebuilt         21 s            18 / 24 / 18 s
+panic file:line               yes                  yes
+```
+
+The rebuild row is why it has three numbers on the B side. B's first reading
+was 37 s, which would have been a 76% regression and a reason to revert. Three
+further samples put it at 18-24 s, straddling A's 21 s: the 37 s was an
+outlier, and a single unreplicated timing was about to become a decision.
+
+**Keep the profile, and stop looking at dev profiles.** 1.8 GB for no cost is
+worth having, backtraces still name the file and line that panicked, and build
+times are indistinguishable. But it is a third, not the order of magnitude the
+uncontrolled reading claimed, and nothing else here is worth another day.
+
+The honest form of the original observation is that a `target/` directory
+grows to tens of gigabytes because it holds every profile ever built, not
+because dependency debug information is enormous.
