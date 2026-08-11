@@ -31,6 +31,7 @@ repository = "https://github.com/samanshaiza004/instar"
 
 [profile.release]
 lto = true
+strip = "symbols"
 
 # The profile that 'dist' will build with
 [profile.dist]

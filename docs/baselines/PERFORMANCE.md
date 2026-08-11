@@ -174,3 +174,62 @@ Recorded because the first person to open the Gallery full-screen reasonably
 described it as "unbelievably laggy", and the answer is the profile rather than
 anything in the frame path. Anything judging how Instar *feels* has to be a
 release build. The gates in this document already are.
+
+## I0: the distributable is 13.4 MiB, not 144
+
+Measured at `55996b2`, rustc 1.97.1, cargo 1.97.1, macOS 26.5.2 (25F84),
+arm64.
+
+```text
+                        dev        release    release + strip
+instar                124.9 MiB    16.8 MiB       13.4 MiB
+overhead              123.9 MiB
+uibench                28.7 MiB
+
+counter.wasm            4.14 MiB                   0.14 MiB
+gallery.wasm            4.28 MiB                   0.18 MiB
+calculator.wasm         4.45 MiB                   0.17 MiB
+```
+
+```text
+clean release build     9m 39s
+release + strip         4m 27s   (relink after a profile change)
+no-op rebuild           0.66s
+target/ after both      29 GiB
+```
+
+**This is the number that answers the question, and it is a factor of ten
+from the one that prompted it.** A 144 MiB debug binary was never evidence
+about what Instar ships; `lto = true` and an optimizing pass remove almost all
+of it, and `strip = "symbols"` takes another 3.4 MiB. The guests go from ~4.3
+MiB to under 200 KiB — a factor of twenty-five.
+
+So the accurate account of the original 144 MiB is:
+
+```text
+~108 MiB  unoptimized, un-LTO'd code the release profile removes
+~ 19 MiB  Wasmtime capability Instar never asked for (package I2)
+~  3 MiB  debug symbols
+~ 13 MiB  the runtime
+```
+
+Only the second of those was a defect. The first is the dev profile working as
+designed, and it is why "Rust makes Instar 144 MB" was the wrong sentence:
+Rust's dev profile generates a lot of debug and incremental material, and
+Instar was linking a general-purpose Wasmtime including capability it never
+configured.
+
+### What this settles, and what it defers
+
+At 13.4 MiB with a JIT compiler linked in, the case for Winch or an AOT
+compiler/runner split is now weak on size grounds alone. Both remain
+interesting for other reasons — Winch for guest startup latency, AOT for
+attack surface — but neither is justified by this table, and the AOT split
+would cost Instar the property that `instar run foo.wasm` accepts an
+architecture-independent component.
+
+The remaining number worth attention is the 29 GiB `target/`, which is
+development ergonomics rather than product. `target/debug/build` is down to
+296 MiB after the guest-build fix, so what is left is `deps` — and the
+untested lever there is `[profile.dev] debug = "line-tables-only"` with
+`[profile.dev.package."*"] debug = false`.
