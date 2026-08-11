@@ -1737,6 +1737,57 @@ percentage of a parent. Percentage sizing stays at one application and stays
 unimplemented. That is the ledger doing its job — the second application split
 one vague missing feature into two precise semantics and needed only one.
 
+#### H4: the Calculator on the SDK, and what the four pains needed
+
+All four `PAIN:` markers are gone, and they did not go the same way:
+
+```text
+1  right-aligned readout inexpressible
+   -> WireTextLayout::End                    wire capability
+2  child counts declared by hand
+   -> Ui takes them from the tree            SDK, hazard removed
+3  keys sized by their labels, not evenly
+   -> basis Fixed(0) + grow + min_width      wire capability
+4  NodeKey mapped back by searching a table
+   -> Routes::message, whole-key             SDK, hazard removed
+```
+
+**Two were missing capabilities and two were missing ergonomics**, and that
+split is the useful result. An SDK that had tried to paper over 1 and 3 would
+have had to invent semantics the host could not honour — a guest-side
+right-alignment would mean measuring text in the guest, and guest-side equal
+shares would mean a second layout engine. The two it did solve were both
+*hazards* rather than verbosity: a child count that silently desynchronizes the
+stream, and a lookup that reopens the ABA hole by matching the numeric half of
+a key.
+
+The rewrite is behaviour-preserving: all four existing Calculator tests pass
+unchanged. A fifth test asserts the capabilities actually took effect, and it
+fails informatively — `[67, 79, 59, 67]` for the keypad without `basis`, and
+ink at `x = 0` without `End`.
+
+```text
+view construction     113 lines  ->   78
+manual node tables      1 (KEYS lookup by id)  ->  0
+manual child counts     7  ->  0
+protocol imports       12 types  ->  10, plus Ui and Routes
+```
+
+Not a line-count exercise: the thesis was *remove protocol bookkeeping without
+inventing an application framework*, and the shape of the code still reads as
+"build a snapshot, handle messages".
+
+**No fifth pain appeared.** Worth stating plainly rather than treating silence
+as success — it means the next SDK feature has no evidence behind it yet, and
+the right move is to stop adding to `instar-sdk` until a second application
+complains about something.
+
+One thing deliberately *not* added: an `.equal_share()` helper. The
+`basis`/`grow`/`min_width` trio is spelled out in the Calculator, because one
+application uses that combination and turning a meaningful arrangement of
+primitives into vocabulary on a single data point is how a thin SDK stops being
+thin.
+
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
 on every primitive while the API underneath it is miserable.

@@ -217,3 +217,48 @@ fn dividing_by_zero_is_shown_rather_than_fatal() {
         "and the calculator is still usable afterwards"
     );
 }
+
+/// The two wire capabilities H2 and H3 added, seen from the application that
+/// asked for them.
+///
+/// Both were `PAIN:` markers in the raw version and neither could be fixed by
+/// an SDK: a right-aligned readout and equal-width keys are things the host
+/// has to be able to do, not things a builder can paper over.
+#[test]
+fn the_keypad_is_evenly_divided_and_the_readout_is_right_aligned() {
+    let calc = Calc::open();
+    let host = calc.0.host();
+    let window = host.window(WINDOW).expect("the window");
+    let layout = window.layout().expect("layout");
+
+    // Every key in a row is the same width, whatever its label says. Without
+    // `basis: Fixed(0)` each starts from its own content and "00" is wider
+    // than "0"; without `min_width: Some(0)` the content minimum binds first.
+    let widths: Vec<i32> = ["0", "00", ".", "="]
+        .iter()
+        .map(|label| layout.get(key(label)).expect("laid out").width)
+        .collect();
+    assert!(
+        widths.windows(2).all(|pair| pair[0] == pair[1]),
+        "a keypad row divides evenly: {widths:?}"
+    );
+
+    // And the readout's glyphs sit at its right edge rather than its left.
+    // Asserted on the shaped artifact, because alignment moves glyphs inside
+    // a box whose rectangle does not change -- a layout assertion cannot see
+    // it at all.
+    let display = layout.get(DISPLAY).expect("laid out");
+    let shaped = layout.text.get(&DISPLAY).expect("the readout is shaped");
+    let ink_right = shaped
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|glyph| glyph.x)
+        .fold(f32::MIN, f32::max);
+    assert!(
+        ink_right > display.width as f32 * 0.5,
+        "the readout is aligned End, so its ink sits in the right half of a \
+         {}-wide box; the last glyph starts at {ink_right}",
+        display.width
+    );
+}

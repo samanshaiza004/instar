@@ -5,12 +5,29 @@
 //! toolkit can be green on every primitive while the API underneath it is
 //! miserable, and only an ordinary application ever finds that out.
 //!
-//! So this is written directly against `instar-ui-protocol`, with no helper
-//! layer, on purpose. `instar-sdk` is supposed to grow from whatever this
-//! makes painful and from nothing else — which means the pain has to be
-//! experienced and recorded rather than predicted. Every awkwardness is noted
-//! in a comment beginning `PAIN:` so the eventual SDK has an actual list of
-//! requirements instead of a designer's guesses.
+//! It was first written directly against `instar-ui-protocol` with no helper
+//! layer, on purpose: `instar-sdk` was supposed to grow from whatever this
+//! made painful and from nothing else, which meant the pain had to be
+//! experienced rather than predicted. Four awkwardnesses were marked `PAIN:`.
+//!
+//! This is the version after. All four are gone, and each disappeared for a
+//! different reason:
+//!
+//! ```text
+//! 1  a right-aligned readout was inexpressible
+//!    -> WireTextLayout::End                          new wire capability
+//! 2  child counts declared by hand, silently wrong
+//!    -> Ui takes them from the tree                  SDK removes a hazard
+//! 3  keys sized by their labels, not evenly
+//!    -> basis Fixed(0) + grow + min_width            new wire capability
+//! 4  NodeKey mapped back to meaning by searching
+//!    -> Routes::message, keyed on the whole key      SDK removes a hazard
+//! ```
+//!
+//! The split is the interesting part. Two were missing *capabilities* and had
+//! to reach the wire; two were missing *ergonomics* and stayed out of it. An
+//! SDK that had tried to paper over 1 and 3 would have had to invent
+//! semantics the host could not honour.
 //!
 //! ```text
 //! ┌─────────────────┐
@@ -29,9 +46,10 @@ wit_bindgen::generate!({
     world: "kernel",
 });
 
+use instar_sdk::{Routes, Ui};
 use instar_ui_protocol::{
-    BatchEncoder, NodeKey, WireAlign, WireColor, WireEvent, WireJustify, WireLayout,
-    WirePaintStyle, WireSize, WireStyle, WireTextStyle, flags, opcode,
+    WireAlign, WireBasis, WireColor, WireEvent, WireLayout, WirePaintStyle, WireSize, WireStyle,
+    WireTextAlign, WireTextLayout, WireTextStyle,
 };
 
 use crate::instar::kernel::kernel_runtime;
@@ -105,6 +123,12 @@ struct Calculator {
     /// Set after `=` or an operator, so the next digit starts a fresh entry
     /// rather than appending to the answer.
     replace_entry: bool,
+    /// What each control in the committed snapshot means.
+    ///
+    /// Held rather than rebuilt on demand because it is only valid for the
+    /// tree it was built from, and `Ui::finish` hands the two out together for
+    /// exactly that reason.
+    routes: Option<Routes<Key>>,
 }
 
 impl Default for Calculator {
@@ -113,6 +137,7 @@ impl Default for Calculator {
             entry: "0".to_string(),
             pending: None,
             replace_entry: true,
+            routes: None,
         }
     }
 }
@@ -173,7 +198,11 @@ impl Calculator {
                     self.show(answer);
                 }
             }
-            Key::Clear => *self = Self::default(),
+            Key::Clear => {
+                self.entry = "0".to_string();
+                self.pending = None;
+                self.replace_entry = true;
+            }
             Key::Negate => {
                 if self.entry.starts_with('-') {
                     self.entry.remove(0);
@@ -223,135 +252,112 @@ fn key_style(key: Key) -> WireStyle {
     }
 }
 
+/// Every key takes an equal share of its row.
+///
+/// Three statements, none of which subsumes the others. `basis: Fixed(0)` says
+/// distribution starts from nothing rather than from each label's own width —
+/// without it, `0` comes out narrower than `00`. `grow: 1.0` says the surplus
+/// is split evenly. `min_width: Some(0)` says a key may go below its content,
+/// because CSS gives flex items an automatic content-based minimum and a
+/// narrow window would otherwise let the widest label win.
+///
+/// Deliberately spelled out rather than wrapped in an SDK `.equal_share()`
+/// helper. One application uses this combination; turning a meaningful
+/// arrangement of primitives into vocabulary on a single data point is how a
+/// thin SDK stops being thin.
+fn equal_share() -> WireLayout {
+    WireLayout {
+        basis: WireBasis::Fixed(0),
+        grow: 1.0,
+        min_width: Some(0),
+        height: WireSize::Fixed(44),
+        align_self: Some(WireAlign::Stretch),
+        ..WireLayout::default()
+    }
+}
+
 impl Calculator {
-    fn encode(&self) -> Vec<u8> {
-        let mut encoder = BatchEncoder::new();
+    /// The whole interface, and what each control means.
+    fn view(&self) -> (Vec<u8>, Routes<Key>) {
+        let mut ui = Ui::new();
+        ui.root(ROOT, |ui| {
+            ui.text(DISPLAY, &self.entry)
+                .layout(WireLayout {
+                    align_self: Some(WireAlign::Stretch),
+                    padding: 12,
+                    ..WireLayout::default()
+                })
+                .style(WireStyle {
+                    text: WireTextStyle {
+                        size: 32,
+                        ..WireTextStyle::default()
+                    },
+                    // The readout reads right to left, like every calculator
+                    // anyone has used. `End` rather than `Right` because the
+                    // two differ for right-to-left text and only one of them
+                    // is a statement of intent.
+                    text_layout: WireTextLayout {
+                        align: WireTextAlign::End,
+                    },
+                    paint: WirePaintStyle {
+                        foreground: Some(INK),
+                        background: Some(DISPLAY_BG),
+                        corner_radius: 8,
+                        ..WirePaintStyle::default()
+                    },
+                    ..WireStyle::default()
+                });
 
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(ROOT),
-            0,
-            None,
-            WireLayout {
-                padding: 12,
-                gap: 10,
-                ..WireLayout::default()
-            },
-            2,
-        );
-
-        // PAIN 1: the display wants its text on the right, and cannot say so.
-        // `align_self` positions the *node*, not the glyphs inside it, so a
-        // right-aligned readout is inexpressible. Stretching the node and
-        // letting the text sit left is visibly wrong for a calculator; not
-        // stretching it makes the panel hug the digits and jump about as they
-        // change. This is Gallery ledger entry 3, reached independently, which
-        // is exactly the second-application evidence the freeze criterion
-        // asks for.
-        encoder.node_styled(
-            opcode::NODE_TEXT,
-            NodeKey::first(DISPLAY),
-            0,
-            Some(&self.entry),
-            WireLayout {
-                align_self: Some(WireAlign::Stretch),
-                padding: 12,
-                ..WireLayout::default()
-            },
-            WireStyle {
-                text: WireTextStyle {
-                    size: 32,
-                    ..WireTextStyle::default()
-                },
-                paint: WirePaintStyle {
-                    foreground: Some(INK),
-                    background: Some(DISPLAY_BG),
-                    corner_radius: 8,
-                    ..WirePaintStyle::default()
-                },
-                ..WireStyle::default()
-            },
-            0,
-        );
-
-        encoder.node(
-            opcode::NODE_COLUMN,
-            NodeKey::first(KEYPAD),
-            0,
-            None,
-            WireLayout {
+            ui.column(KEYPAD, |ui| {
+                for (row, keys) in ROWS.iter().zip(KEYS.chunks(4)) {
+                    ui.row(*row, |ui| {
+                        for (id, label, key) in keys {
+                            ui.button(*id, *label)
+                                .layout(equal_share())
+                                .style(key_style(*key))
+                                .on_activate(*key);
+                        }
+                    })
+                    .layout(WireLayout {
+                        grow: 1.0,
+                        gap: 8,
+                        align_self: Some(WireAlign::Stretch),
+                        ..WireLayout::default()
+                    });
+                }
+            })
+            .layout(WireLayout {
                 grow: 1.0,
                 gap: 8,
                 align_self: Some(WireAlign::Stretch),
                 ..WireLayout::default()
-            },
-            // PAIN 2: this count is `ROWS.len()`, and the encoder has no way
-            // to check it. Every container repeats the hazard the Gallery
-            // already tripped over: declare a number, then emit that many
-            // subtrees, and be wrong silently if they disagree. The wire is
-            // right to be a flat depth-first stream; the *guest* should not
-            // have to hold the invariant by hand.
-            ROWS.len() as u16,
-        );
-
-        for (row_index, row_id) in ROWS.iter().enumerate() {
-            let keys = &KEYS[row_index * 4..row_index * 4 + 4];
-            encoder.node(
-                opcode::NODE_ROW,
-                NodeKey::first(*row_id),
-                0,
-                None,
-                WireLayout {
-                    grow: 1.0,
-                    gap: 8,
-                    align_self: Some(WireAlign::Stretch),
-                    justify_content: WireJustify::SpaceBetween,
-                    ..WireLayout::default()
-                },
-                keys.len() as u16,
-            );
-            for (id, label, key) in keys {
-                encoder.node_styled(
-                    opcode::NODE_BUTTON,
-                    NodeKey::first(*id),
-                    flags::ENABLED,
-                    Some(label),
-                    WireLayout {
-                        // PAIN 3: "each key takes an equal quarter of the row"
-                        // has no direct expression. `grow: 1.0` distributes
-                        // *surplus*, so keys end up sized by their labels plus
-                        // a share -- "0" is narrower than "00". A fixed width
-                        // would stop following the window. This is Gallery
-                        // ledger entry 1 (fractional sizing) arriving from a
-                        // second direction.
-                        grow: 1.0,
-                        height: WireSize::Fixed(44),
-                        align_self: Some(WireAlign::Stretch),
-                        ..WireLayout::default()
-                    },
-                    key_style(*key),
-                    0,
-                );
-            }
-        }
-
-        encoder.finish()
+            });
+        })
+        .layout(WireLayout {
+            padding: 12,
+            gap: 10,
+            ..WireLayout::default()
+        });
+        ui.finish()
     }
 
-    async fn commit(&self) -> Result<(), String> {
-        kernel_ui::commit(self.encode())
+    /// Commits, and keeps the routing table the next event will be read
+    /// against.
+    async fn commit(&mut self) -> Result<(), String> {
+        let (bytes, routes) = self.view();
+        self.routes = Some(routes);
+        kernel_ui::commit(bytes)
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))
     }
 
     fn handle(&mut self, event: WireEvent) {
-        let WireEvent::Click { node } = event;
-        // PAIN 4: the guest maps a `NodeKey` back to meaning by searching its
-        // own table. That is fine at twenty keys and is the shape that does
-        // not scale: every application invents the same lookup, and an id that
-        // drifts from its handler fails silently rather than at compile time.
-        if let Some((_, _, key)) = KEYS.iter().find(|(id, _, _)| *id == node.id) {
+        // The routing table is built with the snapshot it belongs to, so a
+        // key that has since been retired simply is not in it. No lookup
+        // table, no matching on the numeric half of a NodeKey, no chance of
+        // an event for a retired node reaching whatever replaced it.
+        if let Some(key) = self.routes.as_ref().and_then(|r| r.message(&event)) {
             self.apply(*key);
         }
     }

@@ -89,8 +89,16 @@ fn instar_crates(tree: &str) -> Vec<String> {
     found
 }
 
-/// The only Instar crate a guest may link.
-const GUEST_ALLOWED: &str = "instar-ui-protocol";
+/// The Instar crates a guest may link.
+///
+/// Two, since H1. `instar-sdk` is a thin snapshot builder and event router
+/// that depends on the protocol and nothing else — the property this rule
+/// actually protects is not "one crate" but "no guest links a layout engine
+/// or a renderer", and that survives the addition. The subset below is
+/// therefore paired with `the_sdk_is_not_a_back_door_into_the_host`: without
+/// that second test, widening this list would let anything reach a guest by
+/// hiding behind the SDK.
+const GUEST_ALLOWED: [&str; 2] = ["instar-ui-protocol", "instar-sdk"];
 
 /// Stated as a subset rule rather than a list of forbidden crates, because a
 /// blocklist stops covering the case that matters — the crate that does not
@@ -111,23 +119,23 @@ fn no_guest_links_any_instar_crate_but_the_protocol() {
         let linked = instar_crates(&tree);
         let offenders: Vec<&String> = linked
             .iter()
-            .filter(|crate_| crate_.as_str() != GUEST_ALLOWED)
+            .filter(|crate_| !GUEST_ALLOWED.contains(&crate_.as_str()))
             .collect();
         assert!(
             offenders.is_empty(),
             "the {name} guest links {offenders:?}.\n\
-             A guest speaks the wire format and links nothing else of \
-             Instar's — that is what lets instar-ui take on a layout engine \
-             and instar-host a renderer. Whatever this edge was for belongs \
-             above the guest boundary.\n\nFull tree:\n{tree}"
+             A guest speaks the wire format, optionally through the SDK, and \
+             links nothing else of Instar's — that is what lets instar-ui take \
+             on a layout engine and instar-host a renderer. Whatever this edge \
+             was for belongs above the guest boundary.\n\nFull tree:\n{tree}"
         );
 
-        saw_protocol |= linked.iter().any(|crate_| crate_ == GUEST_ALLOWED);
+        saw_protocol |= linked.iter().any(|crate_| crate_ == "instar-ui-protocol");
     }
 
     assert!(
         saw_protocol,
-        "no guest links {GUEST_ALLOWED}, so the matcher above proved nothing"
+        "no guest links instar-ui-protocol, so the matcher above proved nothing"
     );
 }
 
@@ -204,4 +212,31 @@ fn the_host_takes_paint_types_but_no_renderer() {
              Full tree:\n{tree}"
         );
     }
+}
+
+/// The SDK may not become a way for anything else to reach a guest.
+///
+/// `no_guest_links_any_instar_crate_but_the_protocol` was widened when
+/// `instar-sdk` arrived, and a widened allowlist is only as good as what sits
+/// behind the thing it admitted. If the SDK ever grew an edge to `instar-ui`,
+/// every guest would transitively link a layout engine while that test stayed
+/// green — the rule would still read correctly and mean nothing.
+#[test]
+fn the_sdk_is_not_a_back_door_into_the_host() {
+    let tree = tree(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../instar-sdk"),
+        &[],
+    );
+    let linked = instar_crates(&tree);
+    let offenders: Vec<&String> = linked
+        .iter()
+        .filter(|crate_| crate_.as_str() != "instar-sdk" && crate_.as_str() != "instar-ui-protocol")
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "instar-sdk links {offenders:?}, and every guest links instar-sdk.\n\
+         The SDK is guest-visible, so its dependencies are guest dependencies: \
+         an edge here puts that crate inside every application that uses the \
+         builder.\n\nFull tree:\n{tree}"
+    );
 }

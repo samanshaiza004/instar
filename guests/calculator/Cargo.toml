@@ -15,5 +15,9 @@ wit-bindgen = "0.60.0"
 # links the host's UI implementation, its layout engine, or its hit-testing.
 # See docs/PHASE-1.md, "UI layering".
 instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }
+# The thin builder. Optional everywhere else -- the Gallery and the counter
+# still hand-encode -- and used here because this is the application whose
+# complaints it was built from.
+instar-sdk = { path = "../../crates/instar-sdk" }
 
 [workspace]

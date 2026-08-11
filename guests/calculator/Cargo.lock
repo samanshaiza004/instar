@@ -18,6 +18,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 name = "calculator"
 version = "0.0.0"
 dependencies = [
+ "instar-sdk",
  "instar-ui-protocol",
  "wit-bindgen",
 ]
@@ -65,6 +66,13 @@ dependencies = [
  "hashbrown",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "instar-sdk"
+version = "0.0.2"
+dependencies = [
+ "instar-ui-protocol",
 ]
 
 [[package]]
