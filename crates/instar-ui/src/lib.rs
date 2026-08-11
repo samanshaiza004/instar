@@ -339,6 +339,29 @@ pub enum TreeError {
     /// app that wants several things puts a `Stack` or a `Column` there.
     #[error("{key} is a scroll with {children} children; a scroll takes exactly one")]
     ScrollArity { key: NodeKey, children: usize },
+    /// A node stated a flex basis where it is not a flex item.
+    ///
+    /// `basis` describes how a node participates in **its parent's** layout,
+    /// so the parent's layout mode decides whether it means anything —
+    /// the node's own kind is irrelevant. A `Row` inside a `Stack` is still a
+    /// grid item as far as its own basis is concerned.
+    ///
+    /// ```text
+    /// child of Row, Column or Scroll   Fixed permitted
+    /// child of Stack                   Auto only  (a grid item)
+    /// the root                         Auto only  (no parent)
+    /// ```
+    ///
+    /// Refused rather than ignored. Taffy's grid-item style carries placement
+    /// and grid alignment, not `flex_basis`, and CSS defines flex-basis in
+    /// terms of a flex item in a flex container — so a fixed basis here is
+    /// inert, and this project has repeatedly found that accepting a
+    /// meaningful-looking field that secretly no-ops is worse than refusing
+    /// it.
+    #[error(
+        "{key} states a fixed flex basis, but its parent is a {parent}, so it is not a flex item"
+    )]
+    BasisWithoutFlexParent { key: NodeKey, parent: &'static str },
     #[error("{key} was a {was} and is now a {now}; reuse of a key for a different kind of node")]
     KindChanged {
         key: NodeKey,
@@ -405,6 +428,15 @@ impl Tree {
         }
         let mut cursor = 0usize;
         let root = assemble(&batch.nodes, &mut cursor)?;
+        // Checked after assembly, unlike the rules above, because it is the
+        // only one that needs a node's *parent*.
+        if root.layout.basis != WireBasis::Auto {
+            return Err(TreeError::BasisWithoutFlexParent {
+                key: root.key,
+                parent: "window",
+            });
+        }
+        check_basis(&root)?;
         Ok(Self { root })
     }
 
@@ -487,6 +519,30 @@ impl Tree {
     ) -> Option<&Node> {
         hit_test_node(&self.root, layout, scroll, x, y, None)
     }
+}
+
+/// Refuses a fixed basis on a node that is not a flex item.
+///
+/// The rule is about the *property*, not about one `NodeKind`: a basis says
+/// how a node participates in its parent's layout, so the parent's layout mode
+/// is what decides. `Stack` lowers to grid, and grid items have no flex basis.
+fn check_basis(node: &Node) -> Result<(), TreeError> {
+    let parent = match node.kind {
+        NodeKind::Stack => Some("stack"),
+        _ => None,
+    };
+    for child in &node.children {
+        if let Some(parent) = parent
+            && child.layout.basis != WireBasis::Auto
+        {
+            return Err(TreeError::BasisWithoutFlexParent {
+                key: child.key,
+                parent,
+            });
+        }
+        check_basis(child)?;
+    }
+    Ok(())
 }
 
 fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
@@ -1711,6 +1767,69 @@ mod tests {
             Some(NodeKey::first(2)),
             "retirement must not become a blanket cancel"
         );
+    }
+
+    /// A fixed basis is refused where it would silently do nothing.
+    ///
+    /// The rule is about the parent's layout mode, not the child's kind — a
+    /// `Row` inside a `Stack` is still a grid item as far as its own basis is
+    /// concerned, and that is the case a `NodeKind`-based rule would miss.
+    #[test]
+    fn a_fixed_basis_is_refused_where_the_node_is_not_a_flex_item() {
+        let with_basis = |node: Node| {
+            node.with_layout(WireLayout {
+                basis: WireBasis::Fixed(20),
+                ..WireLayout::default()
+            })
+        };
+
+        let in_a_stack = Tree::new(Node::root(
+            0,
+            vec![Node::stack(1, vec![with_basis(Node::button(2, "key"))])],
+        ));
+        assert!(
+            matches!(
+                Tree::decode(&in_a_stack.encode()),
+                Err(TreeError::BasisWithoutFlexParent { key, parent: "stack" })
+                    if key == NodeKey::first(2)
+            ),
+            "a stack child is a grid item, and grid items have no flex basis"
+        );
+
+        // The case a kind-based rule gets wrong: the child is itself a flex
+        // *container*, and still a grid *item*.
+        let container_in_a_stack = Tree::new(Node::root(
+            0,
+            vec![Node::stack(
+                1,
+                vec![with_basis(Node::row(2, vec![Node::button(3, "key")]))],
+            )],
+        ));
+        assert!(
+            matches!(
+                Tree::decode(&container_in_a_stack.encode()),
+                Err(TreeError::BasisWithoutFlexParent { key, .. }) if key == NodeKey::first(2)
+            ),
+            "being a flex container says nothing about how the node itself \
+             participates in its parent"
+        );
+
+        // And the ordinary case still works.
+        let in_a_row = Tree::new(Node::root(
+            0,
+            vec![Node::row(1, vec![with_basis(Node::button(2, "key"))])],
+        ));
+        assert!(
+            Tree::decode(&in_a_row.encode()).is_ok(),
+            "a row child is a flex item, so a basis means something"
+        );
+
+        // Scroll lowers to flex too, so its content child may state one.
+        let in_a_scroll = Tree::new(Node::root(
+            0,
+            vec![Node::scroll(1, with_basis(Node::column(2, vec![])))],
+        ));
+        assert!(Tree::decode(&in_a_scroll.encode()).is_ok());
     }
 
     #[test]
