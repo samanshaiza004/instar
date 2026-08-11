@@ -1808,6 +1808,70 @@ analogue, or a reconciliation layer. The host already reconciles; a second
 reconciler in the guest would be the delta protocol arriving through the back
 door.
 
+### I — the overhead audit
+
+#### I2: Wasmtime's default features are for a general embedding
+
+Wasmtime 47 enables 28 features by default — three GC implementations,
+coredump support, WAT parsing, a compilation cache, profiling hooks — for an
+embedder that does not know what it is embedding. Instar knows exactly what it
+embeds. The proven set is six:
+
+```text
+std  runtime  cranelift  component-model  component-model-async  async
+```
+
+plus `wasmtime-wasi` at `p2` only; the default also builds preview 1, which
+pulls in Wiggle for an ABI no Instar guest speaks.
+
+```text
+instar, dev profile   150,970,904  ->  131,011,960 bytes
+                          144.0 MiB  ->  124.9 MiB     -13.2%
+```
+
+**The first attempt changed nothing, by exactly zero bytes.** `instar-kernel`
+asked for six features and the binary was byte-identical, because
+`instar-host` also depends on `wasmtime` directly and Cargo unified the set
+back to the default 28. A feature minimization is only as narrow as its
+widest declaration, and the measurement is what said so — the diff looked
+correct and did nothing.
+
+One consequence worth keeping: `configured_engine` used to call
+`.wasm_gc(false).wasm_threads(false)`. Those methods do not exist once the
+features are off, so the proposals are now absent from the build rather than
+disabled in a function a later edit could flip back.
+
+#### The development-disk problem is not the binaries
+
+`target` reached 39 GiB, and the intuition that test executables dominate is
+wrong here:
+
+```text
+target/debug/build   20 GiB
+target/debug/deps    23 GiB
+```
+
+`instar-guest-build` compiles each guest into a **complete cargo target
+directory inside `OUT_DIR`**, and a fresh one accumulates for every
+build-script hash. Fifty-one stale guest target directories existed, several
+over a gigabyte, with five separate copies under `instar-shell-*`. Nothing
+prunes them, so every protocol bump leaves another gigabyte behind for good.
+
+```text
+target/debug/build   20 GiB  ->  5.9 MiB    (21 GiB reclaimed)
+```
+
+That is a defect in the guest build rather than a profile setting: it should
+share one target directory across hashes, or clean up after itself. Recorded
+here rather than fixed, because it is its own package.
+
+#### Not yet measured
+
+Release and stripped-release sizes, clean and incremental build times, and the
+`[profile.dev] debug = "line-tables-only"` experiment. Winch against Cranelift,
+and the AOT compiler/runner split, are further out and change packaging rather
+than a number.
+
 ## Closing Phase 2
 
 The claim, deliberately narrow:

@@ -23,7 +23,19 @@ instar-paint = { path = "../instar-paint" }
 tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 # Surfaced only in the runtime thread's guest-outcome types, which are
 # Wasmtime's own results.
-wasmtime = "47.0.3"
+# Types only -- an Engine to hand the kernel, and its Result alias. The
+# feature set must match instar-kernel's or Cargo unifies them back to the
+# default 28, which is exactly what happened the first time this was
+# minimized: the kernel asked for six features and the binary did not change
+# by a single byte.
+wasmtime = { version = "47.0.3", default-features = false, features = [
+    "std",
+    "runtime",
+    "cranelift",
+    "component-model",
+    "component-model-async",
+    "async",
+] }
 accesskit = "0.24.1"
 
 [dev-dependencies]

@@ -6,8 +6,22 @@ license.workspace = true
 description = "Pure Wasmtime Component Model async runtime for Instar: engine config, component loading/validation, WASI context, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind -- see docs/PHASE-1.md's forbidden-dependency list."
 
 [dependencies]
-wasmtime = "47.0.3"
-wasmtime-wasi = "47.0.3"
+# Deliberately not the default feature set. Wasmtime 47 enables 28 features by
+# default for a general-purpose embedding -- three GC implementations, coredump
+# support, WAT parsing, a compilation cache, profiling hooks -- and Instar uses
+# almost none of them. The list below is the set Gate 0, the workspace suite and
+# every guest actually prove necessary; see docs/PHASE-2.md, package I.
+wasmtime = { version = "47.0.3", default-features = false, features = [
+    "std",
+    "runtime",
+    "cranelift",
+    "component-model",
+    "component-model-async",
+    "async",
+] }
+# `p2` only. Instar's guests target wasm32-wasip2, and the default set also
+# builds preview 1, which pulls in Wiggle for an ABI no Instar guest speaks.
+wasmtime-wasi = { version = "47.0.3", default-features = false, features = ["p2"] }
 tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
