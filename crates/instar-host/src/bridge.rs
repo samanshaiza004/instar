@@ -647,6 +647,10 @@ pub struct HostBridge {
     /// contract, and it must not be tied to whether the host found the tree
     /// interesting.
     commit_sequence: u64,
+    /// Host-to-guest interaction messages successfully queued by this bridge.
+    /// This is diagnostic state for the internal real-runtime test harness;
+    /// it is not part of the guest protocol.
+    guest_message_count: u64,
     stats: BridgeStats,
 }
 
@@ -693,6 +697,7 @@ impl HostBridge {
             terminal,
             wake: bridge_wake,
             commit_sequence: 0,
+            guest_message_count: 0,
             stats: BridgeStats::default(),
         })
     }
@@ -733,6 +738,15 @@ impl HostBridge {
     /// value that layout, paint, and accessibility caches key off.
     pub fn commit_sequence(&self) -> u64 {
         self.commit_sequence
+    }
+
+    /// The number of host-to-guest interaction messages successfully queued.
+    ///
+    /// This deliberately counts after host policy and routing have run, so a
+    /// disabled or otherwise rejected interaction does not look like a guest
+    /// message merely because a platform event arrived.
+    pub fn guest_message_count(&self) -> u64 {
+        self.guest_message_count
     }
 
     /// The version of the retained UI state this bridge's window is showing.
@@ -776,8 +790,12 @@ impl HostBridge {
             .into_iter()
             .filter(|effect| match effect {
                 HostEffect::SendToGuest(bytes) => {
-                    self.runtime
-                        .send(RuntimeCommand::DeliverEvent(GuestEvent::new(bytes.clone())));
+                    if self
+                        .runtime
+                        .send(RuntimeCommand::DeliverEvent(GuestEvent::new(bytes.clone())))
+                    {
+                        self.guest_message_count += 1;
+                    }
                     false
                 }
                 _ => true,
@@ -1158,6 +1176,7 @@ mod tests {
             terminal: Arc::default(),
             wake,
             commit_sequence: 0,
+            guest_message_count: 0,
             stats: BridgeStats::default(),
         };
         (bridge, events_tx, wake_count)
