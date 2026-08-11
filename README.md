@@ -145,7 +145,7 @@ not about one machine.
 What each layer costs, measured rather than estimated:
 
 ```bash
-cargo run --release --bin overhead
+cargo run --release --example overhead
 ```
 
 Numbers and method in [docs/OVERHEAD.md](docs/OVERHEAD.md).

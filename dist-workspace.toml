@@ -9,13 +9,25 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
+# Keep release packaging in the pull-request gate as well as on tags.
+pr-run-mode = "upload"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Make the checksum contract explicit instead of relying on dist's default.
+checksum = "sha256"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# The release is for the host executable and installers; source distribution
+# remains the repository's concern rather than a runtime artifact.
+source-tarball = false
 # Enable GitHub's artifact attestation feature for release artifacts
 github-attestations = true
+# Attest the target archives in the matrix, before they are uploaded.
+github-attestations-phase = "build-local-artifacts"
+# release.yml contains the verification gate around dist's generated jobs;
+# check-release-sync.py is the guard for that intentional wrapper.
+allow-dirty = ["ci"]

@@ -3,18 +3,30 @@ name = "instar-shell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+autobins = false
 description = "Instar's desktop shell: owns the winit event loop, presents host-lowered PaintScenes through the Vello CPU backend and softbuffer, and runs a real guest. The only crate that links a window, a renderer, and a font at once."
 
 [[bin]]
 name = "instar"
 path = "src/main.rs"
 
+# These are repository benchmarks, not runtime artifacts. Keep them runnable
+# as examples while making the dist app contain only the host executable.
+[[example]]
+name = "overhead"
+path = "src/bin/overhead.rs"
+
+[[example]]
+name = "uibench"
+path = "src/bin/uibench.rs"
+
 [dependencies]
 instar-host = { path = "../instar-host" }
 instar-paint = { path = "../instar-paint" }
 instar-window = { path = "../instar-window" }
 
-# The benchmark binary (`src/bin/uibench.rs`) drives the UI tree and the wire
+# The benchmark example (`src/bin/uibench.rs`) drives the UI tree and the wire
 # format directly, so this workspace crate is a dependency of the shell, not
 # just of its test targets.
 instar-ui = { path = "../instar-ui" }

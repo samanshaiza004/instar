@@ -3,3 +3,4 @@ target/
 /skills
 /website/dist
 .DS_Store
+__pycache__/
