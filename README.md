@@ -32,10 +32,18 @@ every guest turn.
 > against. Between them they found eight defects no package-level test could
 > have caught, and produced the wire's text alignment and flex basis.
 >
-> What remains of Phase 2 is native accessibility smoke on Windows and Linux
-> ([docs/F4-SMOKE.md](docs/F4-SMOKE.md)) and the overhead audit:
-> [docs/PHASE-2.md](docs/PHASE-2.md). Then text, which is where the ownership
-> model gets its real test: [docs/PHASE-3.md](docs/PHASE-3.md).
+> **Phase 2 is closed** at the `instar-phase-2` tag. What it froze — the green
+> gate, latency, binary size, runtime memory, the protocol version and the
+> whole supported UI vocabulary:
+> [docs/PHASE-2-RESULTS.md](docs/PHASE-2-RESULTS.md). How it got there:
+> [docs/PHASE-2.md](docs/PHASE-2.md).
+>
+> One gate is outstanding and says so: native accessibility behaviour has not
+> been formally smoke-tested on any platform
+> ([docs/F4-SMOKE.md](docs/F4-SMOKE.md)).
+>
+> Next is text, which is where the ownership model gets its real test:
+> [docs/PHASE-3.md](docs/PHASE-3.md).
 >
 > What Instar deliberately does *not* have, and why:
 > [docs/DESIGN-LEDGER.md](docs/DESIGN-LEDGER.md).

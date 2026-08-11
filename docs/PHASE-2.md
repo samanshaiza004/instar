@@ -1922,6 +1922,13 @@ than a number.
 
 ## Closing Phase 2
 
+> **Closed at the `instar-phase-2` tag.** The frozen numbers, the supported
+> vocabulary and the outstanding gate are in
+> [PHASE-2-RESULTS.md](PHASE-2-RESULTS.md). What follows is how the claim was
+> arrived at, kept because the reasoning is the part that does not survive in a
+> results table.
+
+
 The claim, deliberately narrow:
 
 > A Wasm guest can describe a normal desktop interface declaratively while
