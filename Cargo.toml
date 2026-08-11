@@ -6,6 +6,7 @@ members = [
     "crates/instar-kernel",
     "crates/instar-ui",
     "crates/instar-ui-protocol",
+    "crates/instar-text",
     "crates/instar-sdk",
     "crates/instar-window",
     "crates/instar-host",
@@ -28,6 +29,22 @@ version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/samanshaiza004/instar"
+
+# Cargo's own build-performance recommendation: line tables keep backtraces
+# readable while dropping the bulk of the debug information, and dependencies
+# get none at all because nobody steps through Wasmtime. Measured in package I:
+# see docs/baselines/PERFORMANCE.md.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The opt-in for an actual debugging session, when line tables are not enough.
+#   cargo test --profile debugging
+[profile.debugging]
+inherits = "dev"
+debug = true
 
 [profile.release]
 lto = true

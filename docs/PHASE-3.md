@@ -45,19 +45,48 @@ problem, and pretending otherwise is how it becomes a correctness problem.
 
 ## Resources with explicit authority
 
-```text
-instar-text
-├── TextBuffer     content and revisions
-└── TextView       a presentation of a buffer: caret, selection, scroll
+`instar-text` is a **host resource subsystem independent of the semantic UI
+tree**. `instar-host` composes it with `instar-ui`; a UI node may reference a
+text-view resource, but UI-tree lifetime does not define buffer lifetime.
 
-Scratchpad guest
-└── canonical Document
+```text
+              instar-host          composes both
+             /           \
+      instar-ui       instar-text
+      semantic tree    TextBuffer / TextView / TextSystem
+      focus, scroll    revisions, editing, selection
 ```
+
+The criterion that puts it there, rather than inside `instar-ui` beside the
+other host-owned state:
+
+> Is this state's lifetime and meaning subordinate to the semantic UI tree?
+
+Yes for `FocusState` and `ScrollState`. A `Scroll` *is* a tree node, focus
+points at a `NodeKey`, and both obey the retirement rule — when the key stops
+being eligible the state goes with it.
+
+No for text. A buffer must outlive any snapshot that happens to show it; two
+views over one buffer is a supported case with no tree analogue; and recovery
+after a guest generation dies is resource-lifetime semantics, not tree
+semantics. A commit that removes an editor node removes a *presentation*, and
+must not be able to destroy a document.
+
+```text
+instar-text                        Scratchpad guest
+├── TextBuffer   content, revisions └── canonical Document
+├── TextView     caret, selection, scroll
+└── TextSystem   the registry, and the only thing that
+                 knows a buffer has more than one view
+```
+
+`instar-ui → instar-text` is deliberately **absent**, not merely unused. If
+editor measurement later makes that awkward, that is evidence for a narrow
+edge; it is not a reason to authorize one in advance. A layering test holds it.
 
 Deliberately not a generic `document` service. A name like that invites both
 sides to assume they own it, and the whole difficulty here is that neither
-wholly does. Two views of one buffer is a supported case and a good test of
-whether the split is real.
+wholly does.
 
 ## The revision protocol
 
@@ -83,6 +112,17 @@ ApplyEdits(expected_revision, edits)
 Enough to be rigorous about convergence without resurrecting the predecessor's
 transaction machinery. A guest that loses a race is told, and re-reads; it is
 never silently applied to text that moved underneath it.
+
+### Coordinates
+
+> Instar text edits use UTF-8 byte ranges. Consumers requiring additional
+> coordinate representations derive them from their own text state.
+
+Byte ranges because that is what the storage edits in and what the protocol
+carries. Not because downstream consumers need nothing else: Tree-sitter's
+`InputEdit` wants three byte offsets *and* three row-column points, and the
+guest owns the document it would derive those from. Saying "byte-positioned
+throughout" would promise a conversion-free path that does not exist.
 
 ## `textbench` comes before Scratchpad
 
