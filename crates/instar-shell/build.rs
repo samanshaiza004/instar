@@ -4,4 +4,5 @@
 fn main() {
     instar_guest_build::build_guest("counter", "counter", "COUNTER_WASM");
     instar_guest_build::build_guest("gallery", "gallery", "GALLERY_WASM");
+    instar_guest_build::build_guest("calculator", "calculator", "CALCULATOR_WASM");
 }

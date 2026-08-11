@@ -1,7 +1,7 @@
-# The Gallery limitation ledger
+# The limitation ledger
 
-What building the Gallery revealed Instar cannot express, recorded rather than
-implemented.
+What building applications revealed Instar cannot express, recorded rather than
+implemented. Opened by the Gallery; the Calculator now votes.
 
 The rule this file exists to enforce:
 
@@ -46,12 +46,20 @@ a resized window. `min_height`/`max_height` are also literals.
 viewport looks correct at one window size and wrong at every other, and nothing
 in the vocabulary says so.
 
-**Calculator likely needs it.** Probably not. A calculator's layout is a fixed
-grid of keys; percentage sizing is a document-layout want.
+**Calculator likely needs it.** Predicted *no* — "a calculator's layout is a
+fixed grid of keys". **The prediction was wrong.**
 
-**Decision.** Record only. Percentage lengths are a real wire change —
-`WireSize` currently means "content or a bounded integer", and a percentage is
-neither. Wait for a second application to ask.
+**Calculator says:** yes, from the opposite direction. A keypad wants "each key
+takes an equal quarter of the row", and there is no way to say it. `grow: 1.0`
+distributes *surplus*, so keys end up sized by their labels plus a share and
+`0` comes out narrower than `00`. A fixed width stops following the window. The
+Gallery wanted a fraction of a *parent*; the Calculator wants an equal share
+among *siblings*. They are the same missing idea seen from two sides.
+
+**Decision.** Two applications, independently. This has the evidence the freeze
+criterion asks for. Worth noting the two forms are not identical — "half the
+parent" and "an equal share of the row" may be one primitive or two — and that
+distinction should be settled before anything reaches the wire.
 
 ---
 
@@ -72,13 +80,18 @@ rule that everything else depends on.
 
 **Workaround quality.** None. The behaviour is simply absent.
 
-**Calculator likely needs it.** Plausibly — `=` is a natural default. Worth
-watching specifically.
+**Calculator likely needs it.** Predicted plausible.
 
-**Decision.** Record only. This is a semantic property of a node, so it would
-be a wire flag rather than an interaction rule, and it interacts with focus
-ownership in ways that deserve their own thinking. If the Calculator wants it,
-that is the second application and the case is made.
+**Calculator says:** wanted, not needed. Every key is reachable by Tab and
+activates with Enter or Space, so the calculator is fully usable without it.
+What is missing is only that pressing Enter on a freshly-opened window does
+nothing until something has been focused — an ergonomic gap, not a functional
+one.
+
+**Decision.** Still record only, and this is the useful negative result: the
+Calculator is the second application and it did *not* make the case. A feature
+two applications merely find pleasant is exactly what the freeze criterion
+exists to keep out.
 
 ---
 
@@ -98,8 +111,13 @@ it the moment the text wraps.
 **Workaround quality.** Poor and quietly wrong. It coincides with the right
 answer often enough to be mistaken for it.
 
-**Calculator likely needs it.** Almost certainly. A right-aligned display is
-close to universal for calculators.
+**Calculator likely needs it.** Predicted almost certainly.
+
+**Calculator says:** yes, and it is the single worst thing about writing
+against Instar today. A calculator display is right-aligned in every
+implementation anyone has seen, and the workarounds are both bad: stretch the
+node and the digits sit left, which reads as broken; do not stretch it and the
+panel hugs the digits and jumps sideways on every keypress.
 
 **Decision.** Record, and expect to implement. The strongest candidate in the
 ledger.

@@ -1497,6 +1497,90 @@ caption landed on a specimen's spacer — immediately and by name:
 `duplicate node key node216#0`. Node identity is validated at the wire, and a
 guest cannot silently produce an ambiguous tree.
 
+#### G is closed
+
+The frozen criterion, met:
+
+> Every currently supported native input modality must be demonstrably capable
+> of entering through the real platform adapter and producing its intended
+> user-visible effect, in one application.
+
+```text
+pointer      click, disabled refusal            2 tests
+scroll       wheel, nested bubbling, thumb drag 3 tests
+keyboard     Tab, Shift+Tab, Enter, Space       3 tests
+focus        offscreen reveal, ring             2 tests
+a11y         focus, activate, scroll into view  1 test
+guest stall  everything above, wasm blocked     1 test
+```
+
+Eleven tests, each starting from a `winit::event::WindowEvent` and ending at
+something visible. Reinstating any of the three shipped seam defects turns the
+right one red.
+
+What G was for, and what it produced:
+
+```text
+1  found unreachable integration paths
+   CursorMoved, KeyboardInput, ModifiersChanged
+
+2  found final-presentation bugs invisible to scene tests
+   the focus ring, painted and then covered
+
+3  turned a speculative design question into evidence
+   nested scrollbar policy: ScrollbarStyle { Overlay, Inset }
+```
+
+Eight defects in total, none of which any package-level suite could have found,
+because at package level nothing was missing. That is worth more than a
+polished component showcase, and it is why G stops here rather than being made
+prettier. The Gallery has started telling us what Instar lacks; the Calculator
+now gets the deciding vote on whether those lacks deserve runtime changes.
+
+Three ledger entries stay open for H: fractional parent sizing, a default
+control for Enter, and text alignment. Entry 4 closed as a host policy.
+
+`docs/F4-SMOKE.md` remains `PENDING` for the formal macOS checklist. That is a
+**Phase 2** closure gate, not a G gate — G never depended on it, and neither
+does H.
+
+### H — the Calculator, and an SDK that grows from it
+
+#### What the Calculator found, before any SDK existed
+
+Written directly against `instar-ui-protocol` with no helper layer, on purpose:
+the SDK is supposed to grow from what this makes painful, which means the pain
+has to be *experienced* rather than predicted. Four awkwardnesses are marked
+`PAIN:` in the source.
+
+Two of them are missing primitives, and both were already in the ledger — which
+is the second-application evidence the freeze criterion asks for:
+
+```text
+text alignment       ledger 3, and the worst thing about writing this
+equal-share sizing   ledger 1, reached from the opposite direction
+```
+
+The sizing one is worth the detail. The Gallery wanted a fraction of a
+*parent*; the Calculator wants an equal share among *siblings* — "each key
+takes a quarter of the row". `grow` distributes surplus, so keys are sized by
+their labels plus a share and `0` comes out narrower than `00`. Same missing
+idea, two faces, and it is not yet obvious whether it is one primitive or two.
+
+The third ledger entry produced a useful **negative** result. A default control
+for Enter turned out to be *wanted, not needed*: every key is reachable by Tab
+and activates with Enter or Space, so the Calculator is fully usable without
+it. Two applications finding something pleasant is exactly what the freeze
+criterion exists to keep out.
+
+The other two pains are API shape rather than missing capability, and they are
+what `instar-sdk` is for:
+
+```text
+child counts declared by hand   the hazard the Gallery already tripped over
+NodeKey mapped back by search   every application reinvents the same lookup
+```
+
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
 on every primitive while the API underneath it is miserable.
