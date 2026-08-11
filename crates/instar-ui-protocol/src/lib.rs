@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -446,6 +446,37 @@ pub struct WireBorder {
     pub color: WireColor,
 }
 
+/// A flex item's starting main-axis size, before `grow` and `shrink` act.
+///
+/// The fourth member of a vocabulary that already had three. `grow` and
+/// `shrink` distribute *free space*, which is computed from a starting size —
+/// and without a way to say what that starting size is, "these siblings each
+/// take an equal share" is inexpressible. The Calculator hit this immediately:
+/// with `grow: 1.0` alone, a key labelled `0` comes out narrower than one
+/// labelled `00`, because each starts from its own content width.
+///
+/// Independent of `min_width`/`max_width`, which stay their own constraints.
+/// A basis of zero says where distribution starts, not that a node may shrink
+/// to nothing — CSS gives flex items an automatic content-based minimum, and a
+/// caller that wants past it says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireBasis {
+    /// Derive the starting size the usual way, from content or `width`.
+    #[default]
+    Auto,
+    /// Start from exactly this many logical pixels.
+    Fixed(u16),
+}
+
+impl WireBasis {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::Fixed(_) => 1,
+        }
+    }
+}
+
 /// Where a line sits within the width it was broken to.
 ///
 /// `Start` and `End` are direction-aware — left and right respectively for
@@ -584,6 +615,8 @@ pub struct WireLayout {
     /// wire: `0.5` and `2.0` are both meaningful, and rounding them to
     /// integers would distort the vocabulary to dodge a hazard that
     /// [`Reader::flex_factor`] closes properly.
+    /// The size `grow` and `shrink` distribute *from*. See [`WireBasis`].
+    pub basis: WireBasis,
     pub grow: f32,
     /// Share of the deficit when children overflow. Defaults to `1.0`, as CSS
     /// does — a node that does not say otherwise gives way rather than
@@ -617,6 +650,7 @@ impl Default for WireLayout {
             max_width: None,
             min_height: None,
             max_height: None,
+            basis: WireBasis::Auto,
             grow: 0.0,
             shrink: 1.0,
             align_self: None,
@@ -1016,6 +1050,22 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A flex basis: a presence byte, then a length if present.
+    ///
+    /// Shaped like the optional lengths beside it rather than like a size tag,
+    /// because `Auto` is genuinely an absence — "work it out" — and not a
+    /// third kind of measurement.
+    pub fn basis(&mut self, while_reading: &'static str) -> Result<WireBasis, ProtocolError> {
+        match self.u8(while_reading)? {
+            0 => Ok(WireBasis::Auto),
+            1 => Ok(WireBasis::Fixed(self.length(while_reading)?)),
+            value => Err(ProtocolError::UnknownOpcode {
+                context: while_reading,
+                value,
+            }),
+        }
+    }
+
     pub fn text_align(
         &mut self,
         while_reading: &'static str,
@@ -1084,6 +1134,7 @@ impl<'a> Reader<'a> {
             max_width: self.optional_length("max width")?,
             min_height: self.optional_length("min height")?,
             max_height: self.optional_length("max height")?,
+            basis: self.basis("basis")?,
             grow: self.flex_factor("grow")?,
             shrink: self.flex_factor("shrink")?,
             align_self: self.optional_align("align self")?,
@@ -1200,6 +1251,13 @@ fn write_layout(out: &mut Vec<u8>, layout: WireLayout) {
     write_optional_length(out, layout.max_width);
     write_optional_length(out, layout.min_height);
     write_optional_length(out, layout.max_height);
+    match layout.basis {
+        WireBasis::Auto => out.push(0),
+        WireBasis::Fixed(length) => {
+            out.push(1);
+            out.extend_from_slice(&length.to_le_bytes());
+        }
+    }
     write_flex_factor(out, layout.grow);
     write_flex_factor(out, layout.shrink);
     match layout.align_self {
@@ -1895,6 +1953,7 @@ mod tests {
             max_width: Some(400),
             min_height: Some(10),
             max_height: Some(90),
+            basis: WireBasis::Fixed(64),
             grow: 2.5,
             shrink: 0.25,
             align_self: Some(WireAlign::Center),
@@ -1928,24 +1987,25 @@ mod tests {
     /// 21  height: tag(1) value(2)
     /// 24  min_width(1) max_width(1)                    absent: presence only
     /// 26  min_height(1) max_height(1)
-    /// 28  grow(4)
-    /// 32  shrink(4)
-    /// 36  align_self(1)                                absent: presence only
-    /// 37  align_items(1)
-    /// 38  justify_content(1)
-    /// 39  display(1) visibility(1) overflow(1)
-    /// 42  padding(2) gap(2)                            layout ends
-    /// 46  font role(1) size(2) weight(2)               shaping style begins
-    /// 51  text align(1)                                positioning
-    /// 52  border(1)                                    absent: presence only
-    /// 53  foreground(1) background(1)                  absent: presence only
-    /// 55  corner_radius(2)
-    /// 57  cursor(1)
-    /// 58  child_count(2)
-    /// 60  SECTION_END(1)
+    /// 28  basis(1)                                     Auto: presence only
+    /// 29  grow(4)
+    /// 33  shrink(4)
+    /// 37  align_self(1)                                absent: presence only
+    /// 38  align_items(1)
+    /// 39  justify_content(1)
+    /// 40  display(1) visibility(1) overflow(1)
+    /// 43  padding(2) gap(2)                            layout ends
+    /// 47  font role(1) size(2) weight(2)               shaping style begins
+    /// 52  text align(1)                                positioning
+    /// 53  border(1)                                    absent: presence only
+    /// 54  foreground(1) background(1)                  absent: presence only
+    /// 56  corner_radius(2)
+    /// 58  cursor(1)
+    /// 59  child_count(2)
+    /// 61  SECTION_END(1)
     /// ```
-    const DEFAULT_ALIGN_ITEMS_OFFSET: usize = 37;
-    const DEFAULT_BATCH_LEN: usize = 61;
+    const DEFAULT_ALIGN_ITEMS_OFFSET: usize = 38;
+    const DEFAULT_BATCH_LEN: usize = 62;
 
     #[test]
     fn rejects_unknown_align_and_justify_tags() {
@@ -2267,7 +2327,7 @@ mod tests {
         // Font role opens the style block; cursor closes it. Text align sits
         // between the shaping group and the paint group, which is where it
         // belongs conceptually as well as on the wire.
-        for (offset, context) in [(46usize, "font role"), (51, "text align"), (57, "cursor")] {
+        for (offset, context) in [(47usize, "font role"), (52, "text align"), (58, "cursor")] {
             let mut bytes = good.clone();
             bytes[offset] = 99;
             assert!(

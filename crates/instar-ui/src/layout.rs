@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use instar_ui_protocol::{NodeKey, WireAlign, WireDisplay, WireJustify, WireSize};
+use instar_ui_protocol::{NodeKey, WireAlign, WireBasis, WireDisplay, WireJustify, WireSize};
 use taffy::prelude::*;
 
 use crate::scroll::{SCROLLBAR_THICKNESS, ScrollbarStyle};
@@ -292,6 +292,13 @@ fn style(node: &Node, parent: ChildOf, scrollbars: ScrollbarStyle) -> Style {
         },
         // Finite and in range because `Reader::flex_factor` is the only way
         // one reaches this crate.
+        flex_basis: match layout.basis {
+            // Taffy's own default, which is `auto`: derive the starting size
+            // from `size` or from content, exactly as before this field
+            // existed.
+            WireBasis::Auto => Dimension::auto(),
+            WireBasis::Fixed(length) => Dimension::length(f32::from(length)),
+        },
         flex_grow: layout.grow,
         flex_shrink,
         align_self,
@@ -686,6 +693,158 @@ mod intrinsic_sizing {
             600,
             "and the content keeps its own height -- squeezing it to the \
              viewport would leave nothing to scroll"
+        );
+    }
+
+    /// Two keys with different labels and the same basis end up the same
+    /// width.
+    ///
+    /// The Calculator's actual requirement, and the reason `basis` exists:
+    /// `grow` distributes *free space*, computed from a starting size, so with
+    /// `grow` alone a key labelled `0` is narrower than one labelled `00`.
+    ///
+    /// Asserts the final rectangles, never the style values. Whether the
+    /// automatic content-based minimum also has to be lifted is exactly the
+    /// kind of thing a style-level assertion would fail to notice.
+    #[test]
+    fn siblings_sharing_a_basis_end_up_the_same_width() {
+        use crate::{WireBasis, WireLayout};
+        let equal_share = WireLayout {
+            basis: WireBasis::Fixed(0),
+            grow: 1.0,
+            // Load-bearing, and measured rather than assumed. CSS gives a
+            // flex item an automatic content-based minimum in the main axis,
+            // and Taffy honours it: at a row width where the equal share is
+            // narrower than the longest label, `basis: 0` alone gives 25 and
+            // 117 rather than 40 and 40.
+            //
+            // Two statements, deliberately not one. `basis: 0` says where
+            // distribution starts; `min_width: 0` says it may go past content.
+            // Folding the second into the first would let a sizing field
+            // silently override a constraint field.
+            min_width: Some(0),
+            ..WireLayout::default()
+        };
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::row(
+                    1,
+                    vec![
+                        Node::button(2, "0").with_layout(equal_share),
+                        Node::button(3, "00").with_layout(equal_share),
+                        Node::button(4, "000000000000").with_layout(equal_share),
+                    ],
+                )
+                // Narrow on purpose. At 300 the equal share is wider than
+                // every label, the content minimum never binds, and the test
+                // passes with `min_width` removed -- proving nothing about
+                // the constraint it is here to justify.
+                .with_layout(WireLayout {
+                    width: WireSize::Fixed(120),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut text = TextContext::new();
+        let snapshot = compute(
+            &mut text,
+            &tree,
+            Viewport::new(400.0, 300.0),
+            ScrollbarStyle::Overlay,
+        );
+
+        let width = |id: u32| snapshot.get(NodeKey::first(id)).expect("laid out").width;
+        assert_eq!(
+            (width(2), width(3), width(4)),
+            (40, 40, 40),
+            "an equal share is an equal share whatever the label says, even \
+             when the share is narrower than the label"
+        );
+    }
+
+    /// `Auto` and `Fixed(0)` are different things, not two spellings of one.
+    #[test]
+    fn an_auto_basis_still_starts_from_content() {
+        use crate::{WireBasis, WireLayout};
+        let from_content = WireLayout {
+            basis: WireBasis::Auto,
+            grow: 1.0,
+            ..WireLayout::default()
+        };
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::row(
+                    1,
+                    vec![
+                        Node::button(2, "0").with_layout(from_content),
+                        Node::button(3, "000000").with_layout(from_content),
+                    ],
+                )
+                .with_layout(WireLayout {
+                    width: WireSize::Fixed(300),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut text = TextContext::new();
+        let snapshot = compute(
+            &mut text,
+            &tree,
+            Viewport::new(400.0, 300.0),
+            ScrollbarStyle::Overlay,
+        );
+        let width = |id: u32| snapshot.get(NodeKey::first(id)).expect("laid out").width;
+        assert!(
+            width(3) > width(2),
+            "Auto derives the starting size from content, so a longer label \
+             stays wider: {} against {}",
+            width(3),
+            width(2)
+        );
+    }
+
+    /// A basis is a starting size, and the difference between two of them
+    /// survives an equal distribution of what is left.
+    #[test]
+    fn different_bases_keep_their_difference() {
+        use crate::{WireBasis, WireLayout};
+        let with_basis = |length: u16| WireLayout {
+            basis: WireBasis::Fixed(length),
+            grow: 1.0,
+            min_width: Some(0),
+            ..WireLayout::default()
+        };
+        let tree = Tree::new(Node::root(
+            0,
+            vec![
+                Node::row(
+                    1,
+                    vec![
+                        Node::button(2, "a").with_layout(with_basis(20)),
+                        Node::button(3, "b").with_layout(with_basis(40)),
+                    ],
+                )
+                .with_layout(WireLayout {
+                    width: WireSize::Fixed(200),
+                    ..WireLayout::default()
+                }),
+            ],
+        ));
+        let mut text = TextContext::new();
+        let snapshot = compute(
+            &mut text,
+            &tree,
+            Viewport::new(400.0, 300.0),
+            ScrollbarStyle::Overlay,
+        );
+        let width = |id: u32| snapshot.get(NodeKey::first(id)).expect("laid out").width;
+        assert_eq!(
+            width(3) - width(2),
+            20,
+            "equal grow shares the surplus equally, so the 20px head start is \
+             exactly what remains between them"
         );
     }
 

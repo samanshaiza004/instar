@@ -28,7 +28,7 @@ Decision:
 
 ---
 
-## 1. A viewport cannot be sized as a fraction of its parent
+## 1. A viewport cannot be sized as a fraction of its parent — STILL ONE VOTE
 
 **Missing capability.** A `Scroll` whose height is "half the window" or "the
 rest of this row", without a literal.
@@ -49,17 +49,25 @@ in the vocabulary says so.
 **Calculator likely needs it.** Predicted *no* — "a calculator's layout is a
 fixed grid of keys". **The prediction was wrong.**
 
-**Calculator says:** yes, from the opposite direction. A keypad wants "each key
-takes an equal quarter of the row", and there is no way to say it. `grow: 1.0`
-distributes *surplus*, so keys end up sized by their labels plus a share and
-`0` comes out narrower than `00`. A fixed width stops following the window. The
-Gallery wanted a fraction of a *parent*; the Calculator wants an equal share
-among *siblings*. They are the same missing idea seen from two sides.
+**Calculator says:** *no* — and the first reading of its evidence was wrong.
 
-**Decision.** Two applications, independently. This has the evidence the freeze
-criterion asks for. Worth noting the two forms are not identical — "half the
-parent" and "an equal share of the row" may be one primitive or two — and that
-distinction should be settled before anything reaches the wire.
+A keypad wants "each key takes an equal quarter of the row", which looks like
+fractional sizing and is not. The actual missing primitive is **flex basis**:
+`grow` distributes free space computed from a starting size, and without a way
+to state that starting size each key begins at its own content width. The fix
+is `basis: 0, grow: 1`, not a percentage of anything. Taffy models the two
+separately for exactly this reason — `Dimension::percent` resolves against the
+containing block, `flex_basis` sets an item's initial main-axis size.
+
+So the second vote evaporates on inspection. That is the ledger working: the
+Calculator did not merely confirm a vague missing feature, it split one into
+two precise semantics and only needed one of them.
+
+**Decision.** Still one application, still not implemented. Percentage sizing
+would be a genuinely new sizing mode on the strength of a single Gallery
+request. Flex basis shipped instead (H3), because it closes a hole in a
+vocabulary Instar already deliberately exposes — `grow` and `shrink` without a
+basis is an incomplete set — and is backed by the application that needed it.
 
 ---
 

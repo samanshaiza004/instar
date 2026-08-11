@@ -1695,6 +1695,48 @@ One fault is **not** caught, and is recorded rather than papered over: making
 It is wasted work with no consequence, and no counter distinguishes it. Left
 as a rule in the comments rather than given a counter it does not earn.
 
+#### H3: flex basis, and a ledger entry corrected
+
+Protocol v8 adds `WireBasis { Auto, Fixed(u16) }`. `grow` and `shrink`
+distribute *free space*, which is computed from a starting size — and without a
+way to state that starting size, "these siblings take equal shares" is
+inexpressible. Three of the four flex-item concepts were on the wire and the
+fourth was not.
+
+Independent of `min_width`/`max_width`, which stay their own constraints, and
+this turned out to matter empirically rather than as a design preference:
+
+```text
+row 120 wide, two keys, basis 0, grow 1
+
+min_width absent   25 and 117    the content minimum binds
+min_width Some(0)  40 and 40     equal shares
+```
+
+CSS gives a flex item an automatic content-based minimum in the main axis and
+Taffy honours it, so `basis: 0` alone does not permit equal shares. Two
+statements, deliberately not one: `basis: 0` says where distribution starts,
+`min_width: 0` says it may go past content. Folding the second into the first
+would let a sizing field silently override a constraint field.
+
+**The first version of that test proved nothing.** At a row width of 300 the
+equal share was wider than every label, the content minimum never bound, and
+the test passed with `min_width` deleted. Fixture entropy again, and found the
+same way as before — by injecting the fault and watching it stay green. The row
+is 120 wide now, and both constraints discriminate.
+
+Basis is geometry, so it gets no text-specific category: it goes through
+`layout_changed` like any other size, and text work happens downstream only if
+the resulting width moved. The control for that is the inverse of H2's — where
+alignment must *avoid* Taffy, basis must *enter* it, or the new sizes are
+computed and never applied.
+
+Ledger entry 1 is corrected rather than confirmed. The Calculator looked like
+the second vote for fractional sizing and is not: its need is basis, not a
+percentage of a parent. Percentage sizing stays at one application and stays
+unimplemented. That is the ledger doing its job — the second application split
+one vague missing feature into two precise semantics and needed only one.
+
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
 on every primitive while the API underneath it is miserable.

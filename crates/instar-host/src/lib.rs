@@ -2746,6 +2746,72 @@ mod tests {
         );
     }
 
+    // --- H3: basis is geometry, and must be treated as such. ---
+
+    fn keypad_row(basis: instar_ui::WireBasis) -> Tree {
+        use instar_ui::{Node, WireLayout, WireSize};
+        let key = |id: u32, label: &str| {
+            Node::button(id, label).with_layout(WireLayout {
+                basis,
+                grow: 1.0,
+                min_width: Some(0),
+                ..WireLayout::default()
+            })
+        };
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::row(80, vec![key(81, "0"), key(82, "000000000000")]).with_layout(
+                    WireLayout {
+                        width: WireSize::Fixed(120),
+                        ..WireLayout::default()
+                    },
+                ),
+            ],
+        ))
+    }
+
+    /// The inverse of H2's control, and the reason it is worth having.
+    ///
+    /// Several packages have proved that particular changes *avoid* layout.
+    /// This is the complement: a genuine geometry property must not end up
+    /// categorized as paint-only, which would leave the new sizes computed and
+    /// never applied.
+    #[test]
+    fn a_basis_change_enters_layout_and_moves_the_rectangles() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, keypad_row(instar_ui::WireBasis::Auto))
+            .expect("valid");
+        let width = |host: &Host, id: u32| {
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|layout| layout.get(NodeKey::first(id)))
+                .expect("laid out")
+                .width
+        };
+        assert_ne!(
+            width(&host, 81),
+            width(&host, 82),
+            "with Auto the labels decide, so the two differ to begin with"
+        );
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, keypad_row(instar_ui::WireBasis::Fixed(0)))
+            .expect("valid");
+
+        assert_eq!(
+            host.layout_passes(),
+            1,
+            "basis is geometry: it has to enter Taffy, and a category that \
+             skipped layout would compute nothing and change nothing"
+        );
+        assert_eq!(
+            (width(&host, 81), width(&host, 82)),
+            (60, 60),
+            "and the rectangles actually move"
+        );
+    }
+
     // --- H2: alignment is positioning, not shaping. ---
 
     fn aligned_tree(align: instar_ui::WireTextAlign) -> Tree {

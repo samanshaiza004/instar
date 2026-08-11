@@ -38,7 +38,7 @@ pub use diff::{ChangeSet, diff};
 pub use focus::{FocusMove, FocusState, RevealAlignment, focusable_order, reveal};
 pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
-    NodeKey, ProtocolError, WireAlign, WireBorder, WireColor, WireCursor, WireDisplay,
+    NodeKey, ProtocolError, WireAlign, WireBasis, WireBorder, WireColor, WireCursor, WireDisplay,
     WireFontRole, WireJustify, WireLayout, WireOverflow, WirePaintStyle, WireSize, WireStyle,
     WireTextAlign, WireTextLayout, WireTextStyle, WireVisibility, limits,
 };
