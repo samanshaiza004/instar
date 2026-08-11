@@ -1461,7 +1461,7 @@ of it and the Lab's focus order is unchanged: Row and Stack; grow/shrink/min/max
 the monospace role; backgrounds, borders, radii and disabled state; and the
 nested-`Scroll` pair.
 
-The last is not decoration. `docs/GALLERY-LEDGER.md` entry 4 records that two
+The last is not decoration. `docs/DESIGN-LEDGER.md` entry 4 records that two
 nested viewports put their scrollbars at the same x, and leaves the question
 open rather than picking overlay or inset on one data point — AppKit supports
 both and chooses between them from a *user preference*, which is good evidence

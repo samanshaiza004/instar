@@ -77,13 +77,33 @@ pub fn build_guests(guests: &[(&str, &str, &str)]) {
     let artifacts = out_dir.join("artifacts");
     std::fs::create_dir_all(&artifacts).expect("OUT_DIR is writable");
 
+    // A guard rather than a call at the end of the function. Every failure in
+    // `build_guest_into` is a `panic!` -- a guest that will not compile, a
+    // missing component, an unspawnable cargo -- and a panic unwinds straight
+    // past a trailing statement. The first version of this had the cleanup as
+    // the last line with a comment claiming it was unconditional, and it was
+    // not: the success path was clean and every error path leaked, which is
+    // precisely the shape of regression this design invites.
+    let _cleanup = TempTarget(target_dir.clone());
+
     for (name, package, env_var) in guests {
         build_guest_into(name, package, env_var, &target_dir, &artifacts);
     }
+}
 
-    // Before exit, unconditionally. Leaving it on a failure path is how the
-    // directory came back the first time.
-    let _ = std::fs::remove_dir_all(&target_dir);
+/// Removes the nested guest target when it goes out of scope, unwinding
+/// included.
+///
+/// Relies on unwinding, which is what a build script gets by default. Under
+/// `panic = "abort"` the directory would survive a failed build — recoverable
+/// by the next successful one, which removes it, and not worth defending
+/// against a profile nothing here sets.
+struct TempTarget(PathBuf);
+
+impl Drop for TempTarget {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path, artifacts: &Path) {
@@ -242,7 +262,7 @@ fn path_dependencies(manifest: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::path_dependencies;
+    use super::{TempTarget, path_dependencies};
 
     #[test]
     fn reads_a_dependency_in_either_shape() {
@@ -269,5 +289,37 @@ path = \"../other\"
     #[test]
     fn ignores_a_manifest_with_no_path_dependencies() {
         assert!(path_dependencies("[dependencies]\nwit-bindgen = \"0.60.0\"\n").is_empty());
+    }
+    /// The error path, which is the one that regressed.
+    ///
+    /// Cleanup used to be the last statement of `build_guests`, so it ran only
+    /// when every guest compiled. A guest that fails — the ordinary case while
+    /// someone is editing one — left the whole nested Cargo installation
+    /// behind, which is the leak this package exists to close.
+    #[test]
+    fn the_nested_target_is_removed_even_when_a_guest_build_panics() {
+        let dir = std::env::temp_dir().join(format!(
+            "instar-guest-build-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("wasm32-wasip2/debug")).expect("temp dir is writable");
+        std::fs::write(dir.join("wasm32-wasip2/debug/big.bin"), [0u8; 4096])
+            .expect("temp dir is writable");
+        assert!(dir.is_dir(), "the fixture exists to begin with");
+
+        let path = dir.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _cleanup = TempTarget(path);
+            panic!("a guest failed to compile");
+        });
+
+        assert!(result.is_err(), "the panic really happened");
+        assert!(
+            !dir.exists(),
+            "a failed guest build must still remove {}; leaving it is how a \
+             gigabyte per build-script hash accumulates",
+            dir.display()
+        );
     }
 }

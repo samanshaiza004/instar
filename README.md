@@ -19,18 +19,26 @@ every guest turn.
 > What Phase 1 proved, cost, and left as scaffolding:
 > [docs/PHASE-1-RESULTS.md](docs/PHASE-1-RESULTS.md).
 >
-> Phase 2 has since built the retained UI foundation on top of it: full
-> snapshots diffed against a retained tree, generational node identity, an
-> explicit layout vocabulary with rows, stacks and overlap, visibility and
-> clipping, a scroll viewport whose offset the host owns — so a wheel moves
-> the view with no Wasm round trip — and a style vocabulary sorted by what a
-> change to it can invalidate.
+> Phase 2 built the retained UI foundation on top of it: full snapshots
+> diffed against a retained tree, generational node identity, a layout
+> vocabulary with rows, stacks, overlap, visibility and clipping, scroll
+> viewports the host owns — so a wheel moves the view with no Wasm round trip
+> — scrollbar chrome, focus and keyboard traversal, AccessKit accessibility,
+> and a style vocabulary sorted by what a change to it can invalidate.
 >
-> What remains of Phase 2 is scrollbar chrome, focus and keyboard,
-> accessibility, and two guest applications whose job is to find out whether
-> any of this is pleasant to use: [docs/PHASE-2.md](docs/PHASE-2.md). Then
-> text, which is where the ownership model gets its real test:
-> [docs/PHASE-3.md](docs/PHASE-3.md).
+> Two applications then went looking for what that missed. `guests/gallery` is
+> an integration harness first and a visual catalog second; `guests/calculator`
+> answers the different question of whether any of it is pleasant to write
+> against. Between them they found eight defects no package-level test could
+> have caught, and produced the wire's text alignment and flex basis.
+>
+> What remains of Phase 2 is native accessibility smoke on Windows and Linux
+> ([docs/F4-SMOKE.md](docs/F4-SMOKE.md)) and the overhead audit:
+> [docs/PHASE-2.md](docs/PHASE-2.md). Then text, which is where the ownership
+> model gets its real test: [docs/PHASE-3.md](docs/PHASE-3.md).
+>
+> What Instar deliberately does *not* have, and why:
+> [docs/DESIGN-LEDGER.md](docs/DESIGN-LEDGER.md).
 
 ## Why the rewrite
 

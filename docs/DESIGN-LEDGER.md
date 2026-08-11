@@ -1,7 +1,19 @@
-# The limitation ledger
+# The design ledger
 
-What building applications revealed Instar cannot express, recorded rather than
-implemented. Opened by the Gallery; the Calculator now votes.
+What building applications revealed about what Instar cannot express — recorded
+rather than implemented, and kept whatever the outcome. Opened by the Gallery;
+the Calculator votes; entries close in three different ways.
+
+```text
+implemented   evidence from two applications, or one plus a hole in an
+              existing vocabulary
+resolved      the question turned out to have a different answer
+declined      considered, evidence insufficient, deliberately not built
+```
+
+It was called the *limitation* ledger while everything in it was a limitation.
+Some entries are open questions and one is a capability this project decided
+against, so the name stopped describing the contents.
 
 The rule this file exists to enforce:
 
@@ -28,7 +40,7 @@ Decision:
 
 ---
 
-## 1. A viewport cannot be sized as a fraction of its parent — STILL ONE VOTE
+## 1. A viewport cannot be sized as a fraction of its parent — DECLINED
 
 **Missing capability.** A `Scroll` whose height is "half the window" or "the
 rest of this row", without a literal.
@@ -63,15 +75,27 @@ So the second vote evaporates on inspection. That is the ledger working: the
 Calculator did not merely confirm a vague missing feature, it split one into
 two precise semantics and only needed one of them.
 
-**Decision.** Still one application, still not implemented. Percentage sizing
-would be a genuinely new sizing mode on the strength of a single Gallery
-request. Flex basis shipped instead (H3), because it closes a hole in a
+**Decision.** **Declined**, and that is a decision rather than an unfinished
+item.
+
+```text
+Gallery      requested it
+Calculator   did not independently request it
+Status       ledger-only, not implemented
+```
+
+Percentage sizing would be a genuinely new sizing mode on the strength of a
+single request. Flex basis shipped instead (H3), because it closes a hole in a
 vocabulary Instar already deliberately exposes — `grow` and `shrink` without a
 basis is an incomplete set — and is backed by the application that needed it.
 
+Recorded rather than deleted: "we considered this and the evidence was
+insufficient" is part of the design. A ledger that only kept the entries it
+implemented would read as a feature list and teach nothing.
+
 ---
 
-## 2. No way to say "this control is the default"
+## 2. No way to say "this control is the default" — DECLINED
 
 **Missing capability.** Marking one control as the one Enter activates when
 nothing has focus.
@@ -103,7 +127,7 @@ exists to keep out.
 
 ---
 
-## 3. Text has no alignment
+## 3. Text has no alignment — IMPLEMENTED
 
 **Missing capability.** Centring a label, or right-aligning a number.
 
@@ -140,7 +164,7 @@ addition rather than deferred by where its implementation lands.
 
 ---
 
-## 4. Nested viewports put their scrollbars in the same place — CLOSED
+## 4. Nested viewports put their scrollbars in the same place — RESOLVED
 
 **Missing capability.** Any way to tell two overlapping scroll regions apart.
 
