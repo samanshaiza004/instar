@@ -240,3 +240,104 @@ fn the_sdk_is_not_a_back_door_into_the_host() {
          builder.\n\nFull tree:\n{tree}"
     );
 }
+
+/// The runtime's capability surface is what this project declares, not what
+/// Wasmtime enables for a general embedding.
+///
+/// Wasmtime 47 turns on 28 features by default — three GC implementations,
+/// coredump support, WAT parsing, a compilation cache, profiling hooks — for
+/// an embedder that does not know what it is embedding. Instar knows, and
+/// package I cut the set to what Gate 0 and the suites actually prove
+/// necessary.
+///
+/// This test exists because a comment could not hold that line. Cargo builds a
+/// dependency with the **union** of the features every declaration enables, so
+/// `default-features = false` in one crate is undone by a plain
+/// `wasmtime = "47"` in another. That is not hypothetical: the first
+/// minimization touched only `instar-kernel`, `instar-host` still declared the
+/// default set, and the binary came out byte-identical. The diff read
+/// correctly and did nothing.
+///
+/// So a future crate adding an innocent dependency line would silently restore
+/// GC, coredumps and a WAT parser to the shipped runtime while every other
+/// test stayed green. Changing the capability surface must mean changing this
+/// list on purpose.
+#[test]
+fn the_runtime_links_exactly_the_wasmtime_features_instar_declares() {
+    /// The six Instar declares, plus three Wasmtime turns on for itself from
+    /// `cranelift`, `runtime` and `std`. Those three are not Instar's to
+    /// choose; they are listed so the check is exact rather than a
+    /// superset test, which would let a real addition hide among them.
+    ///
+    /// `once_cell` is here because this test found it. The ad-hoc `cargo tree`
+    /// grep used while landing package I matched `[a-z0-9-]+` and silently
+    /// skipped every feature with an underscore — a measurement with the same
+    /// shape of bug as the thing it was measuring.
+    const APPROVED: [&str; 9] = [
+        "async",
+        "component-model",
+        "component-model-async",
+        "cranelift",
+        "once_cell",
+        "runtime",
+        "std",
+        "wasmtime-jit-icache-coherence",
+        "wasmtime-unwinder",
+    ];
+    const APPROVED_WASI: [&str; 1] = ["p2"];
+
+    for (package, approved) in [
+        ("wasmtime", APPROVED.as_slice()),
+        ("wasmtime-wasi", APPROVED_WASI.as_slice()),
+    ] {
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["tree", "-p", package, "-e", "features", "--invert"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("cargo tree runs");
+        assert!(
+            output.status.success(),
+            "cargo tree failed for {package}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tree = String::from_utf8_lossy(&output.stdout);
+
+        let needle = format!("{package} feature \"");
+        let mut enabled: Vec<&str> = tree
+            .lines()
+            .filter_map(|line| line.split_once(&needle))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(feature, _)| feature)
+            .collect();
+        enabled.sort_unstable();
+        enabled.dedup();
+
+        assert!(
+            !enabled.is_empty(),
+            "no {package} features were parsed out of cargo tree, so this test \
+             is checking nothing. The output format has moved:\n{tree}"
+        );
+
+        let added: Vec<&&str> = enabled
+            .iter()
+            .filter(|feature| !approved.contains(feature))
+            .collect();
+        let removed: Vec<&&str> = approved
+            .iter()
+            .filter(|feature| !enabled.contains(feature))
+            .collect();
+
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "{package}'s resolved feature set is not the declared one.\n\
+             added:   {added:?}\n\
+             removed: {removed:?}\n\n\
+             Cargo builds a dependency with the union of every declaration's \
+             features, so a plain `{package} = \"47\"` anywhere in the \
+             workspace restores the defaults regardless of what \
+             instar-kernel and instar-host ask for. If this addition is \
+             intended, widen the list above deliberately and say what needs \
+             it.\n\nFull tree:\n{tree}"
+        );
+    }
+}

@@ -5,5 +5,5 @@
 //! from the real guest tests a program nobody has.
 
 fn main() {
-    instar_guest_build::build_guest("counter", "counter", "COUNTER_WASM");
+    instar_guest_build::build_guests(&[("counter", "counter", "COUNTER_WASM")]);
 }

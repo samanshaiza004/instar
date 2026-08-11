@@ -1861,9 +1861,57 @@ prunes them, so every protocol bump leaves another gigabyte behind for good.
 target/debug/build   20 GiB  ->  5.9 MiB    (21 GiB reclaimed)
 ```
 
-That is a defect in the guest build rather than a profile setting: it should
-share one target directory across hashes, or clean up after itself. Recorded
-here rather than fixed, because it is its own package.
+That is a defect in the guest build rather than a profile setting, and it is
+fixed. Sharing one directory *across* hashes was the wrong answer: Cargo's
+contract is that a build script writes only inside its own `OUT_DIR`, and
+`OUT_DIR` is never cleaned between builds — so the leak is the retention, not
+the nesting.
+
+```text
+OUT_DIR
+├── guest-target/       one shared nested target, removed before exit
+└── artifacts/
+    └── counter.wasm    retained; what the env var points at
+```
+
+```text
+target/debug/build   20 GiB  ->  296 MiB, and it stays there
+```
+
+`build_guests` takes a **slice** rather than being a per-guest call followed by
+a cleanup, because a cleanup a caller can forget is this leak restored
+silently. One shared nested target so guests in one invocation do not each
+recompile `wit-bindgen`, removed unconditionally before the script exits.
+
+The cost is worse than it first looks and is stated in the module docs: the
+nested Cargo cache no longer survives a build-script *re-run*, not merely a new
+hash — so every re-run recompiles that crate's guests from scratch, and re-runs
+happen exactly when a guest developer is iterating. A full rebuild after
+touching the WIT world took 1m42s. If that becomes painful the answer is not to
+retain the directory again; it is to move guest compilation out of `build.rs`
+into an `xtask` with one stable target directory this project owns and can
+garbage-collect.
+
+#### The capability surface is enforced, not commented
+
+`the_runtime_links_exactly_the_wasmtime_features_instar_declares` reads the
+resolved feature sets out of `cargo tree` and requires the declared list
+exactly. Without it a future crate adding a plain `wasmtime = "47.0.3"` would
+restore 23 features — all three GC implementations, coredumps, a WAT parser, a
+compilation cache — while every other test stayed green. That is not
+hypothetical; it is the byte-identical first attempt, seen from the other
+direction.
+
+The list includes three features Wasmtime enables for itself from `cranelift`,
+`runtime` and `std`. They are named rather than allowed as a superset, so a
+real addition cannot hide among them — at the price of a Wasmtime upgrade
+failing this test, which is the correct direction for it to fail in.
+
+Writing it caught a bug in the ad-hoc measurement that preceded it: the
+`cargo tree | grep` used while landing the minimization matched
+`[a-z0-9-]+` and silently skipped every feature containing an underscore, so
+`once_cell` never appeared in the eight features reported. A measurement with
+the same shape of defect as the thing it was measuring.
 
 #### Not yet measured
 

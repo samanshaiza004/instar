@@ -14,10 +14,40 @@
 //! and a different set of assumptions. Building from source next to the test,
 //! on whatever OS the test runs on, is what keeps that honest.
 //!
-//! # Why each guest gets its own target directory
+//! # Why the guests get a nested target directory, and why it is temporary
 //!
 //! This runs *during* an outer cargo build, which holds the workspace's build
-//! lock. Sharing that target directory would deadlock against it.
+//! lock. Sharing that target directory would deadlock against it, so the
+//! guests are compiled into a nested one under `OUT_DIR`.
+//!
+//! That nested directory used to be *retained*, and Cargo never cleans
+//! `OUT_DIR`: a fresh one accumulates for every build-script hash and nothing
+//! prunes them. Fifty-one stale guest target directories were found in one
+//! working tree, several over a gigabyte, five of them under `instar-shell`
+//! alone — 20 GiB of permanently orphaned nested Cargo installations, which
+//! was more than half of `target`.
+//!
+//! So the build now separates the two things `OUT_DIR` was holding:
+//!
+//! ```text
+//! OUT_DIR
+//! ├── guest-target/       one shared nested target, removed before exit
+//! └── artifacts/
+//!     └── counter.wasm    retained; what the env var points at
+//! ```
+//!
+//! One shared nested target rather than one per guest, so guests built by the
+//! same invocation do not each recompile `wit-bindgen` and the protocol.
+//!
+//! The cost is real and worth stating: the nested Cargo cache no longer
+//! survives a build-script re-run, so **every** re-run recompiles all of that
+//! crate's guests from scratch rather than only the changed one. A build
+//! script re-runs when a watched input moves — the WIT world, the workspace
+//! manifest, or any guest source — which is exactly when a guest developer is
+//! iterating. If that becomes painful, the answer is not to retain the
+//! directory again; it is to move guest compilation out of `build.rs` entirely
+//! into an `xtask` with one stable target directory this project owns and can
+//! garbage-collect.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,7 +66,27 @@ use std::process::Command;
 /// On any failure, with the guest's real compiler output. A build script that
 /// failed quietly would surface as a confusing `env!` error in a completely
 /// different crate.
-pub fn build_guest(name: &str, package: &str, env_var: &str) {
+/// Builds every guest in one invocation, then removes the nested target.
+///
+/// A slice rather than repeated calls to a single-guest function, because the
+/// cleanup must not be a separate step a caller can forget — a forgotten
+/// cleanup is the leak this exists to close, restored silently.
+pub fn build_guests(guests: &[(&str, &str, &str)]) {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR always set by cargo"));
+    let target_dir = out_dir.join("guest-target");
+    let artifacts = out_dir.join("artifacts");
+    std::fs::create_dir_all(&artifacts).expect("OUT_DIR is writable");
+
+    for (name, package, env_var) in guests {
+        build_guest_into(name, package, env_var, &target_dir, &artifacts);
+    }
+
+    // Before exit, unconditionally. Leaving it on a failure path is how the
+    // directory came back the first time.
+    let _ = std::fs::remove_dir_all(&target_dir);
+}
+
+fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path, artifacts: &Path) {
     // CARGO_MANIFEST_DIR is the *calling* crate's, and every caller lives at
     // crates/<crate>, so the guests tree is two levels up.
     let manifest = PathBuf::from(
@@ -63,16 +113,13 @@ pub fn build_guest(name: &str, package: &str, env_var: &str) {
     // The guest itself, and every workspace crate it links, transitively.
     watch_package(&guest, &mut Vec::new());
 
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR always set by cargo"));
-    let target_dir = out_dir.join(format!("{name}-target"));
-
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo)
         .current_dir(&guest)
         .arg("build")
         .arg("--target")
         .arg("wasm32-wasip2")
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_TARGET_DIR", target_dir)
         // Inherited flags from the outer build refer to the host target and
         // break the wasm build; `RUSTC_WORKSPACE_WRAPPER` would point at the
         // outer workspace.
@@ -98,19 +145,30 @@ pub fn build_guest(name: &str, package: &str, env_var: &str) {
         );
     }
 
-    let wasm = target_dir
+    let built = target_dir
         .join("wasm32-wasip2")
         .join("debug")
         .join(format!("{}.wasm", package.replace('-', "_")));
 
     assert!(
-        wasm.is_file(),
+        built.is_file(),
         "the {name} guest built successfully but no component at {} -- \
          has its package name changed?",
-        wasm.display()
+        built.display()
     );
 
-    println!("cargo:rustc-env={env_var}={}", wasm.display());
+    // Copied out before the nested target is removed. The env var points at
+    // the retained artifact, so a consumer holding it across a rebuild still
+    // has a file.
+    let artifact = artifacts.join(format!("{name}.wasm"));
+    std::fs::copy(&built, &artifact).unwrap_or_else(|error| {
+        panic!(
+            "could not retain the {name} component at {}: {error}",
+            artifact.display()
+        )
+    });
+
+    println!("cargo:rustc-env={env_var}={}", artifact.display());
 }
 
 /// Declares `path` as an input of the calling crate's build. Cargo scans
