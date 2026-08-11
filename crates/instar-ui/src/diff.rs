@@ -76,6 +76,25 @@ pub struct ChangeSet {
     /// does. Kept apart from [`ChangeSet::paint_changed`] because that one
     /// must not.
     pub text_style_changed: Vec<NodeKey>,
+    /// Nodes whose text **alignment** changed.
+    ///
+    /// Its own category because it invalidates unlike anything else here:
+    ///
+    /// ```text
+    /// reshape  no    line break  no    Taffy  no
+    /// realign  yes   extract     yes   paint  yes   a11y  no
+    /// ```
+    ///
+    /// Parley applies alignment after line breaking and can re-apply it to an
+    /// existing layout, so the cached break survives. Folding this into
+    /// [`ChangeSet::text_style_changed`] would reshape the text and rerun
+    /// Taffy for a change that moves glyphs within lines that already exist --
+    /// the same mistake `paint_changed` was split out to avoid, one field
+    /// along.
+    ///
+    /// Not accessibility-observable: where a line sits inside its own box does
+    /// not change what a screen reader reports.
+    pub text_align_changed: Vec<NodeKey>,
     /// Nodes whose **paint-only** style changed: foreground, background,
     /// border, corner radius.
     ///
@@ -109,6 +128,7 @@ impl ChangeSet {
             && self.layout_changed.is_empty()
             && self.text_changed.is_empty()
             && self.text_style_changed.is_empty()
+            && self.text_align_changed.is_empty()
             && self.paint_changed.is_empty()
             && self.cursor_changed.is_empty()
             && self.enabled_changed.is_empty()
@@ -125,6 +145,20 @@ impl ChangeSet {
             .chain(&self.text_style_changed)
             .chain(&self.created)
             .copied()
+    }
+
+    /// Whether text has to be re-finalized without geometry moving.
+    ///
+    /// Finalization normally happens inside a layout pass, which is the only
+    /// place the final width is known. Alignment breaks that assumption: it
+    /// changes where glyphs sit without changing any rectangle, so it needs a
+    /// reason to re-finalize that is *not* "geometry moved".
+    ///
+    /// Without this, an alignment-only commit has two failure modes and no
+    /// third option: run Taffy pointlessly, or never apply the alignment at
+    /// all. The second is the quiet one.
+    pub fn needs_text_finalize(&self) -> bool {
+        !self.text_align_changed.is_empty()
     }
 
     /// Whether geometry has to be recomputed at all.
@@ -181,6 +215,7 @@ impl ChangeSet {
             .chain(&self.layout_changed)
             .chain(&self.text_changed)
             .chain(&self.text_style_changed)
+            .chain(&self.text_align_changed)
             .chain(&self.paint_changed)
             .chain(&self.cursor_changed)
             .chain(&self.enabled_changed)
@@ -298,6 +333,11 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
         changes.text_style_changed.push(new.key);
         // A different face, size or weight measures differently.
         changes.layout_changed.push(new.key);
+    }
+    if old.style.text_layout != new.style.text_layout {
+        // And *not* `layout_changed`: alignment moves glyphs within a box
+        // whose size it cannot alter, so Taffy has nothing to recompute.
+        changes.text_align_changed.push(new.key);
     }
     if old.style.paint != new.style.paint {
         changes.paint_changed.push(new.key);

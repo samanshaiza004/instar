@@ -585,7 +585,11 @@ impl SceneBuilder {
             ShapingStyle::default(),
             Available::Definite(width),
         );
-        let mut visible = text.finalize(CRASH_KEY, width).clone();
+        // Start: a crash diagnostic is read left to right, and centring a
+        // backtrace would be a stylistic choice made at the worst moment.
+        let mut visible = text
+            .finalize(CRASH_KEY, width, instar_ui::Alignment::Start)
+            .clone();
         let visible_bottom = metrics.logical_size.height as f32 - margin;
         for run in &mut visible.runs {
             run.glyphs.retain(|glyph| glyph.y <= visible_bottom);

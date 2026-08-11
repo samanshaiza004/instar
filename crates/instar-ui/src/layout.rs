@@ -450,6 +450,34 @@ pub fn compute(
     }
 }
 
+/// Re-finalizes text against geometry that has not moved.
+///
+/// The alignment-only path. Every rectangle in `snapshot` is still correct, so
+/// there is nothing for Taffy to do; what has changed is where glyphs sit
+/// inside boxes that already exist. Reuses each node's recorded width, so the
+/// cached line break survives and only `Layout::align` and the extraction run.
+pub fn refinalize_text(text: &mut TextContext, tree: &Tree, snapshot: &mut LayoutSnapshot) {
+    for node in tree.iter() {
+        if !matches!(node.kind, NodeKind::Text { .. } | NodeKind::Button { .. }) {
+            continue;
+        }
+        let Some(rect) = snapshot.get(node.key) else {
+            continue;
+        };
+        let padding = if matches!(node.kind, NodeKind::Button { .. }) {
+            BUTTON_PADDING * 2.0
+        } else {
+            0.0
+        };
+        let final_width = (rect.width as f32 - padding).max(0.0);
+        snapshot.text.insert(
+            node.key,
+            text.finalize(node.key, final_width, node.style.text_layout.align.into())
+                .clone(),
+        );
+    }
+}
+
 fn finalize_text(
     text: &mut TextContext,
     tree: &Tree,
@@ -474,7 +502,11 @@ fn finalize_text(
             0.0
         };
         let final_width = (geometry.size.width - padding).max(0.0);
-        out.insert(node.key, text.finalize(node.key, final_width).clone());
+        out.insert(
+            node.key,
+            text.finalize(node.key, final_width, node.style.text_layout.align.into())
+                .clone(),
+        );
     }
 }
 

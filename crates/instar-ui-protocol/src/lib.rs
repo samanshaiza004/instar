@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -446,6 +446,56 @@ pub struct WireBorder {
     pub color: WireColor,
 }
 
+/// Where a line sits within the width it was broken to.
+///
+/// `Start` and `End` are direction-aware — left and right respectively for
+/// left-to-right text, and reversed for right-to-left — which is why the wire
+/// says those rather than `Left`/`Right`. A guest states intent; which
+/// physical edge that lands on is a property of the text, and resolving it
+/// here would put bidi policy in the guest API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireTextAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl WireTextAlign {
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Start => 0,
+            Self::Center => 1,
+            Self::End => 2,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Start),
+            1 => Some(Self::Center),
+            2 => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// How text is **positioned** within its node, as opposed to shaped.
+///
+/// A separate group from [`WireTextStyle`] because it invalidates differently,
+/// which is the same principle that split paint from shaping in package C.
+/// Parley applies alignment *after* line breaking and can re-apply it to an
+/// existing layout, so changing it needs neither reshaping nor a new line
+/// break nor a layout pass — only a realign, a re-extract, and a repaint.
+///
+/// Folding it into `WireTextStyle` would have made every alignment change
+/// reshape the text and rerun Taffy, which is exactly the class of cost the
+/// invalidation split exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WireTextLayout {
+    pub align: WireTextAlign,
+}
+
 /// The properties that change how text is **shaped**, and therefore measured.
 ///
 /// Separated from [`WirePaintStyle`] because the separation is the design: a
@@ -494,6 +544,8 @@ pub struct WirePaintStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WireStyle {
     pub text: WireTextStyle,
+    /// Positioning, not shaping. See [`WireTextLayout`].
+    pub text_layout: WireTextLayout,
     pub paint: WirePaintStyle,
     pub cursor: WireCursor,
 }
@@ -964,6 +1016,17 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn text_align(
+        &mut self,
+        while_reading: &'static str,
+    ) -> Result<WireTextAlign, ProtocolError> {
+        let value = self.u8(while_reading)?;
+        WireTextAlign::from_tag(value).ok_or(ProtocolError::UnknownOpcode {
+            context: while_reading,
+            value,
+        })
+    }
+
     pub fn cursor(&mut self, while_reading: &'static str) -> Result<WireCursor, ProtocolError> {
         match self.u8(while_reading)? {
             opcode::CURSOR_DEFAULT => Ok(WireCursor::Default),
@@ -976,12 +1039,15 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// A whole style block, in the three groups the diff keys off.
+    /// A whole style block, in the groups the diff keys off.
     pub fn style(&mut self, _while_reading: &'static str) -> Result<WireStyle, ProtocolError> {
         let text = WireTextStyle {
             role: self.font_role("font role")?,
             size: self.length("font size")?,
             weight: self.font_weight("font weight")?,
+        };
+        let text_layout = WireTextLayout {
+            align: self.text_align("text align")?,
         };
         let border = match self.u8("border")? {
             0 => None,
@@ -998,6 +1064,7 @@ impl<'a> Reader<'a> {
         };
         Ok(WireStyle {
             text,
+            text_layout,
             paint,
             cursor: self.cursor("cursor")?,
         })
@@ -1111,6 +1178,7 @@ fn write_style(out: &mut Vec<u8>, style: WireStyle) {
     out.push(style.text.role.tag());
     out.extend_from_slice(&style.text.size.to_le_bytes());
     out.extend_from_slice(&style.text.weight.to_le_bytes());
+    out.push(style.text_layout.align.tag());
     match style.paint.border {
         Some(border) => {
             out.push(1);
@@ -1867,16 +1935,17 @@ mod tests {
     /// 38  justify_content(1)
     /// 39  display(1) visibility(1) overflow(1)
     /// 42  padding(2) gap(2)                            layout ends
-    /// 46  font role(1) size(2) weight(2)               style begins
-    /// 51  border(1)                                    absent: presence only
-    /// 52  foreground(1) background(1)                  absent: presence only
-    /// 54  corner_radius(2)
-    /// 56  cursor(1)
-    /// 57  child_count(2)
-    /// 59  SECTION_END(1)
+    /// 46  font role(1) size(2) weight(2)               shaping style begins
+    /// 51  text align(1)                                positioning
+    /// 52  border(1)                                    absent: presence only
+    /// 53  foreground(1) background(1)                  absent: presence only
+    /// 55  corner_radius(2)
+    /// 57  cursor(1)
+    /// 58  child_count(2)
+    /// 60  SECTION_END(1)
     /// ```
     const DEFAULT_ALIGN_ITEMS_OFFSET: usize = 37;
-    const DEFAULT_BATCH_LEN: usize = 60;
+    const DEFAULT_BATCH_LEN: usize = 61;
 
     #[test]
     fn rejects_unknown_align_and_justify_tags() {
@@ -2019,6 +2088,9 @@ mod tests {
                 role: WireFontRole::Monospace,
                 size: 18,
                 weight: 700,
+            },
+            text_layout: WireTextLayout {
+                align: WireTextAlign::End,
             },
             paint: WirePaintStyle {
                 foreground: Some(WireColor::opaque(1, 2, 3)),
@@ -2192,8 +2264,10 @@ mod tests {
         let good = encoder.finish();
         assert_eq!(good.len(), DEFAULT_BATCH_LEN, "the offsets below assume it");
 
-        // Font role opens the style block; cursor closes it.
-        for (offset, context) in [(46usize, "font role"), (56, "cursor")] {
+        // Font role opens the style block; cursor closes it. Text align sits
+        // between the shaping group and the paint group, which is where it
+        // belongs conceptually as well as on the wire.
+        for (offset, context) in [(46usize, "font role"), (51, "text align"), (57, "cursor")] {
             let mut bytes = good.clone();
             bytes[offset] = 99;
             assert!(

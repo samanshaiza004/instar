@@ -108,6 +108,48 @@ pub enum FontRole {
 /// not. Colour belongs to paint, not here: adding a paint-only property like
 /// colour would silently destroy the reuse optimization, because the style
 /// hash would change on every repaint and force a reshape even though the
+/// Where a line sits within the width it was broken to.
+///
+/// Mirrors [`instar_ui_protocol::WireTextAlign`] the way [`ShapingStyle`]
+/// mirrors the wire's shaping group: the wire is the wire, and this layer
+/// keeps its own vocabulary so the two can move independently.
+///
+/// Deliberately **not** part of `ShapingStyle`. Parley applies alignment after
+/// line breaking and can re-apply it to an existing layout, so changing it
+/// costs a realign and a re-extract -- no reshape, no new break, no layout
+/// pass. Grouping it with role, size and weight would have made every
+/// alignment change pay for all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Alignment {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl From<instar_ui_protocol::WireTextAlign> for Alignment {
+    fn from(wire: instar_ui_protocol::WireTextAlign) -> Self {
+        match wire {
+            instar_ui_protocol::WireTextAlign::Start => Self::Start,
+            instar_ui_protocol::WireTextAlign::Center => Self::Center,
+            instar_ui_protocol::WireTextAlign::End => Self::End,
+        }
+    }
+}
+
+impl From<Alignment> for parley::Alignment {
+    fn from(alignment: Alignment) -> Self {
+        match alignment {
+            // Direction-aware, both of them: Parley resolves Start and End
+            // against the text's own direction, which is why the vocabulary
+            // says these rather than Left and Right.
+            Alignment::Start => Self::Start,
+            Alignment::Center => Self::Center,
+            Alignment::End => Self::End,
+        }
+    }
+}
+
 /// glyphs cannot differ.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapingStyle {
@@ -220,6 +262,14 @@ pub struct TextStats {
     /// indistinguishable in a trace, which is the confusion this whole split
     /// exists to remove.
     pub relinebroken: u64,
+    /// `Layout::align` was invoked because alignment needed applying.
+    ///
+    /// Deliberately "work done", not "the alignment property changed". A width
+    /// change re-breaks the lines and therefore *also* has to re-apply
+    /// alignment, and a counter that only tracked the wire diff would report
+    /// zero for real work — which would make it a description of the protocol
+    /// rather than of the machine.
+    pub realigned: u64,
     /// A query answered without touching the layout: an intrinsic
     /// (`MinContent`/`MaxContent`) measure served from the per-entry cache, or
     /// a finalize at a width the layout is already broken at.
@@ -247,6 +297,13 @@ pub struct TextEntry {
     /// answering a sizing question, and must not disturb this record — that is
     /// what stops a speculative probe from invalidating a finalized artifact.
     pub finalized_width: Option<f32>,
+    /// The alignment the finalized layout was last positioned under.
+    ///
+    /// Separate from the shaping identity above, because it is not part of it:
+    /// Parley applies alignment after line breaking and can re-apply it to an
+    /// existing layout, so a change here needs neither a reshape nor a new
+    /// break.
+    pub finalized_alignment: Alignment,
     /// Intrinsic widths, cached because **Parley no longer caches them
     /// internally** — the caller is expected to. Taffy asks for min- and
     /// max-content repeatedly per pass, so recomputing would reintroduce the
@@ -408,6 +465,7 @@ impl TextContext {
                     source_hash,
                     style_hash,
                     finalized_width: None,
+                    finalized_alignment: Alignment::default(),
                     content_widths,
                     unbroken_height,
                     shaped: ShapedText::default(),
@@ -440,34 +498,72 @@ impl TextContext {
                 // A real height needs a real break, so this one does mutate --
                 // but it deliberately leaves `finalized_width` alone, so a
                 // speculative probe cannot invalidate what `finalize` produced.
+                // Broken, never aligned. This probe is speculative -- Taffy
+                // asks repeatedly and the last answer is not necessarily the
+                // winning one -- and alignment is finalization's job. Applying
+                // it here would recreate exactly the class of mutation bug
+                // that cost 9x the latency in stage 1.
                 entry.layout.break_all_lines(Some(width));
-                entry.layout.align(
-                    parley::Alignment::Start,
-                    parley::AlignmentOptions::default(),
-                );
             }
         }
         (ceil(entry.layout.width()), entry.layout.height().ceil())
     }
 
-    /// Runs after Taffy has final geometry: re-breaks if needed, then extracts.
+    /// Runs after Taffy has final geometry: re-breaks if needed, aligns if
+    /// needed, then extracts.
     ///
-    /// This is the only place [`ShapedText`] is produced.
-    pub fn finalize(&mut self, key: NodeKey, final_width: f32) -> &ShapedText {
+    /// This is the only place [`ShapedText`] is produced, and the only place
+    /// alignment is ever applied.
+    ///
+    /// The three reasons to do work are separate, and so are their costs:
+    ///
+    /// ```text
+    /// width moved       re-break, then re-align, then extract
+    /// alignment moved   re-align, then extract
+    /// neither           reuse
+    /// ```
+    ///
+    /// A re-break always forces a re-align: the lines it produced have not
+    /// been positioned yet, and Parley's alignment is applied to the lines
+    /// that exist.
+    pub fn finalize(
+        &mut self,
+        key: NodeKey,
+        final_width: f32,
+        alignment: Alignment,
+    ) -> &ShapedText {
         let entry = self
             .entries
             .get_mut(&key)
             .expect("finalize requires a prior measure call for the node");
-        if entry.finalized_width != Some(final_width) {
+
+        let rebroke = entry.finalized_width != Some(final_width);
+        if rebroke {
             self.stats.relinebroken += 1;
             entry.layout.break_all_lines(Some(final_width));
-            entry.layout.align(
-                parley::Alignment::Start,
-                parley::AlignmentOptions::default(),
-            );
             entry.finalized_width = Some(final_width);
+        }
+
+        // Decided before anything is mutated. Testing `finalized_alignment`
+        // after assigning it reports reuse for work that was just done, which
+        // is a counter describing its own side effect.
+        let realign = rebroke || entry.finalized_alignment != alignment;
+        if realign {
+            self.stats.realigned += 1;
+            // `align_when_overflowing` stays at Parley's default, under which
+            // an overflowing End or Center line falls back to Start. Whether
+            // Instar wants that is a text-overflow question -- it sits beside
+            // clipping, ellipsis and scrolling -- and answering it with an
+            // alignment flag would be answering the wrong question. Recorded
+            // as unresolved rather than guessed at.
+            entry
+                .layout
+                .align(alignment.into(), parley::AlignmentOptions::default());
+            entry.finalized_alignment = alignment;
             entry.shaped_valid = false;
-        } else {
+        }
+
+        if !realign {
             self.stats.reused += 1;
         }
 
@@ -637,7 +733,7 @@ mod tests {
         );
         assert_eq!((first_width, first_height), (second_width, second_height));
 
-        let shaped = text.finalize(KEY, 200.0);
+        let shaped = text.finalize(KEY, 200.0, Alignment::Start);
         assert!(!shaped.runs.is_empty());
         assert_eq!(
             text.stats().relinebroken,
@@ -647,7 +743,7 @@ mod tests {
         );
         assert_eq!(text.stats().extracted, 1);
 
-        text.finalize(KEY, 200.0);
+        text.finalize(KEY, 200.0, Alignment::Start);
         assert_eq!(
             (text.stats().reused, text.stats().relinebroken),
             (1, 1),
@@ -679,10 +775,10 @@ mod tests {
              neither the persistent break record nor the shaped artifact"
         );
 
-        text.finalize(KEY, 60.0);
+        text.finalize(KEY, 60.0, Alignment::Start);
         assert_eq!((text.stats().rebuilt, text.stats().relinebroken), (1, 1));
 
-        text.finalize(KEY, 140.0);
+        text.finalize(KEY, 140.0, Alignment::Start);
         assert_eq!((text.stats().rebuilt, text.stats().relinebroken), (1, 2));
         assert_eq!(text.stats().extracted, 2, "each real break re-extracts");
     }
@@ -737,7 +833,7 @@ mod tests {
             style(),
             Available::MaxContent,
         );
-        let shaped = text.finalize(KEY, new_width);
+        let shaped = text.finalize(KEY, new_width, Alignment::Start);
         assert!(!shaped.runs.is_empty());
         let _ = shaped;
         assert_eq!(text.stats().rebuilt, 2, "the key must be shaped fresh");
@@ -792,7 +888,7 @@ mod tests {
         assert!(min_width.is_finite() && max_width.is_finite());
         assert!(text.line_count(KEY) >= 1);
 
-        let shaped = text.finalize(KEY, max_width);
+        let shaped = text.finalize(KEY, max_width, Alignment::Start);
         let glyphs: usize = shaped.runs.iter().map(|run| run.glyphs.len()).sum();
         assert!(!shaped.runs.is_empty(), "bidi fixture should produce runs");
         assert!(

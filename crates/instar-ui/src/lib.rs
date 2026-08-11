@@ -40,7 +40,7 @@ pub use instar_ui_protocol as protocol;
 pub use instar_ui_protocol::{
     NodeKey, ProtocolError, WireAlign, WireBorder, WireColor, WireCursor, WireDisplay,
     WireFontRole, WireJustify, WireLayout, WireOverflow, WirePaintStyle, WireSize, WireStyle,
-    WireTextStyle, WireVisibility, limits,
+    WireTextAlign, WireTextLayout, WireTextStyle, WireVisibility, limits,
 };
 pub use layout::{BUTTON_PADDING, LayoutSnapshot, Rect, Viewport};
 pub use ledger::{KeyLedger, MAX_NODE_IDS};
@@ -49,8 +49,8 @@ pub use scroll::{
     ScrollState, Scrollbar, ScrollbarPart, ScrollbarStyle, ThumbDrag,
 };
 pub use text::{
-    Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle, TextContext,
-    TextStats,
+    Alignment, Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle,
+    TextContext, TextStats,
 };
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};

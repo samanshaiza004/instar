@@ -1621,6 +1621,80 @@ has ruled out and a test for it could not discriminate. And the chaining
 methods are deliberately not `#[must_use]` — their purpose is the side effect,
 and marking them makes the ordinary terminal call a lint error.
 
+#### H2: alignment is positioning, not shaping
+
+Protocol v7 adds `WireTextAlign { Start, Center, End }` in a new
+`WireTextLayout` group — **not** in `WireTextStyle`. Parley applies alignment
+*after* line breaking and can re-apply it to an existing layout, so it is not a
+shaping property, and grouping it with role, size and weight would have made
+every alignment change reshape the text and rerun Taffy.
+
+`Start`/`End` rather than `Left`/`Right`: Parley resolves those against the
+text's direction, so the wire stays direction-correct without putting bidi
+policy in the guest API.
+
+```text
+WireTextLayout::align changes
+
+reshape  no   intrinsic  no   Taffy  no   line break  no
+realign  yes  extract    yes  lower  yes  raster      yes   a11y  no
+```
+
+Two things this needed beyond a new enum.
+
+Finalization got its own reason to run. It normally happens inside a layout
+pass, because that is where the final width is known — and alignment changes
+where glyphs sit without moving any rectangle. Without `needs_text_finalize`,
+an alignment-only commit has exactly two outcomes and no third: run Taffy
+pointlessly, or never apply the alignment. The second is the quiet one.
+
+And `realigned` counts **work done**, not the wire diff. A width change
+re-breaks the lines and therefore has to re-align them too; a counter that only
+tracked "the align property changed" would report zero for real work and
+describe the protocol rather than the machine. That is the bug where `End`
+looks right when first applied and then stays positioned against the width that
+is gone.
+
+`measure()` never aligns. It is speculative — Taffy probes repeatedly and the
+last answer is not necessarily the winning one — and Parley only permits
+alignment after a break anyway. Alignment happens in `finalize` and nowhere
+else.
+
+**Overflow alignment is left unresolved.** Parley's `align_when_overflowing`
+defaults to falling back to `Start` for an overflowing `End` or `Center` line,
+and Instar takes the default. Whether that is right is a text-overflow
+question, sitting beside clipping, ellipsis and scrolling; answering it with an
+alignment flag would be answering the wrong question. Recorded rather than
+guessed.
+
+#### The acceptance criterion needed a new counter, and that is the finding
+
+The criterion is:
+
+> An alignment-only update must reach pixels without entering either Taffy or
+> shaping.
+
+The text counters **cannot express it.** Folding alignment into
+`text_style_changed` runs a full layout pass and still reports
+`rebuilt 0, relinebroken 0, realigned 1, reused 0` — because the shaping hash
+did not change and the width did not move. The test passed with the defect
+injected, exactly as written.
+
+So `Host::layout_passes()` exists, and the assertion is `layout_passes == 0`.
+C5's rule, one subsystem along:
+
+> A performance-invariant test must observe *entry* into the forbidden work,
+> not merely the expensive work's cache misses.
+
+Three faults now caught: alignment folded into `text_style_changed`, a re-break
+that does not re-align, and `needs_text_finalize` never firing.
+
+One fault is **not** caught, and is recorded rather than papered over: making
+`measure()` align speculatively again changes no observable state, because
+`finalized_alignment` is tracked separately and `finalize` re-aligns regardless.
+It is wasted work with no consequence, and no counter distinguishes it. Left
+as a rule in the comments rather than given a counter it does not earn.
+
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
 on every primitive while the API underneath it is miserable.

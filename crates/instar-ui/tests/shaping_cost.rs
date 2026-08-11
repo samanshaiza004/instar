@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use instar_ui::NodeKey;
-use instar_ui::text::{Available, FontRole, ShapingStyle, TextContext};
+use instar_ui::text::{Alignment, Available, FontRole, ShapingStyle, TextContext};
 
 fn median(mut samples: Vec<Duration>) -> Duration {
     samples.sort_unstable();
@@ -20,7 +20,7 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 fn shape(text: &mut TextContext, key: NodeKey, string: &str, style: ShapingStyle) -> Duration {
     let started = Instant::now();
     text.measure(key, string, style, Available::Definite(400.0));
-    let _ = text.finalize(key, 400.0);
+    let _ = text.finalize(key, 400.0, Alignment::Start);
     started.elapsed()
 }
 

@@ -280,6 +280,16 @@ impl HostWindow {
         self.layout = Some(tree.layout_with(text, viewport, scrollbars));
     }
 
+    /// Re-finalizes text against geometry that has not moved.
+    ///
+    /// The alignment-only path; see [`instar_ui::layout::refinalize_text`].
+    fn refinalize_text(&mut self, text: &mut TextContext) {
+        let (Some(tree), Some(layout)) = (self.tree.as_ref(), self.layout.as_mut()) else {
+            return;
+        };
+        instar_ui::layout::refinalize_text(text, tree, layout);
+    }
+
     /// Confines every retained offset to what the current layout leaves
     /// scrollable.
     ///
@@ -388,6 +398,19 @@ pub struct InteractionStats {
 #[derive(Debug)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
+    /// How many times Taffy has been entered since the last reset.
+    ///
+    /// Instrumentation, and the only way to state the H2 acceptance criterion
+    /// honestly. The text counters cannot express it: folding alignment into
+    /// `text_style_changed` runs a whole layout pass and *still* reports
+    /// `rebuilt 0, relinebroken 0, realigned 1, reused 0`, because the shaping
+    /// hash did not change and the width did not move. The forbidden work is
+    /// invisible in the counters that measure its consequences.
+    ///
+    /// C5's rule, one subsystem along: a performance-invariant test must
+    /// observe *entry* into the forbidden work, not merely the expensive
+    /// work's cache misses.
+    layout_passes: u64,
     /// Where scrollbars live relative to the content they scroll.
     ///
     /// Host policy, one choice for the whole application, and deliberately not
@@ -417,6 +440,7 @@ impl Host {
     pub fn new() -> Self {
         Self {
             windows: HashMap::new(),
+            layout_passes: 0,
             scrollbars: ScrollbarStyle::default(),
             presentation: PresentationState::default(),
             interaction_stats: InteractionStats::default(),
@@ -446,7 +470,13 @@ impl Host {
         self.text.stats()
     }
 
+    /// Layout passes since [`Host::reset_text_stats`].
+    pub fn layout_passes(&self) -> u64 {
+        self.layout_passes
+    }
+
     pub fn reset_text_stats(&mut self) {
+        self.layout_passes = 0;
         self.text.reset_stats();
     }
 
@@ -918,7 +948,16 @@ impl Host {
         // is a property of the cache's internals rather than of this path.
         // Not entering it at all cannot regress.
         if changes.needs_layout() {
+            self.layout_passes += 1;
             window.recompute_layout(&mut self.text, self.scrollbars);
+        } else if changes.needs_text_finalize() {
+            // Alignment moved and geometry did not. Finalization normally
+            // happens inside a layout pass because that is where the final
+            // width is known -- but every width here is still correct, so
+            // running Taffy would be work with a guaranteed-identical answer.
+            // The alternative to this branch is not "a bit slower"; it is
+            // never applying the alignment at all.
+            window.refinalize_text(&mut self.text);
         }
         // After layout, because the scrollable extent is a layout answer, and
         // before the scene is lowered and the commit is acknowledged, because
@@ -950,6 +989,7 @@ impl Host {
         // Order matters and is the barrier's exit rule: layout first, then the
         // snapshot is replaced, then the scene is lowered against it, and only
         // then may anything be rendered.
+        self.layout_passes += 1;
         window.recompute_layout(&mut self.text, self.scrollbars);
         let wanted = window.redraw_pending || window.layout.is_some();
         self.rebuild_scene(window_id);
@@ -2703,6 +2743,139 @@ mod tests {
                 .any(|effect| matches!(effect, HostEffect::SendToGuest(_))),
             "activation must reach the guest, or the readout never changes and \
              there is nothing for a screen reader to observe"
+        );
+    }
+
+    // --- H2: alignment is positioning, not shaping. ---
+
+    fn aligned_tree(align: instar_ui::WireTextAlign) -> Tree {
+        use instar_ui::{Node, WireAlign, WireLayout, WireStyle, WireTextLayout};
+        Tree::new(Node::root(
+            0,
+            vec![
+                Node::text(90, "a readout")
+                    .with_layout(WireLayout {
+                        align_self: Some(WireAlign::Stretch),
+                        ..WireLayout::default()
+                    })
+                    .with_style(WireStyle {
+                        text_layout: WireTextLayout { align },
+                        ..WireStyle::default()
+                    }),
+            ],
+        ))
+    }
+
+    /// The acceptance criterion for the whole category:
+    ///
+    /// > An alignment-only update must reach pixels without entering either
+    /// > Taffy or shaping.
+    ///
+    /// `reused == 0` is in here for the reason C5 taught: without it, the test
+    /// passes if the change accidentally enters a broader finalization path
+    /// and merely gets a cheap cache hit on the way through.
+    #[test]
+    fn an_alignment_only_change_realigns_and_nothing_else() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::Start))
+            .expect("valid");
+        let before = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|layout| layout.get(NodeKey::first(90)))
+            .expect("the readout is laid out");
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
+            .expect("valid");
+        let stats = host.text_stats();
+
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.realigned,
+                stats.reused
+            ),
+            (0, 0, 1, 0),
+            "alignment realigns and extracts; it must not reshape, re-break, \
+             or slip through a path that merely hits the cache"
+        );
+        assert_eq!(stats.extracted, 1, "the artifact has to be produced again");
+        assert_eq!(
+            host.layout_passes(),
+            0,
+            "and Taffy was never entered. The text counters cannot say this on \
+             their own -- folding alignment into `text_style_changed` runs a \
+             full layout pass and still reports the same four numbers, because \
+             the shaping hash is unchanged and the width did not move. Entry \
+             into the forbidden work has to be observed directly."
+        );
+        assert_eq!(
+            host.window(WINDOW)
+                .and_then(HostWindow::layout)
+                .and_then(|layout| layout.get(NodeKey::first(90))),
+            Some(before),
+            "and no rectangle moved, which is why Taffy had nothing to do"
+        );
+    }
+
+    /// Committing the same alignment again is not work.
+    #[test]
+    fn an_unchanged_alignment_does_nothing_at_all() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
+            .expect("valid");
+
+        host.reset_text_stats();
+        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
+            .expect("valid");
+        let stats = host.text_stats();
+        assert_eq!(
+            (
+                stats.rebuilt,
+                stats.relinebroken,
+                stats.realigned,
+                stats.extracted
+            ),
+            (0, 0, 0, 0),
+            "an identical commit is a no-op, alignment included"
+        );
+    }
+
+    /// A width change re-breaks *and* re-aligns.
+    ///
+    /// The bug this exists for is subtle: `End` looks right when first
+    /// applied, and then stays positioned against the old line width after a
+    /// resize. A counter that only tracked "the alignment property changed"
+    /// would report zero here and describe the wire rather than the machine.
+    #[test]
+    fn a_width_change_reapplies_alignment_to_the_new_lines() {
+        let mut host = ready_host();
+        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
+            .expect("valid");
+
+        host.reset_text_stats();
+        host.handle(WindowOutput::MetricsChanged(WindowMetricsChanged {
+            window_id: WINDOW,
+            logical_size: LogicalSize {
+                width: 260.0,
+                height: 300.0,
+            },
+            physical_size: PhysicalSize {
+                width: 260,
+                height: 300,
+            },
+            scale_factor: 1.0,
+        }));
+
+        let stats = host.text_stats();
+        assert_eq!(stats.rebuilt, 0, "a resize does not reshape");
+        assert_eq!(stats.relinebroken, 1, "it re-breaks");
+        assert_eq!(
+            stats.realigned, 1,
+            "and must re-apply alignment to the lines it just made, or End \
+             stays positioned against the width that is gone"
         );
     }
 
