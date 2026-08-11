@@ -57,7 +57,8 @@ subtask.
 
 | Crate | What it is |
 |---|---|
-| `instar-ui-protocol` | The wire format, and the only Instar crate a guest links. Zero dependencies. |
+| `instar-ui-protocol` | The wire format. Zero dependencies. |
+| `instar-sdk` | A thin guest-side snapshot builder and event router. Depends on the protocol and nothing else. Optional — the wire stays hand-encodable. |
 | `instar-kernel` | Wasmtime Component Model async runtime: engine config, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind. |
 | `instar-ui` | The retained tree, Taffy layout, hit-testing. Never sees DPI. |
 | `instar-window` | winit translation and DPI conversion. Never sees a `NodeKey`. |

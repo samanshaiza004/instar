@@ -1700,6 +1700,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "instar-sdk"
+version = "0.0.2"
+dependencies = [
+ "instar-ui-protocol",
+]
+
+[[package]]
 name = "instar-shell"
 version = "0.0.2"
 dependencies = [

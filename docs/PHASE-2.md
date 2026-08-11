@@ -1581,6 +1581,46 @@ child counts declared by hand   the hazard the Gallery already tripped over
 NodeKey mapped back by search   every application reinvents the same lookup
 ```
 
+#### H1: the SDK, and the layering rule it changes
+
+`instar-sdk` solves PAIN 2 and PAIN 4 and stops. A nested builder that takes
+each child count from the tree rather than from the author, and a routing table
+binding controls to an application's own message type. No signals, no hooks, no
+lifecycle, no store, no memoization, no guest reconciliation — the host already
+reconciles authoritative snapshots, and a second reconciler in the guest is the
+delta protocol arriving through the back door.
+
+It does **not** invent node identity. Keys are supplied by the caller, never
+derived from tree position: focus, pressed state, accessibility identity and
+stale-event rejection all key off identity, and identity derived from position
+changes whenever the tree is restructured. Removing boilerplate around identity
+is ergonomics; generating identity would be a correctness change wearing
+ergonomics as a disguise.
+
+Routing is by the **whole** `NodeKey`. An application writing its own lookup
+naturally matches the numeric half — which is exactly what the Calculator does
+today — and that lets an event for a retired node reach whatever replaced it.
+The ABA hole the generation exists to close, reopened in the guest.
+
+This changes a stated invariant. `instar-ui-protocol` was "the only Instar crate
+a guest links", and now:
+
+```text
+guest-visible:  instar-sdk -> instar-ui-protocol
+forbidden:      instar-ui, instar-host, instar-window, renderers, the shell
+```
+
+The architectural property is unchanged — no guest links a layout engine — and
+the SDK depends on the protocol and nothing else. Using it stays optional;
+`guests/gallery` and `guests/counter` hand-encode.
+
+Two findings from building it, both small and both real. `Handle` carries no
+index: the node is always the last in the current frame, and the borrow
+guarantees it, so an index field would advertise a hazard the borrow checker
+has ruled out and a test for it could not discriminate. And the chaining
+methods are deliberately not `#[must_use]` — their purpose is the side effect,
+and marking them makes the ordinary terminal call a lint error.
+
 The Calculator proves an application is *pleasant to write*, which is a
 different question and the one a gallery cannot answer. A gallery can be green
 on every primitive while the API underneath it is miserable.

@@ -1,0 +1,12 @@
+[package]
+name = "instar-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A thin guest-side builder for Instar interfaces: owns child counts, and routes activations to typed messages. Depends on the wire format and nothing else."
+
+[dependencies]
+# The wire format, and nothing else, ever. An SDK that reached the host's UI
+# implementation would put a layout engine in every guest, which is the whole
+# arrangement this project exists to avoid. See docs/PHASE-1.md, "UI layering".
+instar-ui-protocol = { path = "../instar-ui-protocol" }

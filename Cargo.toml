@@ -6,6 +6,7 @@ members = [
     "crates/instar-kernel",
     "crates/instar-ui",
     "crates/instar-ui-protocol",
+    "crates/instar-sdk",
     "crates/instar-window",
     "crates/instar-host",
     "crates/instar-shell",
