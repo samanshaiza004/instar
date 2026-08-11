@@ -19,6 +19,8 @@ use wasmtime::Store;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+use crate::resource::{EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy};
+
 wasmtime::component::bindgen!({
     path: "wit",
     world: "kernel-spike",
@@ -69,6 +71,7 @@ pub enum Event {
 pub struct SpikeState {
     ctx: WasiCtx,
     table: ResourceTable,
+    limits: MeasuredLimiter,
     /// Events pending delivery to the guest. An async channel is the whole
     /// trick: `next-event` awaits `recv()`, which parks the guest task on a
     /// waker rather than spinning.
@@ -173,6 +176,7 @@ pub struct SpikeHandle {
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     commits: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     metrics: Arc<Metrics>,
+    resource_metrics: Arc<ResourceMetrics>,
 }
 
 impl SpikeHandle {
@@ -210,6 +214,11 @@ impl SpikeHandle {
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
     }
+
+    /// Resource evidence collected from this spike's Store.
+    pub fn resource_metrics(&self) -> Arc<ResourceMetrics> {
+        Arc::clone(&self.resource_metrics)
+    }
 }
 
 /// A spike instance that has been built but not yet run.
@@ -224,6 +233,18 @@ impl Spike {
     /// instantiates the guest fixture -- without running it yet, so tests can
     /// take metrics baselines before the guest does anything.
     pub async fn new(component_bytes: &[u8]) -> wasmtime::Result<(Self, SpikeHandle)> {
+        Self::new_with_policy(component_bytes, ResourcePolicy::instar_default()).await
+    }
+
+    /// As [`Spike::new`], with a caller-chosen resource policy.
+    ///
+    /// Production and the Gate 0 suite use [`Spike::new`]; the parameterised
+    /// form exists so the measurement gate can probe the spike guest's
+    /// core-instance demand.
+    pub async fn new_with_policy(
+        component_bytes: &[u8],
+        policy: ResourcePolicy,
+    ) -> wasmtime::Result<(Self, SpikeHandle)> {
         let engine = crate::engine::configured_engine()?;
         let component = Component::from_binary(&engine, component_bytes)?;
 
@@ -237,10 +258,12 @@ impl Spike {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let commits: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
         let metrics: Arc<Metrics> = Arc::default();
+        let resource_metrics = Arc::new(ResourceMetrics::for_component(&component));
 
         let state = SpikeState {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
+            limits: MeasuredLimiter::new(&policy, Arc::clone(&resource_metrics)),
             events: Arc::new(tokio::sync::Mutex::new(events_rx)),
             commits: Arc::clone(&commits),
             revision: 0,
@@ -248,6 +271,8 @@ impl Spike {
         };
 
         let mut store = Store::new(&engine, state);
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
         let instance = linker.instantiate_async(&mut store, &component).await?;
         let bindings = KernelSpike::new(&mut store, &instance)?;
 
@@ -261,6 +286,7 @@ impl Spike {
                 events: events_tx,
                 commits,
                 metrics,
+                resource_metrics,
             },
         ))
     }

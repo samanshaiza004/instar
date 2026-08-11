@@ -260,6 +260,15 @@ pub enum WindowOutput {
     /// scrollbar thumb already being dragged -- is presentation the host owns
     /// alone, and neither reaches a guest.
     PointerMoved(RawPointerMoved),
+    /// The pointer left the window surface entirely.
+    ///
+    /// Nothing is under the pointer any more: hover is gone, a pointer drag
+    /// cannot continue, and a pointer press cannot complete. The host clears
+    /// the presentation state that only makes sense while the pointer is over
+    /// the window, but semantic focus is not input-capture state and survives.
+    PointerLeft {
+        window_id: WindowId,
+    },
     Scroll(RawScrollEvent),
     Key(RawKeyEvent),
     MetricsChanged(WindowMetricsChanged),
@@ -293,6 +302,16 @@ pub enum WindowOutput {
     /// obeys. `instar-window` has no idea what a render or a hit-test is.
     MetricsInvalidated {
         window_id: WindowId,
+    },
+    /// The window gained or lost keyboard focus.
+    ///
+    /// Carried in both directions so the seam stays a complete lifecycle
+    /// vocabulary. A loss cancels the translator's input-holding state --
+    /// winit will not report the releases of keys held while the window is
+    /// unfocused -- while a gain restores nothing.
+    WindowFocusChanged {
+        window_id: WindowId,
+        focused: bool,
     },
     /// The user asked to close the window; the host decides what that means.
     CloseRequested {
@@ -446,6 +465,21 @@ impl WindowState {
 
     pub fn on_cursor_left(&mut self) {
         self.last_cursor = None;
+    }
+
+    /// The window gained or lost keyboard focus.
+    ///
+    /// Loss is a lifecycle cancellation, not a modifier event: anything this
+    /// translator was holding on behalf of input -- the cursor position and
+    /// the shift state -- is dropped, because the platform will not report
+    /// the releases of keys held while the window was unfocused. Gain is
+    /// deliberately the opposite: it leaves every held value where it is,
+    /// because a gain must not resurrect input that ended with the loss.
+    pub fn on_focus_changed(&mut self, focused: bool) {
+        if !focused {
+            self.on_cursor_left();
+            self.on_modifiers_changed(false);
+        }
     }
 
     /// Winit reports modifier state as its own event, not on the key events it

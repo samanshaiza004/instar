@@ -30,6 +30,10 @@ interface kernel-types {
     variant commit-error {
         /// The batch failed to decode or validate.
         invalid-batch(string),
+        /// Another commit from this generation is still outstanding, so this
+        /// one is refused without being queued. The guest should retry after
+        /// the earlier commit resolves.
+        commit-in-progress,
         /// The committing generation is no longer current, so the host
         /// discarded the batch. A guest should not normally see this: by the
         /// time a generation is superseded its instance is being dropped. It

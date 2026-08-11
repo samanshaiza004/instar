@@ -825,8 +825,12 @@ impl Host {
                 let (x, y) = event.logical_pos.round();
                 self.on_pointer_moved(event.window_id, x, y)
             }
+            WindowOutput::PointerLeft { window_id } => self.on_pointer_left(window_id),
             WindowOutput::Scroll(event) => self.on_scroll(event),
             WindowOutput::Key(event) => self.on_key(event),
+            WindowOutput::WindowFocusChanged { window_id, focused } => {
+                self.on_window_focus_changed(window_id, focused)
+            }
             WindowOutput::RedrawRequested { window_id } => self.on_redraw_requested(window_id),
             // Close policy lives here, not in the window layer. A host with a
             // guest to consult could ask it first; this one exits.
@@ -1329,6 +1333,75 @@ impl Host {
         }
         self.rebuild_scene(window_id);
         vec![HostEffect::Render { window: window_id }]
+    }
+
+    /// The pointer left the window.
+    ///
+    /// A lifecycle cancellation, not an event with a position: hover is gone,
+    /// a scrollbar drag cannot continue, and a pointer press cannot complete
+    /// against anything. What survives is semantic focus and a keyboard Space
+    /// capture -- neither depends on the pointer being over the window.
+    fn on_pointer_left(&mut self, window_id: WindowId) -> Vec<HostEffect> {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return Vec::new();
+        };
+        let hover_changed = window.scroll.set_hovered(None);
+        let had_drag = window.scroll.dragging().is_some();
+        window.scroll.cancel_drag();
+        // `Interaction::cancel` is the existing capture-clearing primitive;
+        // the source check keeps it from touching a Space press the keyboard
+        // owns, which a pointer leaving the window must not cancel.
+        let had_pointer_press = window
+            .interaction
+            .press()
+            .is_some_and(|press| press.source == instar_ui::PressSource::Pointer);
+        if had_pointer_press {
+            window.interaction.cancel();
+        }
+        if !hover_changed && !had_drag && !had_pointer_press {
+            return Vec::new();
+        }
+        self.present_lifecycle_cancellation(window_id)
+    }
+
+    /// The window gained or lost keyboard focus.
+    ///
+    /// Loss cancels every transient input capture made against this surface
+    /// -- hover, a pointer press, a thumb drag, and a Space held on the
+    /// focused control -- because winit will not deliver the releases while
+    /// the window is unfocused. The focused [`NodeKey`] is retained: it is
+    /// semantic state, and the keyboard may come back. Gain emits the
+    /// lifecycle event but restores nothing, because held input died with the
+    /// loss and must not be resurrected.
+    fn on_window_focus_changed(&mut self, window_id: WindowId, focused: bool) -> Vec<HostEffect> {
+        if focused {
+            return Vec::new();
+        }
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return Vec::new();
+        };
+        let hover_changed = window.scroll.set_hovered(None);
+        let had_drag = window.scroll.dragging().is_some();
+        window.scroll.cancel_drag();
+        let had_press = window.interaction.pressed().is_some();
+        window.interaction.cancel();
+        if !hover_changed && !had_drag && !had_press {
+            return Vec::new();
+        }
+        self.present_lifecycle_cancellation(window_id)
+    }
+
+    /// Lower the scene for a lifecycle cancellation and ask for the frame
+    /// that shows it, deferring the request while the metrics barrier is open.
+    fn present_lifecycle_cancellation(&mut self, window_id: WindowId) -> Vec<HostEffect> {
+        self.rebuild_scene(window_id);
+        let window = self.windows.entry(window_id).or_default();
+        if window.metrics.is_ready() {
+            vec![HostEffect::Render { window: window_id }]
+        } else {
+            window.redraw_pending = true;
+            Vec::new()
+        }
     }
 
     /// A key went down or came up.
@@ -4078,6 +4151,256 @@ mod tests {
         assert!(window.scroll.dragging().is_none(), "the drag went with it");
         assert!(window.scroll.hovered().is_none(), "so did the hover");
         assert!(window.scroll.is_empty(), "and the offset");
+    }
+
+    // --- HARDEN-1: window lifecycle cancellation. ---
+
+    fn focus_lost() -> WindowOutput {
+        WindowOutput::WindowFocusChanged {
+            window_id: WINDOW,
+            focused: false,
+        }
+    }
+
+    fn focus_regained() -> WindowOutput {
+        WindowOutput::WindowFocusChanged {
+            window_id: WINDOW,
+            focused: true,
+        }
+    }
+
+    #[test]
+    fn pointer_left_cancels_a_pointer_press_but_keeps_focus() {
+        let mut host = keyboard_host();
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|layout| layout.get(NodeKey::first(91)))
+            .unwrap();
+        let (x, y) = (f64::from(rect.x + 1), f64::from(rect.y + 1));
+        host.handle(pointer(PointerState::Pressed, x, y));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91))
+        );
+
+        let effects = host.handle(WindowOutput::PointerLeft { window_id: WINDOW });
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "a press the pointer started cannot outlive the pointer"
+        );
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(91)),
+            "semantic focus is not pointer capture and survives a CursorLeft"
+        );
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "clearing the pressed look is a visible change and asks for a frame"
+        );
+
+        assert!(
+            activations(&host.handle(pointer(PointerState::Released, x, y))).is_empty(),
+            "the later release cannot complete a press the pointer no longer owns"
+        );
+    }
+
+    #[test]
+    fn pointer_left_keeps_a_keyboard_space_capture_and_requests_no_frame() {
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91))
+        );
+
+        let effects = host.handle(WindowOutput::PointerLeft { window_id: WINDOW });
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91)),
+            "a Space capture belongs to focus, not to the pointer"
+        );
+        assert_eq!(focused(&host), Some(NodeKey::first(91)));
+        assert!(
+            effects.is_empty(),
+            "nothing visible changed, so a CursorLeft must not ask for a \
+             frame: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_left_cancels_a_scrollbar_drag() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        let viewport = NodeKey::first(50);
+        let x = f64::from(bar.thumb.x + 2);
+        let start_y = f64::from(bar.thumb.y + 2);
+
+        host.handle(pointer(PointerState::Pressed, x, start_y));
+        host.handle(moved(x, start_y + 30.0));
+        let offset = host.window(WINDOW).unwrap().scroll.get(viewport).y;
+        assert!(offset > 0, "the drag is live before the pointer leaves");
+
+        let effects = host.handle(WindowOutput::PointerLeft { window_id: WINDOW });
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_none(),
+            "a drag whose pointer left the window cannot continue"
+        );
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "releasing the thumb's held look is a visible change"
+        );
+
+        host.handle(moved(-500.0, -500.0));
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.get(viewport).y,
+            offset,
+            "a later move must not resume the cancelled drag"
+        );
+    }
+
+    #[test]
+    fn pointer_left_clears_scrollbar_hover_and_a_noop_requests_no_frame() {
+        let mut host = scrolled_host();
+        let bar = bar_of(&host);
+        host.on_pointer_moved(WINDOW, bar.thumb.x + 2, bar.thumb.y + 2);
+        assert!(
+            host.window(WINDOW).unwrap().scroll.hovered().is_some(),
+            "hover is present before the pointer leaves"
+        );
+
+        let effects = host.handle(WindowOutput::PointerLeft { window_id: WINDOW });
+        assert_eq!(
+            host.window(WINDOW).unwrap().scroll.hovered(),
+            None,
+            "hover presentation cannot survive the pointer leaving"
+        );
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "removing hover is a visible change and asks for a frame"
+        );
+
+        assert!(
+            host.handle(WindowOutput::PointerLeft { window_id: WINDOW })
+                .is_empty(),
+            "a second PointerLeft changes nothing visible, so no frame"
+        );
+    }
+
+    #[test]
+    fn focus_loss_cancels_a_pointer_press_and_the_release_cannot_activate() {
+        let mut host = keyboard_host();
+        let rect = host
+            .window(WINDOW)
+            .and_then(HostWindow::layout)
+            .and_then(|layout| layout.get(NodeKey::first(91)))
+            .unwrap();
+        let (x, y) = (f64::from(rect.x + 1), f64::from(rect.y + 1));
+        host.handle(pointer(PointerState::Pressed, x, y));
+
+        let effects = host.handle(focus_lost());
+        assert_eq!(host.window(WINDOW).unwrap().interaction.pressed(), None);
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(91)),
+            "focus loss retains the focused NodeKey"
+        );
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "clearing the pressed look is a visible change"
+        );
+
+        assert!(
+            activations(&host.handle(pointer(PointerState::Released, x, y))).is_empty(),
+            "the release that follows focus loss cannot activate anything"
+        );
+    }
+
+    #[test]
+    fn focus_loss_cancels_a_space_capture_and_the_release_cannot_activate() {
+        let mut host = keyboard_host();
+        host.handle(key_event(instar_window::Key::Space, true, false));
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            Some(NodeKey::first(91))
+        );
+
+        let effects = host.handle(focus_lost());
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "a Space held on the focused control dies with focus"
+        );
+        assert_eq!(focused(&host), Some(NodeKey::first(91)));
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "the held button's pressed look cleared, so a frame is due"
+        );
+
+        assert!(
+            activations(&host.handle(key_event(instar_window::Key::Space, false, false)))
+                .is_empty(),
+            "the Space up after focus loss cannot activate anything"
+        );
+
+        assert!(
+            host.handle(focus_regained()).is_empty(),
+            "regaining focus restores nothing and asks for nothing"
+        );
+        assert_eq!(
+            host.window(WINDOW).unwrap().interaction.pressed(),
+            None,
+            "the held input is not resurrected by a regain"
+        );
+        assert!(
+            activations(&host.handle(key_event(instar_window::Key::Space, false, false)))
+                .is_empty(),
+            "and a later Space up still cannot activate the dead capture"
+        );
+    }
+
+    #[test]
+    fn focus_loss_clears_hover_and_drag_while_retaining_focus() {
+        let mut host = scrolled_host();
+        host.handle(key(instar_window::Key::Tab, false));
+        assert_eq!(focused(&host), Some(NodeKey::first(53)));
+
+        let bar = bar_of(&host);
+        let x = f64::from(bar.thumb.x + 2);
+        let start_y = f64::from(bar.thumb.y + 2);
+        host.on_pointer_moved(WINDOW, bar.thumb.x + 2, bar.thumb.y + 2);
+        host.handle(pointer(PointerState::Pressed, x, start_y));
+        assert!(
+            host.window(WINDOW).unwrap().scroll.dragging().is_some(),
+            "the drag is live before focus is lost"
+        );
+
+        let effects = host.handle(focus_lost());
+        let window = host.window(WINDOW).unwrap();
+        assert_eq!(window.scroll.hovered(), None);
+        assert_eq!(window.scroll.dragging(), None);
+        assert_eq!(
+            focused(&host),
+            Some(NodeKey::first(53)),
+            "the focused NodeKey survives focus loss"
+        );
+        assert!(
+            effects.contains(&HostEffect::Render { window: WINDOW }),
+            "hover and the held thumb both cleared, so a frame is due"
+        );
+    }
+
+    #[test]
+    fn focus_loss_with_nothing_captured_requests_no_frame() {
+        let mut host = keyboard_host();
+        let effects = host.handle(focus_lost());
+        assert!(
+            effects.is_empty(),
+            "a loss that changes no hover, press or drag is a no-op: \
+             {effects:?}"
+        );
+        assert_eq!(focused(&host), Some(NodeKey::first(91)));
     }
 
     // --- C5: a paint-only change must not touch the text cache. ---

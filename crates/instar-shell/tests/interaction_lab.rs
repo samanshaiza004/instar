@@ -115,8 +115,8 @@ impl Lab {
 
     /// The real path: a winit event, translated, routed.
     ///
-    /// A translation that yields nothing is not an error — `CursorLeft` and
-    /// `ModifiersChanged` legitimately produce no output — so this reports
+    /// A translation that yields nothing is not an error — for example,
+    /// `ModifiersChanged` only updates translator state — so this reports
     /// whether anything was routed.
     fn send(&mut self, event: WindowEvent) -> Vec<HostEffect> {
         match winit_adapter::translate(&mut self.state, WINDOW, &event) {
@@ -142,6 +142,12 @@ impl Lab {
         self.send(WindowEvent::CursorMoved {
             device_id: winit::event::DeviceId::dummy(),
             position: PhysicalPosition::new(x, y),
+        })
+    }
+
+    fn leave(&mut self) -> Vec<HostEffect> {
+        self.send(WindowEvent::CursorLeft {
+            device_id: winit::event::DeviceId::dummy(),
         })
     }
 
@@ -178,6 +184,10 @@ impl Lab {
         self.send(WindowEvent::ModifiersChanged(state.into()));
     }
 
+    fn focus(&mut self, focused: bool) -> Vec<HostEffect> {
+        self.send(WindowEvent::Focused(focused))
+    }
+
     fn offset_of(&self, viewport: NodeKey) -> i32 {
         self.bridge
             .host()
@@ -204,6 +214,15 @@ impl Lab {
             .expect("the window")
             .focus()
             .focus_visible()
+    }
+
+    fn hovered(&self) -> Option<(NodeKey, instar_ui::ScrollbarPart)> {
+        self.bridge
+            .host()
+            .window(WINDOW)
+            .expect("the window")
+            .scroll()
+            .hovered()
     }
 
     /// The rect a control occupies, in content coordinates.
@@ -291,6 +310,137 @@ fn a_pointer_click_reaches_the_guest_and_comes_back_as_a_visible_change() {
         lab.status().starts_with("pointer 1"),
         "the guest should have counted the click: {}",
         lab.status()
+    );
+}
+
+// --- Window lifecycle cancellation --------------------------------------
+
+/// HARDEN-1's pointer regression, through real winit events: a press before
+/// focus loss is cancelled, so a later release cannot activate anything.
+#[test]
+fn a_release_after_focus_loss_cannot_activate() {
+    let mut lab = Lab::open();
+    let (x, y) = lab.screen_point_of(POINTER_TARGET, OUTER);
+
+    lab.move_to(x, y);
+    lab.button(ElementState::Pressed);
+    lab.focus(false);
+    let effects = lab.button(ElementState::Released);
+
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, HostEffect::SendToGuest(_))),
+        "the release must not reach the guest: {effects:?}"
+    );
+    assert!(
+        lab.status().starts_with("pointer 0"),
+        "the guest must not have counted a click: {}",
+        lab.status()
+    );
+}
+
+/// HARDEN-1's keyboard regression, at the deepest point winit permits: Space
+/// goes down, focus is lost, and the Space up cannot complete a capture that
+/// died with the window's focus.
+#[test]
+fn space_up_after_focus_loss_cannot_activate() {
+    let mut lab = Lab::open();
+    lab.press_key(NamedKey::Tab);
+    lab.press_key(NamedKey::Tab);
+    assert_eq!(lab.focused(), Some(POINTER_TARGET));
+
+    lab.key(NamedKey::Space, true);
+    lab.focus(false);
+    let effects = lab.key(NamedKey::Space, false);
+
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, HostEffect::SendToGuest(_))),
+        "the Space up must not reach the guest: {effects:?}"
+    );
+    assert!(
+        lab.status().starts_with("pointer 0"),
+        "the guest must not have counted an activation: {}",
+        lab.status()
+    );
+}
+
+/// Shift is translator state, so focus loss must forget it: winit will not
+/// report the release while the window is unfocused, and a regain must not
+/// resurrect it. Traversal stays forward until the platform reports shift
+/// held again.
+#[test]
+fn focus_loss_forgets_shift_until_it_is_reported_again() {
+    let mut lab = Lab::open();
+    lab.press_key(NamedKey::Tab);
+    assert_eq!(lab.focused(), Some(STALL));
+
+    lab.shift(true);
+    lab.focus(false);
+    lab.focus(true);
+    lab.press_key(NamedKey::Tab);
+    assert_eq!(
+        lab.focused(),
+        Some(POINTER_TARGET),
+        "after focus loss and regain, Tab traverses forward -- the held \
+         shift must not have been resurrected"
+    );
+
+    lab.shift(true);
+    lab.press_key(NamedKey::Tab);
+    assert_eq!(
+        lab.focused(),
+        Some(STALL),
+        "and once the platform reports shift held again, traversal reverses"
+    );
+}
+
+/// A thumb drag is pointer-owned, so CursorLeft cancels it: a later move over
+/// the scrollbar must not continue scrolling the viewport.
+#[test]
+fn cursor_left_cancels_a_thumb_drag() {
+    let mut lab = Lab::open();
+    let bar = scrollbar(&lab, OUTER);
+    let thumb_x = f64::from(bar.thumb.x + bar.thumb.width / 2);
+    let thumb_y = f64::from(bar.thumb.y + 2);
+
+    lab.move_to(thumb_x, thumb_y);
+    lab.button(ElementState::Pressed);
+    lab.move_to(thumb_x, thumb_y + 40.0);
+    let dragged = lab.offset_of(OUTER);
+    assert!(dragged > 0, "the drag is live before the pointer leaves");
+
+    lab.leave();
+    lab.move_to(thumb_x, thumb_y + 80.0);
+    assert_eq!(
+        lab.offset_of(OUTER),
+        dragged,
+        "the drag cannot continue after CursorLeft"
+    );
+
+    lab.button(ElementState::Released);
+}
+
+/// Hover is presentation, so CursorLeft must remove it the moment the pointer
+/// is no longer over the window.
+#[test]
+fn cursor_left_removes_scrollbar_hover() {
+    let mut lab = Lab::open();
+    let bar = scrollbar(&lab, OUTER);
+
+    lab.move_to(f64::from(bar.thumb.x + 2), f64::from(bar.thumb.y + 2));
+    assert!(
+        lab.hovered().is_some(),
+        "hover is present before the pointer leaves"
+    );
+
+    lab.leave();
+    assert_eq!(
+        lab.hovered(),
+        None,
+        "hover presentation cannot survive the pointer leaving the window"
     );
 }
 

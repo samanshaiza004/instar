@@ -31,6 +31,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bridge::{CommitRejection, CommitSink};
+use crate::resource::{EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy};
 
 wasmtime::component::bindgen!({
     path: "wit",
@@ -164,6 +165,12 @@ pub struct SharedKernel {
     commits: Mutex<Vec<(GenerationId, Vec<u8>)>>,
     revision: AtomicU64,
     stale_commits_rejected: AtomicU64,
+    /// Commits refused because their generation already had one outstanding.
+    ///
+    /// Kept separate from stale rejections because the two are different
+    /// failures: a stale generation is dead, while an in-progress rejection
+    /// is a live generation being asked to overlap itself.
+    commit_in_progress_rejections: AtomicU64,
     /// Where commits go when an embedder owns the retained tree (WP7B1).
     ///
     /// Absent by default, and the absence is a supported mode rather than an
@@ -189,6 +196,7 @@ impl Default for SharedKernel {
             commits: Mutex::default(),
             revision: AtomicU64::new(0),
             stale_commits_rejected: AtomicU64::new(0),
+            commit_in_progress_rejections: AtomicU64::new(0),
             commit_sink: OnceLock::new(),
         }
     }
@@ -221,6 +229,12 @@ impl SharedKernel {
     /// exists to prevent.
     pub fn stale_commits_rejected(&self) -> u64 {
         self.stale_commits_rejected.load(Ordering::SeqCst)
+    }
+
+    /// How many commits were refused because another commit from the same
+    /// generation was already outstanding.
+    pub fn commit_single_flight_rejections(&self) -> u64 {
+        self.commit_in_progress_rejections.load(Ordering::SeqCst)
     }
 
     pub fn live_operations(&self) -> usize {
@@ -261,12 +275,25 @@ impl SharedKernel {
     async fn commit_batch(
         &self,
         generation: GenerationId,
+        commit_slot: Arc<tokio::sync::Semaphore>,
         batch: Vec<u8>,
     ) -> Result<CommitResult, CommitError> {
         if !self.is_current(generation) {
             self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
             return Err(CommitError::StaleGeneration);
         }
+
+        // Single-flight gate. The permit is RAII: it is released when this
+        // future completes, is rejected, is cancelled, or is dropped -- so a
+        // later sequential commit can always proceed after the first resolves.
+        let _commit_permit = match commit_slot.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.commit_in_progress_rejections
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(CommitError::CommitInProgress);
+            }
+        };
 
         let Some(sink) = self.commit_sink.get() else {
             // No owner installed: keep the batch here so a headless caller can
@@ -311,7 +338,9 @@ struct GenerationState {
     table: ResourceTable,
     kernel: Arc<SharedKernel>,
     generation: GenerationId,
+    commit_slot: Arc<tokio::sync::Semaphore>,
     events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Event>>>,
+    limits: MeasuredLimiter,
 }
 
 impl WasiView for GenerationState {
@@ -372,12 +401,16 @@ impl instar::kernel::kernel_ui::HostWithStore<GenerationState>
         batch: Vec<u8>,
     ) -> impl std::future::Future<Output = wasmtime::Result<Result<CommitResult, CommitError>>> + Send
     {
-        let (kernel, generation) = accessor.with(|mut access| {
+        let (kernel, generation, commit_slot) = accessor.with(|mut access| {
             let state = access.get();
-            (Arc::clone(&state.kernel), state.generation)
+            (
+                Arc::clone(&state.kernel),
+                state.generation,
+                Arc::clone(&state.commit_slot),
+            )
         });
 
-        async move { Ok(kernel.commit_batch(generation, batch).await) }
+        async move { Ok(kernel.commit_batch(generation, commit_slot, batch).await) }
     }
 }
 
@@ -492,6 +525,7 @@ pub struct RuntimeGeneration {
     store: Store<GenerationState>,
     bindings: Kernel,
     events: tokio::sync::mpsc::Sender<Event>,
+    metrics: Arc<ResourceMetrics>,
 }
 
 /// How many events may be queued for a guest that has not yet asked for them.
@@ -613,6 +647,11 @@ impl RuntimeGeneration {
     pub fn concurrent_state_table_size(&mut self) -> usize {
         self.store.concurrent_state_table_size()
     }
+
+    /// Resource evidence collected from this generation's Store.
+    pub fn metrics(&self) -> Arc<ResourceMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 /// Owns the engine, the shared host state, and the generation sequence.
@@ -621,10 +660,24 @@ pub struct Runtime {
     component: Component,
     linker: Linker<GenerationState>,
     kernel: Arc<SharedKernel>,
+    policy: ResourcePolicy,
 }
 
 impl Runtime {
     pub fn new(component_bytes: &[u8]) -> wasmtime::Result<Self> {
+        Self::new_with_policy(component_bytes, ResourcePolicy::instar_default())
+    }
+
+    /// Builds a runtime whose generations run under `policy`.
+    ///
+    /// Production uses [`Runtime::new`], which applies Instar's one policy.
+    /// The parameterised constructor exists so the measurement gate can probe
+    /// a component's core-instance demand and so the resource tests can prove
+    /// containment with a deliberately small ceiling.
+    pub fn new_with_policy(
+        component_bytes: &[u8],
+        policy: ResourcePolicy,
+    ) -> wasmtime::Result<Self> {
         let engine = crate::engine::configured_engine()?;
         let component = Component::from_binary(&engine, component_bytes)?;
 
@@ -637,11 +690,24 @@ impl Runtime {
             component,
             linker,
             kernel: Arc::default(),
+            policy,
         })
     }
 
     pub fn kernel(&self) -> Arc<SharedKernel> {
         Arc::clone(&self.kernel)
+    }
+
+    /// The engine this runtime instantiates its generations on.
+    ///
+    /// Handed to the runtime thread so an out-of-band shutdown can increment
+    /// the epoch and interrupt non-yielding Wasm.
+    pub fn engine(&self) -> wasmtime::Engine {
+        self.engine.clone()
+    }
+
+    pub fn policy(&self) -> ResourcePolicy {
+        self.policy
     }
 
     /// Creates the next generation: a fresh `Store`, a fresh instance, and a
@@ -654,15 +720,22 @@ impl Runtime {
         let id = GenerationId(self.kernel.current.fetch_add(1, Ordering::SeqCst) + 1);
 
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let metrics = Arc::new(ResourceMetrics::for_component(&self.component));
         let state = GenerationState {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             kernel: Arc::clone(&self.kernel),
             generation: id,
+            commit_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             events: Arc::new(tokio::sync::Mutex::new(events_rx)),
+            limits: MeasuredLimiter::new(&self.policy, Arc::clone(&metrics)),
         };
 
         let mut store = Store::new(&self.engine, state);
+        store.limiter(|state| &mut state.limits);
+        // The shutdown path's single epoch increment is the deadline. See
+        // `resource::EPOCH_DEADLINE_TICKS`.
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
         let instance = self
             .linker
             .instantiate_async(&mut store, &self.component)
@@ -674,6 +747,7 @@ impl Runtime {
             store,
             bindings,
             events: events_tx,
+            metrics,
         })
     }
 
@@ -711,4 +785,256 @@ impl Runtime {
 /// The guest fixture component for the kernel world, built by `build.rs`.
 pub fn guest_component_bytes() -> std::io::Result<Vec<u8>> {
     std::fs::read(env!("KERNEL_GUEST_WASM"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::{CommitRequest, CommitSink};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A sink that accepts requests and lets the test answer them by hand.
+    #[derive(Default)]
+    struct HeldSink {
+        held: Mutex<Vec<CommitRequest>>,
+    }
+
+    impl CommitSink for HeldSink {
+        fn submit(&self, request: CommitRequest) -> Result<(), CommitRequest> {
+            self.held.lock().expect("held sink poisoned").push(request);
+            Ok(())
+        }
+    }
+
+    impl HeldSink {
+        async fn wait_for_one(&self) -> CommitRequest {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let mut held = self.held.lock().expect("held sink poisoned");
+                        if !held.is_empty() {
+                            return held.remove(0);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the sink never received the commit")
+        }
+    }
+
+    fn kernel_with_sink() -> (Arc<SharedKernel>, Arc<HeldSink>) {
+        let kernel = Arc::new(SharedKernel::default());
+        let sink = Arc::new(HeldSink::default());
+        kernel
+            .install_commit_sink(sink.clone())
+            .expect("installs once");
+        (kernel, sink)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_commits_are_single_flight_and_the_slot_releases() {
+        let (kernel, sink) = kernel_with_sink();
+        let slot = Arc::new(tokio::sync::Semaphore::new(1));
+        kernel.current.store(1, Ordering::SeqCst);
+
+        let first = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .await
+            }
+        });
+        let first_request = sink.wait_for_one().await;
+        assert_eq!(first_request.generation(), GenerationId(1));
+
+        // The second attempt must fail immediately, before any request is
+        // created or enqueued.
+        let second = kernel
+            .commit_batch(GenerationId(1), Arc::clone(&slot), b"second".to_vec())
+            .await;
+        assert!(
+            matches!(second, Err(CommitError::CommitInProgress)),
+            "the concurrent attempt must fail as commit-in-progress, got {second:?}"
+        );
+        assert_eq!(kernel.commit_single_flight_rejections(), 1);
+
+        let screened = first_request
+            .screen(kernel.current_generation())
+            .expect("gen1 is current");
+        screened.accept(7);
+        assert_eq!(
+            first
+                .await
+                .expect("task ran")
+                .expect("commit resolves")
+                .revision,
+            7
+        );
+
+        // Once the first resolves, a later sequential commit works again.
+        let third = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"third".to_vec())
+                    .await
+            }
+        });
+        let third_request = sink.wait_for_one().await;
+        let screened = third_request
+            .screen(kernel.current_generation())
+            .expect("gen1 is current");
+        screened.accept(8);
+        assert_eq!(
+            third
+                .await
+                .expect("task ran")
+                .expect("commit resolves")
+                .revision,
+            8
+        );
+        assert_eq!(kernel.commit_single_flight_rejections(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_an_in_flight_commit_releases_the_slot() {
+        let (kernel, sink) = kernel_with_sink();
+        let slot = Arc::new(tokio::sync::Semaphore::new(1));
+        kernel.current.store(1, Ordering::SeqCst);
+
+        let first = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .await
+            }
+        });
+        let held = sink.wait_for_one().await;
+
+        // Cancel the guest side of the commit. The permit must be released by
+        // the future's drop even though the host never answered.
+        first.abort();
+        assert!(first.await.is_err(), "the in-flight commit was dropped");
+        drop(held);
+
+        let second = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"second".to_vec())
+                    .await
+            }
+        });
+        let second_request = sink.wait_for_one().await;
+        let screened = second_request
+            .screen(kernel.current_generation())
+            .expect("gen1 is current");
+        screened.accept(9);
+        assert_eq!(
+            second
+                .await
+                .expect("task ran")
+                .expect("commit resolves")
+                .revision,
+            9
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_generation_does_not_share_the_previous_slot() {
+        let (kernel, sink) = kernel_with_sink();
+        let first_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let second_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        kernel.current.store(1, Ordering::SeqCst);
+
+        let _first = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&first_slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .await
+            }
+        });
+        let _first_request = sink.wait_for_one().await;
+
+        // Gen1 is still outstanding, but gen2 has its own slot: it must not be
+        // refused as "commit in progress" by gen1's commit.
+        kernel.current.store(2, Ordering::SeqCst);
+        let second = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&second_slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(2), slot, b"second".to_vec())
+                    .await
+            }
+        });
+        let second_request = sink.wait_for_one().await;
+        assert_eq!(second_request.generation(), GenerationId(2));
+
+        let screened = second_request
+            .screen(kernel.current_generation())
+            .expect("gen2 is current");
+        screened.accept(11);
+        assert_eq!(
+            second
+                .await
+                .expect("task ran")
+                .expect("commit resolves")
+                .revision,
+            11
+        );
+        assert_eq!(kernel.commit_single_flight_rejections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_commits_fail_before_the_single_flight_slot() {
+        let (kernel, sink) = kernel_with_sink();
+        let current_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        kernel.current.store(2, Ordering::SeqCst);
+
+        // Occupy gen2's slot so the ordering is observable: gen1's stale
+        // commit must be rejected as stale, not as commit-in-progress.
+        let occupied = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&current_slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(2), slot, b"current".to_vec())
+                    .await
+            }
+        });
+        let held = sink.wait_for_one().await;
+
+        let stale = kernel
+            .commit_batch(
+                GenerationId(1),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                b"stale".to_vec(),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(CommitError::StaleGeneration)),
+            "the stale commit must be rejected as stale, got {stale:?}"
+        );
+        assert_eq!(kernel.stale_commits_rejected(), 1);
+        assert_eq!(
+            kernel.commit_single_flight_rejections(),
+            0,
+            "a dead generation must not consume a live generation's slot"
+        );
+
+        drop(held);
+        occupied.abort();
+    }
 }

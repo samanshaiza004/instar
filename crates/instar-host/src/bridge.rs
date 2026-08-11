@@ -71,10 +71,10 @@
 //! `recv_timeout` parks the thread properly, where a Tokio receiver would
 //! leave it spinning.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use instar_kernel::bridge::{CommitRejection, CommitRequest, CommitSink, GuestEvent};
 use instar_kernel::runtime::{GenerationId, Runtime};
@@ -140,6 +140,16 @@ pub enum HostUserEvent {
         generation: GenerationId,
         request: CommitRequest,
     },
+}
+
+/// How a guest generation ended.
+///
+/// This is terminal state, not ordinary work: it cannot compete with commits
+/// for queue capacity, cannot be dropped by back-pressure, and is observed
+/// exactly once. The runtime thread stores it in a dedicated single slot that
+/// the main thread drains before touching any ordinary `UiCommit` work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalOutcome {
     /// The guest trapped, or returned an error from `run`.
     GuestTrapped {
         generation: GenerationId,
@@ -162,7 +172,15 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 struct MainThreadSink {
     events: SyncSender<HostUserEvent>,
     wake: Wake,
-    dropped: AtomicU64,
+    dropped: Arc<AtomicU64>,
+}
+
+/// The main-thread side of the bridge, as handed to the runtime thread.
+struct MainThreadChannels {
+    events: SyncSender<HostUserEvent>,
+    terminal: Arc<Mutex<Option<TerminalOutcome>>>,
+    dropped_commits: Arc<AtomicU64>,
+    wake: Wake,
 }
 
 impl MainThreadSink {
@@ -195,7 +213,6 @@ impl CommitSink for MainThreadSink {
             // is the one that knows how to turn "nobody took this" into a
             // verdict the guest can act on.
             Err(HostUserEvent::UiCommit { request, .. }) => Err(request),
-            Err(_) => unreachable!("emit returns the event it was given"),
         }
     }
 }
@@ -211,6 +228,9 @@ enum Ending {
 struct Started {
     generation: GenerationId,
     kernel: Arc<instar_kernel::runtime::SharedKernel>,
+    /// The engine the guest runs on, so the main thread can increment its
+    /// epoch as the out-of-band half of shutdown.
+    engine: wasmtime::Engine,
 }
 
 /// Owns the guest: one thread, one Tokio runtime, one generation at a time.
@@ -230,6 +250,11 @@ pub struct RuntimeThread {
     /// state through it; that all goes over the command queue.
     kernel: Arc<instar_kernel::runtime::SharedKernel>,
     dropped_commands: u64,
+    /// Commits the runtime thread could not queue because the runtime->main
+    /// queue was full or the main thread was gone.
+    dropped_commits: Arc<AtomicU64>,
+    /// The engine hosting the guest, retained for shutdown's epoch increment.
+    engine: wasmtime::Engine,
 }
 
 impl RuntimeThread {
@@ -242,35 +267,41 @@ impl RuntimeThread {
     pub fn spawn(
         component: Vec<u8>,
         events: SyncSender<HostUserEvent>,
+        terminal: Arc<Mutex<Option<TerminalOutcome>>>,
+        dropped_commits: Arc<AtomicU64>,
         wake: Wake,
     ) -> Result<Self, String> {
         let (commands_tx, commands_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(tokio::sync::Notify::new());
         let thread_stop = Arc::clone(&stop);
+        let thread_dropped_commits = Arc::clone(&dropped_commits);
+        let channels = MainThreadChannels {
+            events,
+            terminal,
+            dropped_commits,
+            wake,
+        };
 
         let join = std::thread::Builder::new()
             .name("instar-runtime".to_string())
-            .spawn(move || {
-                run_thread(
-                    component,
-                    commands_rx,
-                    thread_stop,
-                    events,
-                    wake,
-                    started_tx,
-                )
-            })
+            .spawn(move || run_thread(component, commands_rx, thread_stop, channels, started_tx))
             .map_err(|error| format!("could not start the runtime thread: {error}"))?;
 
         match started_rx.recv() {
-            Ok(Ok(Started { generation, kernel })) => Ok(Self {
+            Ok(Ok(Started {
+                generation,
+                kernel,
+                engine,
+            })) => Ok(Self {
                 commands: commands_tx,
                 stop,
                 join: Some(join),
                 generation,
                 kernel,
                 dropped_commands: 0,
+                dropped_commits: thread_dropped_commits,
+                engine,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("the runtime thread died before it started a guest".to_string()),
@@ -284,6 +315,12 @@ impl RuntimeThread {
     /// Host operations still in flight for the guest.
     pub fn live_operations(&self) -> usize {
         self.kernel.live_operations()
+    }
+
+    /// Commits refused because another commit from the same generation was
+    /// already outstanding.
+    pub fn commit_single_flight_rejections(&self) -> u64 {
+        self.kernel.commit_single_flight_rejections()
     }
 
     /// Commands queued for the runtime thread but not yet taken.
@@ -313,12 +350,24 @@ impl RuntimeThread {
         self.dropped_commands
     }
 
+    /// Commits dropped because the runtime->main queue was full or the main
+    /// thread was gone.
+    pub fn dropped_commits(&self) -> u64 {
+        self.dropped_commits.load(Ordering::Relaxed)
+    }
+
     /// Asks the guest to stop and waits for the thread.
     ///
-    /// The signal jumps the command queue, because the state most in need of
-    /// shutting down is exactly the state where that queue is full.
+    /// The cooperative signal jumps the command queue, because the state most
+    /// in need of shutting down is exactly the state where that queue is full.
+    /// The epoch increment is the second, independent half: it interrupts a
+    /// guest executing non-yielding Wasm that will never look at the queue.
+    /// Together they bound shutdown for executing Wasm (epoch trap), parked
+    /// guests (cooperative shutdown), and guests suspended inside host
+    /// operations (the runtime's own `SHUTDOWN_GRACE`).
     pub fn shutdown(&mut self) {
         self.stop.notify_one();
+        self.engine.increment_epoch();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -336,6 +385,7 @@ impl std::fmt::Debug for RuntimeThread {
         f.debug_struct("RuntimeThread")
             .field("generation", &self.generation)
             .field("dropped_commands", &self.dropped_commands)
+            .field("dropped_commits", &self.dropped_commits())
             .finish_non_exhaustive()
     }
 }
@@ -345,8 +395,7 @@ fn run_thread(
     component: Vec<u8>,
     mut commands: mpsc::Receiver<RuntimeCommand>,
     stop: Arc<tokio::sync::Notify>,
-    events: SyncSender<HostUserEvent>,
-    wake: Wake,
+    channels: MainThreadChannels,
     started: std::sync::mpsc::Sender<Result<Started, String>>,
 ) {
     // Current-thread on purpose. This thread exists to drive one guest and the
@@ -365,9 +414,9 @@ fn run_thread(
     };
 
     let sink = Arc::new(MainThreadSink {
-        events,
-        wake,
-        dropped: AtomicU64::new(0),
+        events: channels.events,
+        wake: channels.wake,
+        dropped: channels.dropped_commits,
     });
 
     runtime.block_on(async move {
@@ -397,6 +446,7 @@ fn run_thread(
         let started = started.send(Ok(Started {
             generation: id,
             kernel: Arc::clone(&kernel),
+            engine: runtime.engine(),
         }));
         if started.is_err() {
             return;
@@ -413,13 +463,21 @@ fn run_thread(
         // guest task.
         runtime.destroy_generation(generation);
 
-        let _ = sink.emit(match ending {
-            Ending::Exited => HostUserEvent::GuestExited { generation: id },
-            Ending::Trapped(error) => HostUserEvent::GuestTrapped {
-                generation: id,
-                error,
-            },
-        });
+        // Terminal state lives outside the bounded queue on purpose. The main
+        // thread observes it exactly once, before any queued commit, and it
+        // cannot be dropped by a saturated work queue. The wake is what makes
+        // a parked winit loop look.
+        {
+            let mut slot = channels.terminal.lock().expect("terminal slot poisoned");
+            *slot = Some(match ending {
+                Ending::Exited => TerminalOutcome::GuestExited { generation: id },
+                Ending::Trapped(error) => TerminalOutcome::GuestTrapped {
+                    generation: id,
+                    error,
+                },
+            });
+        }
+        (sink.wake)();
     });
 }
 
@@ -551,6 +609,10 @@ pub struct BridgeStats {
     pub applied_commits: u64,
     /// Events the winit thread could not queue because the runtime was behind.
     pub dropped_commands: u64,
+    /// Commits the runtime thread could not queue because the runtime->main
+    /// queue was full or the main thread was gone. Terminal outcomes are not
+    /// work and are never counted here.
+    pub dropped_commits: u64,
 }
 
 /// The main thread's half of the bridge.
@@ -571,6 +633,12 @@ pub struct HostBridge {
     window: WindowId,
     runtime: RuntimeThread,
     events: std::sync::mpsc::Receiver<HostUserEvent>,
+    /// The terminal slot shared with the runtime thread. A guest generation
+    /// stores at most one outcome here, outside the bounded work queue.
+    terminal: Arc<Mutex<Option<TerminalOutcome>>>,
+    /// Wake callback retained so a bounded pump can arrange another pass when
+    /// it stops with ordinary work still queued.
+    wake: Wake,
     /// Accepted guest commits, in order.
     ///
     /// The counter the guest sees: `screened.accept(...)` is handed this value,
@@ -606,13 +674,24 @@ impl HostBridge {
 
     fn start(host: Host, component: Vec<u8>, window: WindowId, wake: Wake) -> Result<Self, String> {
         let (events_tx, events_rx) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
-        let runtime = RuntimeThread::spawn(component, events_tx, wake)?;
+        let terminal: Arc<Mutex<Option<TerminalOutcome>>> = Arc::default();
+        let dropped_commits = Arc::new(AtomicU64::new(0));
+        let bridge_wake = Arc::clone(&wake);
+        let runtime = RuntimeThread::spawn(
+            component,
+            events_tx,
+            Arc::clone(&terminal),
+            dropped_commits,
+            wake,
+        )?;
         Ok(Self {
             host,
             generation: runtime.generation(),
             window,
             runtime,
             events: events_rx,
+            terminal,
+            wake: bridge_wake,
             commit_sequence: 0,
             stats: BridgeStats::default(),
         })
@@ -635,8 +714,15 @@ impl HostBridge {
     pub fn stats(&self) -> BridgeStats {
         BridgeStats {
             dropped_commands: self.runtime.dropped_commands(),
+            dropped_commits: self.runtime.dropped_commits(),
             ..self.stats
         }
+    }
+
+    /// Commits refused by the kernel because another commit from the same
+    /// generation was already outstanding.
+    pub fn commit_single_flight_rejections(&self) -> u64 {
+        self.runtime.commit_single_flight_rejections()
     }
 
     /// The sequence number of the last accepted guest commit.
@@ -746,16 +832,64 @@ impl HostBridge {
             .send(RuntimeCommand::CancelOperation(operation))
     }
 
-    /// Drains everything the runtime thread has queued, without blocking.
+    /// How many ordinary messages one pump call may process before yielding.
+    ///
+    /// Together with [`PUMP_TIME_BUDGET`] this keeps a winit user-event turn
+    /// bounded even when the guest has queued a large backlog. The item bound
+    /// is deterministic; the time bound is a short ceiling for expensive items.
+    pub const PUMP_ITEM_BUDGET: usize = 64;
+
+    /// The elapsed-time budget for one pump call. Once it is spent, the pump
+    /// arranges another wake and returns; a winit event-loop turn never
+    /// becomes a hidden batch job.
+    pub const PUMP_TIME_BUDGET: Duration = Duration::from_millis(1);
+
+    /// Drains up to one pump budget of runtime thread work, without blocking.
     ///
     /// This is what a winit `user_event` handler calls: the proxy only says
-    /// *that* something arrived, and the queue says what.
+    /// *that* something arrived, and the queue says what. Terminal state is
+    /// observed before any ordinary work; if the budget stops the pass with
+    /// ordinary work still queued, the retained wake arranges another pass.
     pub fn pump(&mut self) -> Vec<HostEffect> {
+        self.pump_bounded(Self::PUMP_ITEM_BUDGET, Self::PUMP_TIME_BUDGET)
+    }
+
+    /// The budgeted pump, parameterised so deterministic tests can force the
+    /// item or time bound without waiting on wall-clock luck.
+    fn pump_bounded(&mut self, item_budget: usize, time_budget: Duration) -> Vec<HostEffect> {
         let mut effects = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
-            effects.extend(self.on_user_event(event));
+        let deadline = Instant::now() + time_budget;
+        let mut processed = 0usize;
+
+        loop {
+            // Terminal first, on every turn. A generation that has ended makes
+            // every still-queued commit unacceptable, so the outcome must be
+            // observed before another byte of ordinary work is touched.
+            let outcome = self.terminal.lock().expect("terminal slot poisoned").take();
+            if let Some(outcome) = outcome {
+                effects.extend(self.on_terminal(outcome));
+                // Retirement changes the generation to zero. Continue through
+                // the ordinary budget so queued commits are screened stale,
+                // without turning terminal handling into an unbounded drain.
+                continue;
+            }
+
+            match self.events.try_recv() {
+                Ok(event) => {
+                    effects.extend(self.on_user_event(event));
+                    processed += 1;
+                    if processed >= item_budget || Instant::now() >= deadline {
+                        // A continuation wake is harmless if the queue happens
+                        // to be empty exactly here, and necessary whenever it
+                        // is not: winit must not block waiting for a pass the
+                        // main thread was asked to arrange itself.
+                        (self.wake)();
+                        return effects;
+                    }
+                }
+                Err(_) => return effects,
+            }
         }
-        effects
     }
 
     /// Parks until the runtime thread queues something, or `timeout` passes,
@@ -767,13 +901,42 @@ impl HostBridge {
     /// calls this: winit owns the parking there, and the proxy wake is what
     /// ends it.
     pub fn wait(&mut self, timeout: Duration) -> Vec<HostEffect> {
+        if self
+            .terminal
+            .lock()
+            .expect("terminal slot poisoned")
+            .is_some()
+        {
+            return self.pump();
+        }
         let first = match self.events.recv_timeout(timeout) {
             Ok(event) => event,
-            Err(_) => return Vec::new(),
+            // Nothing ordinary arrived. Terminal may have been stored while we
+            // were parked, and pump observes it first.
+            Err(_) => return self.pump(),
         };
-        let mut effects = self.on_user_event(first);
+
+        // The terminal slot is checked again after the receive: a terminal
+        // outcome may have arrived before this queued commit was drained, and
+        // in that case the commit must be refused, not applied.
+        let mut effects = Vec::new();
+        let outcome = self.terminal.lock().expect("terminal slot poisoned").take();
+        if let Some(outcome) = outcome {
+            effects.extend(self.on_terminal(outcome));
+            effects.extend(self.on_user_event(first));
+            effects.extend(self.pump());
+            return effects;
+        }
+
+        effects.extend(self.on_user_event(first));
         effects.extend(self.pump());
         effects
+    }
+
+    /// Stores a terminal outcome as if the runtime thread had just reported
+    /// it. The next pump observes it exactly once, before ordinary work.
+    pub fn report_terminal(&mut self, outcome: TerminalOutcome) {
+        *self.terminal.lock().expect("terminal slot poisoned") = Some(outcome);
     }
 
     /// Applies one message from the runtime thread, in the order
@@ -786,7 +949,13 @@ impl HostBridge {
     pub fn on_user_event(&mut self, event: HostUserEvent) -> Vec<HostEffect> {
         match event {
             HostUserEvent::UiCommit { request, .. } => self.on_ui_commit(request),
-            HostUserEvent::GuestTrapped { generation, error } => {
+        }
+    }
+
+    /// Applies one terminal outcome exactly once.
+    fn on_terminal(&mut self, outcome: TerminalOutcome) -> Vec<HostEffect> {
+        match outcome {
+            TerminalOutcome::GuestTrapped { generation, error } => {
                 self.retire(generation);
                 // Presentation first, so the `GuestGone` the caller receives is
                 // already accompanied by the frame that shows it.
@@ -799,7 +968,7 @@ impl HostBridge {
                 });
                 effects
             }
-            HostUserEvent::GuestExited { generation } => {
+            TerminalOutcome::GuestExited { generation } => {
                 self.retire(generation);
                 let mut effects = self.host.on_guest_gone(self.window, generation, None);
                 effects.push(HostEffect::GuestGone {
@@ -888,5 +1057,228 @@ impl std::fmt::Debug for HostBridge {
             .field("commit_sequence", &self.commit_sequence)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HostWindow;
+    use instar_kernel::bridge::commit_request;
+    use instar_kernel::runtime::SharedKernel;
+    use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
+    use instar_ui::{NodeKey, NodeKind};
+    use instar_window::{LogicalSize, PhysicalSize, WindowMetricsChanged};
+
+    const WINDOW: WindowId = WindowId::from_raw(1);
+    const GEN: GenerationId = GenerationId(1);
+
+    fn metrics() -> WindowMetricsChanged {
+        WindowMetricsChanged {
+            window_id: WINDOW,
+            logical_size: LogicalSize {
+                width: 400.0,
+                height: 400.0,
+            },
+            physical_size: PhysicalSize {
+                width: 400,
+                height: 400,
+            },
+            scale_factor: 1.0,
+        }
+    }
+
+    fn valid_batch(text: &str) -> Vec<u8> {
+        let fill = WireLayout {
+            align_self: Some(WireAlign::Stretch),
+            ..WireLayout::default()
+        };
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(opcode::NODE_ROOT, NodeKey::first(0), 0, None, fill, 1)
+            .node(opcode::NODE_COLUMN, NodeKey::first(1), 0, None, fill, 1)
+            .node(
+                opcode::NODE_TEXT,
+                NodeKey::first(2),
+                flags::ENABLED,
+                Some(text),
+                WireLayout::default(),
+                0,
+            );
+        encoder.finish()
+    }
+
+    fn label_text(bridge: &HostBridge) -> String {
+        match bridge
+            .host()
+            .window(WINDOW)
+            .and_then(HostWindow::tree)
+            .and_then(|tree| tree.find(NodeKey::first(2)))
+            .map(|node| &node.kind)
+        {
+            Some(NodeKind::Text { text }) => text.clone(),
+            other => panic!("expected a text node, found {other:?}"),
+        }
+    }
+
+    /// A bridge whose runtime thread is inert: the test feeds its queue
+    /// directly through the returned sender. Real guest behaviour is covered
+    /// by `crates/instar-host/tests/bridge.rs`; here the main-thread half is
+    /// being driven deterministically.
+    fn test_bridge() -> (
+        HostBridge,
+        std::sync::mpsc::SyncSender<HostUserEvent>,
+        Arc<AtomicU64>,
+    ) {
+        let (events_tx, events_rx) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
+        let (commands_tx, _commands_rx) = mpsc::channel(1);
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let wake_count = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wake_count);
+        let wake: Wake = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let bridge = HostBridge {
+            host: Host::new(),
+            generation: GEN,
+            window: WINDOW,
+            runtime: RuntimeThread {
+                commands: commands_tx,
+                stop,
+                join: None,
+                generation: GEN,
+                kernel: Arc::new(SharedKernel::default()),
+                dropped_commands: 0,
+                dropped_commits: Arc::new(AtomicU64::new(0)),
+                engine: instar_kernel::engine::configured_engine()
+                    .expect("a dummy engine for the inert test bridge"),
+            },
+            events: events_rx,
+            terminal: Arc::default(),
+            wake,
+            commit_sequence: 0,
+            stats: BridgeStats::default(),
+        };
+        (bridge, events_tx, wake_count)
+    }
+
+    fn queued_commit(batch: Vec<u8>) -> HostUserEvent {
+        HostUserEvent::UiCommit {
+            generation: GEN,
+            request: commit_request(GEN, batch).0,
+        }
+    }
+
+    #[test]
+    fn pump_respects_its_item_budget_and_schedules_continuation() {
+        let (mut bridge, events_tx, wake_count) = test_bridge();
+        const TOTAL: usize = 128;
+        for _ in 0..TOTAL {
+            events_tx
+                .try_send(queued_commit(b"undecodable".to_vec()))
+                .expect("the queue accepts the test load");
+        }
+
+        let effects = bridge.pump_bounded(16, Duration::from_secs(60));
+        assert!(effects.is_empty());
+        assert_eq!(bridge.stats().rejected_commits, 16);
+        assert!(
+            wake_count.load(Ordering::Relaxed) > 0,
+            "work remains, so the pump must arrange another wake"
+        );
+
+        bridge.pump_bounded(usize::MAX, Duration::from_secs(60));
+        assert_eq!(bridge.stats().rejected_commits, TOTAL as u64);
+    }
+
+    #[test]
+    fn pump_respects_its_time_budget() {
+        let (mut bridge, events_tx, wake_count) = test_bridge();
+        for _ in 0..4 {
+            events_tx
+                .try_send(queued_commit(b"undecodable".to_vec()))
+                .expect("the queue accepts the test load");
+        }
+
+        // A zero time budget forces the time bound to fire after one item.
+        bridge.pump_bounded(usize::MAX, Duration::ZERO);
+        assert_eq!(
+            bridge.stats().rejected_commits,
+            1,
+            "the elapsed-time budget must stop the pass"
+        );
+        assert!(wake_count.load(Ordering::Relaxed) > 0);
+
+        bridge.pump_bounded(usize::MAX, Duration::from_secs(60));
+        assert_eq!(bridge.stats().rejected_commits, 4);
+    }
+
+    #[test]
+    fn bounded_pump_preserves_ordinary_ordering() {
+        let (mut bridge, events_tx, _wake_count) = test_bridge();
+        bridge.on_window_event(WindowOutput::MetricsChanged(metrics()));
+        for text in ["first", "second", "third"] {
+            events_tx
+                .try_send(queued_commit(valid_batch(text)))
+                .expect("the queue accepts the test load");
+        }
+
+        bridge.pump_bounded(2, Duration::from_secs(60));
+        assert_eq!(bridge.commit_sequence(), 2);
+        assert_eq!(
+            label_text(&bridge),
+            "second",
+            "after two items the second-queued batch must be the one applied"
+        );
+
+        bridge.pump_bounded(usize::MAX, Duration::from_secs(60));
+        assert_eq!(bridge.commit_sequence(), 3);
+        assert_eq!(label_text(&bridge), "third");
+    }
+
+    #[test]
+    fn terminal_is_observed_first_exactly_once_and_drops_no_work() {
+        let (mut bridge, events_tx, wake_count) = test_bridge();
+
+        // Saturate the bounded ordinary queue, then report terminal state. The
+        // terminal outcome must still be observed, and must not be counted as
+        // dropped work; every queued commit is refused instead of applied.
+        for _ in 0..QUEUE_CAPACITY {
+            events_tx
+                .try_send(queued_commit(b"undecodable".to_vec()))
+                .expect("the queue accepts exactly its capacity");
+        }
+        bridge.report_terminal(TerminalOutcome::GuestExited { generation: GEN });
+
+        let effects = bridge.pump_bounded(64, Duration::from_secs(60));
+        assert_eq!(
+            effects,
+            vec![HostEffect::GuestGone {
+                generation: GEN,
+                error: None,
+            }],
+            "the terminal outcome is observed before any queued commit"
+        );
+        assert_eq!(bridge.stats().stale_commits, 64);
+        assert_eq!(bridge.stats().applied_commits, 0);
+        assert_eq!(bridge.stats().dropped_commits, 0);
+        assert_eq!(bridge.generation(), GenerationId(0));
+        assert!(
+            wake_count.load(Ordering::Relaxed) > 0,
+            "the remaining stale work must schedule a continuation"
+        );
+
+        while bridge.stats().stale_commits < QUEUE_CAPACITY as u64 {
+            assert!(
+                bridge.pump_bounded(64, Duration::from_secs(60)).is_empty(),
+                "terminal state must not be observed again"
+            );
+        }
+        assert_eq!(bridge.stats().stale_commits, QUEUE_CAPACITY as u64);
+        assert!(
+            bridge.pump().is_empty(),
+            "the terminal outcome is consumed exactly once"
+        );
     }
 }

@@ -114,7 +114,7 @@ pub fn translate(
 
         WindowEvent::CursorLeft { .. } => {
             state.on_cursor_left();
-            None
+            Some(WindowOutput::PointerLeft { window_id })
         }
 
         WindowEvent::MouseInput {
@@ -154,6 +154,18 @@ pub fn translate(
         WindowEvent::ModifiersChanged(modifiers) => {
             state.on_modifiers_changed(modifiers.state().shift_key());
             None
+        }
+
+        // Keyboard focus is a lifecycle cancellation surface: losing focus
+        // means winit will not deliver the releases of keys held while the
+        // window was focused, so the translator drops what it was holding.
+        // Gaining focus emits the event but restores nothing.
+        WindowEvent::Focused(focused) => {
+            state.on_focus_changed(*focused);
+            Some(WindowOutput::WindowFocusChanged {
+                window_id,
+                focused: *focused,
+            })
         }
 
         // Package E built focus traversal, Enter/Space activation and the
@@ -213,7 +225,7 @@ mod tests {
     use super::*;
     use crate::{LogicalPoint, RawScrollEvent};
     use winit::dpi::PhysicalPosition;
-    use winit::event::{DeviceId, MouseScrollDelta, TouchPhase};
+    use winit::event::{DeviceId, ElementState, MouseScrollDelta, TouchPhase};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
 
@@ -254,6 +266,24 @@ mod tests {
         }
     }
 
+    fn mouse(state: ElementState) -> WindowEvent {
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: winit::event::MouseButton::Left,
+        }
+    }
+
+    fn left() -> WindowEvent {
+        WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        }
+    }
+
+    fn focused(focused: bool) -> WindowEvent {
+        WindowEvent::Focused(focused)
+    }
+
     /// A move is an event, and it carries where it happened.
     ///
     /// This arm returned `None` for the whole of packages B through F, which
@@ -282,20 +312,120 @@ mod tests {
     fn a_move_still_positions_the_button_event_that_follows_it() {
         let mut state = state(2.0);
         translate(&mut state, WINDOW, &moved(80.0, 40.0));
-        match translate(
-            &mut state,
-            WINDOW,
-            &WindowEvent::MouseInput {
-                device_id: DeviceId::dummy(),
-                state: winit::event::ElementState::Pressed,
-                button: winit::event::MouseButton::Left,
-            },
-        ) {
+        match translate(&mut state, WINDOW, &mouse(ElementState::Pressed)) {
             Some(WindowOutput::Pointer(event)) => {
                 assert_eq!(event.logical_pos, LogicalPoint { x: 40.0, y: 20.0 })
             }
             other => panic!("expected a press, got {other:?}"),
         }
+    }
+
+    /// The pointer leaving is an event with a lifecycle, not a quiet internal
+    /// detail: the cursor position is cleared and the host is told, so it can
+    /// cancel hover, a press, and a thumb drag that can no longer continue.
+    #[test]
+    fn cursor_left_clears_the_position_and_emits_pointer_left() {
+        let mut state = state(1.0);
+        translate(&mut state, WINDOW, &moved(40.0, 30.0));
+        assert_eq!(state.last_cursor(), Some(LogicalPoint::new(40.0, 30.0)));
+
+        match translate(&mut state, WINDOW, &left()) {
+            Some(WindowOutput::PointerLeft { window_id }) => assert_eq!(window_id, WINDOW),
+            other => panic!("CursorLeft must emit PointerLeft, got {other:?}"),
+        }
+        assert_eq!(
+            state.last_cursor(),
+            None,
+            "CursorLeft clears the position the next button event would use"
+        );
+        assert!(
+            translate(&mut state, WINDOW, &mouse(ElementState::Released)).is_none(),
+            "a button event after the pointer left has nowhere to be"
+        );
+    }
+
+    /// Focus loss is the same class of cancellation for the keyboard: the
+    /// window may never hear the releases, so holding shift past a loss would
+    /// make the first Tab after regain traverse backwards forever.
+    #[test]
+    fn focus_loss_clears_cursor_and_shift_and_emits_window_focus_changed() {
+        let mut state = state(1.0);
+        translate(&mut state, WINDOW, &moved(40.0, 30.0));
+        translate(
+            &mut state,
+            WINDOW,
+            &WindowEvent::ModifiersChanged(winit::keyboard::ModifiersState::SHIFT.into()),
+        );
+
+        match translate(&mut state, WINDOW, &focused(false)) {
+            Some(WindowOutput::WindowFocusChanged { window_id, focused }) => {
+                assert_eq!(window_id, WINDOW);
+                assert!(!focused);
+            }
+            other => panic!("Focused(false) must emit WindowFocusChanged, got {other:?}"),
+        }
+        assert_eq!(
+            state.last_cursor(),
+            None,
+            "focus loss leaves no cursor position behind"
+        );
+        assert!(
+            !state.on_key(Key::Tab, true, false).shift,
+            "focus loss forgets shift rather than waiting for a release that \
+             may never arrive"
+        );
+    }
+
+    /// A regain is reported so the host has the full lifecycle, but it is not
+    /// permission to resurrect input that ended with the loss.
+    #[test]
+    fn focus_gain_emits_the_event_without_resurrecting_cursor_or_modifiers() {
+        let mut state = state(1.0);
+        translate(&mut state, WINDOW, &moved(40.0, 30.0));
+        translate(
+            &mut state,
+            WINDOW,
+            &WindowEvent::ModifiersChanged(winit::keyboard::ModifiersState::SHIFT.into()),
+        );
+        translate(&mut state, WINDOW, &focused(false));
+
+        match translate(&mut state, WINDOW, &focused(true)) {
+            Some(WindowOutput::WindowFocusChanged { window_id, focused }) => {
+                assert_eq!(window_id, WINDOW);
+                assert!(focused);
+            }
+            other => panic!("Focused(true) must emit WindowFocusChanged, got {other:?}"),
+        }
+        assert_eq!(
+            state.last_cursor(),
+            None,
+            "a regain must not fake a cursor position that was never reported"
+        );
+        assert!(
+            !state.on_key(Key::Tab, true, false).shift,
+            "a regain must not resurrect a shift state that ended with the loss"
+        );
+    }
+
+    /// The window-layer half of the HARDEN-1 press regression: a press before
+    /// focus loss, followed by a release, must not even be attributed to a
+    /// position once the loss cleared the cursor.
+    #[test]
+    fn a_release_after_focus_loss_has_nowhere_to_land() {
+        let mut state = state(1.0);
+        translate(&mut state, WINDOW, &moved(40.0, 30.0));
+        match translate(&mut state, WINDOW, &mouse(ElementState::Pressed)) {
+            Some(WindowOutput::Pointer(event)) => assert_eq!(event.state, PointerState::Pressed),
+            other => panic!("expected a press, got {other:?}"),
+        }
+
+        translate(&mut state, WINDOW, &focused(false));
+
+        assert!(
+            translate(&mut state, WINDOW, &mouse(ElementState::Released)).is_none(),
+            "the release must not be attributed to a position that left with \
+             focus"
+        );
     }
 
     /// The wrong-window guard applies here too: this window's scale factor

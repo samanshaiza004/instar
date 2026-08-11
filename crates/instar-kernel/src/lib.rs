@@ -25,5 +25,6 @@
 
 pub mod bridge;
 pub mod engine;
+pub mod resource;
 pub mod runtime;
 pub mod spike;

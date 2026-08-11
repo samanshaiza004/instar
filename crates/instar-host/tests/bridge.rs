@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, Wake};
+use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, TerminalOutcome, Wake};
 use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
@@ -71,6 +71,7 @@ const NONSENSE: NodeKey = NodeKey::first(8);
 const GIANT: NodeKey = NodeKey::first(9);
 const SILENT: NodeKey = NodeKey::first(10);
 const FLOOD: NodeKey = NodeKey::first(11);
+const FLOOD_COMMITS: NodeKey = NodeKey::first(12);
 
 /// The bound a click-to-committed-tree round-trip must stay inside.
 ///
@@ -747,8 +748,21 @@ fn an_old_generation_commit_is_rejected_before_decoding() {
     let (mut bridge, _wakes) = ready();
     let old = bridge.generation();
 
-    // Retire the generation the way a clean guest exit does.
-    bridge.on_user_event(HostUserEvent::GuestExited { generation: old });
+    // Retire the generation the way a clean guest exit does: report the
+    // terminal outcome, then let the next pump observe it before ordinary work.
+    bridge.report_terminal(TerminalOutcome::GuestExited { generation: old });
+    assert_eq!(
+        bridge.pump(),
+        vec![HostEffect::GuestGone {
+            generation: old,
+            error: None,
+        }],
+        "the exit is observed exactly once and produces the guest-gone effect"
+    );
+    assert!(
+        bridge.pump().is_empty(),
+        "a second pump must not re-observe the terminal outcome"
+    );
     assert_eq!(
         bridge.generation(),
         GenerationId(0),
@@ -833,6 +847,57 @@ fn a_thousand_click_cycles_return_to_baseline() {
         bridge.pump().is_empty(),
         "and nothing should be left waiting on the runtime->main queue"
     );
+}
+
+// --- HARDEN-2: single-flight commits ---
+
+/// A guest fires 512 commits at once and then terminates. Exactly one commit
+/// may become outstanding; the other 511 must be refused by the kernel before
+/// a request is created, and the guest's own sequential summary commit proves
+/// the single-flight slot released after the first resolved.
+#[test]
+fn a_flood_of_concurrent_commits_allows_one_and_then_terminates() {
+    let (mut bridge, _wakes) = ready();
+    let baseline_sequence = bridge.commit_sequence();
+    let baseline_applied = bridge.stats().applied_commits;
+
+    click(&mut bridge, FLOOD_COMMITS);
+    let ending = await_guest_gone(&mut bridge);
+    assert_eq!(
+        ending, None,
+        "the flood guest should terminate cleanly after its summary commit"
+    );
+
+    let summary = label(&bridge);
+    assert_eq!(
+        summary, "Flooded 512 commits: applied 1, in-progress 511, other 0",
+        "the guest should observe exactly one accepted commit and 511 refusals"
+    );
+    assert_eq!(
+        bridge.commit_single_flight_rejections(),
+        511,
+        "the kernel must count every in-progress refusal"
+    );
+    assert_eq!(
+        bridge.commit_sequence() - baseline_sequence,
+        2,
+        "the first flood commit plus the sequential summary commit both apply"
+    );
+    assert_eq!(
+        bridge.stats().applied_commits - baseline_applied,
+        2,
+        "no other flood attempt may reach the host"
+    );
+    assert_eq!(bridge.stats().rejected_commits, 0);
+    assert_eq!(bridge.stats().stale_commits, 0);
+    assert_eq!(bridge.stats().dropped_commits, 0);
+    assert_eq!(bridge.stats().dropped_commands, 0);
+    assert_eq!(bridge.queued_commands(), 0);
+    assert!(
+        bridge.pump().is_empty(),
+        "terminal state and the ordinary queue are fully drained"
+    );
+    bridge.shutdown();
 }
 
 // --- WP8: the rest of what a guest is permitted to do wrong ---

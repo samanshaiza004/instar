@@ -23,6 +23,9 @@
 //! | Silent | Stops committing entirely | a guest that goes quiet without dying |
 //! | Trap | Panics | the host-owned crash surface |
 //! | Flood | Returns an error far over the crash cap | that the crash surface itself is bounded |
+//! | Spin | Runs a non-yielding Wasm loop forever | that out-of-band shutdown can interrupt executing Wasm |
+//! | Grow | Allocates past the Instar memory policy | that a policy violation is a contained guest failure |
+//! | Sleep | Awaits a 30s host operation | that shutdown stays bounded for a guest suspended in a host op |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -46,9 +49,13 @@ use instar_ui_protocol::{
 };
 
 use crate::instar::kernel::kernel_runtime;
-use crate::instar::kernel::kernel_types::RuntimeError;
+use crate::instar::kernel::kernel_types::{CommitError, CommitResult, RuntimeError};
 use crate::instar::kernel::kernel_ui;
 use crate::instar::kernel::ops;
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 const ROOT: NodeKey = NodeKey::first(0);
 const COLUMN: NodeKey = NodeKey::first(1);
@@ -62,6 +69,10 @@ const NONSENSE: NodeKey = NodeKey::first(8);
 const GIANT: NodeKey = NodeKey::first(9);
 const SILENT: NodeKey = NodeKey::first(10);
 const FLOOD: NodeKey = NodeKey::first(11);
+const FLOOD_COMMITS: NodeKey = NodeKey::first(12);
+const SPIN: NodeKey = NodeKey::first(13);
+const GROW: NodeKey = NodeKey::first(14);
+const SLEEP: NodeKey = NodeKey::first(15);
 
 /// How long the bulk operation runs. Long enough that it is unambiguously
 /// still in flight while the gate measures a click round-trip against it.
@@ -70,6 +81,20 @@ const BULK_MILLIS: &str = "3000";
 /// Comfortably over the host's 32 KiB crash-surface cap, so the clamp is
 /// exercised by a real trap rather than only by a unit test.
 const FLOOD_LINES: usize = 4_000;
+
+/// How many commits the flood button fires concurrently. Comfortably beyond
+/// any queue bound, so the host's single-flight gate is what refuses them,
+/// not channel capacity.
+const CONCURRENT_COMMITS: usize = 512;
+
+/// How much memory the Grow button asks for. Deliberately twice the Instar
+/// default policy ceiling (64 MiB), so the request can only succeed if the
+/// policy has drifted out from under the fixture.
+const GROW_BYTES: usize = 128 * 1024 * 1024;
+
+/// How long the Sleep button blocks inside a host operation. Far beyond any
+/// shutdown grace, so a shutdown that waited on it would be visibly broken.
+const SLEEP_MILLIS: &str = "30000";
 
 fn container(padding: u16, gap: u16) -> WireLayout {
     WireLayout {
@@ -109,6 +134,17 @@ struct Hostile {
     /// trap: this string crosses the boundary intact, and its length is the
     /// guest's to choose.
     bail: Option<String>,
+    /// Set to fire [`CONCURRENT_COMMITS`] commits at once, then commit a
+    /// summary and terminate cleanly.
+    flood: bool,
+    /// Set to enter a non-yielding Wasm loop after the next commit.
+    spin: bool,
+    /// Set to attempt an allocation past the Instar memory policy.
+    grow: bool,
+    /// Set to suspend inside a 30s host operation.
+    sleep: bool,
+    /// When set, replaces the label text for the next normal commit.
+    label_override: Option<String>,
 }
 
 impl Hostile {
@@ -122,12 +158,16 @@ impl Hostile {
         let mut encoder = BatchEncoder::new();
         encoder
             .node(opcode::NODE_ROOT, ROOT, 0, None, container(8, 0), 1)
-            .node(opcode::NODE_COLUMN, COLUMN, 0, None, container(0, 4), 10)
+            .node(opcode::NODE_COLUMN, COLUMN, 0, None, container(0, 4), 14)
             .node(
                 opcode::NODE_TEXT,
                 LABEL,
                 0,
-                Some(&format!("Clicked {} times, {} bulk", self.count, self.bulk)),
+                Some(
+                    self.label_override
+                        .as_deref()
+                        .unwrap_or(&format!("Clicked {} times, {} bulk", self.count, self.bulk)),
+                ),
                 WireLayout::default(),
                 0,
             )
@@ -202,6 +242,38 @@ impl Hostile {
                 Some("Fail loudly"),
                 WireLayout::default(),
                 0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                FLOOD_COMMITS,
+                flags::ENABLED,
+                Some("Flood 512 commits"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                SPIN,
+                flags::ENABLED,
+                Some("Spin forever"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                GROW,
+                flags::ENABLED,
+                Some("Grow past policy"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                SLEEP,
+                flags::ENABLED,
+                Some("Sleep on host op"),
+                WireLayout::default(),
+                0,
             );
         encoder.finish()
     }
@@ -268,6 +340,60 @@ impl Hostile {
         }
     }
 
+    /// Fires [`CONCURRENT_COMMITS`] commits concurrently and waits for every
+    /// verdict. The join is hand-rolled because a guest fixture has no
+    /// executor crate to depend on: the Component Model task polls each import
+    /// future until its waitable is ready, which is exactly what the kernel's
+    /// single-flight gate is being asked to survive.
+    async fn flood_commits(&self) -> String {
+        let mut pending: Vec<Option<PendingCommit>> = Vec::with_capacity(CONCURRENT_COMMITS);
+        for _ in 0..CONCURRENT_COMMITS {
+            pending.push(Some(Box::pin(kernel_ui::commit(self.encode()))));
+        }
+        let outcome = JoinCommits {
+            pending,
+            applied: 0,
+            in_progress: 0,
+            other: 0,
+        }
+        .await;
+        format!(
+            "Flooded {} commits: applied {}, in-progress {}, other {}",
+            CONCURRENT_COMMITS, outcome.applied, outcome.in_progress, outcome.other
+        )
+    }
+
+    /// Allocates [`GROW_BYTES`] inside one linear memory.
+    ///
+    /// The Instar policy's `memory_bytes` ceiling is below this, so the
+    /// allocation must fail as a guest trap. If the allocation succeeds, the
+    /// guest commits that fact so a drifted policy fails the gate loudly
+    /// instead of silently passing.
+    async fn grow_memory(&mut self) -> Result<(), String> {
+        let bytes = vec![0u8; GROW_BYTES];
+        self.label_override = Some(format!("Grew {} bytes (policy drift!)", bytes.len()));
+        self.commit().await
+    }
+
+    /// Suspends inside a host operation for [`SLEEP_MILLIS`].
+    async fn sleep_on_host_op(&self) -> Result<(), String> {
+        let id = ops::start("delay", SLEEP_MILLIS.as_bytes());
+        match ops::await_op(id).await {
+            Ok(_bytes) => Ok(()),
+            Err(error) => Err(format!("sleep op failed: {error:?}")),
+        }
+    }
+
+    /// Never returns and never calls a host import: a real non-yielding Wasm
+    /// loop. Only the engine epoch mechanism can stop it.
+    fn spin_forever(&self) -> ! {
+        let mut counter: u64 = 0;
+        loop {
+            counter = counter.wrapping_add(1);
+            core::hint::black_box(counter);
+        }
+    }
+
     fn handle(&mut self, event: WireEvent) {
         match event {
             WireEvent::Click { node } if node == COUNT => self.count += 1,
@@ -311,9 +437,76 @@ impl Hostile {
                         .join("\n")
                 ));
             }
+            WireEvent::Click { node } if node == FLOOD_COMMITS => {
+                self.flood = true;
+            }
+            WireEvent::Click { node } if node == SPIN => {
+                self.label_override = Some("Spinning...".to_string());
+                self.spin = true;
+            }
+            WireEvent::Click { node } if node == GROW => {
+                self.label_override = Some("Growing...".to_string());
+                self.grow = true;
+            }
+            WireEvent::Click { node } if node == SLEEP => {
+                self.label_override = Some("Sleeping...".to_string());
+                self.sleep = true;
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
+        }
+    }
+}
+
+/// Outcome of the concurrent commit flood.
+struct FloodOutcome {
+    applied: u32,
+    in_progress: u32,
+    other: u32,
+}
+
+type PendingCommit = Pin<Box<dyn Future<Output = Result<CommitResult, CommitError>>>>;
+
+/// Polls a set of commit futures together, collecting the verdict each one
+/// produces. Completed futures are taken out so they are never polled twice.
+struct JoinCommits {
+    pending: Vec<Option<PendingCommit>>,
+    applied: u32,
+    in_progress: u32,
+    other: u32,
+}
+
+impl Future for JoinCommits {
+    type Output = FloodOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut remaining = 0usize;
+        for slot in &mut this.pending {
+            let Some(future) = slot.as_mut() else {
+                continue;
+            };
+            match future.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    match result {
+                        Ok(_) => this.applied += 1,
+                        Err(CommitError::CommitInProgress) => this.in_progress += 1,
+                        Err(_) => this.other += 1,
+                    }
+                    *slot = None;
+                }
+                Poll::Pending => remaining += 1,
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(FloodOutcome {
+                applied: this.applied,
+                in_progress: this.in_progress,
+                other: this.other,
+            })
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -327,6 +520,11 @@ impl Guest for Component {
             bulk: 0,
             mode: Mode::Normal,
             bail: None,
+            flood: false,
+            spin: false,
+            grow: false,
+            sleep: false,
+            label_override: None,
         };
         hostile.commit().await?;
 
@@ -339,7 +537,24 @@ impl Guest for Component {
                     if let Some(error) = hostile.bail.take() {
                         return Err(error);
                     }
+                    if std::mem::take(&mut hostile.flood) {
+                        let summary = hostile.flood_commits().await;
+                        hostile.label_override = Some(summary);
+                        hostile.commit().await?;
+                        return Ok(());
+                    }
                     hostile.commit().await?;
+                    // Each hostile mode is one-shot, and each engages after
+                    // its state-changing commit so the host can observe it.
+                    if std::mem::take(&mut hostile.spin) {
+                        hostile.spin_forever();
+                    }
+                    if std::mem::take(&mut hostile.grow) {
+                        hostile.grow_memory().await?;
+                    }
+                    if std::mem::take(&mut hostile.sleep) {
+                        hostile.sleep_on_host_op().await?;
+                    }
                 }
                 Err(RuntimeError::Shutdown) => return Ok(()),
                 Err(RuntimeError::Internal(message)) => return Err(message),
