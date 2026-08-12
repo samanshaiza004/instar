@@ -628,13 +628,86 @@ all before any Wasm participation
 TextSystem unit tests        edit and selection semantics
 TextView presentation tests  caret and selection geometry
 pixel tests                  caret, selection, preedit actually visible
-RuntimeHarness               a real WindowEvent reaches a TextView
+adapter integration          a real WindowEvent reaches a TextView through
+                             the host text-input seam
 manual IME smoke             the platform candidate window behaves
 ```
+
+The fourth line originally said "RuntimeHarness — a real `WindowEvent` reaches
+a `TextView`", and implementation disproved its premise. `RuntimeHarness` drives
+events through the *bridge* to a guest tree, and no wire vocabulary declares an
+editor surface, so nothing a guest commits can produce a text view to reach.
+
+Rather than invent `NODE_TEXT_VIEW` inside a pointer fixture, B2d proves the
+strongest claim that exists:
+
+```text
+B2   real WindowEvent -> winit adapter -> host text-input seam -> TextView
+
+B2e  real guest tree  -> TextView attachment -> the same host seam
+```
+
+That is not a weaker test. It is evidence that corresponds to architecture
+that exists, and the seam it exercises is production code B2e will call rather
+than test-only editor logic that would be written twice.
 
 The last is manual because winit itself documents IME support and candidate
 placement as varying by platform. It is a checklist item like F4, not a claim
 CI can make.
+
+### B2e — the attachment contract
+
+Deliberately its own package, because `NODE_TEXT_VIEW` is not plumbing. It
+cannot be added without answering:
+
+```text
+who creates a TextViewId?
+how does a guest obtain one?
+does removing the node detach the view, or destroy it?
+does it destroy the buffer?              it must not
+is focus identity a NodeKey or a TextViewId?
+what AccessKit role does the surface expose?
+can one TextView be attached twice?
+what survives a guest restart?
+```
+
+The shape of the answer is already implied by Package A's resource-lifetime
+rule, and is recorded here so that B2e argues about the remaining question
+rather than this one:
+
+```text
+semantic UI node
+  NodeKey                  presentation identity
+     └── references
+           TextViewId      editor-resource identity
+                └── TextBufferId
+```
+
+**Not** `NodeKey == TextView identity`. Collapsing them would reverse the
+crate and lifetime decision Package A established: a `NodeKey` dies when the
+tree stops containing it, and a document must not.
+
+```text
+semantic node owns   geometry, focusability, clipping, accessibility
+                     placement, attachment
+TextView owns        caret, selection, editor scroll, preedit, presentation
+TextBuffer owns      text, revisions, journal
+```
+
+So removing the node means: remove the presentation, retire pointer capture
+and focus naming that `NodeKey`, detach the view. It does **not** mean destroy
+the view or the buffer.
+
+One question is left open on purpose — *how a guest acquires the `TextViewId`
+it puts in a snapshot* — because answering it touches the resource and
+synchronization surface Phase 3 deferred, and inventing a convenient answer
+inside a pointer test is exactly what B2d refused to do.
+
+**B2e comes before B3.** Keyboard routing makes attachment unavoidable: the
+moment `ArrowLeft` exists, the host needs a principled answer to which focused
+control receives it. There is one canonical `FocusState`, and standing up a
+temporary `active_text_view` beside it would be a second answer to focus —
+the same defect class this project has now removed three times.
 
 ### Out of scope for B
 

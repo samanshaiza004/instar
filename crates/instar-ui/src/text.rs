@@ -441,8 +441,18 @@ impl TextLayout {
         if !self.shaped_valid {
             self.shaped = extract(&self.layout);
             self.shaped_valid = true;
+            EXTRACTIONS.with(|count| count.set(count.get() + 1));
         }
         &self.shaped
+    }
+
+    /// Glyph extractions performed on this thread.
+    ///
+    /// Diagnostic. Package B needs to be able to say whether moving a caret
+    /// re-derives render artifacts, and a counter is the only honest way to
+    /// answer that — a timing comparison would be measuring the machine.
+    pub fn extractions_on_this_thread() -> u64 {
+        EXTRACTIONS.with(|count| count.get())
     }
 
     pub fn width(&self) -> f32 {
@@ -615,6 +625,10 @@ fn ceil(width: f32) -> f32 {
 }
 
 thread_local! {
+    /// Glyph extractions on this thread. See
+    /// [`TextLayout::extractions_on_this_thread`].
+    static EXTRACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     /// Font stacks built on this thread.
     ///
     /// Parley intends a `FontContext` to be roughly one per application, and a

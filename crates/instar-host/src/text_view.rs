@@ -36,6 +36,7 @@ use std::ops::Range;
 use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
 use instar_text::{
     Revision, Selection, ShapingWindow, TextAffinity, TextPosition, TextStorage, TextViewId,
+    TextViewport,
 };
 use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
 
@@ -1364,5 +1365,131 @@ mod tests {
             .expect("a caret at byte 0 of an empty document has geometry");
         assert!(caret.height > 0.0, "and a line box to occupy");
         assert_eq!(caret.y, 0.0);
+    }
+}
+
+// ------------------------------------------------- the host text-input seam
+
+/// A live text view the host is presenting, and everything a pointer needs to
+/// reach it.
+///
+/// # What this is not, yet
+///
+/// It is **not** attached to the semantic UI tree. No wire vocabulary declares
+/// an editor surface, so nothing a guest commits can produce one of these.
+/// That is deliberate: `NODE_TEXT_VIEW` would drag in who creates a
+/// `TextViewId`, how a guest obtains one, whether removing a node detaches or
+/// destroys the view, whether it destroys the *buffer* (it must not), and
+/// whether focus identity is a `NodeKey` or a `TextViewId`. That is guest-
+/// facing architecture, not plumbing, and package B2e is where it gets decided.
+///
+/// What this *is* is the real route a future attachment will feed. The pointer
+/// path below is production code that B2e will call with a view it looked up
+/// from a node, rather than test-only editor logic that would then have to be
+/// written twice.
+pub struct HostTextSurface {
+    pub view: TextViewId,
+    pub viewport: TextViewport,
+    /// Where the surface sits in the window, in logical pixels.
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub presentation: PresentedText,
+    /// The revision `presentation` was built from.
+    pub revision: Revision,
+}
+
+/// What a pointer event did to a text surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPointerOutcome {
+    /// Nothing here: the event was not for this surface, or there was no drag.
+    Ignored,
+    /// The selection changed and the view needs repainting.
+    SelectionChanged(Selection),
+    /// A drag ended, or was cancelled by the lifecycle.
+    CaptureReleased,
+}
+
+/// Routes one translated window event to a text surface.
+///
+/// The whole seam, and deliberately the *only* way a pointer reaches text:
+///
+/// ```text
+/// winit::WindowEvent
+///   -> instar-window::winit_adapter::translate
+///   -> WindowOutput
+///   -> here
+///   -> instar-text::Selection
+/// ```
+///
+/// Every lifecycle event that ends a drag is handled by the same rules Phase 2
+/// established for a scrollbar thumb: `PointerLeft` and losing window focus
+/// cancel, a release ends it, and nothing else is a special case.
+pub fn handle_pointer(
+    interaction: &mut TextInteraction,
+    surface: &HostTextSurface,
+    output: &instar_window::WindowOutput,
+) -> TextPointerOutcome {
+    use instar_window::{PointerState, WindowOutput};
+
+    match output {
+        WindowOutput::Pointer(event) if event.state == PointerState::Pressed => {
+            let Some(position) = surface.position_at(event.logical_pos) else {
+                return TextPointerOutcome::Ignored;
+            };
+            let selection = interaction.press(surface.view, position, surface.revision);
+            TextPointerOutcome::SelectionChanged(selection)
+        }
+        WindowOutput::Pointer(event) if event.state == PointerState::Released => {
+            if interaction.is_dragging() {
+                interaction.release();
+                TextPointerOutcome::CaptureReleased
+            } else {
+                TextPointerOutcome::Ignored
+            }
+        }
+        WindowOutput::PointerMoved(event) => {
+            // Deliberately does not check whether the pointer is still over
+            // this surface. Capture means the drag owns the view until it
+            // ends, and a selection that stopped extending when the pointer
+            // wandered would be a drag that gives up halfway.
+            let Some(position) = surface.position_at(event.logical_pos) else {
+                return TextPointerOutcome::Ignored;
+            };
+            match interaction.drag_to(position, surface.revision) {
+                Some(selection) => TextPointerOutcome::SelectionChanged(selection),
+                None => TextPointerOutcome::Ignored,
+            }
+        }
+        WindowOutput::PointerLeft { .. } => {
+            if interaction.is_dragging() {
+                interaction.cancel();
+                TextPointerOutcome::CaptureReleased
+            } else {
+                TextPointerOutcome::Ignored
+            }
+        }
+        WindowOutput::WindowFocusChanged { focused: false, .. } => {
+            if interaction.is_dragging() {
+                interaction.cancel();
+                TextPointerOutcome::CaptureReleased
+            } else {
+                TextPointerOutcome::Ignored
+            }
+        }
+        _ => TextPointerOutcome::Ignored,
+    }
+}
+
+impl HostTextSurface {
+    /// A window-space point as a document position, or `None` when the point
+    /// is outside this surface.
+    fn position_at(&self, point: instar_window::LogicalPoint) -> Option<TextPosition> {
+        let x = point.x as f32 - self.origin_x;
+        let y = point.y as f32 - self.origin_y;
+        if x < 0.0 || y < 0.0 || y > self.viewport.height {
+            return None;
+        }
+        self.presentation
+            .position_at(x, y, self.viewport.row_height)
     }
 }
