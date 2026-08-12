@@ -951,10 +951,19 @@ guest create-empty-buffer()
 
 #### Three things that are load-bearing rather than incidental
 
-**Never hold Store or table access across the main-thread await.** For
-`create-view`: take the borrowed lease, copy its two `u32`s, release table
-access, *then* marshal. `Accessor` grants Store access *between* await points,
-not across them.
+**No Store-backed borrow survives the main-thread await.** Not a borrowed
+`ResourceTable` entry, not a `Resource<T>`-derived reference, not anything else
+the Store owns. For `create-view`: take the borrowed lease, copy its two
+`u32`s, drop the borrow, *then* marshal.
+
+Stated that way rather than as "no Store access across the await", which was
+shorthand borrowed from the true-async `commit` path and is not what this shape
+does. Synchronous WIT with `imports: { default: async | trappable }` generates
+async Rust methods while the call stays blocking from WebAssembly's point of
+view; `store` is a separate flag, and true WIT `async` functions are what get
+`Accessor` semantics. B2e-1 does not need `HostWithStore` or `Accessor` at all
+— the ordinary async imported-resource shape with a `ResourceTable` is enough,
+and it is what the spike compiled.
 
 **A failed table push must compensate.** The host resource already exists by
 the time `ResourceTable::push` runs:
@@ -1061,6 +1070,38 @@ no sink, or a disconnected one -> an error, never a parked guest
 
 The last matters as much as the rest: a capability boundary that can hang is
 worse than one that refuses.
+
+And the race, which is worth more than ordinary teardown because it is what
+proves the registry actually closes the cross-thread window:
+
+```text
+create-view for generation 17 is in flight
+GuestGone(17) arrives
+
+allowed    GuestGone wins   -> the request is refused, nothing is allocated
+allowed    creation wins    -> the view exists, its lease is registered, and
+                              GuestGone then releases it
+forbidden  an orphaned TextView with no owner at all
+```
+
+#### Typed refusals are not traps
+
+`trappable` grants the *ability* to trap; it does not make every refusal one.
+
+```text
+text-error   resource limits, a stale lease, no text service available
+trap         a corrupted ResourceTable, an impossible internal invariant
+```
+
+The first set are ordinary Instar refusals a guest should be able to handle.
+The second are bugs.
+
+#### `ResourceTable` holds handles, `TextSystem` holds relationships
+
+No parent/child ownership tricks in the table for buffer-to-view. That relation
+lives in `TextSystem`, or Component Model handle lifetime quietly becomes
+Instar document lifetime — which is the whole thing this package exists to keep
+apart.
 
 The generational allocator matters here: the Component Model gives handle
 safety at the ABI, but once a handle resolves to a `TextViewId`, it is Instar's

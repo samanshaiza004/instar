@@ -27,16 +27,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bridge::{CommitRejection, CommitSink};
 use crate::resource::{EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy};
+use crate::text_bridge::{GuestTextBuffer, GuestTextView};
 
 wasmtime::component::bindgen!({
     path: "wit",
     world: "kernel",
-    imports: { default: trappable },
+    // Only the text capability is async. Its WIT functions are synchronous --
+    // the guest blocks inside the call -- while the Rust host method awaits the
+    // thread that owns the text subsystem. Making the *default* async would
+    // change every other kernel import for no reason.
+    imports: {
+        default: trappable,
+        "instar:text/text": async | trappable,
+    },
+    with: {
+        // Each guest handle is a lease -- two `u32`s naming a host resource --
+        // and never the resource itself. See `text_bridge`.
+        "instar:text/text.text-buffer": crate::text_bridge::GuestTextBuffer,
+        "instar:text/text.text-view": crate::text_bridge::GuestTextView,
+    },
 });
 
 use instar::kernel::kernel_types::{CommitError, CommitResult, OpError, RuntimeError};
@@ -183,6 +197,13 @@ pub struct SharedKernel {
     /// live guest is not a thing this design has an answer for, so it is not
     /// expressible.
     commit_sink: OnceLock<Arc<dyn CommitSink>>,
+    /// Where text-resource requests go.
+    ///
+    /// Unlike `commit_sink`, absence has **no** fallback. A headless commit log
+    /// is a meaningful thing to read back; a kernel-invented text system is
+    /// not, and pretending to create a buffer nobody owns would hand a guest a
+    /// capability onto nothing.
+    text_sink: OnceLock<Arc<dyn crate::text_bridge::TextSink>>,
 }
 
 impl Default for SharedKernel {
@@ -198,6 +219,7 @@ impl Default for SharedKernel {
             stale_commits_rejected: AtomicU64::new(0),
             commit_in_progress_rejections: AtomicU64::new(0),
             commit_sink: OnceLock::new(),
+            text_sink: OnceLock::new(),
         }
     }
 }
@@ -258,6 +280,52 @@ impl SharedKernel {
         self.commit_sink
             .set(sink)
             .map_err(|_| "a commit sink is already installed")
+    }
+
+    /// Installs the owner of the text subsystem. Once, before any generation
+    /// runs, exactly as [`Self::install_commit_sink`].
+    pub fn install_text_sink(
+        &self,
+        sink: Arc<dyn crate::text_bridge::TextSink>,
+    ) -> Result<(), &'static str> {
+        self.text_sink
+            .set(sink)
+            .map_err(|_| "a text sink is already installed")
+    }
+
+    pub fn has_text_sink(&self) -> bool {
+        self.text_sink.get().is_some()
+    }
+
+    /// Marshals one text operation to whoever owns the text subsystem.
+    ///
+    /// Returns a refusal rather than parking on every failure path: no sink, a
+    /// sink that would not take the request, and a reply channel torn down
+    /// mid-flight all wake the guest with something it can act on.
+    pub async fn submit_text(
+        &self,
+        generation: GenerationId,
+        operation: crate::text_bridge::TextOperation,
+    ) -> Result<crate::text_bridge::TextAnswer, crate::text_bridge::TextRefusal> {
+        use crate::text_bridge::{TextRefusal, text_request};
+
+        let Some(sink) = self.text_sink.get() else {
+            return Err(TextRefusal::HostUnavailable);
+        };
+
+        let (request, reply) = text_request(generation, operation);
+        if let Err(returned) = sink.submit(request) {
+            // Nobody took ownership of answering it, so answering it is this
+            // path's job. Dropping it would also answer, via the reply guard,
+            // but saying so explicitly is what makes that not an accident.
+            returned.refuse(TextRefusal::HostUnavailable);
+            return Err(TextRefusal::HostUnavailable);
+        }
+
+        match reply.await {
+            Ok(verdict) => verdict,
+            Err(_) => Err(TextRefusal::HostUnavailable),
+        }
     }
 
     pub fn has_commit_sink(&self) -> bool {
@@ -385,6 +453,148 @@ impl instar::kernel::ops::Host for GenerationState {
 }
 
 impl instar::kernel::kernel_ui::Host for GenerationState {}
+
+impl instar::text::text_types::Host for GenerationState {}
+
+impl From<crate::text_bridge::TextRefusal> for instar::text::text_types::TextError {
+    fn from(refusal: crate::text_bridge::TextRefusal) -> Self {
+        use crate::text_bridge::TextRefusal;
+        match refusal {
+            TextRefusal::TooManyBuffers(limit) => Self::TooManyBuffers(limit),
+            TextRefusal::TooManyViews(limit) => Self::TooManyViews(limit),
+            TextRefusal::NoSuchResource => Self::NoSuchResource,
+            // A guest whose generation died while a request was in flight is
+            // told the host could not serve it, not that its handle was bad.
+            TextRefusal::StaleGeneration | TextRefusal::HostUnavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// The guest's text capabilities.
+///
+/// Every method here does the same three things: copy the tiny opaque lease
+/// out of the resource table, release every Store-backed borrow, and only then
+/// await the thread that owns the text subsystem. Nothing derived from the
+/// table survives the await — which is the invariant, stated in terms of what
+/// can actually go wrong rather than as "no Store access".
+impl instar::text::text::Host for GenerationState {
+    async fn create_empty_buffer(
+        &mut self,
+    ) -> wasmtime::Result<Result<Resource<GuestTextBuffer>, instar::text::text_types::TextError>>
+    {
+        use crate::text_bridge::{TextAnswer, TextOperation};
+
+        let answer = self
+            .kernel
+            .submit_text(self.generation, TextOperation::CreateBuffer)
+            .await;
+        let key = match answer {
+            Ok(TextAnswer::Created(key)) => key,
+            Ok(TextAnswer::Released) => {
+                // The sink answered a creation with a release. That is not a
+                // refusal a guest can act on; it is the host contradicting
+                // itself, which is what traps are for.
+                return Err(wasmtime::Error::msg(
+                    "text sink answered create-empty-buffer with a release",
+                ));
+            }
+            Err(refusal) => return Ok(Err(refusal.into())),
+        };
+
+        // The host resource exists now. If the table will not take a handle to
+        // it, the failure that was meant to refuse a resource must not be the
+        // one that leaks it.
+        match self.table.push(GuestTextBuffer { key }) {
+            Ok(handle) => Ok(Ok(handle)),
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .submit_text(self.generation, TextOperation::ReleaseBuffer { key })
+                    .await;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn create_view(
+        &mut self,
+        buffer: Resource<GuestTextBuffer>,
+    ) -> wasmtime::Result<Result<Resource<GuestTextView>, instar::text::text_types::TextError>>
+    {
+        use crate::text_bridge::{TextAnswer, TextOperation};
+
+        // Copied, then the borrow ends. Nothing table-derived crosses the
+        // await below.
+        let buffer_key = self.table.get(&buffer)?.key;
+
+        let answer = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::CreateView { buffer: buffer_key },
+            )
+            .await;
+        let key = match answer {
+            Ok(TextAnswer::Created(key)) => key,
+            Ok(TextAnswer::Released) => {
+                return Err(wasmtime::Error::msg(
+                    "text sink answered create-view with a release",
+                ));
+            }
+            Err(refusal) => return Ok(Err(refusal.into())),
+        };
+
+        match self.table.push(GuestTextView { key }) {
+            Ok(handle) => Ok(Ok(handle)),
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .submit_text(self.generation, TextOperation::ReleaseView { key })
+                    .await;
+                Err(error.into())
+            }
+        }
+    }
+}
+
+/// Explicit guest drops.
+///
+/// The table entry goes first, so the lease is extracted and every borrow is
+/// released before the main thread is asked to let the resource go. Note what
+/// is *not* here: any cross-thread work in a Rust `Drop` impl. A destructor
+/// doing hidden thread-affine work is the lifecycle coupling this project has
+/// spent two phases removing, and it would not run on the path that matters
+/// anyway — a trapped generation destroys its Store without the guest dropping
+/// anything.
+impl instar::text::text::HostTextBuffer for GenerationState {
+    async fn drop(&mut self, handle: Resource<GuestTextBuffer>) -> wasmtime::Result<()> {
+        use crate::text_bridge::TextOperation;
+        let lease = self.table.delete(handle)?;
+        let _ = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::ReleaseBuffer { key: lease.key },
+            )
+            .await;
+        Ok(())
+    }
+}
+
+impl instar::text::text::HostTextView for GenerationState {
+    async fn drop(&mut self, handle: Resource<GuestTextView>) -> wasmtime::Result<()> {
+        use crate::text_bridge::TextOperation;
+        let lease = self.table.delete(handle)?;
+        let _ = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::ReleaseView { key: lease.key },
+            )
+            .await;
+        Ok(())
+    }
+}
 
 /// Committing suspends the guest (WP7B1).
 ///
