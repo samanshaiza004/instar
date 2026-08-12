@@ -160,6 +160,33 @@ mod tests {
         assert_eq!(buffer.slice(0..6).unwrap().materialize(), "héllo");
     }
 
+    /// The crate's stated invariant, held by a test rather than only by a
+    /// benchmark.
+    ///
+    /// `textbench` measures this across three documents and eight operations,
+    /// but a benchmark nobody runs on a Tuesday is not a regression lock. If a
+    /// `to_string()` ever appears on the editing path, this goes red first.
+    #[test]
+    fn an_ordinary_edit_never_asks_for_the_document_contiguously() {
+        let mut buffer = TextBuffer::from_text(&"x".repeat(1_000_000));
+        crate::instrument::reset();
+
+        buffer
+            .apply(&TextEdit::replace(500_000..500_100, "short"))
+            .expect("valid");
+
+        let counts = crate::instrument::snapshot();
+        assert_eq!(
+            counts.whole_buffer_materializations, 0,
+            "a hundred bytes changed in a megabyte, and nothing asked for the \
+             megabyte"
+        );
+        assert_eq!(
+            counts.materialized_bytes, 100,
+            "the only copy an edit makes is the material undo has to keep"
+        );
+    }
+
     /// The undo journal holds the material an edit touched, and nothing else.
     ///
     /// The number that matters is what a small edit in a large document costs:

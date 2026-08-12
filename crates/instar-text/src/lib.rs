@@ -63,6 +63,7 @@
 
 mod buffer;
 mod edit;
+pub mod instrument;
 mod storage;
 mod system;
 mod view;

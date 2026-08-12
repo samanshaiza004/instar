@@ -1639,6 +1639,7 @@ dependencies = [
  "instar-host",
  "instar-paint",
  "instar-render-vello-cpu",
+ "instar-text",
  "instar-ui",
  "instar-window",
  "softbuffer",

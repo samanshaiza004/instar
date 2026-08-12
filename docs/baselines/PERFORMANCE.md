@@ -283,3 +283,102 @@ uncontrolled reading claimed, and nothing else here is worth another day.
 The honest form of the original observation is that a `target/` directory
 grows to tens of gigabytes because it holds every profile ever built, not
 because dependency debug information is enormous.
+
+## Phase 3, package A: local text editing
+
+```bash
+cargo run --release --example textbench
+```
+
+Measured at `e6d8fff`, macOS 26.5.2, arm64. Host-local only: a synthetic edit
+into a `TextBuffer`, and the transform of every attached `TextView`. No OS
+input, no IME, no shaping, no pixels — package A has no native text input path,
+so a number for one would describe machinery that does not exist.
+
+### Latency, p50 / p95 / p99
+
+```text
+operation                     1 MiB              10 MiB     5 MiB single line
+insert start           0.2/0.3/0.3 µs      0.2/0.3/0.4 µs      0.2/0.3/0.4 µs
+insert middle          0.2/0.3/0.3 µs      0.3/0.3/0.4 µs      0.3/0.4/0.4 µs
+insert end             0.3/0.3/0.4 µs      0.3/0.8/1.5 µs      0.3/0.3/0.4 µs
+delete middle          0.2/0.2/0.3 µs      0.2/0.3/0.3 µs      0.4/0.5/1.1 µs
+replace selection      0.2/0.3/1.3 µs      0.3/0.4/0.5 µs      0.3/0.4/0.5 µs
+paste 100 KiB           30/68/215  µs       29/44/80   µs       16/34/67   µs
+undo                   0.1/0.2/0.2 µs      0.1/0.2/0.2 µs      0.1/0.2/0.2 µs
+redo                   0.2/0.2/0.2 µs      0.2/0.2/0.4 µs      0.2/0.3/0.7 µs
+```
+
+A tenfold document costs nothing measurable. The 5 MiB single line — the case
+that finds a line index quietly assuming short lines — is not distinguishable
+from the others either.
+
+### Copying, for exactly one operation
+
+```text
+                       payload  undo-kept  materlz  bytes  whole-buffer   alloc
+1 MiB  insert middle         1          1        1      0             0  2859 B
+10 MiB insert middle         1          1        1      0             0  3179 B
+10 MiB replace selection    10        110        1    100             0   386 B
+10 MiB paste 100 KiB    102400     102400        1      0             0 409 KiB
+```
+
+**`whole-buffer materializations: 0`, across all three documents and all eight
+operations.** That is the invariant `instar-text` states, and it is the number
+the package exists to produce. `materlz` counts one per edit because an edit
+reads back the material it overwrites, for undo — 100 bytes for a 100-byte
+replacement, zero for an insertion.
+
+### Memory
+
+```text
+document             text     buffer live   journal after 1,000 edits   per view
+1 MiB            1024 KiB        1065 KiB                      67 KiB    32-108 B
+10 MiB           10.0 MiB        10.4 MiB                      67 KiB
+5 MiB one line   5120 KiB        5313 KiB                      67 KiB
+```
+
+The journal column is a thousand one-byte insertions into each document and is
+the same 67 KiB in all three: undo costs what was typed, not what it was typed
+into. A view costs tens of bytes and does not vary with the document; the range
+is the registry's hash map growing, not the view.
+
+Adding views does not slow editing: p50 is 0.3 µs at one, two, and eight views
+of the same buffer.
+
+### Why these numbers are believable
+
+A benchmark is evidence only if the wrong implementation looks wrong. Running
+it against `TextStorage::replace` rewritten as rope → contiguous `String` →
+edit → rebuild:
+
+```text
+                              healthy      rope -> String -> rope
+insert middle, 1 MiB           0.2 µs                    264 µs
+insert middle, 10 MiB          0.3 µs                  8,189 µs
+1 MiB -> 10 MiB                  flat                       31x
+allocated per edit             2,859 B                  26.4 MiB
+whole-buffer materializations        0            1 per operation
+```
+
+The healthy implementation is flat as the document grows by 10x; the faulted
+one tracks document size. That is the discrimination the table has to have
+before its zeros mean anything.
+
+Two instruments, because neither is sufficient alone. `instar_text::instrument`
+counts contiguous copies made through the crate's API, so it names *who* asked
+for the document; it cannot see a copy assembled inside `storage.rs` from
+`crop`'s chunks directly. The counting allocator in `textbench` sees any
+allocation however it was built, but cannot attribute it — and cannot see bytes
+a B-tree moves inside memory it already owns, so it is a lower bound on copying
+rather than a total. It is reported as bytes *allocated*, which is what it is.
+
+### What package A has and has not answered
+
+Answered: small local edits show no O(document-size) latency or copying,
+nothing on the editing path materializes the document, undo scales with changed
+material, and each extra view costs view-sized memory.
+
+Not answered, and not attempted: whether this survives a real keyboard, an IME
+preedit, shaping, and a guest that disagrees about the document. Those are
+packages B and C.

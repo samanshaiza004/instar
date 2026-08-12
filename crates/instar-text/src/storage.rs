@@ -47,6 +47,10 @@ pub struct TextStorage {
 #[derive(Debug, Clone, Copy)]
 pub struct TextSlice<'a> {
     slice: crop::RopeSlice<'a>,
+    /// How long the storage this came from was, so [`TextSlice::materialize`]
+    /// can tell a region from the whole document. Without it the counter could
+    /// say a copy happened but not whether it was the copy that matters.
+    storage_len: usize,
 }
 
 impl<'a> TextSlice<'a> {
@@ -66,9 +70,12 @@ impl<'a> TextSlice<'a> {
     /// The region as an owned `String`.
     ///
     /// Named for what it costs. Every caller is a place `textbench` should be
-    /// able to find, which is why this is not `to_string` or `Display`.
+    /// able to find, which is why this is not `to_string` or `Display` — and
+    /// why it is counted: see [`crate::instrument`].
     pub fn materialize(&self) -> String {
-        self.slice.chunks().collect()
+        let text: String = self.slice.chunks().collect();
+        crate::instrument::record_materialization(text.len(), self.storage_len);
+        text
     }
 }
 
@@ -112,6 +119,7 @@ impl TextStorage {
         self.check(range.clone())?;
         Ok(TextSlice {
             slice: self.rope.byte_slice(range),
+            storage_len: self.len_bytes(),
         })
     }
 
@@ -245,6 +253,61 @@ mod tests {
         assert_eq!(storage.byte_of_line(0).unwrap(), 0);
         assert_eq!(storage.line_of_byte(4 * 1024 * 1024).unwrap(), 0);
         assert_eq!(storage.slice(10..20).unwrap().len_bytes(), 10);
+    }
+
+    /// The counter this crate's central claim is stated in.
+    ///
+    /// Asking for ten bytes and asking for the document are both copies, and
+    /// only one of them is the mistake. A counter that could not tell them
+    /// apart would report a number nobody could act on.
+    #[test]
+    fn a_region_and_the_whole_document_are_counted_apart() {
+        let storage = TextStorage::from_text(&"abcdefghij".repeat(100_000));
+        crate::instrument::reset();
+
+        assert_eq!(
+            storage.slice(500_000..500_010).unwrap().materialize().len(),
+            10
+        );
+        let counts = crate::instrument::snapshot();
+        assert_eq!(counts.materializations, 1);
+        assert_eq!(counts.materialized_bytes, 10);
+        assert_eq!(
+            counts.whole_buffer_materializations, 0,
+            "ten bytes out of a megabyte is a region, not the document"
+        );
+
+        assert_eq!(
+            storage
+                .slice(0..storage.len_bytes())
+                .unwrap()
+                .materialize()
+                .len(),
+            1_000_000
+        );
+        assert_eq!(
+            crate::instrument::snapshot().whole_buffer_materializations,
+            1,
+            "and asking for the whole megabyte is exactly what has to be visible"
+        );
+    }
+
+    /// The cheapest possible edit must not trip the loudest possible counter.
+    #[test]
+    fn an_empty_buffer_is_not_a_whole_buffer_materialization() {
+        let storage = TextStorage::new();
+        crate::instrument::reset();
+
+        assert_eq!(storage.slice(0..0).unwrap().materialize(), "");
+
+        let counts = crate::instrument::snapshot();
+        assert_eq!(counts.materializations, 1, "the call still happened");
+        assert_eq!(
+            counts.whole_buffer_materializations, 0,
+            "every insertion into an empty buffer slices 0..0, and counting \
+             that as materializing the document would make the counter fire \
+             loudest on the cheapest edit there is"
+        );
     }
 
     /// A slice of a large document is a view, not a copy.
