@@ -224,6 +224,24 @@ impl TextSystem {
         Ok(applied)
     }
 
+    /// How many buffers are live. Diagnostics, and what B2e's lease teardown
+    /// tests assert a return to baseline against.
+    pub fn live_buffers(&self) -> usize {
+        self.buffers.len()
+    }
+
+    pub fn live_views(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Every live buffer.
+    ///
+    /// For a caller that has to decide which buffers are still reachable, and
+    /// cannot answer that from a handle it was given.
+    pub fn buffers(&self) -> impl Iterator<Item = TextBufferId> + '_ {
+        self.buffers.keys().copied()
+    }
+
     /// How many views a buffer has. Diagnostics, and what `textbench` counts.
     pub fn views_of(&self, buffer: TextBufferId) -> usize {
         self.views.values().filter(|v| v.buffer() == buffer).count()
