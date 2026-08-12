@@ -77,6 +77,18 @@ pub enum NodeKind {
     Text { text: String },
     /// Interactive. Hit-testing resolves to these.
     Button { label: String, enabled: bool },
+    /// A surface showing a host-owned text view.
+    ///
+    /// Carries no resource identity, deliberately. This crate needs to know a
+    /// node *is* a text surface — for layout, hit-testing, focusability and
+    /// clipping — and nothing more. Which view it shows is resolved during
+    /// admission and held beside the tree, in `instar-host`, because a
+    /// `TextViewId` is `instar-text` vocabulary and this crate does not know
+    /// that crate exists.
+    ///
+    /// A leaf: the inside of the surface is host presentation of the attached
+    /// resource.
+    TextView,
 }
 
 impl NodeKind {
@@ -103,6 +115,7 @@ impl NodeKind {
             Self::Scroll => "scroll",
             Self::Text { .. } => "text",
             Self::Button { .. } => "button",
+            Self::TextView => "text view",
         }
     }
 }
@@ -339,6 +352,14 @@ pub enum TreeError {
     /// app that wants several things puts a `Stack` or a `Column` there.
     #[error("{key} is a scroll with {children} children; a scroll takes exactly one")]
     ScrollArity { key: NodeKey, children: usize },
+    /// A text view with children.
+    ///
+    /// The inside of the surface is host presentation of the attached
+    /// resource, so there is exactly one answer to who owns it. An application
+    /// that wants a toolbar above an editor puts both in a `Column`, rather
+    /// than putting the toolbar inside the editor.
+    #[error("{key} is a text view with {children} children; a text view is a leaf")]
+    TextViewArity { key: NodeKey, children: usize },
     /// A node stated a flex basis where it is not a flex item.
     ///
     /// `basis` describes how a node participates in **its parent's** layout,
@@ -408,6 +429,7 @@ impl Tree {
             opcode::NODE_STACK => return Err(TreeError::BadRoot("stack")),
             opcode::NODE_SCROLL => return Err(TreeError::BadRoot("scroll")),
             opcode::NODE_TEXT => return Err(TreeError::BadRoot("text")),
+            opcode::NODE_TEXT_VIEW => return Err(TreeError::BadRoot("text view")),
             _ => return Err(TreeError::BadRoot("button")),
         }
         for node in &batch.nodes[1..] {
@@ -421,6 +443,12 @@ impl Tree {
         for node in &batch.nodes {
             if node.kind == opcode::NODE_SCROLL && node.child_count != 1 {
                 return Err(TreeError::ScrollArity {
+                    key: node.key,
+                    children: node.child_count as usize,
+                });
+            }
+            if node.kind == opcode::NODE_TEXT_VIEW && node.child_count != 0 {
+                return Err(TreeError::TextViewArity {
                     key: node.key,
                     children: node.child_count as usize,
                 });
@@ -562,6 +590,11 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
             label: wire.text.clone().unwrap_or_default(),
             enabled: wire.is_enabled(),
         },
+        // The attachment slot is deliberately dropped here. It is
+        // commit-local: `instar-host` reads it off the `WireBatch` during
+        // admission and keeps the resolved identity, so retaining the index
+        // would be retaining the wrong thing.
+        opcode::NODE_TEXT_VIEW => NodeKind::TextView,
         // Unreachable via `decode_batch`, which rejects unknown kinds; handled
         // rather than panicked because `from_wire` is public and a caller may
         // hand-build a `WireBatch`.
@@ -595,6 +628,11 @@ fn encode_node(encoder: &mut BatchEncoder, node: &Node) {
         NodeKind::Stack => (opcode::NODE_STACK, None, 0),
         NodeKind::Scroll => (opcode::NODE_SCROLL, None, 0),
         NodeKind::Text { text } => (opcode::NODE_TEXT, Some(text.as_str()), 0),
+        // Re-encoding a retained text view cannot reproduce its attachment:
+        // the slot was commit-local and is gone by design. This path exists
+        // for round-trip tests of tree structure, so it writes slot 0 and the
+        // structure is what round-trips.
+        NodeKind::TextView => (opcode::NODE_TEXT_VIEW, None, 0),
         NodeKind::Button { label, enabled } => (
             opcode::NODE_BUTTON,
             Some(label.as_str()),
@@ -2328,4 +2366,87 @@ fn reachable_for_interaction(node: &Node, key: NodeKey) -> bool {
             .children
             .iter()
             .any(|child| reachable_for_interaction(child, key))
+}
+
+#[cfg(test)]
+mod text_view_tree {
+    use super::*;
+    use instar_ui_protocol::{BatchEncoder, WireLayout, flags};
+
+    const ROOT: NodeKey = NodeKey::first(0);
+    const VIEW: NodeKey = NodeKey::first(1);
+
+    fn batch(slot: u16) -> Vec<u8> {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(opcode::NODE_ROOT, ROOT, 0, None, WireLayout::default(), 1);
+        encoder.text_view(VIEW, flags::ENABLED, slot, WireLayout::default());
+        encoder.finish()
+    }
+
+    /// A text view decodes to a kind that carries no resource identity.
+    #[test]
+    fn a_text_view_decodes_without_its_attachment() {
+        let tree = Tree::decode(&batch(3)).expect("valid");
+        let view = tree.find(VIEW).expect("present");
+
+        assert_eq!(view.kind, NodeKind::TextView);
+        assert!(
+            view.children.is_empty(),
+            "and it is a leaf in the retained tree too"
+        );
+    }
+
+    /// The slot is commit-local, and the retained tree is where it stops.
+    ///
+    /// Not a limitation: `instar-host` reads the slot off the `WireBatch`
+    /// during admission and keeps the resolved resource identity instead.
+    /// Retaining the index would retain a number that means something
+    /// different in the next commit.
+    #[test]
+    fn the_retained_tree_holds_no_attachment_slot() {
+        let three = Tree::decode(&batch(3)).expect("valid");
+
+        let mut encoder = BatchEncoder::new();
+        encoder.node(opcode::NODE_ROOT, ROOT, 0, None, WireLayout::default(), 1);
+        encoder.text_view(VIEW, flags::ENABLED, 9, WireLayout::default());
+        let nine = Tree::decode(&encoder.finish()).expect("valid");
+
+        assert_eq!(
+            three.find(VIEW).unwrap().kind,
+            nine.find(VIEW).unwrap().kind,
+            "slots 3 and 9 produce the same retained node, because the slot is \
+             not part of what is retained"
+        );
+    }
+
+    /// `BatchEncoder::text_view` is leaf-only by construction, so a guest
+    /// claiming children is built through `from_wire` rather than by patching
+    /// bytes — which is also the path a hand-built `WireBatch` takes, and the
+    /// reason `from_wire` validates rather than trusting its caller.
+    #[test]
+    fn a_text_view_with_children_is_refused() {
+        let mut wire =
+            instar_ui_protocol::decode_batch(&batch(3)).expect("the honest batch decodes");
+        wire.nodes[1].child_count = 2;
+        // The root still claims one child, so the tree is otherwise coherent.
+        assert!(matches!(
+            Tree::from_wire(&wire),
+            Err(TreeError::TextViewArity {
+                key: VIEW,
+                children: 2
+            })
+        ));
+    }
+
+    /// A text view cannot be the root: the root is the window, and a window is
+    /// not an editor.
+    #[test]
+    fn a_text_view_cannot_be_the_root() {
+        let mut encoder = BatchEncoder::new();
+        encoder.text_view(ROOT, flags::ENABLED, 0, WireLayout::default());
+        assert!(matches!(
+            Tree::decode(&encoder.finish()),
+            Err(TreeError::BadRoot("text view"))
+        ));
+    }
 }
