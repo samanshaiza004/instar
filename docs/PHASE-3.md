@@ -655,59 +655,187 @@ The last is manual because winit itself documents IME support and candidate
 placement as varying by platform. It is a checklist item like F4, not a claim
 CI can make.
 
-### B2e — the attachment contract
+### B2e — the attachment contract, frozen
 
-Deliberately its own package, because `NODE_TEXT_VIEW` is not plumbing. It
-cannot be added without answering:
+The first genuinely new guest-facing resource design since Phase 2, and the
+reason B2d stopped where it did. Frozen here before any of it is built.
 
-```text
-who creates a TextViewId?
-how does a guest obtain one?
-does removing the node detach the view, or destroy it?
-does it destroy the buffer?              it must not
-is focus identity a NodeKey or a TextViewId?
-what AccessKit role does the surface expose?
-can one TextView be attached twice?
-what survives a guest restart?
-```
+#### The decision
 
-The shape of the answer is already implied by Package A's resource-lifetime
-rule, and is recorded here so that B2e argues about the remaining question
-rather than this one:
+> `TextBuffer` and `TextView` are WIT resources. Neither a WIT handle nor a
+> `TextViewId` is ever serialized into the UI snapshot. A commit carries a
+> side table of **borrowed** `text-view` handles, and a wire node references an
+> attachment *slot*.
+
+Three identities, each meaning something different, none collapsed into
+another:
 
 ```text
-semantic UI node
-  NodeKey                  presentation identity
-     └── references
-           TextViewId      editor-resource identity
-                └── TextBufferId
+NodeKey        semantic and presentation identity; belongs to the retained tree
+text-view      a guest capability, valid under Component Model resource rules
+TextViewId     host resource identity, generational; belongs to instar-text
 ```
 
-**Not** `NodeKey == TextView identity`. Collapsing them would reverse the
-crate and lifetime decision Package A established: a `NodeKey` dies when the
-tree stops containing it, and a document must not.
+#### The shape
+
+```wit
+interface text {
+    resource text-buffer;
+    resource text-view;
+
+    create-empty-buffer: async func() -> result<text-buffer, text-error>;
+    create-view: async func(buffer: borrow<text-buffer>)
+        -> result<text-view, text-error>;
+}
+
+interface ui {
+    use text.{text-view};
+
+    commit: async func(
+        snapshot: list<u8>,
+        text-views: list<borrow<text-view>>,
+    ) -> result<u64, commit-error>;
+}
+```
+
+and in the packed tree:
+
+```rust
+NodeKind::TextView { attachment: u16 }     // not { view_id: TextViewId }
+```
+
+**Verified against the pinned toolchain before freezing**, because the whole
+design rests on it: `list<borrow<text-view>>` parses under wasm-tools 1.255,
+generates host bindings under `wasmtime 47.0.3`'s `bindgen!`, and generates
+guest bindings under `wit-bindgen 0.60` as
+`ui::commit(snapshot: &[u8], text_views: &[&TextView]) -> u64`. A contract
+frozen on a feature the toolchain could not express would have been a plan,
+not a decision.
+
+#### Admission
 
 ```text
-semantic node owns   geometry, focusability, clipping, accessibility
-                     placement, attachment
-TextView owns        caret, selection, editor scroll, preedit, presentation
-TextBuffer owns      text, revisions, journal
+generation screen
+  -> resolve borrowed WIT handles to TextViewIds
+  -> decode snapshot
+  -> validate attachment indices are in range
+  -> validate TextViewId liveness and eligibility
+  -> validate at most one live attachment per TextView
+  -> atomic retained-tree apply
 ```
 
-So removing the node means: remove the presentation, retire pointer capture
-and focus naming that `NodeKey`, detach the view. It does **not** mean destroy
-the view or the buffer.
+The retained tree stores the resolved `TextViewId`. It never stores a
+`Resource<T>` or a handle-table index: Component Model handles are opaque
+table-backed capabilities, not stable application identifiers, and the guest's
+table dies with its Store.
 
-One question is left open on purpose — *how a guest acquires the `TextViewId`
-it puts in a snapshot* — because answering it touches the resource and
-synchronization surface Phase 3 deferred, and inventing a convenient answer
-inside a pointer test is exactly what B2d refused to do.
+What goes in the Wasmtime `ResourceTable` is deliberately tiny — `{ id:
+TextBufferId }` and `{ id: TextViewId }`. The rope, journal, selections and
+views stay in the main-thread `TextSystem`. The Store does not become their
+owner, which is also what makes restart tractable later: dropping a Store
+destroys the guest's ability to *name* a document, not the document.
 
-**B2e comes before B3.** Keyboard routing makes attachment unavoidable: the
-moment `ArrowLeft` exists, the host needs a principled answer to which focused
-control receives it. There is one canonical `FocusState`, and standing up a
-temporary `active_text_view` beside it would be a second answer to focus —
-the same defect class this project has now removed three times.
+Borrowed rather than owned handles work because `commit` already suspends the
+guest until the host has finished applying: every borrow can be resolved
+before the request enters retained state, so nothing in the main-thread tree
+ever holds a Component Model borrow.
+
+#### Frozen semantics
+
+```text
+a TextView is attached to at most one live UI node at a time
+a TextBuffer may have many TextViews
+removing a TextView node detaches the view; it destroys neither view nor buffer
+NodeKey remains the focus identity; the host follows the attachment to reach
+    the TextViewId. There is still exactly one FocusState
+removing, hiding or disabling the node retires pointer capture and focus by
+    the existing NodeKey rules, and does not touch document lifetime
+a stale, unknown, duplicated or out-of-range attachment rejects the entire
+    commit before any mutation
+a guest dropping its handle loses the capability for future commits; an
+    already accepted attachment keeps the view alive until that attachment
+    goes, so a drop cannot tear presentation out of an accepted snapshot
+runtime-generation restart and recovery remain Package C
+```
+
+Two views of one buffer means two `TextView`s. One view attached twice would
+be one caret, selection, scroll offset and IME state in two places at once.
+
+#### What B2e deliberately does not do
+
+Only `create-empty-buffer`. No `create-buffer(contents)`, because that
+immediately raises canonical snapshot transfer, copy limits, bootstrap
+revisions, acknowledgement and resynchronization — Package C's problem, pulled
+forward. The synthetic empty insertion row already exists, so B3 can type into
+an empty document, and C decides later how canonical contents initialize the
+replica.
+
+#### The alternative that was rejected
+
+```text
+commit(snapshot)
+attach_text_view(node_key, view)      // rejected
+```
+
+That is a mutation stream running beside the authoritative snapshot, and it
+permits a state where the tree says a text node exists while a separate
+attachment call says otherwise. With the side table, **a snapshot's structure
+and its resource references are accepted atomically as one description** —
+which is the property the whole commit model is built on.
+
+#### Hostile cases, because this is a capability boundary
+
+```text
+attachment index out of range        -> commit refused
+one TextView attached to two nodes   -> commit refused
+stale TextView generation            -> commit refused
+a handle from another generation     -> commit refused
+node removed                         -> view survives, detached
+text node replaced by an ordinary one-> attachment released
+commit refused mid-validation        -> old tree and old attachments intact
+```
+
+#### The proof B2 could not honestly run
+
+```text
+real guest: create-empty-buffer, create-view, commit a TextView node
+            with a borrowed attachment
+  -> RuntimeHarness
+  -> real WindowEvent -> winit adapter
+  -> FocusState and hit test
+  -> resolved TextViewId
+  -> the exact handle_pointer seam B2d proved
+  -> caret and selection pixels
+```
+
+**No B2 logic may be rewritten to make this pass.** That is an acceptance
+criterion for B2e itself: attachment supplies a `TextViewId` to the seam that
+already exists; it does not create a second editor interaction route.
+
+#### Order
+
+```text
+B2e-0  freeze this contract                            <- done
+B2e-1  host resource leases: create-empty-buffer, create-view
+B2e-2  protocol v9: TextView node and attachment slot
+B2e-3  the commit side table, resolved before decode and apply
+B2e-4  attachment lifetime and retirement rules
+B2e-5  the RuntimeHarness vertical proof above
+```
+
+#### Recorded, not started
+
+AccessKit has `TextInput` and `MultilineTextInput` roles, so a `TextView`'s
+accessibility projection will hang off the semantic `NodeKey` and its
+attachment. That the role exists is not evidence that text accessibility is
+solved: selection, value and text-range semantics need B3 and B4 to have
+established what editing actually does first.
+
+There is a pattern here worth noticing and **not** generalizing yet: a semantic
+snapshot may reference a specialized host resource through a typed capability
+attachment without that resource becoming part of the tree's lifetime. Images,
+2D scene surfaces and GPU resources may eventually want the same shape.
+`TextView` is the first proof, and one proof is not a framework.
 
 ### Out of scope for B
 
