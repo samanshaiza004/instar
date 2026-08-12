@@ -250,6 +250,32 @@ that window's origin, and every buffer position needs translating in. A bug
 there is a caret that lands in the wrong place only when scrolled, which is
 exactly the kind of defect that survives a unit suite.
 
+### Where shaping lives, and why the forbidden edge stays forbidden
+
+This is the moment the layering note above anticipated — "if editor measurement
+later makes that awkward, that is evidence for a narrow edge". The awkwardness
+is real: `instar-ui::TextContext` owns the `FontContext` and `LayoutContext`,
+which are expensive and must not be duplicated. Two font contexts in one
+process would mean loading faces twice and, worse, a `Text` node and a
+`TextView` potentially resolving the same family to different faces.
+
+It does **not** justify `instar-ui → instar-text`. The dependency actually
+wanted is on the shared font stack, not on the semantic tree, and
+`TextContext::shape(text, style)` is already keyless — it is private, not
+absent. So:
+
+```text
+instar-ui     owns the font stack, exposes a keyless shaping primitive
+              and knows nothing about TextBuffer
+instar-text   decides which bytes, and translates positions across the
+              window origin; no font dependency
+instar-host   composes them: takes the window, slices the rope, shapes
+```
+
+No new crate, no second `FontContext`, and the layering test keeps holding an
+edge that stays genuinely absent. That composition is exactly what
+`instar-host` is documented to be for.
+
 ### The enormous-line decision, made before B1 rather than after
 
 A rope handles 5 MiB on one line. A naive `TextView` still destroys the
