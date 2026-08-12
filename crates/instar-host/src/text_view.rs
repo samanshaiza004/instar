@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
-use instar_text::{Revision, ShapingWindow, TextStorage};
+use instar_text::{Revision, ShapingWindow, TextStorage, TextViewId};
 use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
 
 /// Counters for the two questions B2 has to be able to answer.
@@ -152,6 +152,77 @@ pub struct TextPosition {
     pub affinity: Affinity,
 }
 
+/// A selection, in document coordinates.
+///
+/// # Why not a Parley `Selection`
+///
+/// Parley's `Selection` is a range *within one layout*, and this editor shapes
+/// one layout per row. Storing the view's selection as one would break the
+/// moment a drag crossed a row boundary — which is the ordinary case, not an
+/// edge case.
+///
+/// So the document holds anchor and focus in absolute bytes, and a Parley
+/// `Selection` is a *temporary projection* of that onto one segment, built to
+/// ask for geometry and thrown away.
+///
+/// # Why anchor and focus rather than a range
+///
+/// Dragging backwards is not the same interaction as dragging forwards, even
+/// when the selected bytes are identical: the focus is the end that moves, and
+/// canonicalizing to `min..max` loses which one that is. Parley keeps the
+/// distinction for the same reason.
+///
+/// # Not yet reconciled with `instar_text::Selection`
+///
+/// `TextView` already has a `Selection { anchor, head }` in bare byte offsets,
+/// which is the *editable* selection — what a replacement would overwrite.
+/// This one is interaction and presentation state, and carries affinity
+/// because a caret at a bidi boundary cannot be drawn from a byte alone.
+///
+/// They are deliberately separate while only one of them is load-bearing: B2
+/// draws, and nothing edits yet. **B3 must unify them**, because two answers to
+/// "where is the selection" is exactly the class of defect this project keeps
+/// paying to remove. The likely resolution is affinity moving into
+/// `instar-text`, which owns document positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    /// Where the selection started and does not move from.
+    pub anchor: TextPosition,
+    /// The end the pointer is dragging.
+    pub focus: TextPosition,
+}
+
+impl TextSelection {
+    pub fn at(position: TextPosition) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+        }
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        self.anchor.byte == self.focus.byte
+    }
+
+    /// The selected bytes, ordered. Direction is lost here deliberately: this
+    /// is for intersecting with a segment, not for describing the gesture.
+    pub fn range(&self) -> Range<usize> {
+        if self.anchor.byte <= self.focus.byte {
+            self.anchor.byte..self.focus.byte
+        } else {
+            self.focus.byte..self.anchor.byte
+        }
+    }
+
+    /// Moves the focus, leaving the anchor where it was.
+    pub fn extend_to(&self, focus: TextPosition) -> Self {
+        Self {
+            anchor: self.anchor,
+            focus,
+        }
+    }
+}
+
 /// Everything one frame of one view draws.
 pub struct PresentedText {
     pub segments: Vec<PresentedSegment>,
@@ -255,6 +326,76 @@ impl PresentedText {
         })
     }
 
+    /// The rectangles a document selection covers within one segment.
+    ///
+    /// The projection, and the only place it happens:
+    ///
+    /// ```text
+    /// absolute selection
+    ///   -> intersect with this segment's buffer_range
+    ///   -> translate both endpoints to layout-local offsets
+    ///   -> a Parley Selection inside this one layout
+    ///   -> geometry_with, straight into the callback
+    /// ```
+    ///
+    /// Nothing is collected: the rectangles go to `f` as Parley produces them.
+    pub fn selection_geometry_with(
+        &self,
+        segment: &PresentedSegment,
+        selection: TextSelection,
+        mut f: impl FnMut(CaretGeometry),
+    ) {
+        if selection.is_collapsed() {
+            return;
+        }
+        let selected = selection.range();
+        let start = selected.start.max(segment.buffer_range.start);
+        let end = selected.end.min(segment.buffer_range.end);
+        if start >= end {
+            return;
+        }
+
+        let (Some(local_start), Some(local_end)) =
+            (segment.buffer_to_local(start), segment.buffer_to_local(end))
+        else {
+            return;
+        };
+
+        // Affinity is taken from the real endpoints only where the selection
+        // actually begins or ends in this segment. A row in the middle of a
+        // multi-row drag is entered and left at its own boundaries, and
+        // borrowing a distant endpoint's affinity there would be describing a
+        // position that is not in this layout.
+        let anchor_affinity = if start == selection.range().start {
+            endpoint_affinity(&selection, start)
+        } else {
+            Affinity::Downstream
+        };
+        let focus_affinity = if end == selection.range().end {
+            endpoint_affinity(&selection, end)
+        } else {
+            Affinity::Upstream
+        };
+
+        segment.layout.selection_geometry_with(
+            instar_ui::TextCursor {
+                index: local_start,
+                affinity: anchor_affinity,
+            },
+            instar_ui::TextCursor {
+                index: local_end,
+                affinity: focus_affinity,
+            },
+            |geometry| {
+                f(CaretGeometry {
+                    x: geometry.x + segment.origin_x,
+                    y: geometry.y + segment.origin_y,
+                    ..geometry
+                });
+            },
+        );
+    }
+
     /// The segment a vertical position falls in, clamped to the window.
     ///
     /// Clamped rather than `None` outside, because a drag that leaves the top
@@ -329,6 +470,118 @@ pub fn present(
     Ok(PresentedText { segments })
 }
 
+/// A pointer drag that belongs to one text view until it ends.
+///
+/// # Logical capture, not OS capture
+///
+/// Once a drag begins, pointer movement inside the window belongs to the
+/// originating view until release or cancellation — even if the pointer
+/// crosses another view. That is the Phase 2 rule for scrollbar thumbs,
+/// unchanged.
+///
+/// Deliberately **not** `Window::set_cursor_grab`. Winit's grab modes are
+/// materially platform-dependent — `Confined` is unsupported on macOS,
+/// `Locked` on X11 — so enforcing capture through the OS would make identical
+/// code behave differently per platform. Host-side transient state is
+/// deterministic everywhere, and it is the same shape of state the scroll
+/// subsystem already keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextDrag {
+    view: TextViewId,
+    anchor: TextPosition,
+    /// The revision the presentation was built from when the drag began.
+    revision: Revision,
+}
+
+/// The host's transient text-pointer state: at most one drag at a time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextInteraction {
+    drag: Option<TextDrag>,
+}
+
+impl TextInteraction {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// The view that owns the current drag, if any.
+    pub fn captured_view(&self) -> Option<TextViewId> {
+        self.drag.map(|drag| drag.view)
+    }
+
+    /// A press: collapses the selection and takes capture.
+    pub fn press(
+        &mut self,
+        view: TextViewId,
+        position: TextPosition,
+        revision: Revision,
+    ) -> TextSelection {
+        self.drag = Some(TextDrag {
+            view,
+            anchor: position,
+            revision,
+        });
+        TextSelection::at(position)
+    }
+
+    /// A pointer move.
+    ///
+    /// `over` is the view the pointer is currently above, and is deliberately
+    /// *not* used to decide which view is being edited: a drag begun in view A
+    /// keeps extending A's selection while the pointer passes over B. Returns
+    /// `None` when no drag is active.
+    pub fn drag_to(&mut self, position: TextPosition, revision: Revision) -> Option<TextSelection> {
+        let drag = self.drag?;
+        // An edit during a drag retires it. The presented segments the drag is
+        // producing positions from describe text that has changed, and
+        // transforming a live capture across an edit is a synchronization
+        // problem that does not need solving before keyboard input exists.
+        if drag.revision != revision {
+            self.drag = None;
+            return None;
+        }
+        Some(TextSelection {
+            anchor: drag.anchor,
+            focus: position,
+        })
+    }
+
+    /// The pointer came up. Capture ends; the selection stands.
+    pub fn release(&mut self) {
+        self.drag = None;
+    }
+
+    /// The drag is over and produced nothing further.
+    ///
+    /// Focus loss, the cursor leaving the window, the view being retired: the
+    /// same lifecycle events Phase 2 already cancels a scrollbar drag on. No
+    /// new special case, and no outside-window autoscroll — that is an editor
+    /// behaviour to add when an application asks for it.
+    pub fn cancel(&mut self) {
+        self.drag = None;
+    }
+
+    /// Cancels a drag that belongs to a view which is no longer live.
+    pub fn retire_view(&mut self, view: TextViewId) {
+        if self.drag.is_some_and(|drag| drag.view == view) {
+            self.drag = None;
+        }
+    }
+}
+
+/// Which endpoint of a selection sits at `byte`, and with what affinity.
+fn endpoint_affinity(selection: &TextSelection, byte: usize) -> Affinity {
+    if selection.anchor.byte == byte {
+        selection.anchor.affinity
+    } else {
+        selection.focus.affinity
+    }
+}
+
 /// The caret's width, in logical pixels.
 ///
 /// Host chrome policy, like the focus ring and the scrollbar thumb — not wire
@@ -357,6 +610,9 @@ pub struct Frame {
     pub caret_color: Color,
     /// Where the caret is, when the view has one.
     pub caret: Option<TextPosition>,
+    /// What is selected, when anything is.
+    pub selection: Option<TextSelection>,
+    pub selection_color: Color,
     /// The buffer revision this frame is drawing. A segment shaped from a
     /// different revision cannot position a caret: its geometry describes text
     /// that has since changed.
@@ -392,6 +648,31 @@ pub fn lower(presented: &mut PresentedText, frame: &Frame) -> PaintScene {
             ),
         },
     ];
+    // Selection first, so it sits *behind* the glyphs. The order here is the
+    // whole of the focus-ring lesson: a command that exists is not a thing
+    // that is visible, and a highlight painted over its own text is a
+    // highlight that hides it.
+    if let Some(selection) = frame.selection {
+        let scale = frame.scale;
+        let colour = frame.selection_color;
+        let mut rects = Vec::new();
+        for segment in &presented.segments {
+            presented.selection_geometry_with(segment, selection, |geometry| {
+                rects.push(physical(
+                    geometry.x,
+                    geometry.y,
+                    geometry.width,
+                    geometry.height,
+                    scale,
+                ));
+            });
+        }
+        commands.extend(rects.into_iter().map(|rect| PaintCommand::FillRect {
+            rect,
+            color: colour,
+        }));
+    }
+
     let mut fonts = Vec::new();
     let mut font_ids = HashMap::new();
 
@@ -959,5 +1240,205 @@ mod tests {
         instrument::reset();
         let _ = present_text("hello\n", 0);
         assert_eq!(instrument::snapshot().presentation_reshapes, 1);
+    }
+
+    // ------------------------------------------- B2c: selection and capture
+
+    fn view(id: u32) -> TextViewId {
+        TextViewId { id, generation: 0 }
+    }
+
+    fn at(byte: usize) -> TextPosition {
+        TextPosition {
+            byte,
+            affinity: Affinity::Downstream,
+        }
+    }
+
+    /// A drag begun in one view keeps extending that view's selection while
+    /// the pointer is somewhere else entirely.
+    #[test]
+    fn a_drag_belongs_to_the_view_it_started_in() {
+        let mut interaction = TextInteraction::new();
+        let a = view(1);
+        let b = view(2);
+
+        interaction.press(a, at(10), Revision::default());
+        assert_eq!(interaction.captured_view(), Some(a));
+
+        // The pointer is now over b. The selection is still a's.
+        let selection = interaction
+            .drag_to(at(40), Revision::default())
+            .expect("a drag in progress");
+        assert_eq!(selection.anchor, at(10));
+        assert_eq!(selection.focus, at(40));
+        assert_eq!(
+            interaction.captured_view(),
+            Some(a),
+            "crossing view {b:?} handed the drag over, which is not what \
+             capture means"
+        );
+    }
+
+    /// Direction survives, because dragging backwards is a different gesture
+    /// from dragging forwards even when the bytes match.
+    #[test]
+    fn a_reverse_drag_selects_the_same_bytes_and_keeps_its_direction() {
+        let mut interaction = TextInteraction::new();
+        interaction.press(view(1), at(40), Revision::default());
+        let backwards = interaction
+            .drag_to(at(10), Revision::default())
+            .expect("dragging");
+
+        assert_eq!(
+            backwards.range(),
+            10..40,
+            "the same bytes as a forward drag"
+        );
+        assert_eq!(backwards.anchor, at(40), "but the anchor is where it began");
+        assert_eq!(backwards.focus, at(10));
+        assert_ne!(
+            backwards,
+            TextSelection {
+                anchor: at(10),
+                focus: at(40)
+            },
+            "canonicalizing to min..max would lose which end is moving"
+        );
+    }
+
+    /// Every lifecycle event Phase 2 cancels a scrollbar drag on.
+    #[test]
+    fn a_drag_is_cancelled_by_the_lifecycle_rather_than_by_a_special_case() {
+        let mut interaction = TextInteraction::new();
+
+        // Focus loss / cursor left.
+        interaction.press(view(1), at(10), Revision::default());
+        interaction.cancel();
+        assert!(!interaction.is_dragging());
+        assert!(interaction.drag_to(at(20), Revision::default()).is_none());
+
+        // The view goes away.
+        interaction.press(view(1), at(10), Revision::default());
+        interaction.retire_view(view(2));
+        assert!(
+            interaction.is_dragging(),
+            "another view's retirement is not ours"
+        );
+        interaction.retire_view(view(1));
+        assert!(!interaction.is_dragging());
+
+        // Release.
+        interaction.press(view(1), at(10), Revision::default());
+        interaction.release();
+        assert!(!interaction.is_dragging());
+    }
+
+    /// An edit during a drag retires it.
+    #[test]
+    fn an_edit_during_a_drag_retires_the_capture() {
+        let mut interaction = TextInteraction::new();
+        interaction.press(view(1), at(10), Revision::default());
+
+        assert!(
+            interaction
+                .drag_to(at(20), Revision::default().next())
+                .is_none(),
+            "the presented segments this drag reads positions from describe \
+             text that has changed"
+        );
+        assert!(
+            !interaction.is_dragging(),
+            "and the drag is gone rather than merely refused once"
+        );
+    }
+
+    /// The projection, on the case that distinguishes it from painting whole
+    /// rows: a selection starting midway through one row and ending midway
+    /// through another.
+    #[test]
+    fn a_cross_row_selection_projects_onto_each_row_it_touches() {
+        let presented = present_text("aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc\ndddddddddd\n", 0);
+        let rows: Vec<_> = presented
+            .segments
+            .iter()
+            .map(|s| s.buffer_range.clone())
+            .collect();
+        assert!(
+            rows.len() >= 4,
+            "the fixture needs a row past the selection to prove it is left \
+             alone, and crop does not count a trailing newline as a line"
+        );
+
+        // Start five characters into row 0, end five into row 2.
+        let selection = TextSelection {
+            anchor: at(rows[0].start + 5),
+            focus: at(rows[2].start + 5),
+        };
+
+        let mut per_row = Vec::new();
+        for segment in &presented.segments {
+            let mut widest: f32 = 0.0;
+            let mut any = false;
+            presented.selection_geometry_with(segment, selection, |g| {
+                any = true;
+                widest = widest.max(g.width);
+            });
+            per_row.push((segment.row, any, widest));
+        }
+
+        assert!(per_row[0].1, "row 0 is partly selected");
+        assert!(per_row[1].1, "row 1 is entirely selected");
+        assert!(per_row[2].1, "row 2 is partly selected");
+        assert!(
+            !per_row[3].1,
+            "row 3 is past the selection and must not be highlighted"
+        );
+        assert!(
+            per_row[1].2 > per_row[0].2 && per_row[1].2 > per_row[2].2,
+            "the middle row is fully covered and the first and last are not: \
+             widths {:?} -- an implementation that highlighted every touched \
+             row whole would make these equal",
+            per_row.iter().map(|r| r.2).collect::<Vec<_>>()
+        );
+    }
+
+    /// A collapsed selection paints nothing at all.
+    #[test]
+    fn a_collapsed_selection_has_no_geometry() {
+        let presented = present_text("hello world\n", 0);
+        let mut rects = 0;
+        presented.selection_geometry_with(&presented.segments[0], TextSelection::at(at(3)), |_| {
+            rects += 1
+        });
+        assert_eq!(rects, 0, "a caret is not a highlight");
+    }
+
+    /// The deep case, for the same reason every other seam test has one.
+    #[test]
+    fn a_deep_selection_projects_through_the_window_origin() {
+        let storage = document(100_000);
+        let presented = present_at(&storage, 1_900_000);
+        let first = presented.segments[0].buffer_range.clone();
+        let third = presented.segments[2].buffer_range.clone();
+        assert!(first.start > 4_000_000, "deep enough to matter");
+
+        let selection = TextSelection {
+            anchor: at(first.start + 3),
+            focus: at(third.start + 3),
+        };
+
+        let mut rows_highlighted = 0;
+        for segment in &presented.segments {
+            let mut any = false;
+            presented.selection_geometry_with(segment, selection, |_| any = true);
+            if any {
+                rows_highlighted += 1;
+            }
+        }
+        assert_eq!(
+            rows_highlighted, 3,
+            "three rows are touched by a selection spanning rows 0..2"
+        );
     }
 }

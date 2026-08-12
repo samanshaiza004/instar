@@ -457,6 +457,65 @@ No blinking yet. Blink is timer, focus and lifecycle semantics, and it proves
 nothing about coordinate correctness; it belongs after B2c gives the view a
 real interaction lifecycle.
 
+#### Selection lives in document coordinates
+
+> A `TextView`'s selection is an absolute anchor and focus in buffer bytes. A
+> Parley `Selection` is a temporary projection of it onto one presented
+> segment, built to ask for geometry and thrown away.
+
+Parley's `Selection` is a range *within one layout*, and this editor shapes one
+layout per row — so storing the view's selection as one breaks the moment a
+drag crosses a row, which is the ordinary case rather than an edge case.
+
+Anchor and focus, not a range: dragging backwards is a different gesture from
+dragging forwards even when the selected bytes are identical, and `min..max`
+loses which end is moving.
+
+Paint order, which is the focus-ring lesson a third time:
+
+```text
+background -> selection -> glyphs -> caret
+```
+
+#### Capture is logical
+
+> A text drag owns the view it began in until release or cancellation, even
+> when the pointer crosses another view.
+
+Not `Window::set_cursor_grab`: winit's grab modes are materially
+platform-dependent — `Confined` unsupported on macOS, `Locked` on X11 — so
+enforcing capture through the OS would make identical code behave differently
+per platform. Host transient state is deterministic everywhere and is what the
+scroll subsystem already does.
+
+Cancellation reuses Phase 2's lifecycle rules with no new special case: focus
+loss, cursor left, view retired. No outside-window autoscroll — that is an
+editor behaviour to add when an application asks.
+
+An edit during a drag **retires** it. The presented segments the drag reads
+positions from describe text that has changed, and transforming a live capture
+across an edit is a synchronization problem that does not need solving before
+keyboard input exists.
+
+#### Two selections, deliberately, until B3
+
+`instar_text::Selection` is the *editable* selection in bare byte offsets;
+`TextSelection` is interaction and presentation state and carries affinity,
+which a caret at a bidi boundary needs and a byte offset cannot express.
+
+They are separate while only one is load-bearing — B2 draws, nothing edits.
+**B3 must unify them**, because two answers to "where is the selection" is
+precisely the class of defect this project keeps paying to remove. The likely
+resolution is affinity moving into `instar-text`, which owns document
+positions.
+
+#### An empty document presents no rows
+
+`crop` reports zero lines for an empty rope, not one empty line, so a view of
+an empty buffer has no segments and a caret in it has nowhere to be drawn. Both
+line-counting conventions are pinned by a test now. B3 needs this fixed the
+moment anything types into an empty document.
+
 The target an arrow key should eventually reach is `reshapes: 0, extractions:
 0, layout rebuilds: 0, caret paint only`. B2 does not have to get there; it has
 to be able to say whether it did, because that measurement is what shows where

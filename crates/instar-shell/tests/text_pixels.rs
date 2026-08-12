@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use instar_host::text_view::{Frame, Presentation, TextPosition, lower, present};
+use instar_host::text_view::{Frame, Presentation, TextPosition, TextSelection, lower, present};
 use instar_paint::{Color, PhysicalSize};
 use instar_shell::{Presenter, default_font};
 use instar_text::{Revision, TextStorage, TextViewport};
@@ -27,6 +27,8 @@ const INK: Color = Color::opaque(255, 255, 255);
 /// Deliberately not the ink colour, so caret pixels are distinguishable from
 /// glyph pixels in a rasterized frame.
 const CARET: Color = Color::opaque(255, 0, 0);
+/// Distinguishable from both ink and caret in a rasterized frame.
+const SELECTION: Color = Color::opaque(0, 0, 255);
 
 /// The one row in the document with anything on it.
 const MARKED_ROW: usize = 90_000;
@@ -96,6 +98,8 @@ fn frame_with_caret(storage: &TextStorage, row: usize, caret: Option<TextPositio
             ink: INK,
             caret_color: CARET,
             caret,
+            selection: None,
+            selection_color: SELECTION,
             revision: Revision::default(),
         },
     );
@@ -289,6 +293,8 @@ fn a_caret_below_the_viewport_does_not_leak_into_the_frame() {
                 ink: INK,
                 caret_color: CARET,
                 caret: Some(caret),
+                selection: None,
+                selection_color: SELECTION,
                 revision: Revision::default(),
             },
         );
@@ -348,6 +354,8 @@ fn a_stale_revision_draws_no_caret() {
                 byte: MARKED_ROW + 2,
                 affinity: Affinity::Downstream,
             }),
+            selection: None,
+            selection_color: SELECTION,
             // The buffer moved on after this window was shaped.
             revision: Revision::default().next(),
         },
@@ -409,6 +417,8 @@ fn a_caret_survives_a_fractional_display_scale() {
                     byte: MARKED_ROW + 2,
                     affinity: Affinity::Downstream,
                 }),
+                selection: None,
+                selection_color: SELECTION,
                 revision: Revision::default(),
             },
         );
@@ -427,4 +437,157 @@ fn a_caret_survives_a_fractional_display_scale() {
             "at scale {scale} a one-logical-pixel caret rounded away to nothing"
         );
     }
+}
+
+/// A document with text on several consecutive rows, for selection tests.
+fn prose() -> TextStorage {
+    TextStorage::from_text(&"ABCDEFGHIJ\n".repeat(8))
+}
+
+/// Renders `prose` with a selection, at the top of the document.
+fn selection_frame(selection: Option<TextSelection>) -> Vec<u8> {
+    let storage = prose();
+    let viewport = TextViewport::new(HEIGHT as f32, ROW_HEIGHT);
+    let window = viewport.visible(&storage, 0).expect("valid");
+    let mut context = TextContext::with_monospace_face(Arc::clone(&default_font()));
+    let mut presented = present(
+        &mut context,
+        &storage,
+        &window,
+        &Presentation {
+            style: style(),
+            row_height: ROW_HEIGHT,
+            wrap_width: None,
+        },
+        Revision::default(),
+    )
+    .expect("shapeable");
+
+    let scene = lower(
+        &mut presented,
+        &Frame {
+            surface: PhysicalSize {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+            scale: 1.0,
+            viewport_width: WIDTH as f32,
+            viewport_height: HEIGHT as f32,
+            background: BACKGROUND,
+            ink: INK,
+            caret_color: CARET,
+            caret: None,
+            selection,
+            selection_color: SELECTION,
+            revision: Revision::default(),
+        },
+    );
+    Presenter::new(PhysicalSize {
+        width: WIDTH,
+        height: HEIGHT,
+    })
+    .expect("the renderer starts")
+    .render(&scene)
+    .expect("renderable")
+    .to_vec()
+}
+
+fn count_where(frame: &[u8], f: impl Fn(&[u8]) -> bool) -> usize {
+    frame.chunks_exact(4).filter(|p| f(p)).count()
+}
+
+/// B2c: a selection reaches pixels, and sits behind the text.
+///
+/// The ordering half is the focus-ring lesson again: a highlight emitted after
+/// the glyphs would cover them, and the scene would look identical.
+#[test]
+fn a_selection_renders_behind_its_glyphs() {
+    let selected = selection_frame(Some(TextSelection {
+        anchor: TextPosition {
+            byte: 2,
+            affinity: Affinity::Downstream,
+        },
+        focus: TextPosition {
+            byte: 30,
+            affinity: Affinity::Downstream,
+        },
+    }));
+    let plain = selection_frame(None);
+
+    let blue = |p: &[u8]| p[2] > 200 && p[0] < 60 && p[1] < 60;
+    let white = |p: &[u8]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+
+    assert!(count_where(&plain, blue) == 0, "no selection, no highlight");
+    assert!(
+        count_where(&selected, blue) > 100,
+        "the selection produced {} highlight pixels",
+        count_where(&selected, blue)
+    );
+    // Restricted to a fully selected row, and compared against the same row
+    // unselected. Counting white anywhere in the frame does not work: rows 3
+    // to 7 are outside the selection, so their glyphs satisfy "some white
+    // exists" even when the highlight has painted over every selected glyph.
+    let row_1 = |frame: &[u8], f: &dyn Fn(&[u8]) -> bool| {
+        let band = ROW_HEIGHT as usize..2 * ROW_HEIGHT as usize;
+        band.flat_map(|y| (0..WIDTH as usize).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let index = (y * WIDTH as usize + x) * 4;
+                f(&frame[index..index + 4])
+            })
+            .count()
+    };
+
+    let glyphs_plain = row_1(&plain, &white);
+    let glyphs_selected = row_1(&selected, &white);
+    assert!(glyphs_plain > 0, "the fixture has glyphs on row 1");
+    assert!(
+        row_1(&selected, &blue) > 0,
+        "row 1 is inside the selection and is highlighted"
+    );
+    assert!(
+        glyphs_selected * 2 > glyphs_plain,
+        "row 1 has {glyphs_selected} glyph pixels when selected against \
+         {glyphs_plain} when not -- the highlight was painted over the text \
+         rather than behind it, and the scene would look identical either way"
+    );
+}
+
+/// The discriminating case: a selection starting midway through one row and
+/// ending midway through another.
+///
+/// An implementation that highlighted every touched row whole would give the
+/// first and last rows the same width as the middle one.
+#[test]
+fn a_cross_row_selection_does_not_highlight_whole_rows() {
+    let frame = selection_frame(Some(TextSelection {
+        anchor: TextPosition {
+            byte: 5,
+            affinity: Affinity::Downstream,
+        },
+        // Row 0 is bytes 0..10, row 1 is 11..21, row 2 is 22..32.
+        focus: TextPosition {
+            byte: 27,
+            affinity: Affinity::Downstream,
+        },
+    }));
+
+    let blue = |p: &[u8]| p[2] > 200 && p[0] < 60 && p[1] < 60;
+    let widths: Vec<usize> = (0..3)
+        .map(|row| {
+            let y = row * ROW_HEIGHT as usize + 10;
+            (0..WIDTH as usize)
+                .filter(|x| {
+                    let index = (y * WIDTH as usize + x) * 4;
+                    blue(&frame[index..index + 4])
+                })
+                .count()
+        })
+        .collect();
+
+    assert!(
+        widths[1] > widths[0] && widths[1] > widths[2],
+        "the middle row is fully selected and the first and last are not: \
+         {widths:?}"
+    );
+    assert!(widths[0] > 0 && widths[2] > 0, "all three rows are touched");
 }

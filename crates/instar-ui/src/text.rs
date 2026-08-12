@@ -385,6 +385,38 @@ impl TextLayout {
         }
     }
 
+    /// The rectangles a selection between two layout-local cursors covers.
+    ///
+    /// A callback rather than a returned `Vec`: Parley offers both, and the
+    /// allocating form builds a temporary vector per segment per frame. With
+    /// twenty-three segments visible that is twenty-three allocations to paint
+    /// one highlight.
+    ///
+    /// Both cursors are **layout-local**. Projecting a document-wide selection
+    /// onto one segment is `instar-host`'s job, because a Parley `Selection`
+    /// lives inside a single layout and this editor shapes one per row — a
+    /// selection stored as a Parley `Selection` would break the moment a drag
+    /// crossed a row boundary.
+    pub fn selection_geometry_with(
+        &self,
+        anchor: TextCursor,
+        focus: TextCursor,
+        mut f: impl FnMut(CaretGeometry),
+    ) {
+        let selection = parley::Selection::new(
+            parley::Cursor::from_byte_index(&self.layout, anchor.index, anchor.affinity.into()),
+            parley::Cursor::from_byte_index(&self.layout, focus.index, focus.affinity.into()),
+        );
+        selection.geometry_with(&self.layout, |box_, _line| {
+            f(CaretGeometry {
+                x: box_.x0 as f32,
+                y: box_.y0 as f32,
+                width: (box_.x1 - box_.x0) as f32,
+                height: (box_.y1 - box_.y0) as f32,
+            });
+        });
+    }
+
     /// Breaks the text into lines at `width`, or unbroken when `None`.
     pub fn break_lines(&mut self, width: Option<f32>) {
         self.layout.break_all_lines(width);

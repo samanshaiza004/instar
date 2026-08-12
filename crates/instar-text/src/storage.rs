@@ -98,7 +98,14 @@ impl TextStorage {
         self.len_bytes() == 0
     }
 
-    /// Total lines, counting a trailing newline's empty last line.
+    /// Total lines.
+    ///
+    /// A trailing newline does **not** add an empty final line: `"a\nb\n"` is
+    /// two lines, not three. An empty document has **zero** lines rather than
+    /// one. Both are `crop`'s definitions, both are pinned by a test, and both
+    /// are the opposite of the other common convention — the difference is an
+    /// off-by-one at the end of every document, and, for the empty case, a view
+    /// that presents no rows at all.
     pub fn len_lines(&self) -> usize {
         self.rope.line_len()
     }
@@ -230,6 +237,24 @@ mod tests {
             before,
             "a refused edit leaves the storage exactly as it was"
         );
+    }
+
+    /// Which line-counting convention `crop` uses, pinned.
+    ///
+    /// An earlier version of this method's documentation claimed the opposite.
+    /// It was found by a viewport fixture that indexed one row past the end.
+    #[test]
+    fn a_trailing_newline_does_not_add_an_empty_last_line() {
+        assert_eq!(TextStorage::from_text("a\nb\nc\n").len_lines(), 3);
+        assert_eq!(TextStorage::from_text("a\nb\nc").len_lines(), 3);
+        assert_eq!(
+            TextStorage::from_text("").len_lines(),
+            0,
+            "an empty document has no lines at all, not one empty one -- which \
+             is why a view of one presents no rows, and why a caret in an empty \
+             buffer has nowhere to be drawn until something gives it a row"
+        );
+        assert_eq!(TextStorage::from_text("\n").len_lines(), 1);
     }
 
     #[test]
