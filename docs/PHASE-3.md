@@ -683,20 +683,45 @@ interface text {
     resource text-buffer;
     resource text-view;
 
-    create-empty-buffer: async func() -> result<text-buffer, text-error>;
-    create-view: async func(buffer: borrow<text-buffer>)
+    create-empty-buffer: func() -> result<text-buffer, text-error>;
+    create-view: func(buffer: borrow<text-buffer>)
         -> result<text-view, text-error>;
 }
 
 interface ui {
     use text.{text-view};
 
-    commit: async func(
+    commit: func(
         snapshot: list<u8>,
         text-views: list<borrow<text-view>>,
     ) -> result<u64, commit-error>;
 }
 ```
+
+#### Synchronous in WIT, async in Rust
+
+> `ui.commit` **stays a synchronous WIT function.** Its Wasmtime host
+> implementation is Rust-async, so the runtime thread can await main-thread
+> application without blocking native interaction.
+
+An earlier draft of this section wrote it as `async func`, which would have
+been a regression: `commit` is already synchronous WIT today, and declaring a
+WIT function `async` opts into Component Model async semantics — overlapping
+subtasks, explicit borrow-lifetime machinery, a different ABI. That is close to
+the opposite of what a commit wants. Instar's admission is deliberately
+single-flight:
+
+```text
+guest calls commit
+  -> the guest cannot proceed through that call
+  -> the Rust host future awaits the main-thread apply
+  -> accepted or refused
+  -> the guest resumes
+```
+
+**The host may execute asynchronously without the guest-visible operation
+being concurrently outstanding.** `bindgen!`'s `imports: { default: async |
+trappable }` is exactly that distinction, and it is what the resources use too.
 
 and in the packed tree:
 
@@ -705,12 +730,31 @@ NodeKind::TextView { attachment: u16 }     // not { view_id: TextViewId }
 ```
 
 **Verified against the pinned toolchain before freezing**, because the whole
-design rests on it: `list<borrow<text-view>>` parses under wasm-tools 1.255,
-generates host bindings under `wasmtime 47.0.3`'s `bindgen!`, and generates
-guest bindings under `wit-bindgen 0.60` as
-`ui::commit(snapshot: &[u8], text_views: &[&TextView]) -> u64`. A contract
-frozen on a feature the toolchain could not express would have been a plan,
-not a decision.
+design rests on it. `list<borrow<text-view>>` parses under wasm-tools 1.255,
+generates host bindings under `wasmtime 47.0.3`, and generates guest bindings
+under `wit-bindgen 0.60` as
+`ui::commit(snapshot: &[u8], text_views: &[&TextView]) -> u64`.
+
+The full B2e-1 shape was then written and compiled — synchronous WIT resources,
+`imports: { default: async | trappable }`, `with:` mapping each resource to a
+host lease type, and `async fn` implementations of the generated traits:
+
+```rust
+impl Host for State {
+    async fn create_empty_buffer(&mut self)
+        -> wasmtime::Result<Result<Resource<GuestTextBuffer>, TextError>>
+    async fn create_view(&mut self, buffer: Resource<GuestTextBuffer>)
+        -> wasmtime::Result<Result<Resource<GuestTextView>, TextError>>
+}
+```
+
+Two details the spike settled that the documentation did not: the `with` key
+separates the resource with a **dot** (`"instar:probe/text.text-buffer"`), not
+a slash; and `async` alone omits the `wasmtime::Result` wrapper, so
+`trappable` is required for `ResourceTable` operations that can fail.
+
+A contract frozen on a feature the toolchain could not express would have been
+a plan, not a decision.
 
 #### Admission
 
@@ -816,11 +860,72 @@ already exists; it does not create a second editor interaction route.
 
 ```text
 B2e-0  freeze this contract                            <- done
-B2e-1  host resource leases: create-empty-buffer, create-view
+B2e-1  the first WIT resources, and their leases.
+       No change to ui.commit, no protocol bump, no attachment path,
+       no change to the B2d seam
 B2e-2  protocol v9: TextView node and attachment slot
 B2e-3  the commit side table, resolved before decode and apply
 B2e-4  attachment lifetime and retirement rules
 B2e-5  the RuntimeHarness vertical proof above
+```
+
+Each step gets one responsibility. Combining resources, a protocol bump, a
+borrowed side table and a new concurrency mode into one jump is how a package
+stops being reviewable.
+
+#### B2e-1's question, and its lease lifetimes
+
+> Can a guest acquire and release typed capabilities naming main-thread
+> `TextSystem` resources, without Wasmtime owning those resources?
+
+```text
+Wasmtime Store / runtime thread     main thread
+  ResourceTable                       TextSystem
+    GuestTextBuffer { id }    --->      TextBuffer   rope, revision, journal
+    GuestTextView   { id }    --->      TextView     caret, selection, scroll
+```
+
+Drop semantics, frozen for the unattached case B2e-1 covers:
+
+```text
+drop a TextView handle              -> lease removed; the internal view may go
+drop a TextBuffer handle while a
+  TextView still refers to it       -> the buffer stays
+```
+
+B2e-4 adds the second owner, and the accounting it implies:
+
+```text
+TextView lives while    a guest lease OR a retained UI attachment exists
+TextBuffer lives while  a guest lease OR a live TextView exists
+```
+
+Not generalized into a resource framework. Two resources, and whatever falls
+out of them.
+
+What B2e-1 must prove, before any tree is involved:
+
+```text
+create-empty-buffer          -> a real bounded TextBuffer slot
+create-view(buffer)          -> a view referring to that exact buffer
+drop an unattached view      -> the slot returns; reuse advances the generation
+a stale WIT resource         -> cannot reach the view that replaced it
+drop a buffer with a live view -> both remain valid
+MAX_TEXT_BUFFERS exceeded    -> an explicit error, not a panic
+MAX_TEXT_VIEWS exceeded      -> an explicit error
+guest trap / generation death -> leases cleaned, nothing leaked
+```
+
+The generational allocator matters here: the Component Model gives handle
+safety at the ABI, but once a handle resolves to a `TextViewId`, it is Instar's
+own generation that stops a stale id reaching the resource that replaced it.
+
+Four counters, so teardown tests can assert a return to baseline rather than
+that a `drop` ran:
+
+```text
+live guest buffer leases    live TextBuffers
+live guest view leases      live TextViews
 ```
 
 #### Recorded, not started
