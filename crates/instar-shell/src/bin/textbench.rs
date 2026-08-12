@@ -65,7 +65,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use instar_text::{Selection, TextBufferId, TextEdit, TextSystem, TextViewId, instrument};
+use instar_text::{
+    Selection, TextBufferId, TextEdit, TextSystem, TextViewId, Viewport, instrument,
+};
 
 // ---------------------------------------------------------------- allocator
 
@@ -560,6 +562,65 @@ fn views_table() {
     );
 }
 
+/// How much of a document a view has to shape to draw one screen of it.
+///
+/// The window only, not the shaping: package B1 has no font stack wired to a
+/// `TextView` yet, so `glyphs lowered` and `frame time` are not here. Which
+/// bytes get shaped is the architectural claim, and it is decided entirely by
+/// this table — a window that tracks the document rather than the viewport
+/// cannot be rescued by a fast shaper.
+fn viewport_table() {
+    println!("\n=== viewport-bounded shaping window ===\n");
+    println!(
+        "{:<20}  {:<10}  {:>10}  {:>6}  {:>14}  {:>10}  {:>12}",
+        "document", "position", "first row", "rows", "bytes shaped", "truncated", "window p50"
+    );
+
+    // 400 logical pixels of 20-pixel rows: about a screen, and around 1.5 KiB
+    // of the 62-byte-line fixtures.
+    let viewport = Viewport::new(400.0, 20.0);
+
+    for document in documents() {
+        let (system, buffer, _) = open(&document.text);
+        let storage = system.buffer(buffer).expect("a live buffer").text();
+
+        // Proportional rather than a fixed pixel offset: 1.9 million pixels is
+        // past the end of the 1 MiB document, and a clamped empty window would
+        // report a zero that looks like the claim being proved when it is only
+        // the fixture running out.
+        let deep = (storage.len_lines() as f32 * 0.8 * viewport.row_height) as i32;
+
+        for (label, scroll) in [("top", 0i32), ("80% down", deep)] {
+            let window = viewport.visible(storage, scroll).expect("in bounds");
+
+            let mut samples = Vec::with_capacity(2_000);
+            for _ in 0..2_000 {
+                let start = Instant::now();
+                let built = viewport.visible(storage, scroll).expect("in bounds");
+                samples.push(start.elapsed());
+                std::hint::black_box(built.bytes_shaped());
+            }
+
+            println!(
+                "{:<20}  {:<10}  {:>10}  {:>6}  {:>14}  {:>10}  {:>12}",
+                document.name,
+                label,
+                window.rows.start,
+                window.rows.len(),
+                bytes(window.bytes_shaped() as u64),
+                if window.any_truncated() { "yes" } else { "no" },
+                duration(percentiles(samples).p50),
+            );
+        }
+    }
+    println!(
+        "\nA tenfold document costs the same window, and row 135,298 costs what row\n\
+         13,528 costs. The single line is capped at MAX_SHAPED_PARAGRAPH_BYTES and\n\
+         says so, because five megabytes of one paragraph is the case that would\n\
+         otherwise look correct on every other fixture."
+    );
+}
+
 fn memory_table() {
     println!("\n=== memory ===\n");
     println!(
@@ -658,6 +719,7 @@ fn main() {
         }
     }
 
+    viewport_table();
     views_table();
     memory_table();
 

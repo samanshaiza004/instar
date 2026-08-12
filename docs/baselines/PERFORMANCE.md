@@ -382,3 +382,32 @@ material, and each extra view costs view-sized memory.
 Not answered, and not attempted: whether this survives a real keyboard, an IME
 preedit, shaping, and a guest that disagrees about the document. Those are
 packages B and C.
+
+### B1: the shaping window
+
+```text
+document              position     first row   rows   bytes shaped   truncated   p50
+1 MiB                 top                  0     23         1426 B          no  0.9 µs
+1 MiB                 80% down         13528     25         1550 B          no  1.4 µs
+10 MiB                top                  0     23         1426 B          no  0.9 µs
+10 MiB                80% down        135298     25         1550 B          no  1.3 µs
+5 MiB single line     top                  0      1         64 KiB         yes  0.0 µs
+5 MiB single line     80% down             0      1         64 KiB         yes  0.0 µs
+```
+
+A tenfold document costs the same window, and row 135,298 costs what row
+13,528 costs — `O(rows × log n)`, with no walk of anything above the viewport.
+The single line is capped at `MAX_SHAPED_PARAGRAPH_BYTES` and reports
+`truncated`, because five megabytes in one paragraph is the case that would
+look correct on every other fixture.
+
+This is the window, not the shaping: B1 has no font stack wired to a
+`TextView` yet, so glyphs lowered and frame time are not here. Which bytes get
+shaped is the architectural claim, and a window that tracked the document
+could not be rescued by a fast shaper.
+
+Four injections, all caught: no paragraph cap, a window that always starts at
+row 0, a cut that ignores character boundaries, and a `paragraph_at` that falls
+back to the nearest paragraph instead of answering `None`. The second is worth
+noting — it also showed up as the unit suite going from 0.03 s to 0.83 s, which
+is what a document scan looks like from the outside.

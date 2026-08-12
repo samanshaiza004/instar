@@ -140,6 +140,15 @@ impl TextStorage {
         Ok(self.rope.byte_of_line(line))
     }
 
+    /// Whether a byte offset is a UTF-8 character boundary.
+    ///
+    /// Public because a caller choosing where to cut — [`crate::Viewport`]
+    /// bounding an enormous paragraph — has to be able to ask before cutting,
+    /// rather than cutting and handling the error.
+    pub fn is_char_boundary(&self, byte: usize) -> bool {
+        byte <= self.len_bytes() && self.rope.is_char_boundary(byte)
+    }
+
     /// The line a byte offset falls on.
     pub fn line_of_byte(&self, byte: usize) -> Result<usize, TextError> {
         self.check(byte..byte)?;
