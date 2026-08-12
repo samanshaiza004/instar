@@ -249,7 +249,7 @@ impl TextHost {
         }
     }
 
-    /// Every lease a generation still holds, released.
+    /// A dead generation's leases and whatever they were keeping alive.
     ///
     /// Called from `Host::on_guest_gone` for both a trap and a clean exit,
     /// because a guest whose `run` returned has ended just as completely as
@@ -259,37 +259,58 @@ impl TextHost {
     /// Keyed only by generation. Using a `WindowId` to decide what to release
     /// would tie a document's lifetime to a surface.
     pub fn release_generation(&mut self, generation: GenerationId) {
-        let Some(leases) = self.leases.remove(&generation) else {
-            return;
-        };
-        for view in leases.views {
-            self.system.close_view(view);
-        }
-        for buffer in leases.buffers {
-            if self.system.views_of(buffer) == 0 {
-                self.system.close_buffer(buffer);
-            }
-        }
-        // Views that outlived their generation's buffer lease can leave a
-        // buffer nobody can reach. Nothing else owns one yet -- B2e-4 adds
-        // retained UI attachment as the second owner -- so an unreferenced
-        // buffer with no lease is unreachable and goes.
-        self.collect_unreachable_buffers();
+        self.release_generation_leases(generation);
+        self.collect_unowned_resources();
+    }
+
+    /// Forgets what a generation held. Destroys nothing.
+    ///
+    /// Split from collection deliberately. Today the two always run together,
+    /// so the split buys nothing yet — but B2e-4 adds retained UI attachment as
+    /// a second owner of a view, and it changes only the *ownership predicate*
+    /// below. Without the split it would instead be rewriting a function whose
+    /// name says a generation's death destroys documents, which is precisely
+    /// the thing B2e exists to disprove.
+    fn release_generation_leases(&mut self, generation: GenerationId) {
+        self.leases.remove(&generation);
         self.leases.retain(|_, leases| !leases.is_empty());
     }
 
-    fn collect_unreachable_buffers(&mut self) {
-        let leased: HashSet<TextBufferId> = self
+    /// Destroys every text resource nothing owns any more.
+    ///
+    /// The ownership predicate, and the whole of what B2e-4 will extend:
+    ///
+    /// ```text
+    /// a view    is owned while a guest lease names it
+    ///           B2e-4 adds: or a retained UI attachment does
+    /// a buffer  is owned while a guest lease names it, or a live view does
+    /// ```
+    fn collect_unowned_resources(&mut self) {
+        let leased_views: HashSet<TextViewId> = self
+            .leases
+            .values()
+            .flat_map(|leases| leases.views.iter().copied())
+            .collect();
+        let unowned: Vec<TextViewId> = self
+            .system
+            .views()
+            .filter(|id| !leased_views.contains(id))
+            .collect();
+        for id in unowned {
+            self.system.close_view(id);
+        }
+
+        let leased_buffers: HashSet<TextBufferId> = self
             .leases
             .values()
             .flat_map(|leases| leases.buffers.iter().copied())
             .collect();
-        let orphaned: Vec<TextBufferId> = self
+        let unowned: Vec<TextBufferId> = self
             .system
             .buffers()
-            .filter(|id| !leased.contains(id) && self.system.views_of(*id) == 0)
+            .filter(|id| !leased_buffers.contains(id) && self.system.views_of(*id) == 0)
             .collect();
-        for id in orphaned {
+        for id in unowned {
             self.system.close_buffer(id);
         }
     }

@@ -242,6 +242,11 @@ impl TextSystem {
         self.buffers.keys().copied()
     }
 
+    /// Every live view.
+    pub fn views(&self) -> impl Iterator<Item = TextViewId> + '_ {
+        self.views.keys().copied()
+    }
+
     /// How many views a buffer has. Diagnostics, and what `textbench` counts.
     pub fn views_of(&self, buffer: TextBufferId) -> usize {
         self.views.values().filter(|v| v.buffer() == buffer).count()

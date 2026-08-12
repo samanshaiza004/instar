@@ -78,6 +78,7 @@ use std::time::{Duration, Instant};
 
 use instar_kernel::bridge::{CommitRejection, CommitRequest, CommitSink, GuestEvent};
 use instar_kernel::runtime::{GenerationId, Runtime};
+use instar_kernel::text_bridge::{TextRequest, TextSink};
 use instar_ui::Tree;
 use instar_window::{WindowId, WindowOutput};
 use tokio::sync::mpsc;
@@ -140,6 +141,18 @@ pub enum HostUserEvent {
         generation: GenerationId,
         request: CommitRequest,
     },
+    /// The guest asked for a text resource and is suspended awaiting it.
+    ///
+    /// Ordinary work, deliberately on the same bounded queue as commits rather
+    /// than a text-specific one: creating and dropping a resource is guest
+    /// work like any other, and a second queue would mean a second answer to
+    /// back-pressure and a second pump budget to keep in step. Terminal
+    /// lifecycle stays on the out-of-band path, so `GuestGone` still outranks
+    /// every queued text request.
+    TextRequest {
+        generation: GenerationId,
+        request: TextRequest,
+    },
 }
 
 /// How a guest generation ended.
@@ -201,6 +214,23 @@ impl MainThreadSink {
     }
 }
 
+impl TextSink for MainThreadSink {
+    /// Non-blocking, exactly as commits are. A full or disconnected queue
+    /// means the main thread has stopped draining, and in that state a guest
+    /// is better told its request will not be answered than parked on it.
+    fn submit(&self, request: TextRequest) -> Result<(), TextRequest> {
+        let generation = request.generation();
+        match self.emit(HostUserEvent::TextRequest {
+            generation,
+            request,
+        }) {
+            Ok(()) => Ok(()),
+            Err(HostUserEvent::TextRequest { request, .. }) => Err(request),
+            Err(_) => unreachable!("emit returns the event it was given"),
+        }
+    }
+}
+
 impl CommitSink for MainThreadSink {
     fn submit(&self, request: CommitRequest) -> Result<(), CommitRequest> {
         let generation = request.generation();
@@ -213,6 +243,7 @@ impl CommitSink for MainThreadSink {
             // is the one that knows how to turn "nobody took this" into a
             // verdict the guest can act on.
             Err(HostUserEvent::UiCommit { request, .. }) => Err(request),
+            Err(_) => unreachable!("emit returns the event it was given"),
         }
     }
 }
@@ -433,6 +464,14 @@ fn run_thread(
             let _ = started.send(Err(error.to_string()));
             return;
         }
+        // Before the component can run, so a guest never finds the capability
+        // missing. Absence would be an immediate refusal rather than a hang,
+        // but a guest that has to handle a service the host simply forgot to
+        // install is a guest handling a bug.
+        if let Err(error) = kernel.install_text_sink(sink.clone()) {
+            let _ = started.send(Err(error.to_string()));
+            return;
+        }
 
         let mut generation = match runtime.new_generation().await {
             Ok(generation) => generation,
@@ -603,6 +642,8 @@ pub struct BridgeStats {
     /// Commits refused because their generation was no longer current. Refused
     /// *before* decoding — that is the point of counting them here.
     pub stale_commits: u64,
+    /// Text requests refused because their generation was already gone.
+    pub stale_text_requests: u64,
     /// Commits that decoded but did not validate, or did not decode.
     pub rejected_commits: u64,
     /// Commits applied.
@@ -967,6 +1008,7 @@ impl HostBridge {
     pub fn on_user_event(&mut self, event: HostUserEvent) -> Vec<HostEffect> {
         match event {
             HostUserEvent::UiCommit { request, .. } => self.on_ui_commit(request),
+            HostUserEvent::TextRequest { request, .. } => self.on_text_request(request),
         }
     }
 
@@ -1004,6 +1046,24 @@ impl HostBridge {
         if self.generation == generation {
             self.generation = GenerationId(0);
         }
+    }
+
+    /// Serves one text request, generation first.
+    ///
+    /// Same ordering rule as a commit and for the same reason: a superseded
+    /// generation does not get to allocate host resources on its way out, and
+    /// `TextRequest` has no way to show its operation until it has been
+    /// screened. A stale request is answered by `screen` itself, so it can
+    /// neither park the guest nor reach `TextHost`.
+    ///
+    /// Returns no effects: a resource appearing or going away changes nothing
+    /// on screen until something attaches it, which is B2e-4.
+    fn on_text_request(&mut self, request: TextRequest) -> Vec<HostEffect> {
+        match request.screen(self.generation) {
+            Ok(screened) => self.host.text_resources_mut().serve(screened),
+            Err(_stale) => self.stats.stale_text_requests += 1,
+        }
+        Vec::new()
     }
 
     fn on_ui_commit(&mut self, request: CommitRequest) -> Vec<HostEffect> {
