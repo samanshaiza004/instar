@@ -74,7 +74,7 @@ pub use edit::{AppliedEdit, EditJournal, TextEdit};
 pub use storage::{TextSlice, TextStorage};
 pub use system::{MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextSystem};
 pub use view::{Selection, TextView};
-pub use viewport::{MAX_SHAPED_PARAGRAPH_BYTES, ParagraphWindow, ShapingWindow, Viewport};
+pub use viewport::{MAX_SHAPED_PARAGRAPH_BYTES, ParagraphWindow, ShapingWindow, TextViewport};
 
 /// A buffer's version, advancing once per applied edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

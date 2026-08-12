@@ -309,7 +309,15 @@ presentation memory
 layout time
 ```
 
-with the 5 MiB single line producing the same bytes-shaped as the others.
+and, separately, when the 5 MiB single line stays bounded by
+`MAX_SHAPED_PARAGRAPH_BYTES` and does not scale with line or document length.
+
+Not "the same bytes-shaped as the others" — an earlier draft of this section
+said that, and the measurement contradicts it by design. One capped paragraph
+is ~64 KiB against ~1.5 KiB for a screen of ordinary lines. Requiring them to
+match byte for byte would serve nothing: the architectural property is that
+the number stops growing, not that it lands on the same value as a different
+kind of document.
 
 ### B2 — pointer selection and caret movement
 

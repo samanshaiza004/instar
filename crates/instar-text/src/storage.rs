@@ -142,7 +142,7 @@ impl TextStorage {
 
     /// Whether a byte offset is a UTF-8 character boundary.
     ///
-    /// Public because a caller choosing where to cut — [`crate::Viewport`]
+    /// Public because a caller choosing where to cut — [`crate::TextViewport`]
     /// bounding an enormous paragraph — has to be able to ask before cutting,
     /// rather than cutting and handling the error.
     pub fn is_char_boundary(&self, byte: usize) -> bool {

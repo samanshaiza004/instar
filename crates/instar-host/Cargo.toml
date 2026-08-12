@@ -11,6 +11,13 @@ instar-kernel = { path = "../instar-kernel" }
 instar-ui = { path = "../instar-ui" }
 instar-window = { path = "../instar-window" }
 
+# The text resource subsystem, composed with instar-ui rather than layered
+# under it. This crate is the only place they meet: instar-text chooses which
+# bytes a view must shape and knows nothing of fonts; instar-ui shapes a
+# string and knows nothing of documents. A layering test holds
+# `instar-ui -> instar-text` absent.
+instar-text = { path = "../instar-text" }
+
 # Paint *intent* only: scene types, no renderer. This crate is the layer that
 # bridges logical presentation to physical rendering (docs/PHASE-1.md), so
 # lowering a laid-out tree to a PaintScene belongs here -- but choosing a

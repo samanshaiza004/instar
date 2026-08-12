@@ -46,6 +46,7 @@
 
 pub mod bridge;
 pub mod present;
+pub mod text_view;
 
 use std::collections::HashMap;
 use std::sync::Arc;

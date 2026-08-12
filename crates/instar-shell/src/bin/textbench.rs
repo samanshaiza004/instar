@@ -65,9 +65,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use instar_host::text_view::present;
 use instar_text::{
-    Selection, TextBufferId, TextEdit, TextSystem, TextViewId, Viewport, instrument,
+    Selection, TextBufferId, TextEdit, TextSystem, TextViewId, TextViewport, instrument,
 };
+use instar_ui::{FontRole, ShapingStyle, TextContext};
 
 // ---------------------------------------------------------------- allocator
 
@@ -578,7 +580,7 @@ fn viewport_table() {
 
     // 400 logical pixels of 20-pixel rows: about a screen, and around 1.5 KiB
     // of the 62-byte-line fixtures.
-    let viewport = Viewport::new(400.0, 20.0);
+    let viewport = TextViewport::new(400.0, 20.0);
 
     for document in documents() {
         let (system, buffer, _) = open(&document.text);
@@ -618,6 +620,77 @@ fn viewport_table() {
          13,528 costs. The single line is capped at MAX_SHAPED_PARAGRAPH_BYTES and\n\
          says so, because five megabytes of one paragraph is the case that would\n\
          otherwise look correct on every other fixture."
+    );
+}
+
+/// What it costs to turn that window into glyphs.
+///
+/// The window table above is the architectural claim; this is the check that
+/// the claim survives contact with a shaper. Glyph count and presentation
+/// memory must track the visible region, because a window that is bounded and
+/// a presentation that is not would leave the invariant technically true and
+/// practically worthless.
+fn shaping_table() {
+    println!("\n=== shaping the window ===\n");
+    println!(
+        "{:<20}  {:<10}  {:>14}  {:>8}  {:>14}  {:>12}",
+        "document", "position", "bytes shaped", "glyphs", "presentation", "shape p50"
+    );
+
+    let viewport = TextViewport::new(400.0, 20.0);
+    let style = ShapingStyle {
+        role: FontRole::Monospace,
+        size: 14.0,
+        weight: 400,
+        wrap: false,
+    };
+    // One font stack for the whole benchmark, as Parley intends and as
+    // instar-host does.
+    let mut context = TextContext::with_monospace_face(instar_shell::default_font());
+
+    for document in documents() {
+        let (system, buffer, _) = open(&document.text);
+        let storage = system.buffer(buffer).expect("a live buffer").text();
+        let deep = (storage.len_lines() as f32 * 0.8 * viewport.row_height) as i32;
+
+        for (label, scroll) in [("top", 0i32), ("80% down", deep)] {
+            let window = viewport.visible(storage, scroll).expect("in bounds");
+
+            // Warm: the first shape of a face loads it, and that cost belongs
+            // to starting up rather than to a frame.
+            let _ = present(&mut context, storage, &window, style, 20.0, None);
+
+            let before = live();
+            let mut presented = present(&mut context, storage, &window, style, 20.0, None)
+                .expect("a window is always shapeable");
+            let glyphs = presented.glyphs();
+            let presentation = live() - before;
+
+            let mut samples = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let start = Instant::now();
+                let mut frame = present(&mut context, storage, &window, style, 20.0, None)
+                    .expect("a window is always shapeable");
+                std::hint::black_box(frame.glyphs());
+                samples.push(start.elapsed());
+            }
+
+            println!(
+                "{:<20}  {:<10}  {:>14}  {:>8}  {:>14}  {:>12}",
+                document.name,
+                label,
+                bytes(presented.bytes_shaped() as u64),
+                glyphs,
+                bytes(presentation.max(0) as u64),
+                duration(percentiles(samples).p50),
+            );
+        }
+    }
+    println!(
+        "\nGlyphs and presentation memory follow the window, not the document. The\n\
+         single line shapes its 64 KiB cap, which is the bound working rather\n\
+         than the bound failing -- an uncapped paragraph would be five megabytes\n\
+         of glyphs to draw eighty columns."
     );
 }
 
@@ -720,6 +793,7 @@ fn main() {
     }
 
     viewport_table();
+    shaping_table();
     views_table();
     memory_table();
 

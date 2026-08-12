@@ -31,7 +31,7 @@
 //! Wrapping needs an incrementally maintained row index — every editor that
 //! wraps large documents has one — and building that before a caret has ever
 //! moved would be inventing machinery for a feature nothing has asked for. The
-//! boundary is stated rather than hidden: [`Viewport::visible`] takes a row
+//! boundary is stated rather than hidden: [`TextViewport::visible`] takes a row
 //! height and assumes it applies to every row.
 //!
 //! # Enormous paragraphs
@@ -67,7 +67,7 @@ pub const MAX_SHAPED_PARAGRAPH_BYTES: usize = 64 * 1024;
 /// arithmetic and expressing the margin in pixels would mean converting it back
 /// immediately.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Viewport {
+pub struct TextViewport {
     /// Visible height in logical pixels.
     pub height: f32,
     /// The height of one row, in logical pixels.
@@ -77,7 +77,7 @@ pub struct Viewport {
     pub overscan_rows: usize,
 }
 
-impl Viewport {
+impl TextViewport {
     pub fn new(height: f32, row_height: f32) -> Self {
         Self {
             height,
@@ -239,7 +239,7 @@ mod tests {
     /// scan: a tenfold document with the same viewport shapes the same bytes.
     #[test]
     fn work_tracks_the_viewport_rather_than_the_document() {
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
 
         let small = document(1_000);
         let large = document(100_000);
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn scrolling_deep_does_not_shape_what_was_scrolled_past() {
         let storage = document(100_000);
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
 
         let near = viewport.visible(&storage, 2_000).expect("in bounds");
         let deep = viewport.visible(&storage, 1_900_000).expect("in bounds");
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn the_top_of_a_document_has_nothing_above_it_to_overscan() {
         let storage = document(1_000);
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
 
         let top = viewport.visible(&storage, 0).expect("in bounds");
         let interior = viewport.visible(&storage, 2_000).expect("in bounds");
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn an_enormous_paragraph_contributes_a_bounded_segment() {
         let storage = TextStorage::from_text(&"x".repeat(5 * 1024 * 1024));
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
 
         let window = viewport.visible(&storage, 0).expect("in bounds");
 
@@ -336,7 +336,7 @@ mod tests {
         // Three-byte characters do not divide the 64 KiB cap evenly, so the
         // naive cut lands mid-character.
         let storage = TextStorage::from_text(&"あ".repeat(100_000));
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
 
         let window = viewport.visible(&storage, 0).expect("in bounds");
         let segment = &window.paragraphs[0];
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn a_buffer_offset_and_a_paragraph_offset_convert_both_ways() {
         let storage = document(100_000);
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
         let window = viewport.visible(&storage, 1_900_000).expect("in bounds");
 
         let paragraph = &window.paragraphs[3];
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn a_position_outside_the_window_is_not_silently_reassigned() {
         let storage = document(100_000);
-        let viewport = Viewport::new(400.0, 20.0);
+        let viewport = TextViewport::new(400.0, 20.0);
         let window = viewport.visible(&storage, 1_900_000).expect("in bounds");
 
         assert_eq!(
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn an_empty_document_shapes_nothing() {
         let storage = TextStorage::new();
-        let window = Viewport::new(400.0, 20.0)
+        let window = TextViewport::new(400.0, 20.0)
             .visible(&storage, 0)
             .expect("in bounds");
         assert_eq!(window.bytes_shaped(), 0);
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn scrolling_past_the_end_clamps() {
         let storage = document(10);
-        let window = Viewport::new(400.0, 20.0)
+        let window = TextViewport::new(400.0, 20.0)
             .visible(&storage, 100_000)
             .expect("a clamped window is still a valid one");
         assert!(window.rows.end <= storage.len_lines());

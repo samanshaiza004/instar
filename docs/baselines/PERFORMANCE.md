@@ -411,3 +411,66 @@ row 0, a cut that ignores character boundaries, and a `paragraph_at` that falls
 back to the nearest paragraph instead of answering `None`. The second is worth
 noting — it also showed up as the unit suite going from 0.03 s to 0.83 s, which
 is what a document scan looks like from the outside.
+
+### B1b: the window, shaped
+
+```text
+document              position   bytes shaped   glyphs   presentation   shape p50
+1 MiB                 top              1403 B     1403        285 KiB      194 µs
+1 MiB                 80% down         1525 B     1525        115 KiB      212 µs
+10 MiB                top              1403 B     1403        106 KiB      202 µs
+10 MiB                80% down         1525 B     1525        115 KiB      221 µs
+5 MiB single line     top              64 KiB    65536       2306 KiB     6691 µs
+5 MiB single line     80% down         64 KiB    65536       2306 KiB     6689 µs
+```
+
+Glyphs and presentation memory follow the window rather than the document, and
+a deeply scrolled row is proved to reach pixels by a rasterizing test rather
+than by a scene assertion — the distinction Phase 2 paid for with the focus
+ring, which had a correct scene and an invisible ring for two packages.
+
+Two findings worth carrying into B2.
+
+**Per-window re-shaping is ~200 µs and nothing is cached across frames.** At
+8.4 µs per row that is 1.2% of a 60 Hz budget, so it is not urgent, but a
+scrolling view currently reshapes every visible row every frame. A per-row
+cache keyed by content is the obvious lever if it ever matters.
+
+**The 64 KiB paragraph cap costs 6.7 ms to shape.** The cap does its job — the
+number stops growing with the line — but 6.7 ms is a visible hitch, so
+"bounded" and "affordable" are not the same claim. Only a viewport's width of
+an unwrapped line is ever visible, so a smaller cap is likely right; it is left
+at 64 KiB because choosing the number properly needs the horizontal-scroll work
+B2 has not done yet.
+
+### The font extraction defect this found
+
+`textbench` was built to catch a `to_string` on the editing path. It found
+something else, in code shipped since Phase 1 and on the path of every text
+node in the UI:
+
+```text
+extract one 61-glyph line        before              after
+  shipped monospace face       62 µs / 184,776 B    1.3 µs / 1,056 B
+  a system face             2,530 µs / 7,910,720 B  1.2 µs / 1,056 B
+```
+
+Two causes, both in `instar-ui::text::extract`. The cache key was a hash of the
+entire font file, so producing it read megabytes. And `FontFace::data` is an
+`Arc<[u8]>` built with `Arc::from(bytes)` from Parley's `Blob<u8>` — a
+different `Arc` type, so every extraction copied the whole font.
+
+The first fix keyed on `Blob`'s own unique id, which makes both costs vanish.
+`instar-ui`'s `layout_is_deterministic` rejected it within the hour: two
+`TextContext`s each load the face into their own blob, so the same font
+produced two different keys and two identical layouts compared unequal.
+
+So the key stays content-derived and the *lookup* became free — the blob id
+indexes a cache holding both the hash and the single copy of the bytes, and
+the expensive read happens once per face per thread instead of once per
+extraction.
+
+Worth recording as a method note: this was invisible to every existing test and
+to the warm-click gate, because the keyed path re-extracts only when a string
+changes and the gate's guest changes one short label. It took a benchmark that
+shapes twenty-three rows at once to make a per-extraction cost visible at all.

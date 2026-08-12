@@ -1590,6 +1590,7 @@ dependencies = [
  "instar-guest-build",
  "instar-kernel",
  "instar-paint",
+ "instar-text",
  "instar-ui",
  "instar-window",
  "tokio",

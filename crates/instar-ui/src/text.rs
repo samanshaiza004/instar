@@ -202,13 +202,34 @@ pub struct Glyph {
 }
 
 /// A face a run refers to, as the bytes a renderer needs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct FontFace {
     pub data: std::sync::Arc<[u8]>,
     pub index: u32,
-    /// Stable identity for renderer-side caches. Must change when the bytes
-    /// do.
+    /// Stable identity for renderer-side caches.
+    ///
+    /// Derived from the font blob's own id, so it changes when the bytes do —
+    /// and, unlike a content hash, may also differ between two blobs holding
+    /// identical bytes. That is the right trade: the same face loaded twice is
+    /// a rare and harmless cache miss, while hashing the file to rule it out
+    /// cost 2.5 ms per extraction with a system face.
     pub key: u64,
+}
+
+/// Hand-written so a failing assertion is readable.
+///
+/// The derived `Debug` prints `data` byte by byte. A `ShapedText` appears
+/// inside `LayoutSnapshot`, so one failed layout comparison produced a 182 MB
+/// dump of two font files rendered as decimal integers — which is not a
+/// diagnostic, it is a denial of one.
+impl std::fmt::Debug for FontFace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontFace")
+            .field("key", &self.key)
+            .field("index", &self.index)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
 }
 
 /// The render artifact for one text node: what to draw, in logical space.
@@ -222,6 +243,87 @@ pub struct ShapedText {
     /// Logical extents of the laid-out text.
     pub width: f32,
     pub height: f32,
+}
+
+/// A shaped layout whose lifetime the caller owns.
+///
+/// # Why this exists rather than returning `ShapedText`
+///
+/// `ShapedText` is a *render artifact* — glyph ids and positions, derived from
+/// a layout and cheap to rebuild from it. The `Layout` is the reusable truth:
+/// it is what can be re-broken at a new width, re-aligned, and hit-tested.
+/// That split is the Stage 1 fix this module is built around, and handing a
+/// caller only the derived half would push them into reshaping to answer a
+/// question the layout could have answered.
+///
+/// Concretely, `parley::editing::Cursor` operates against a `Layout`. A
+/// `TextView` that received only glyph positions would discover at the first
+/// mouse click that it cannot hit-test, and would either shape a second time
+/// or grow a parallel layout path.
+///
+/// # Why it is opaque
+///
+/// The other way to avoid that is to return `parley::Layout` directly, and
+/// then `instar-host` depends on Parley's types and "`instar-ui` owns text
+/// shaping" stops being true. The wrapper is the middle: callers get the
+/// reusable truth, Parley stays inside this crate, and the editing geometry
+/// operations B2 needs can be added here without moving the seam.
+pub struct TextLayout {
+    layout: parley::Layout<[u8; 4]>,
+    shaped: ShapedText,
+    shaped_valid: bool,
+}
+
+impl TextLayout {
+    /// Breaks the text into lines at `width`, or unbroken when `None`.
+    pub fn break_lines(&mut self, width: Option<f32>) {
+        self.layout.break_all_lines(width);
+        self.shaped_valid = false;
+    }
+
+    /// Positions the broken lines. Must follow a break; Parley aligns the
+    /// lines that exist.
+    pub fn align(&mut self, alignment: Alignment) {
+        self.layout
+            .align(alignment.into(), parley::AlignmentOptions::default());
+        self.shaped_valid = false;
+    }
+
+    /// The render artifact, extracted once per layout change.
+    ///
+    /// `&mut self` for a getter is deliberate: extraction is real work, and
+    /// this module's whole cache exists because re-extracting an unchanged
+    /// layout was the cost worth removing. A `&self` version returning by
+    /// value would reintroduce it once per visible paragraph per frame.
+    pub fn shaped(&mut self) -> &ShapedText {
+        if !self.shaped_valid {
+            self.shaped = extract(&self.layout);
+            self.shaped_valid = true;
+        }
+        &self.shaped
+    }
+
+    pub fn width(&self) -> f32 {
+        self.layout.width()
+    }
+
+    pub fn height(&self) -> f32 {
+        self.layout.height()
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.layout.len()
+    }
+}
+
+impl std::fmt::Debug for TextLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextLayout")
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("lines", &self.line_count())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a Taffy measure pass is asking for.
@@ -370,18 +472,42 @@ fn ceil(width: f32) -> f32 {
     width.ceil()
 }
 
+thread_local! {
+    /// Font stacks built on this thread.
+    ///
+    /// Parley intends a `FontContext` to be roughly one per application, and a
+    /// fresh one enumerates the system's faces. "Long-lived" is the kind of
+    /// intention that decays into a per-frame construction nobody notices,
+    /// because the only symptom is that everything is slow — so it is counted,
+    /// and a test asserts the count does not move across a frame.
+    ///
+    /// Thread-local rather than global because the test harness runs tests in
+    /// parallel on separate threads, and a process-wide counter would report
+    /// another test's context.
+    static CONSTRUCTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl TextContext {
     /// Builds the long-lived Parley resources.
     ///
     /// Both contexts are expensive to construct and reusable across every
     /// layout pass, so this is created once and kept for the life of the UI.
     pub fn new() -> Self {
+        CONSTRUCTED.with(|count| count.set(count.get() + 1));
         Self {
             entries: HashMap::new(),
             stats: TextStats::default(),
             font_context: parley::FontContext::new(),
             layout_context: parley::LayoutContext::new(),
         }
+    }
+
+    /// How many font stacks this thread has built.
+    ///
+    /// Diagnostic, in the same spirit as [`TextStats`]: a number that makes an
+    /// intention checkable instead of aspirational.
+    pub fn constructed_on_this_thread() -> u64 {
+        CONSTRUCTED.with(|count| count.get())
     }
 
     /// Builds the long-lived Parley resources with a registered monospace face.
@@ -584,6 +710,30 @@ impl TextContext {
         self.entries.get(&key).map_or(0, |entry| entry.layout.len())
     }
 
+    /// Shapes text this context will not cache, for a caller that owns the
+    /// result.
+    ///
+    /// The keyed path exists because the semantic tree gives every text node a
+    /// stable `NodeKey` to cache against. A `TextView` has no such key: it
+    /// shapes a *window* that moves as the view scrolls, so the caller decides
+    /// what to keep and for how long.
+    ///
+    /// What is shared is the part that must be: the `FontContext` and
+    /// `LayoutContext`. Parley intends those to be long-lived, roughly one per
+    /// application, and a second set would load every face twice — and could
+    /// resolve the same family to a different face for a `Text` node than for
+    /// a `TextView` showing the same font.
+    ///
+    /// This is the whole of `instar-ui`'s knowledge of editors: it shapes a
+    /// string. It does not know a `TextBuffer` exists.
+    pub fn shape_keyless(&mut self, text: &str, style: ShapingStyle) -> TextLayout {
+        TextLayout {
+            layout: self.shape(text, &style),
+            shaped: ShapedText::default(),
+            shaped_valid: false,
+        }
+    }
+
     fn shape(&mut self, text: &str, style: &ShapingStyle) -> parley::Layout<[u8; 4]> {
         let family = match style.role {
             FontRole::SystemUi => parley::FontFamily::from(parley::GenericFamily::SystemUi),
@@ -646,15 +796,14 @@ fn extract(layout: &parley::Layout<[u8; 4]>) -> ShapedText {
             };
             let run = glyph_run.run();
             let font_data = run.font();
-            let bytes = font_data.data.as_ref();
-            let key = font_key(bytes, font_data.index);
-            let font_index = match fonts.iter().position(|face| face.key == key) {
+            let face = cached_face(font_data);
+            let font_index = match fonts.iter().position(|held| held.key == face.key) {
                 Some(index) => index,
                 None => {
                     fonts.push(FontFace {
-                        data: Arc::from(bytes),
+                        data: face.data,
                         index: font_data.index,
-                        key,
+                        key: face.key,
                     });
                     fonts.len() - 1
                 }
@@ -682,11 +831,64 @@ fn extract(layout: &parley::Layout<[u8; 4]>) -> ShapedText {
     }
 }
 
-fn font_key(bytes: &[u8], index: u32) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    index.hash(&mut hasher);
-    hasher.finish()
+/// A face's key and bytes, computed once per face instead of once per
+/// extraction.
+///
+/// # What was wrong
+///
+/// Extraction did two things per call that both read the whole font file: it
+/// hashed the bytes to produce a cache key, and it built `FontFace::data` with
+/// `Arc::from(bytes)` — a copy, because Parley hands out a `Blob<u8>` whose
+/// inner `Arc` is a different type. `textbench` measured the result:
+///
+/// ```text
+/// one 61-glyph line     shipped monospace      a system face
+/// extract              62 µs / 184,776 B    2,530 µs / 7,910,720 B
+/// ```
+///
+/// # Why memoized rather than replaced
+///
+/// `Blob` carries a unique id, and keying on that alone would make both costs
+/// vanish — but it would also make `FontFace::key` non-deterministic, because
+/// two `TextContext`s each load the face into their own blob. `instar-ui`
+/// asserts that layout is deterministic, and it caught exactly that.
+///
+/// So the key stays content-derived and the *lookup* becomes free: the blob id
+/// indexes a cache holding the hash and the one copy of the bytes. The
+/// expensive read happens once per face per thread.
+///
+/// The bytes are not eliminated entirely because the alternative is putting a
+/// `Blob` into `FontFace` and therefore into `instar-paint::FontResource`,
+/// which would push a font-library type into the renderer-neutral paint crate
+/// to save a copy that now happens once.
+#[derive(Clone)]
+struct CachedFace {
+    key: u64,
+    data: Arc<[u8]>,
+}
+
+thread_local! {
+    static FACES: std::cell::RefCell<HashMap<(u64, u32), CachedFace>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn cached_face(font: &parley::FontData) -> CachedFace {
+    FACES.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry((font.data.id(), font.index))
+            .or_insert_with(|| {
+                let bytes = font.data.data();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                font.index.hash(&mut hasher);
+                CachedFace {
+                    key: hasher.finish(),
+                    data: Arc::from(bytes),
+                }
+            })
+            .clone()
+    })
 }
 
 /// # Known limitation, recorded rather than papered over

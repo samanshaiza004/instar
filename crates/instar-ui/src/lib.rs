@@ -50,7 +50,7 @@ pub use scroll::{
 };
 pub use text::{
     Alignment, Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle,
-    TextContext, TextStats,
+    TextContext, TextLayout, TextStats,
 };
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};
