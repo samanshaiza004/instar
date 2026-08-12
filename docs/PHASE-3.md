@@ -299,6 +299,51 @@ everything before it, which is O(bytes before it) however the shaping is
 chunked. If that turns out to matter, it is a finding for B1 to report, not a
 promise made here.
 
+#### Measured, and left provisional
+
+```text
+MAX_SHAPED_PARAGRAPH_BYTES = 64 KiB
+
+correctness   bounded, and does not scale with the line   PASS
+performance   6.7 ms to shape the cap                     NOT ACCEPTED
+decision      deferred until horizontal scrolling shows
+              which indexing model is needed
+```
+
+**Bounded and affordable are not the same claim.** The cap does exactly what it
+was written to do — the number stops growing with the line — and 6.7 ms is
+still a visible hitch.
+
+The number is deliberately not tuned. Changing 64 KiB to 8 KiB would trade one
+arbitrary constant for another, because the real answer for a giant unwrapped
+line is not a smaller brute-force window:
+
+```text
+5 MiB logical line
+   -> horizontal presentation index
+   -> a bounded chunk around the visible x-range,
+      plus bounded shaping context either side
+   -> TextLayout
+```
+
+Reaching a deep x-position in variable-width text without measuring everything
+before it needs retained width information. That is the same shape of problem
+as soft wrap, and it deserves the same treatment: do not optimize the constant
+before the model is known.
+
+Three related problems are now visible, and they are deliberately **not**
+unified yet:
+
+```text
+vertical navigation, unwrapped     line index from the rope     cheap already
+horizontal navigation, giant line  needs shaped widths          future index
+soft wrapping                      rows depend on prior breaks  future index
+```
+
+The last two may eventually share one incremental presentation index. Merging
+them now would be designing that index from two guesses instead of one
+requirement.
+
 B1 closes when work tracks the visible region:
 
 ```text
@@ -329,6 +374,61 @@ host-local and require no guest event.
 Phase 2's doctrine carries forward unchanged: transient editor interaction
 naming text positions is host-owned and stays responsive independent of guest
 progress.
+
+The path is already built on both sides; B2 joins them:
+
+```text
+pointer position                    absolute position
+   -> PresentedSegment                 -> buffer_to_local
+   -> TextLayout::cursor_from_point    -> cursor_from_byte_index
+   -> segment-local byte + affinity    -> cursor geometry
+   -> local_to_buffer                  -> paint caret
+   -> absolute position
+   -> TextSystem
+```
+
+**The rule that keeps it honest:**
+
+> Pointer hit-testing and caret geometry must use the *same* `TextLayout`
+> instance that produced the presented glyphs.
+
+Calling `shape_keyless` again to answer a click would give a view two layouts
+that can disagree about where text is. Phase 2 has already paid once for two
+answers to a geometric question.
+
+The tests worth writing attack the translation seam, not Parley:
+
+```text
+click a top-of-file row
+click row 90,000, and prove the buffer byte is deep in the document
+inject buffer_range.start = 0, and prove only the deep case fails
+click through multibyte UTF-8
+a bidi fixture, where affinity decides the visual position at an
+    ambiguous boundary
+drag a selection across two presented rows
+caret and selection pixel tests
+```
+
+The last because Phase 2 proved scene commands can exist while being
+invisible.
+
+And instrument, without necessarily optimizing yet:
+
+```text
+pointer -> buffer position
+buffer position -> caret geometry
+caret-only repaint
+visible-text reshapes triggered
+```
+
+The target an arrow key should eventually reach is `reshapes: 0, extractions:
+0, layout rebuilds: 0, caret paint only`. B2 does not have to get there; it has
+to be able to say whether it did, because that measurement is what shows where
+the next cache boundary belongs.
+
+No cross-frame row cache before then. At ~200 µs for a full visible window,
+caching would mean inventing invalidation semantics with no evidence about
+what invalidates.
 
 ### B3 — keyboard, with commands and text kept apart
 

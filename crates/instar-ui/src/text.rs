@@ -268,6 +268,22 @@ pub struct ShapedText {
 /// shaping" stops being true. The wrapper is the middle: callers get the
 /// reusable truth, Parley stays inside this crate, and the editing geometry
 /// operations B2 needs can be added here without moving the seam.
+///
+/// # What this is, and what it must never become
+///
+/// > A `TextLayout` is **presentation state, not buffer state**. It may be
+/// > reused while the revision, byte range, style and layout constraints it
+/// > was built from remain valid. It never becomes canonical text truth.
+///
+/// Written down before caching exists, because caching is when it gets
+/// violated. A layout that outlives the range it was shaped from is a second
+/// answer to what the document says, and the first symptom is a caret placed
+/// from stale geometry — the same shape of defect as two answers to where a
+/// node is on screen, which Phase 2 already paid for once.
+///
+/// The corollary for B2: hit-testing and caret geometry must use the *same
+/// instance* that produced the presented glyphs. Re-shaping the same string to
+/// answer a click is how a view acquires two layouts that disagree.
 pub struct TextLayout {
     layout: parley::Layout<[u8; 4]>,
     shaped: ShapedText,
@@ -1098,5 +1114,89 @@ mod tests {
             "bidi fixture should resolve a face"
         );
         assert!(glyphs > 0, "bidi fixture should produce glyphs");
+    }
+
+    /// A face built from arbitrary bytes. `cached_face` hashes and copies; it
+    /// never parses, so these need not be real fonts.
+    fn face(bytes: &[u8], index: u32) -> parley::FontData {
+        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes.to_vec());
+        parley::FontData::new(parley::fontique::Blob::new(data), index)
+    }
+
+    /// The regression that broke `layout_is_deterministic`.
+    ///
+    /// `Blob::new` hands out a fresh id every call, so two `TextContext`s
+    /// loading the same file hold blobs with different ids. A key derived from
+    /// the id alone therefore made one font produce two identities, and two
+    /// identical layouts compare unequal.
+    #[test]
+    fn the_same_bytes_and_index_are_the_same_face_in_any_context() {
+        let first = cached_face(&face(b"a plausible font file", 0));
+        let second = cached_face(&face(b"a plausible font file", 0));
+
+        assert_ne!(
+            face(b"a plausible font file", 0).data.id(),
+            face(b"a plausible font file", 0).data.id(),
+            "the premise: blob ids differ even for identical bytes"
+        );
+        assert_eq!(
+            first.key, second.key,
+            "and the key must not, or layout stops being deterministic"
+        );
+    }
+
+    /// A collection index selects a different face inside one file, so it is
+    /// part of the identity rather than a detail hanging off it.
+    #[test]
+    fn a_collection_index_is_part_of_a_face_key() {
+        let bytes = b"a font collection with several faces";
+        assert_ne!(
+            cached_face(&face(bytes, 0)).key,
+            cached_face(&face(bytes, 1)).key,
+            "two faces of one TTC would otherwise share a renderer cache entry"
+        );
+    }
+
+    #[test]
+    fn different_bytes_are_different_faces() {
+        assert_ne!(
+            cached_face(&face(b"one font", 0)).key,
+            cached_face(&face(b"another font", 0)).key
+        );
+    }
+
+    /// The other half of the defect: the bytes are copied once per face, not
+    /// once per extraction.
+    #[test]
+    fn a_faces_bytes_are_copied_once_and_then_shared() {
+        let font = face(b"a plausible font file", 0);
+        let first = cached_face(&font);
+        let second = cached_face(&font);
+
+        assert!(
+            Arc::ptr_eq(&first.data, &second.data),
+            "a second extraction of the same face copied the font again -- this \
+             cost 7.9 MB per extraction with a system face"
+        );
+    }
+
+    /// Never dump the backing font bytes again.
+    #[test]
+    fn a_font_face_debugs_as_a_summary_rather_than_a_font() {
+        let rendered = format!(
+            "{:?}",
+            FontFace {
+                data: Arc::from(&b"pretend this is two megabytes"[..]),
+                index: 3,
+                key: 42,
+            }
+        );
+
+        assert_eq!(rendered, "FontFace { key: 42, index: 3, bytes: 29 }");
+        assert!(
+            !rendered.contains("112"),
+            "the derived Debug printed every byte as a decimal integer, which \
+             turned one failed layout comparison into a 182 MB dump: {rendered}"
+        );
     }
 }

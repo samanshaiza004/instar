@@ -432,16 +432,26 @@ ring, which had a correct scene and an invisible ring for two packages.
 Two findings worth carrying into B2.
 
 **Per-window re-shaping is ~200 µs and nothing is cached across frames.** At
-8.4 µs per row that is 1.2% of a 60 Hz budget, so it is not urgent, but a
-scrolling view currently reshapes every visible row every frame. A per-row
-cache keyed by content is the obvious lever if it ever matters.
+8.4 µs per row that is 1.2% of a 60 Hz budget. Deliberately left uncached: a
+cross-frame row cache before pointer and caret behaviour exists would mean
+inventing invalidation semantics with no evidence about what invalidates them.
+B2 instruments whether a caret move triggers reshaping, and that measurement is
+what decides where the cache boundary belongs.
 
-**The 64 KiB paragraph cap costs 6.7 ms to shape.** The cap does its job — the
-number stops growing with the line — but 6.7 ms is a visible hitch, so
-"bounded" and "affordable" are not the same claim. Only a viewport's width of
-an unwrapped line is ever visible, so a smaller cap is likely right; it is left
-at 64 KiB because choosing the number properly needs the horizontal-scroll work
-B2 has not done yet.
+**The 64 KiB paragraph cap costs 6.7 ms to shape — provisional, not accepted.**
+
+```text
+correctness   bounded, does not scale with the line      PASS
+performance   6.7 ms worst case                          NOT ACCEPTED
+decision      deferred until horizontal scrolling shows
+              which indexing model is needed
+```
+
+Bounded and affordable are not the same claim. The number is not tuned because
+trading 64 KiB for 8 KiB trades one arbitrary constant for another: reaching a
+deep x-position in variable-width text without measuring everything before it
+needs a retained horizontal index, which is the same shape of problem as soft
+wrap. Do not optimize the constant before the model is known.
 
 ### The font extraction defect this found
 
