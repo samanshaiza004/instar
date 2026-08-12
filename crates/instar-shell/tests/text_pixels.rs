@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use instar_host::text_view::{Frame, Presentation, TextPosition, TextSelection, lower, present};
+use instar_host::text_view::{Frame, Presentation, lower, present};
 use instar_paint::{Color, PhysicalSize};
 use instar_shell::{Presenter, default_font};
-use instar_text::{Revision, TextStorage, TextViewport};
-use instar_ui::{Affinity, FontRole, ShapingStyle, TextContext};
+use instar_text::{Revision, Selection, TextPosition, TextStorage, TextViewport};
+use instar_ui::{FontRole, ShapingStyle, TextContext};
 
 const ROW_HEIGHT: f32 = 20.0;
 const WIDTH: u32 = 480;
@@ -192,10 +192,7 @@ fn a_caret_reaches_pixels() {
     let with = frame_with_caret(
         &storage,
         MARKED_ROW,
-        Some(TextPosition {
-            byte: marked_start + 2,
-            affinity: Affinity::Downstream,
-        }),
+        Some(TextPosition::at(marked_start + 2)),
     );
 
     assert!(
@@ -275,10 +272,7 @@ fn a_caret_below_the_viewport_does_not_leak_into_the_frame() {
              y={}",
             row.origin_y
         );
-        let caret = TextPosition {
-            byte: row.buffer_range.start,
-            affinity: Affinity::Downstream,
-        };
+        let caret = TextPosition::at(row.buffer_range.start);
         let scene = lower(
             &mut presented,
             &Frame {
@@ -350,10 +344,7 @@ fn a_stale_revision_draws_no_caret() {
             background: BACKGROUND,
             ink: INK,
             caret_color: CARET,
-            caret: Some(TextPosition {
-                byte: MARKED_ROW + 2,
-                affinity: Affinity::Downstream,
-            }),
+            caret: Some(TextPosition::at(MARKED_ROW + 2)),
             selection: None,
             selection_color: SELECTION,
             // The buffer moved on after this window was shaped.
@@ -413,10 +404,7 @@ fn a_caret_survives_a_fractional_display_scale() {
                 background: BACKGROUND,
                 ink: INK,
                 caret_color: CARET,
-                caret: Some(TextPosition {
-                    byte: MARKED_ROW + 2,
-                    affinity: Affinity::Downstream,
-                }),
+                caret: Some(TextPosition::at(MARKED_ROW + 2)),
                 selection: None,
                 selection_color: SELECTION,
                 revision: Revision::default(),
@@ -445,7 +433,7 @@ fn prose() -> TextStorage {
 }
 
 /// Renders `prose` with a selection, at the top of the document.
-fn selection_frame(selection: Option<TextSelection>) -> Vec<u8> {
+fn selection_frame(selection: Option<Selection>) -> Vec<u8> {
     let storage = prose();
     let viewport = TextViewport::new(HEIGHT as f32, ROW_HEIGHT);
     let window = viewport.visible(&storage, 0).expect("valid");
@@ -502,15 +490,9 @@ fn count_where(frame: &[u8], f: impl Fn(&[u8]) -> bool) -> usize {
 /// the glyphs would cover them, and the scene would look identical.
 #[test]
 fn a_selection_renders_behind_its_glyphs() {
-    let selected = selection_frame(Some(TextSelection {
-        anchor: TextPosition {
-            byte: 2,
-            affinity: Affinity::Downstream,
-        },
-        focus: TextPosition {
-            byte: 30,
-            affinity: Affinity::Downstream,
-        },
+    let selected = selection_frame(Some(Selection {
+        anchor: TextPosition::at(2),
+        head: TextPosition::at(30),
     }));
     let plain = selection_frame(None);
 
@@ -559,16 +541,10 @@ fn a_selection_renders_behind_its_glyphs() {
 /// first and last rows the same width as the middle one.
 #[test]
 fn a_cross_row_selection_does_not_highlight_whole_rows() {
-    let frame = selection_frame(Some(TextSelection {
-        anchor: TextPosition {
-            byte: 5,
-            affinity: Affinity::Downstream,
-        },
+    let frame = selection_frame(Some(Selection {
+        anchor: TextPosition::at(5),
         // Row 0 is bytes 0..10, row 1 is 11..21, row 2 is 22..32.
-        focus: TextPosition {
-            byte: 27,
-            affinity: Affinity::Downstream,
-        },
+        head: TextPosition::at(27),
     }));
 
     let blue = |p: &[u8]| p[2] > 200 && p[0] < 60 && p[1] < 60;

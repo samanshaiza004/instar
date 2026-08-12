@@ -34,8 +34,30 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
-use instar_text::{Revision, ShapingWindow, TextStorage, TextViewId};
+use instar_text::{
+    Revision, Selection, ShapingWindow, TextAffinity, TextPosition, TextStorage, TextViewId,
+};
 use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
+
+/// A document position's affinity, as the shaping layer names it.
+///
+/// The only conversion between the two, and the reason `instar-ui` does not
+/// depend on `instar-text` for an enum: `instar-text` owns document positions,
+/// `instar-ui` owns the Parley-facing projection, and this function is the
+/// seam. Three lines is a cheaper boundary than a crate dependency.
+fn layout_affinity(affinity: TextAffinity) -> Affinity {
+    match affinity {
+        TextAffinity::Downstream => Affinity::Downstream,
+        TextAffinity::Upstream => Affinity::Upstream,
+    }
+}
+
+fn document_affinity(affinity: Affinity) -> TextAffinity {
+    match affinity {
+        Affinity::Downstream => TextAffinity::Downstream,
+        Affinity::Upstream => TextAffinity::Upstream,
+    }
+}
 
 /// Counters for the two questions B2 has to be able to answer.
 ///
@@ -140,89 +162,6 @@ impl PresentedSegment {
     }
 }
 
-/// A caret position in a document.
-///
-/// Byte offset plus affinity, together, everywhere. Parley states that
-/// affinity affects a cursor's visual location, so a document position that
-/// dropped it would be a position that cannot be drawn back correctly — the
-/// same byte sits in two different places at a bidi boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextPosition {
-    pub byte: usize,
-    pub affinity: Affinity,
-}
-
-/// A selection, in document coordinates.
-///
-/// # Why not a Parley `Selection`
-///
-/// Parley's `Selection` is a range *within one layout*, and this editor shapes
-/// one layout per row. Storing the view's selection as one would break the
-/// moment a drag crossed a row boundary — which is the ordinary case, not an
-/// edge case.
-///
-/// So the document holds anchor and focus in absolute bytes, and a Parley
-/// `Selection` is a *temporary projection* of that onto one segment, built to
-/// ask for geometry and thrown away.
-///
-/// # Why anchor and focus rather than a range
-///
-/// Dragging backwards is not the same interaction as dragging forwards, even
-/// when the selected bytes are identical: the focus is the end that moves, and
-/// canonicalizing to `min..max` loses which one that is. Parley keeps the
-/// distinction for the same reason.
-///
-/// # Not yet reconciled with `instar_text::Selection`
-///
-/// `TextView` already has a `Selection { anchor, head }` in bare byte offsets,
-/// which is the *editable* selection — what a replacement would overwrite.
-/// This one is interaction and presentation state, and carries affinity
-/// because a caret at a bidi boundary cannot be drawn from a byte alone.
-///
-/// They are deliberately separate while only one of them is load-bearing: B2
-/// draws, and nothing edits yet. **B3 must unify them**, because two answers to
-/// "where is the selection" is exactly the class of defect this project keeps
-/// paying to remove. The likely resolution is affinity moving into
-/// `instar-text`, which owns document positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextSelection {
-    /// Where the selection started and does not move from.
-    pub anchor: TextPosition,
-    /// The end the pointer is dragging.
-    pub focus: TextPosition,
-}
-
-impl TextSelection {
-    pub fn at(position: TextPosition) -> Self {
-        Self {
-            anchor: position,
-            focus: position,
-        }
-    }
-
-    pub fn is_collapsed(&self) -> bool {
-        self.anchor.byte == self.focus.byte
-    }
-
-    /// The selected bytes, ordered. Direction is lost here deliberately: this
-    /// is for intersecting with a segment, not for describing the gesture.
-    pub fn range(&self) -> Range<usize> {
-        if self.anchor.byte <= self.focus.byte {
-            self.anchor.byte..self.focus.byte
-        } else {
-            self.focus.byte..self.anchor.byte
-        }
-    }
-
-    /// Moves the focus, leaving the anchor where it was.
-    pub fn extend_to(&self, focus: TextPosition) -> Self {
-        Self {
-            anchor: self.anchor,
-            focus,
-        }
-    }
-}
-
 /// Everything one frame of one view draws.
 pub struct PresentedText {
     pub segments: Vec<PresentedSegment>,
@@ -288,7 +227,7 @@ impl PresentedText {
             // inside the segment -- but it is translated through the same
             // helper the tests exercise rather than by adding the origin here.
             byte: segment.local_to_buffer(cursor.index)?,
-            affinity: cursor.affinity,
+            affinity: document_affinity(cursor.affinity),
         })
     }
 
@@ -317,7 +256,7 @@ impl PresentedText {
         let local = segment.buffer_to_local(position.byte)?;
         let cursor = segment
             .layout
-            .cursor_from_byte_index(local, position.affinity);
+            .cursor_from_byte_index(local, layout_affinity(position.affinity));
         let geometry = segment.layout.caret_geometry(cursor, width);
         Some(CaretGeometry {
             x: geometry.x + segment.origin_x,
@@ -342,10 +281,10 @@ impl PresentedText {
     pub fn selection_geometry_with(
         &self,
         segment: &PresentedSegment,
-        selection: TextSelection,
+        selection: Selection,
         mut f: impl FnMut(CaretGeometry),
     ) {
-        if selection.is_collapsed() {
+        if selection.is_empty() {
             return;
         }
         let selected = selection.range();
@@ -369,22 +308,22 @@ impl PresentedText {
         let anchor_affinity = if start == selection.range().start {
             endpoint_affinity(&selection, start)
         } else {
-            Affinity::Downstream
+            TextAffinity::Downstream
         };
         let focus_affinity = if end == selection.range().end {
             endpoint_affinity(&selection, end)
         } else {
-            Affinity::Upstream
+            TextAffinity::Upstream
         };
 
         segment.layout.selection_geometry_with(
             instar_ui::TextCursor {
                 index: local_start,
-                affinity: anchor_affinity,
+                affinity: layout_affinity(anchor_affinity),
             },
             instar_ui::TextCursor {
                 index: local_end,
-                affinity: focus_affinity,
+                affinity: layout_affinity(focus_affinity),
             },
             |geometry| {
                 f(CaretGeometry {
@@ -519,13 +458,13 @@ impl TextInteraction {
         view: TextViewId,
         position: TextPosition,
         revision: Revision,
-    ) -> TextSelection {
+    ) -> Selection {
         self.drag = Some(TextDrag {
             view,
             anchor: position,
             revision,
         });
-        TextSelection::at(position)
+        Selection::from_position(position)
     }
 
     /// A pointer move.
@@ -534,7 +473,7 @@ impl TextInteraction {
     /// *not* used to decide which view is being edited: a drag begun in view A
     /// keeps extending A's selection while the pointer passes over B. Returns
     /// `None` when no drag is active.
-    pub fn drag_to(&mut self, position: TextPosition, revision: Revision) -> Option<TextSelection> {
+    pub fn drag_to(&mut self, position: TextPosition, revision: Revision) -> Option<Selection> {
         let drag = self.drag?;
         // An edit during a drag retires it. The presented segments the drag is
         // producing positions from describe text that has changed, and
@@ -544,9 +483,9 @@ impl TextInteraction {
             self.drag = None;
             return None;
         }
-        Some(TextSelection {
+        Some(Selection {
             anchor: drag.anchor,
-            focus: position,
+            head: position,
         })
     }
 
@@ -574,11 +513,11 @@ impl TextInteraction {
 }
 
 /// Which endpoint of a selection sits at `byte`, and with what affinity.
-fn endpoint_affinity(selection: &TextSelection, byte: usize) -> Affinity {
+fn endpoint_affinity(selection: &Selection, byte: usize) -> TextAffinity {
     if selection.anchor.byte == byte {
         selection.anchor.affinity
     } else {
-        selection.focus.affinity
+        selection.head.affinity
     }
 }
 
@@ -611,7 +550,7 @@ pub struct Frame {
     /// Where the caret is, when the view has one.
     pub caret: Option<TextPosition>,
     /// What is selected, when anything is.
-    pub selection: Option<TextSelection>,
+    pub selection: Option<Selection>,
     pub selection_color: Color,
     /// The buffer revision this frame is drawing. A segment shaped from a
     /// different revision cannot position a caret: its geometry describes text
@@ -1040,14 +979,8 @@ mod tests {
         let segment = &presented.segments[0];
 
         let boundary = segment.buffer_range.start + 4;
-        let downstream = TextPosition {
-            byte: boundary,
-            affinity: Affinity::Downstream,
-        };
-        let upstream = TextPosition {
-            byte: boundary,
-            affinity: Affinity::Upstream,
-        };
+        let downstream = TextPosition::with_affinity(boundary, TextAffinity::Downstream);
+        let upstream = TextPosition::with_affinity(boundary, TextAffinity::Upstream);
 
         let a = presented
             .caret_geometry(downstream, 1.0, Revision::default())
@@ -1095,14 +1028,7 @@ mod tests {
 
         assert!(
             presented
-                .caret_geometry(
-                    TextPosition {
-                        byte: 0,
-                        affinity: Affinity::Downstream
-                    },
-                    1.0,
-                    Revision::default()
-                )
+                .caret_geometry(TextPosition::at(0), 1.0, Revision::default())
                 .is_none(),
             "byte 0 is far above this window"
         );
@@ -1129,10 +1055,10 @@ mod tests {
             ("mid-text", segment.buffer_range.start + 5),
             ("segment end", segment.buffer_range.end),
         ] {
-            for affinity in [Affinity::Downstream, Affinity::Upstream] {
+            for affinity in [TextAffinity::Downstream, TextAffinity::Upstream] {
                 let geometry = presented
                     .caret_geometry(
-                        TextPosition { byte, affinity },
+                        TextPosition::with_affinity(byte, affinity),
                         CARET_WIDTH,
                         Revision::default(),
                     )
@@ -1153,21 +1079,11 @@ mod tests {
         let start = presented.segments[0].buffer_range.start;
 
         let first = presented
-            .caret_geometry(
-                TextPosition {
-                    byte: start,
-                    affinity: Affinity::Downstream,
-                },
-                CARET_WIDTH,
-                Revision::default(),
-            )
+            .caret_geometry(TextPosition::at(start), CARET_WIDTH, Revision::default())
             .expect("presented");
         let later = presented
             .caret_geometry(
-                TextPosition {
-                    byte: start + 8,
-                    affinity: Affinity::Downstream,
-                },
+                TextPosition::at(start + 8),
                 CARET_WIDTH,
                 Revision::default(),
             )
@@ -1184,10 +1100,7 @@ mod tests {
     #[test]
     fn a_stale_segment_cannot_position_a_caret() {
         let presented = present_text("hello world\n", 0);
-        let position = TextPosition {
-            byte: 3,
-            affinity: Affinity::Downstream,
-        };
+        let position = TextPosition::at(3);
 
         assert!(
             presented
@@ -1215,14 +1128,7 @@ mod tests {
 
         instrument::reset();
         for byte in 0..10 {
-            presented.caret_geometry(
-                TextPosition {
-                    byte,
-                    affinity: Affinity::Downstream,
-                },
-                CARET_WIDTH,
-                Revision::default(),
-            );
+            presented.caret_geometry(TextPosition::at(byte), CARET_WIDTH, Revision::default());
         }
 
         let counts = instrument::snapshot();
@@ -1249,10 +1155,7 @@ mod tests {
     }
 
     fn at(byte: usize) -> TextPosition {
-        TextPosition {
-            byte,
-            affinity: Affinity::Downstream,
-        }
+        TextPosition::at(byte)
     }
 
     /// A drag begun in one view keeps extending that view's selection while
@@ -1271,7 +1174,7 @@ mod tests {
             .drag_to(at(40), Revision::default())
             .expect("a drag in progress");
         assert_eq!(selection.anchor, at(10));
-        assert_eq!(selection.focus, at(40));
+        assert_eq!(selection.head, at(40));
         assert_eq!(
             interaction.captured_view(),
             Some(a),
@@ -1296,12 +1199,12 @@ mod tests {
             "the same bytes as a forward drag"
         );
         assert_eq!(backwards.anchor, at(40), "but the anchor is where it began");
-        assert_eq!(backwards.focus, at(10));
+        assert_eq!(backwards.head, at(10));
         assert_ne!(
             backwards,
-            TextSelection {
+            Selection {
                 anchor: at(10),
-                focus: at(40)
+                head: at(40)
             },
             "canonicalizing to min..max would lose which end is moving"
         );
@@ -1371,9 +1274,9 @@ mod tests {
         );
 
         // Start five characters into row 0, end five into row 2.
-        let selection = TextSelection {
+        let selection = Selection {
             anchor: at(rows[0].start + 5),
-            focus: at(rows[2].start + 5),
+            head: at(rows[2].start + 5),
         };
 
         let mut per_row = Vec::new();
@@ -1408,9 +1311,11 @@ mod tests {
     fn a_collapsed_selection_has_no_geometry() {
         let presented = present_text("hello world\n", 0);
         let mut rects = 0;
-        presented.selection_geometry_with(&presented.segments[0], TextSelection::at(at(3)), |_| {
-            rects += 1
-        });
+        presented.selection_geometry_with(
+            &presented.segments[0],
+            Selection::from_position(at(3)),
+            |_| rects += 1,
+        );
         assert_eq!(rects, 0, "a caret is not a highlight");
     }
 
@@ -1423,9 +1328,9 @@ mod tests {
         let third = presented.segments[2].buffer_range.clone();
         assert!(first.start > 4_000_000, "deep enough to matter");
 
-        let selection = TextSelection {
+        let selection = Selection {
             anchor: at(first.start + 3),
-            focus: at(third.start + 3),
+            head: at(third.start + 3),
         };
 
         let mut rows_highlighted = 0;
@@ -1440,5 +1345,24 @@ mod tests {
             rows_highlighted, 3,
             "three rows are touched by a selection spanning rows 0..2"
         );
+    }
+
+    /// The synthetic row, through the whole presentation path.
+    ///
+    /// `crop` reports zero lines for an empty rope, so before B2c's fix this
+    /// produced no segments at all and a caret in a new document had nowhere
+    /// to be drawn — which B3 would have hit on its very first keystroke.
+    #[test]
+    fn an_empty_document_can_still_hold_a_caret() {
+        let presented = present_text("", 0);
+
+        assert_eq!(presented.segments.len(), 1, "one row to put a caret in");
+        assert_eq!(presented.bytes_shaped(), 0, "and no text in it");
+
+        let caret = presented
+            .caret_geometry(TextPosition::at(0), CARET_WIDTH, Revision::default())
+            .expect("a caret at byte 0 of an empty document has geometry");
+        assert!(caret.height > 0.0, "and a line box to occupy");
+        assert_eq!(caret.y, 0.0);
     }
 }

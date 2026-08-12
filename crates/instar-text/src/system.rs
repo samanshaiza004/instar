@@ -247,7 +247,7 @@ impl TextSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Selection;
+    use crate::{Selection, TextPosition};
 
     /// Every test wants a buffer, and none of them is testing the bound.
     fn open(text: &mut TextSystem, content: &str) -> TextBufferId {
@@ -385,8 +385,8 @@ mod tests {
         let buffer = open(&mut text, "hello world");
         let a = text.open_view(buffer).unwrap();
         text.view_mut(a).unwrap().set_selection(Selection {
-            anchor: 6,
-            head: 11,
+            anchor: TextPosition::at(6),
+            head: TextPosition::at(11),
         });
 
         text.apply_edit(a, TextEdit::replace(6..11, "there"))

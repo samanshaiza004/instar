@@ -497,24 +497,66 @@ positions from describe text that has changed, and transforming a live capture
 across an edit is a synchronization problem that does not need solving before
 keyboard input exists.
 
-#### Two selections, deliberately, until B3
+#### One selection, and the evidence that decided where it lives
 
-`instar_text::Selection` is the *editable* selection in bare byte offsets;
-`TextSelection` is interaction and presentation state and carries affinity,
-which a caret at a bidi boundary needs and a byte offset cannot express.
+Package A declined to add an affinity type, in this project's usual order: "a
+type with one meaningful value is speculative generality — the enum arrives if
+a case needs both." B2a is that case, and it arrived with a measurement rather
+than an argument. So the deferral ended and `instar-text` gained
+[`TextAffinity`] and `TextPosition`:
 
-They are separate while only one is load-bearing — B2 draws, nothing edits.
-**B3 must unify them**, because two answers to "where is the selection" is
-precisely the class of defect this project keeps paying to remove. The likely
-resolution is affinity moving into `instar-text`, which owns document
-positions.
+```text
+instar-text::Selection      absolute buffer positions with affinity
+                            persistent TextView state, the only authority
+        ->  instar-host maps positions into a segment
+        ->  instar-ui / Parley Selection, segment-local and temporary
+        ->  geometry
+```
 
-#### An empty document presents no rows
+Two *representations* during rendering, one authority. That is healthy;
+Parley's `Selection` is defined as a range within a single layout, so it should
+stay ephemeral when a document is many independently shaped segments.
 
-`crop` reports zero lines for an empty rope, not one empty line, so a view of
-an empty buffer has no segments and a caret in it has nowhere to be drawn. Both
-line-counting conventions are pinned by a test now. B3 needs this fixed the
-moment anything types into an empty document.
+`instar-ui` did **not** grow a dependency on `instar-text` to share the enum.
+It keeps its own Parley-facing `Affinity` and `instar-host` converts — six
+lines, against a crate edge the layering tests exist to hold absent.
+
+#### Two "which side?" questions, renamed apart
+
+The old name for the edit rule was "the affinity policy", which became
+dangerously overloaded the moment real affinity arrived. They answer different
+questions and nothing may make one decide the other:
+
+```text
+edit stickiness   an insertion happens exactly at a position. Does the
+                  position stay before the new text or move after it?
+                  Decided by whether this view did the typing, and stored
+                  nowhere — it is a property of an edit, not of a position.
+
+visual affinity   a byte offset is visually ambiguous. Which side does the
+                  caret draw on? Decided by where the user put it, and
+                  carried with the position ever after.
+```
+
+Held apart by a test, not only by two names: an edit moves *where* a position
+is and must leave its affinity alone. That test was written because the fault
+injection for it initially passed — nothing had been checking it.
+
+#### An empty document gets a synthetic insertion row
+
+`crop` reports zero lines for an empty rope and does not count a trailing
+newline as another line. Both are the upstream contract and both are now pinned
+by tests; neither is corrected in storage to make the editor easier.
+
+Presentation supplies what the editor needs instead:
+
+> An empty document has zero storage lines but one synthetic insertion row.
+
+A line box, not text: nothing invents a newline, the row's range is `0..0`, and
+a caret in it sits at byte 0 of a zero-byte document — which is exactly true.
+Three transitions are locked by tests: empty presents one row with a visible
+caret; typing the first character replaces it with an ordinary row; deleting
+the last character brings it back.
 
 The target an arrow key should eventually reach is `reshapes: 0, extractions:
 0, layout rebuilds: 0, caret paint only`. B2 does not have to get there; it has

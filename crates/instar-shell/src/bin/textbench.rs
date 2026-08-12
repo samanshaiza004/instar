@@ -525,7 +525,7 @@ fn views_table() {
             system
                 .view_mut(*view)
                 .expect("a live view")
-                .set_selection(Selection { anchor: head, head });
+                .set_selection(Selection::at(head));
         }
 
         let mut samples = Vec::with_capacity(2_000);

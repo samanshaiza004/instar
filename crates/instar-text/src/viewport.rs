@@ -115,6 +115,27 @@ impl TextViewport {
         scroll_y: i32,
     ) -> Result<ShapingWindow, TextError> {
         let total_rows = storage.len_lines();
+
+        // An empty document has *zero* lines in `crop`, not one empty line —
+        // and that is the upstream contract, not a bug to work around in
+        // storage. But an editor still needs somewhere to put a caret before
+        // anything has been typed, so presentation supplies one row that the
+        // document does not have.
+        //
+        // Deliberately not a newline invented in the buffer: the synthetic row
+        // is a line box, not text. Its range is `0..0`, so a caret in it is at
+        // byte 0 of a zero-byte document, which is exactly true.
+        if total_rows == 0 {
+            return Ok(ShapingWindow {
+                rows: 0..1,
+                paragraphs: vec![ParagraphWindow {
+                    row: 0,
+                    bytes: 0..0,
+                    truncated: false,
+                }],
+            });
+        }
+
         let rows = self.rows(scroll_y, total_rows);
 
         let mut paragraphs = Vec::with_capacity(rows.len());
@@ -391,15 +412,55 @@ mod tests {
         assert_eq!(window.paragraphs[0].local(0), None);
     }
 
-    /// An empty document has a viewport and nothing in it.
+    /// An empty document presents one row, so a caret has somewhere to be.
+    ///
+    /// `crop` reports zero lines for an empty rope, which is its contract and
+    /// not something to correct in storage. The row is supplied here, in
+    /// presentation, and it is a line box rather than text: nothing invents a
+    /// newline, and its range is `0..0`.
     #[test]
-    fn an_empty_document_shapes_nothing() {
+    fn an_empty_document_presents_one_row_to_put_a_caret_in() {
         let storage = TextStorage::new();
         let window = TextViewport::new(400.0, 20.0)
             .visible(&storage, 0)
             .expect("in bounds");
-        assert_eq!(window.bytes_shaped(), 0);
+
+        assert_eq!(window.bytes_shaped(), 0, "there is no text to shape");
+        assert_eq!(
+            window.paragraphs.len(),
+            1,
+            "but there is a row, or a caret in an empty document has nowhere \
+             to be drawn"
+        );
+        assert_eq!(window.paragraphs[0].bytes, 0..0);
+        assert_eq!(window.paragraph_at(0).map(|p| p.row), None);
         assert!(!window.any_truncated());
+    }
+
+    /// The three transitions around the synthetic row.
+    #[test]
+    fn the_synthetic_row_appears_and_disappears_with_the_document() {
+        let viewport = TextViewport::new(400.0, 20.0);
+
+        let empty = TextStorage::new();
+        assert_eq!(viewport.visible(&empty, 0).unwrap().paragraphs.len(), 1);
+
+        // Type the first character: an ordinary row replaces the synthetic one.
+        let typed = TextStorage::from_text("a");
+        let window = viewport.visible(&typed, 0).unwrap();
+        assert_eq!(window.paragraphs.len(), 1);
+        assert_eq!(
+            window.paragraphs[0].bytes,
+            0..1,
+            "the row is now real, and carries the byte that was typed"
+        );
+
+        // Delete it again: the synthetic row returns.
+        let emptied = TextStorage::from_text("");
+        assert_eq!(
+            viewport.visible(&emptied, 0).unwrap().paragraphs[0].bytes,
+            0..0
+        );
     }
 
     /// Scrolling past the end clamps rather than asking the rope for a row it
