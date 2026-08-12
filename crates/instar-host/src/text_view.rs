@@ -37,6 +37,62 @@ use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
 use instar_text::{Revision, ShapingWindow, TextStorage};
 use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
 
+/// Counters for the two questions B2 has to be able to answer.
+///
+/// Not an optimization, and not a promise of one. The target a caret move
+/// should eventually reach is zero reshaping — but at ~200 µs for a whole
+/// visible window there is no case for building a cache yet, and building one
+/// before pointer and caret behaviour exist would mean inventing invalidation
+/// semantics with no evidence about what invalidates them.
+///
+/// So: measure now, decide later. If B2c shows every pointer move reshaping
+/// twenty-three rows, that is evidence. If it does not, the cache was never
+/// worth its invalidation bugs.
+pub mod instrument {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Counts {
+        /// Calls to [`super::PresentedText::caret_geometry`].
+        pub caret_geometry_queries: u64,
+        /// Calls to [`super::present`], each of which reshapes a whole window.
+        pub presentation_reshapes: u64,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = const {
+            Cell::new(Counts {
+                caret_geometry_queries: 0,
+                presentation_reshapes: 0,
+            })
+        };
+    }
+
+    pub fn snapshot() -> Counts {
+        COUNTS.with(|counts| counts.get())
+    }
+
+    pub fn reset() {
+        COUNTS.with(|counts| counts.set(Counts::default()));
+    }
+
+    pub(super) fn record_caret_query() {
+        COUNTS.with(|counts| {
+            let mut current = counts.get();
+            current.caret_geometry_queries += 1;
+            counts.set(current);
+        });
+    }
+
+    pub(super) fn record_reshape() {
+        COUNTS.with(|counts| {
+            let mut current = counts.get();
+            current.presentation_reshapes += 1;
+            counts.set(current);
+        });
+    }
+}
+
 /// One shaped row of a document, and where in the document it came from.
 pub struct PresentedSegment {
     /// The byte range of the buffer this was shaped from.
@@ -167,10 +223,26 @@ impl PresentedText {
 
     /// Where to draw the caret for a document position, in view coordinates.
     ///
-    /// `None` when the position is not currently presented, which is the
-    /// honest answer for a caret scrolled off screen.
-    pub fn caret_geometry(&self, position: TextPosition, width: f32) -> Option<CaretGeometry> {
+    /// `None` when the position is not currently presented — the honest answer
+    /// for a caret scrolled off screen — and `None` when the segment was shaped
+    /// from a different `revision`.
+    ///
+    /// The revision check is what makes [`PresentedSegment::buffer_revision`]
+    /// load-bearing rather than decorative. A caret positioned from geometry
+    /// that describes text which has since changed is worse than no caret: it
+    /// is confidently in the wrong place, and it will be at its most wrong
+    /// exactly when an edit has just happened.
+    pub fn caret_geometry(
+        &self,
+        position: TextPosition,
+        width: f32,
+        revision: Revision,
+    ) -> Option<CaretGeometry> {
+        instrument::record_caret_query();
         let segment = self.segment_at(position.byte)?;
+        if segment.buffer_revision != revision {
+            return None;
+        }
         let local = segment.buffer_to_local(position.byte)?;
         let cursor = segment
             .layout
@@ -228,6 +300,7 @@ pub fn present(
     presentation: &Presentation,
     buffer_revision: Revision,
 ) -> Result<PresentedText, instar_text::TextError> {
+    instrument::record_reshape();
     let mut segments = Vec::with_capacity(window.paragraphs.len());
 
     for paragraph in &window.paragraphs {
@@ -256,6 +329,40 @@ pub fn present(
     Ok(PresentedText { segments })
 }
 
+/// The caret's width, in logical pixels.
+///
+/// Host chrome policy, like the focus ring and the scrollbar thumb — not wire
+/// vocabulary. A guest describes an editor; it does not describe how wide the
+/// insertion point is on this machine. Logical because everything in
+/// `instar-ui` is: physicalization happens once, here, at lowering.
+pub const CARET_WIDTH: f32 = 1.0;
+
+/// One frame of one text view.
+///
+/// Grouped rather than passed loose for the same reason [`Presentation`] is:
+/// this is already eight values, several of them `f32`s and `Color`s that
+/// would be silently swappable.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    pub surface: PhysicalSize,
+    pub scale: f32,
+    /// The view's logical size. Glyphs *and* caret are clipped to it, so a
+    /// caret belonging to a row scrolled out of view cannot leak into the
+    /// frame — one coordinate system and one clip stack, not an independent
+    /// caret path.
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    pub background: Color,
+    pub ink: Color,
+    pub caret_color: Color,
+    /// Where the caret is, when the view has one.
+    pub caret: Option<TextPosition>,
+    /// The buffer revision this frame is drawing. A segment shaped from a
+    /// different revision cannot position a caret: its geometry describes text
+    /// that has since changed.
+    pub revision: Revision,
+}
+
 /// Lowers a presented window to drawing commands.
 ///
 /// Reuses `present::push_shaped`, which is the same routine every `Text` node
@@ -267,14 +374,24 @@ pub fn present(
 /// Shaping stays in logical space at `scale = 1.0`; physicalization happens
 /// here, at the glyph, because Vello selects bitmap and colour strikes from
 /// the font size and a global transform would not be equivalent.
-pub fn lower(
-    presented: &mut PresentedText,
-    size: PhysicalSize,
-    scale: f32,
-    background: Color,
-    ink: Color,
-) -> PaintScene {
-    let mut commands = vec![PaintCommand::Clear { color: background }];
+pub fn lower(presented: &mut PresentedText, frame: &Frame) -> PaintScene {
+    let mut commands = vec![
+        PaintCommand::Clear {
+            color: frame.background,
+        },
+        // Everything the view draws lives inside this. The caret is emitted
+        // between the same push and pop as the glyphs, because a caret with
+        // its own clip is a second coordinate system waiting to disagree.
+        PaintCommand::PushClip {
+            rect: physical(
+                0.0,
+                0.0,
+                frame.viewport_width,
+                frame.viewport_height,
+                frame.scale,
+            ),
+        },
+    ];
     let mut fonts = Vec::new();
     let mut font_ids = HashMap::new();
 
@@ -286,17 +403,51 @@ pub fn lower(
             &mut font_ids,
             segment.layout.shaped(),
             origin,
-            scale,
-            ink,
+            frame.scale,
+            frame.ink,
         );
     }
 
+    // After the glyphs, so a caret inside a glyph's ink is visible rather than
+    // painted under it. The focus ring cost this project a package by being
+    // emitted first and then covered.
+    if let Some(position) = frame.caret
+        && let Some(geometry) = presented.caret_geometry(position, CARET_WIDTH, frame.revision)
+    {
+        commands.push(PaintCommand::FillRect {
+            rect: physical(
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+                frame.scale,
+            ),
+            color: frame.caret_color,
+        });
+    }
+
+    commands.push(PaintCommand::PopClip);
+
     PaintScene {
-        size,
+        size: frame.surface,
         commands,
         masks: Vec::new(),
         fonts,
         images: Vec::new(),
+    }
+}
+
+/// A logical rectangle in physical pixels, never narrower than one.
+///
+/// A one-logical-pixel caret at a fractional scale can round to zero width,
+/// which draws nothing at all — the caret disappears on some displays and not
+/// others, which is exactly the class of defect that is hardest to reproduce.
+fn physical(x: f32, y: f32, width: f32, height: f32, scale: f32) -> instar_paint::Rect {
+    instar_paint::Rect {
+        x: (x * scale).round() as i32,
+        y: (y * scale).round() as i32,
+        width: (width * scale).round().max(1.0) as u32,
+        height: (height * scale).round().max(1.0) as u32,
     }
 }
 
@@ -618,9 +769,11 @@ mod tests {
         };
 
         let a = presented
-            .caret_geometry(downstream, 1.0)
+            .caret_geometry(downstream, 1.0, Revision::default())
             .expect("presented");
-        let b = presented.caret_geometry(upstream, 1.0).expect("presented");
+        let b = presented
+            .caret_geometry(upstream, 1.0, Revision::default())
+            .expect("presented");
 
         assert_ne!(
             (a.x, a.y),
@@ -642,7 +795,7 @@ mod tests {
             .position_at(40.0, 5.0 * 20.0 + 5.0, 20.0)
             .expect("inside the window");
         let caret = presented
-            .caret_geometry(position, 1.0)
+            .caret_geometry(position, 1.0, Revision::default())
             .expect("a presented position has geometry");
 
         assert_eq!(
@@ -666,10 +819,145 @@ mod tests {
                         byte: 0,
                         affinity: Affinity::Downstream
                     },
-                    1.0
+                    1.0,
+                    Revision::default()
                 )
                 .is_none(),
             "byte 0 is far above this window"
         );
+    }
+
+    // -------------------------------------------------- B2b: the caret
+
+    /// Parley is authoritative for which cursor states exist inside a layout.
+    ///
+    /// `from_byte_index` snaps to a cluster start, forces `Downstream` at byte
+    /// 0 because there is no upstream cluster there, and resolves anything past
+    /// the end to the layout end with `Upstream`. So the invariant Instar can
+    /// claim is *not* that an arbitrary `(byte, affinity)` pair survives — it is
+    /// that Instar preserves affinity across its own seam and lets Parley
+    /// normalize inside the layout.
+    #[test]
+    fn a_caret_has_geometry_at_every_edge_of_a_segment() {
+        let text = "hello world\nsecond line\n";
+        let presented = present_text(text, 0);
+        let segment = &presented.segments[0];
+
+        for (label, byte) in [
+            ("document start", segment.buffer_range.start),
+            ("mid-text", segment.buffer_range.start + 5),
+            ("segment end", segment.buffer_range.end),
+        ] {
+            for affinity in [Affinity::Downstream, Affinity::Upstream] {
+                let geometry = presented
+                    .caret_geometry(
+                        TextPosition { byte, affinity },
+                        CARET_WIDTH,
+                        Revision::default(),
+                    )
+                    .unwrap_or_else(|| panic!("{label} should have caret geometry"));
+                assert!(
+                    geometry.height > 0.0,
+                    "{label} produced a caret with no height, which draws nothing"
+                );
+                assert!(geometry.x >= 0.0, "{label} produced a negative x");
+            }
+        }
+    }
+
+    /// A caret advances along a line rather than sitting at its start.
+    #[test]
+    fn a_caret_moves_right_as_its_byte_offset_grows() {
+        let presented = present_text("hello world\n", 0);
+        let start = presented.segments[0].buffer_range.start;
+
+        let first = presented
+            .caret_geometry(
+                TextPosition {
+                    byte: start,
+                    affinity: Affinity::Downstream,
+                },
+                CARET_WIDTH,
+                Revision::default(),
+            )
+            .expect("presented");
+        let later = presented
+            .caret_geometry(
+                TextPosition {
+                    byte: start + 8,
+                    affinity: Affinity::Downstream,
+                },
+                CARET_WIDTH,
+                Revision::default(),
+            )
+            .expect("presented");
+
+        assert!(
+            later.x > first.x,
+            "eight characters in, the caret is still at x={}",
+            later.x
+        );
+    }
+
+    /// `buffer_revision` made load-bearing.
+    #[test]
+    fn a_stale_segment_cannot_position_a_caret() {
+        let presented = present_text("hello world\n", 0);
+        let position = TextPosition {
+            byte: 3,
+            affinity: Affinity::Downstream,
+        };
+
+        assert!(
+            presented
+                .caret_geometry(position, CARET_WIDTH, Revision::default())
+                .is_some(),
+            "the revision it was shaped from works"
+        );
+        assert!(
+            presented
+                .caret_geometry(position, CARET_WIDTH, Revision::default().next())
+                .is_none(),
+            "a caret positioned from geometry describing text that has since \
+             changed is worse than no caret -- it is confidently wrong, exactly \
+             when an edit has just happened"
+        );
+    }
+
+    /// Moving a caret inside a presented window does not reshape it.
+    ///
+    /// Measured rather than required: the point is that B2 can answer the
+    /// question, not that the answer is already zero.
+    #[test]
+    fn moving_a_caret_within_a_window_queries_geometry_without_reshaping() {
+        let presented = present_text("hello world\nsecond line\n", 0);
+
+        instrument::reset();
+        for byte in 0..10 {
+            presented.caret_geometry(
+                TextPosition {
+                    byte,
+                    affinity: Affinity::Downstream,
+                },
+                CARET_WIDTH,
+                Revision::default(),
+            );
+        }
+
+        let counts = instrument::snapshot();
+        assert_eq!(counts.caret_geometry_queries, 10);
+        assert_eq!(
+            counts.presentation_reshapes, 0,
+            "ten caret moves reshaped the window {} times",
+            counts.presentation_reshapes
+        );
+    }
+
+    /// And the counter is not vacuous: presenting does count as a reshape.
+    #[test]
+    fn presenting_a_window_counts_as_a_reshape() {
+        instrument::reset();
+        let _ = present_text("hello\n", 0);
+        assert_eq!(instrument::snapshot().presentation_reshapes, 1);
     }
 }

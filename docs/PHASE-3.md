@@ -427,6 +427,36 @@ caret-only repaint
 visible-text reshapes triggered
 ```
 
+#### What Parley normalizes, and what Instar may therefore claim
+
+`Cursor::from_byte_index` snaps to a cluster's start, forces `Downstream` at
+byte 0 because there is no upstream cluster there, and resolves anything past
+the end to the layout end with `Upstream`. So this is **not** an invariant:
+
+```text
+(byte, affinity) in  ->  the same (byte, affinity) out
+```
+
+What Instar can claim, and what its tests assert:
+
+> Instar preserves affinity across its own coordinate seam. Parley remains
+> authoritative for which cursor states are valid inside a shaped layout.
+
+#### The caret is host chrome
+
+Like the focus ring and the scrollbar thumb. Not a semantic node, not wire
+vocabulary: a guest describes an editor, not how wide an insertion point is on
+this machine. `CARET_WIDTH` is 1.0 *logical* pixel, physicalized once at
+lowering, which keeps the Phase 2 DPI boundary intact — `instar-ui` still never
+sees display scale.
+
+Glyphs and caret share one clip and one coordinate system. There is no separate
+caret coordinate path.
+
+No blinking yet. Blink is timer, focus and lifecycle semantics, and it proves
+nothing about coordinate correctness; it belongs after B2c gives the view a
+real interaction lifecycle.
+
 The target an arrow key should eventually reach is `reshapes: 0, extractions:
 0, layout rebuilds: 0, caret paint only`. B2 does not have to get there; it has
 to be able to say whether it did, because that measurement is what shows where
