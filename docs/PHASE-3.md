@@ -721,7 +721,32 @@ guest calls commit
 
 **The host may execute asynchronously without the guest-visible operation
 being concurrently outstanding.** `bindgen!`'s `imports: { default: async |
-trappable }` is exactly that distinction, and it is what the resources use too.
+trappable }` is exactly that distinction, and it is what the text resources
+use.
+
+#### `kernel-ui.commit` is `async func` today, and changing it is a migration
+
+Recorded because two earlier statements in this document were wrong about it,
+both from reading `wit/world.wit` — the Gate 0 spike, whose `commit` is
+synchronous — and attributing it to `wit/kernel.wit`, whose `commit` is not:
+
+```wit
+// wit/kernel.wit, today
+commit: async func(batch: list<u8>) -> result<commit-result, commit-error>;
+```
+
+`runtime.rs` implements it through `HostWithStore` and an `Accessor`, which is
+the Component Model async import form and exists *because* the WIT says
+`async`. So "keep `commit` synchronous" is a **change to working code that Gate
+0 validated**, not a preservation of the status quo, and it is not something
+B2e-1 does on the way past.
+
+The rule above therefore binds the *new* surface: every function in
+`instar:text` is synchronous WIT, and its host implementation is Rust-async.
+Whether `kernel-ui.commit` should migrate to match is a separate decision with
+its own evidence — the async import machinery is load-bearing and tested — and
+it is deliberately left open rather than folded into a package about text
+resources.
 
 and in the packed tree:
 

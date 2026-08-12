@@ -1,0 +1,77 @@
+package instar:text@0.1.0;
+
+// Instar's text capability, as a package of its own rather than more surface
+// on `instar:kernel`.
+//
+// The kernel world is guest *lifecycle*: events, operations, cancellation, and
+// the UI commit. Text is an optional host service a guest may or may not use,
+// and folding it into the kernel would start a list — text-buffer, text-view,
+// image, audio-graph, gpu-surface, file-handle — that ends with one giant
+// runtime API instead of a kernel plus capabilities.
+//
+// `instar-kernel` assembles the world and generates the bindings; it does not
+// semantically own this interface. `instar-text`, the Rust crate that
+// implements the text model, does not know this file exists: it has no
+// Wasmtime, no WIT, and no idea a guest is involved. Putting `text.wit` there
+// would gradually turn "the text model" into "the guest ABI adapter for text".
+
+interface text-types {
+    /// Why a text resource could not be created.
+    ///
+    /// Deliberately not a generic error string: each variant is a bound the
+    /// host enforces, and a guest that hits one should be able to tell which.
+    variant text-error {
+        /// The live-buffer ceiling was reached. A bound on *live* resources,
+        /// not on historical ones -- slots are reused.
+        too-many-buffers(u32),
+        /// The live-view ceiling was reached.
+        too-many-views(u32),
+        /// The handle named a resource this generation cannot reach: it was
+        /// dropped, or it belonged to a generation that no longer exists.
+        no-such-resource,
+        /// The host could not answer -- it is shutting down, or the thread
+        /// that owns the text subsystem is gone.
+        unavailable,
+    }
+}
+
+/// Host-owned text resources, leased to a guest as capabilities.
+///
+/// # These are leases, not documents
+///
+/// A `text-buffer` handle is a capability naming a buffer the *host* owns on
+/// the thread that owns presentation. The rope, its revisions and its journal
+/// are never in the guest's resource table, and never in its linear memory.
+/// Dropping a handle ends the guest's ability to name a document; whether the
+/// document itself ends is the host's decision, which is what makes guest
+/// restart survivable later.
+///
+/// # Synchronous here, async in the host
+///
+/// None of these is a WIT `async func`. Declaring one would opt into Component
+/// Model async semantics -- overlapping subtasks and a different ABI -- when
+/// what is actually wanted is the opposite: the guest suspends inside the call
+/// while the host's Rust future awaits the thread that owns the text
+/// subsystem. `bindgen!`'s `imports: { default: async | trappable }` is that
+/// distinction, and it needs nothing from the WIT.
+interface text {
+    use text-types.{text-error};
+
+    resource text-buffer;
+    resource text-view;
+
+    /// Opens an empty document.
+    ///
+    /// Empty, and only empty, in this package. Creating a buffer from guest
+    /// contents raises canonical transfer, copy limits, bootstrap revisions
+    /// and resynchronization all at once -- which is Package C, and pulling it
+    /// forward here would mean designing synchronization inside a resource
+    /// constructor.
+    create-empty-buffer: func() -> result<text-buffer, text-error>;
+
+    /// Opens a view onto a buffer.
+    ///
+    /// Borrowed, because a view does not take ownership of the document: many
+    /// views may name one buffer, and the buffer outlives any of them.
+    create-view: func(buffer: borrow<text-buffer>) -> result<text-view, text-error>;
+}
