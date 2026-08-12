@@ -399,8 +399,7 @@ answers to a geometric question.
 The tests worth writing attack the translation seam, not Parley:
 
 ```text
-click a top-of-file row
-click row 90,000, and prove the buffer byte is deep in the document
+click row 0, and click row 90,000
 inject buffer_range.start = 0, and prove only the deep case fails
 click through multibyte UTF-8
 a bidi fixture, where affinity decides the visual position at an
@@ -411,6 +410,13 @@ caret and selection pixel tests
 
 The last because Phase 2 proved scene commands can exist while being
 invisible.
+
+**The blind spot is one row wide, not "the top of the file".** An earlier
+draft of this section said a fixture that never scrolls cannot detect a lost
+origin, and the fault injection disproved it: row 12 of an *unscrolled* view
+still begins several hundred bytes in, so dropping the origin breaks it too.
+Only row 0 starts at byte 0. The control fixture has to be that row
+specifically, and B2a has a test occupying exactly it.
 
 And instrument, without necessarily optimizing yet:
 

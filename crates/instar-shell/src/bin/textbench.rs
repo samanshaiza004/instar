@@ -65,7 +65,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use instar_host::text_view::present;
+use instar_host::text_view::{Presentation, present};
 use instar_text::{
     Selection, TextBufferId, TextEdit, TextSystem, TextViewId, TextViewport, instrument,
 };
@@ -638,11 +638,15 @@ fn shaping_table() {
     );
 
     let viewport = TextViewport::new(400.0, 20.0);
-    let style = ShapingStyle {
-        role: FontRole::Monospace,
-        size: 14.0,
-        weight: 400,
-        wrap: false,
+    let presentation = Presentation {
+        style: ShapingStyle {
+            role: FontRole::Monospace,
+            size: 14.0,
+            weight: 400,
+            wrap: false,
+        },
+        row_height: 20.0,
+        wrap_width: None,
     };
     // One font stack for the whole benchmark, as Parley intends and as
     // instar-host does.
@@ -650,6 +654,7 @@ fn shaping_table() {
 
     for document in documents() {
         let (system, buffer, _) = open(&document.text);
+        let revision = system.revision(buffer).expect("a live buffer");
         let storage = system.buffer(buffer).expect("a live buffer").text();
         let deep = (storage.len_lines() as f32 * 0.8 * viewport.row_height) as i32;
 
@@ -658,18 +663,18 @@ fn shaping_table() {
 
             // Warm: the first shape of a face loads it, and that cost belongs
             // to starting up rather than to a frame.
-            let _ = present(&mut context, storage, &window, style, 20.0, None);
+            let _ = present(&mut context, storage, &window, &presentation, revision);
 
             let before = live();
-            let mut presented = present(&mut context, storage, &window, style, 20.0, None)
+            let mut presented = present(&mut context, storage, &window, &presentation, revision)
                 .expect("a window is always shapeable");
             let glyphs = presented.glyphs();
-            let presentation = live() - before;
+            let presentation_bytes = live() - before;
 
             let mut samples = Vec::with_capacity(200);
             for _ in 0..200 {
                 let start = Instant::now();
-                let mut frame = present(&mut context, storage, &window, style, 20.0, None)
+                let mut frame = present(&mut context, storage, &window, &presentation, revision)
                     .expect("a window is always shapeable");
                 std::hint::black_box(frame.glyphs());
                 samples.push(start.elapsed());
@@ -681,7 +686,7 @@ fn shaping_table() {
                 label,
                 bytes(presented.bytes_shaped() as u64),
                 glyphs,
-                bytes(presentation.max(0) as u64),
+                bytes(presentation_bytes.max(0) as u64),
                 duration(percentiles(samples).p50),
             );
         }

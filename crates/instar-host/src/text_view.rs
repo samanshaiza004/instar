@@ -24,15 +24,18 @@
 //! much unless something carries the origin.
 //!
 //! It is written and tested here before there is a caret, because the defect
-//! it prevents is invisible at the top of a file: a fixture that never scrolls
-//! passes with the origin dropped entirely.
+//! it prevents has a blind spot exactly one row wide. Row 0 starts at byte 0,
+//! so adding the origin and forgetting to add it give the same answer there —
+//! and nowhere else, not even elsewhere in an unscrolled view. A suite whose
+//! only click fixture is the first row would agree that a broken translation
+//! works.
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
-use instar_text::{ShapingWindow, TextStorage};
-use instar_ui::{ShapingStyle, TextContext, TextLayout};
+use instar_text::{Revision, ShapingWindow, TextStorage};
+use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
 
 /// One shaped row of a document, and where in the document it came from.
 pub struct PresentedSegment {
@@ -49,6 +52,14 @@ pub struct PresentedSegment {
     /// Where it sits in the view, in logical pixels.
     pub origin_x: f32,
     pub origin_y: f32,
+    /// The buffer revision this was shaped from.
+    ///
+    /// Carried before anything caches, because it is what makes a stale
+    /// segment detectable rather than merely unlikely. A `TextLayout` is
+    /// presentation state; the moment one outlives the buffer state it was
+    /// built from, hit-testing against it answers a question about a document
+    /// that no longer exists.
+    pub buffer_revision: Revision,
     pub layout: TextLayout,
 }
 
@@ -71,6 +82,18 @@ impl PresentedSegment {
     pub fn local_to_buffer(&self, local: usize) -> Option<usize> {
         (local <= self.buffer_range.len()).then(|| self.buffer_range.start + local)
     }
+}
+
+/// A caret position in a document.
+///
+/// Byte offset plus affinity, together, everywhere. Parley states that
+/// affinity affects a cursor's visual location, so a document position that
+/// dropped it would be a position that cannot be drawn back correctly — the
+/// same byte sits in two different places at a bidi boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextPosition {
+    pub byte: usize,
+    pub affinity: Affinity,
 }
 
 /// Everything one frame of one view draws.
@@ -109,6 +132,87 @@ impl PresentedText {
             .iter()
             .find(|segment| segment.buffer_to_local(buffer).is_some())
     }
+
+    /// A point in the view, as a position in the document.
+    ///
+    /// The whole coordinate path, in one place rather than scattered across
+    /// callers:
+    ///
+    /// ```text
+    /// viewport point
+    ///   -> the segment whose rows contain it
+    ///   -> segment-local point
+    ///   -> TextLayout::cursor_from_point   (Parley: cluster, line, direction)
+    ///   -> local byte + affinity
+    ///   -> + buffer_range.start
+    ///   -> document position
+    /// ```
+    ///
+    /// Hit-testing goes through the layout that produced the visible glyphs.
+    /// Shaping the same string again to answer a click would give the view two
+    /// layouts that can disagree about where text is.
+    pub fn position_at(&self, x: f32, y: f32, row_height: f32) -> Option<TextPosition> {
+        let segment = self.segment_for_point(y, row_height)?;
+        let cursor = segment
+            .layout
+            .cursor_from_point(x - segment.origin_x, y - segment.origin_y);
+        Some(TextPosition {
+            // `cursor_from_point` clamps into the layout, so this is always
+            // inside the segment -- but it is translated through the same
+            // helper the tests exercise rather than by adding the origin here.
+            byte: segment.local_to_buffer(cursor.index)?,
+            affinity: cursor.affinity,
+        })
+    }
+
+    /// Where to draw the caret for a document position, in view coordinates.
+    ///
+    /// `None` when the position is not currently presented, which is the
+    /// honest answer for a caret scrolled off screen.
+    pub fn caret_geometry(&self, position: TextPosition, width: f32) -> Option<CaretGeometry> {
+        let segment = self.segment_at(position.byte)?;
+        let local = segment.buffer_to_local(position.byte)?;
+        let cursor = segment
+            .layout
+            .cursor_from_byte_index(local, position.affinity);
+        let geometry = segment.layout.caret_geometry(cursor, width);
+        Some(CaretGeometry {
+            x: geometry.x + segment.origin_x,
+            y: geometry.y + segment.origin_y,
+            ..geometry
+        })
+    }
+
+    /// The segment a vertical position falls in, clamped to the window.
+    ///
+    /// Clamped rather than `None` outside, because a drag that leaves the top
+    /// or bottom of the view should extend to the first or last visible
+    /// position, not stop responding.
+    fn segment_for_point(&self, y: f32, row_height: f32) -> Option<&PresentedSegment> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let row = (y / row_height).floor().max(0.0) as usize;
+        Some(
+            self.segments
+                .get(row)
+                .unwrap_or_else(|| self.segments.last().expect("checked non-empty")),
+        )
+    }
+}
+
+/// How a view is presented, as distinct from what it is showing.
+///
+/// Grouped rather than passed as loose parameters: `present` was at seven
+/// arguments, which is clippy's limit, and B2 adds more. A parameter list that
+/// long is also one where two `f32`s can be swapped silently.
+#[derive(Debug, Clone, Copy)]
+pub struct Presentation {
+    pub style: ShapingStyle,
+    /// Logical pixels per row.
+    pub row_height: f32,
+    /// Width to wrap at, or `None` for one line per paragraph.
+    pub wrap_width: Option<f32>,
 }
 
 /// Shapes exactly the window `instar-text` chose, and nothing else.
@@ -121,9 +225,8 @@ pub fn present(
     context: &mut TextContext,
     storage: &TextStorage,
     window: &ShapingWindow,
-    style: ShapingStyle,
-    row_height: f32,
-    wrap_width: Option<f32>,
+    presentation: &Presentation,
+    buffer_revision: Revision,
 ) -> Result<PresentedText, instar_text::TextError> {
     let mut segments = Vec::with_capacity(window.paragraphs.len());
 
@@ -133,8 +236,8 @@ pub fn present(
         let bytes = without_trailing_newline(storage, paragraph.bytes.clone())?;
         let text = storage.slice(bytes.clone())?.materialize();
 
-        let mut layout = context.shape_keyless(&text, style);
-        layout.break_lines(wrap_width);
+        let mut layout = context.shape_keyless(&text, presentation.style);
+        layout.break_lines(presentation.wrap_width);
 
         segments.push(PresentedSegment {
             row: paragraph.row,
@@ -143,8 +246,9 @@ pub fn present(
             // Relative to the window's first row, so a view scrolled to row
             // 135,298 draws its first segment at the top of the viewport
             // rather than 2.7 million pixels below it.
-            origin_y: (paragraph.row - window.rows.start) as f32 * row_height,
+            origin_y: (paragraph.row - window.rows.start) as f32 * presentation.row_height,
             buffer_range: bytes,
+            buffer_revision,
             layout,
         });
     }
@@ -234,9 +338,12 @@ mod tests {
             &mut context,
             storage,
             &window,
-            ShapingStyle::default(),
-            20.0,
-            None,
+            &Presentation {
+                style: ShapingStyle::default(),
+                row_height: 20.0,
+                wrap_width: None,
+            },
+            Revision::default(),
         )
         .expect("a window is always shapeable")
     }
@@ -289,13 +396,11 @@ mod tests {
 
     /// The reason the deep fixture above exists, stated as its own test.
     ///
-    /// At the top of a document the first segment starts at byte 0, so
-    /// `buffer_range.start` is zero and dropping it entirely changes nothing.
-    /// This passes with the origin removed; the deep test does not. Every
-    /// fixture in a suite starting at the top of a file would agree that a
-    /// broken translation works.
+    /// The first segment starts at byte 0, so `buffer_range.start` is zero and
+    /// dropping it entirely changes nothing *here*. This passes with the origin
+    /// removed; the deep test does not.
     #[test]
-    fn at_the_top_of_a_document_the_origin_is_zero_and_proves_nothing() {
+    fn on_the_first_row_the_origin_is_zero_and_proves_nothing() {
         let storage = document(1_000);
         let presented = present_at(&storage, 0);
 
@@ -325,9 +430,12 @@ mod tests {
                 &mut context,
                 &storage,
                 &window,
-                ShapingStyle::default(),
-                20.0,
-                None,
+                &Presentation {
+                    style: ShapingStyle::default(),
+                    row_height: 20.0,
+                    wrap_width: None,
+                },
+                Revision::default(),
             )
             .expect("a window is always shapeable");
         }
@@ -385,6 +493,183 @@ mod tests {
             presented.bytes_shaped(),
             instar_text::MAX_SHAPED_PARAGRAPH_BYTES,
             "five megabytes on one row, and 64 KiB of it shaped"
+        );
+    }
+
+    // ------------------------------------------- B2a: the coordinate seam
+
+    /// Presents an arbitrary document so a hit-test has something to land in.
+    fn present_text(text: &str, scroll: i32) -> PresentedText {
+        let storage = TextStorage::from_text(text);
+        let viewport = TextViewport::new(400.0, 20.0);
+        let window = viewport.visible(&storage, scroll).expect("in bounds");
+        let mut context = TextContext::new();
+        present(
+            &mut context,
+            &storage,
+            &window,
+            &Presentation {
+                style: ShapingStyle::default(),
+                row_height: 20.0,
+                wrap_width: None,
+            },
+            Revision::default(),
+        )
+        .expect("a window is always shapeable")
+    }
+
+    /// Failure class 1: the window origin.
+    ///
+    /// A click twelve rows down a view scrolled to row 90,000 must produce a
+    /// byte millions deep, not a byte twelve rows into the file.
+    #[test]
+    fn a_click_deep_in_a_document_produces_a_deep_buffer_position() {
+        let storage = document(100_000);
+        let presented = present_at(&storage, 1_900_000);
+        let first_row = presented.segments[0].row;
+
+        let position = presented
+            .position_at(30.0, 12.0 * 20.0 + 5.0, 20.0)
+            .expect("a point inside the window hits a row");
+
+        assert!(
+            position.byte > 4_000_000,
+            "a click at row {} landed at byte {}, which is near the top of the \
+             file -- the window origin was lost",
+            first_row + 12,
+            position.byte
+        );
+        let segment = presented
+            .segment_at(position.byte)
+            .expect("the position came from a presented row");
+        assert_eq!(segment.row, first_row + 12);
+    }
+
+    /// The control that makes the previous test mean something — and it is
+    /// narrower than "the top of the file".
+    ///
+    /// Only **row 0** has origin zero. Row 12 of an unscrolled view still
+    /// starts several hundred bytes in, so a lost origin is detectable there.
+    /// The blind spot is exactly one row wide, and this test occupies it: a
+    /// suite whose only click fixture is the first row would agree that a
+    /// broken translation works.
+    #[test]
+    fn a_click_on_the_first_row_cannot_detect_a_lost_origin() {
+        let storage = document(1_000);
+        let presented = present_at(&storage, 0);
+        assert_eq!(presented.segments[0].buffer_range.start, 0);
+
+        let position = presented
+            .position_at(30.0, 5.0, 20.0)
+            .expect("a point on the first row");
+
+        assert!(
+            position.byte < 50,
+            "row 0 is the one place adding the origin and forgetting to add it \
+             give the same answer"
+        );
+    }
+
+    /// Failure class 2: UTF-8.
+    ///
+    /// Every position a click can produce has to be a byte a rope will accept.
+    /// Landing inside a multi-byte character would be an error the moment the
+    /// caret was used to edit.
+    #[test]
+    fn every_click_across_multibyte_text_lands_on_a_character_boundary() {
+        let text = "héllo wörld — ünïcode\nそして日本語のテキスト\n";
+        let storage = TextStorage::from_text(text);
+        let presented = present_text(text, 0);
+
+        for x in 0..200 {
+            for row in 0..2 {
+                let position = presented
+                    .position_at(x as f32, row as f32 * 20.0 + 5.0, 20.0)
+                    .expect("inside the window");
+                assert!(
+                    storage.is_char_boundary(position.byte),
+                    "clicking at x={x} on row {row} produced byte {}, which is \
+                     inside a character",
+                    position.byte
+                );
+            }
+        }
+    }
+
+    /// Failure class 3: affinity survives the translation.
+    ///
+    /// Parley resolves the same byte offset to different visual places
+    /// depending on affinity. A document position that dropped it could not be
+    /// drawn back correctly, so the round trip has to preserve it.
+    #[test]
+    fn affinity_is_carried_across_the_seam_rather_than_discarded() {
+        let text = "abc \u{05d0}\u{05d1}\u{05d2} def\n";
+        let presented = present_text(text, 0);
+        let segment = &presented.segments[0];
+
+        let boundary = segment.buffer_range.start + 4;
+        let downstream = TextPosition {
+            byte: boundary,
+            affinity: Affinity::Downstream,
+        };
+        let upstream = TextPosition {
+            byte: boundary,
+            affinity: Affinity::Upstream,
+        };
+
+        let a = presented
+            .caret_geometry(downstream, 1.0)
+            .expect("presented");
+        let b = presented.caret_geometry(upstream, 1.0).expect("presented");
+
+        assert_ne!(
+            (a.x, a.y),
+            (b.x, b.y),
+            "the same byte at a direction boundary drew in the same place for \
+             both affinities, which means affinity is being dropped somewhere \
+             between the position and the geometry"
+        );
+    }
+
+    /// A caret round-trips: click, then ask where to draw it, and get back the
+    /// row that was clicked.
+    #[test]
+    fn a_clicked_position_draws_its_caret_on_the_row_that_was_clicked() {
+        let storage = document(100_000);
+        let presented = present_at(&storage, 1_900_000);
+
+        let position = presented
+            .position_at(40.0, 5.0 * 20.0 + 5.0, 20.0)
+            .expect("inside the window");
+        let caret = presented
+            .caret_geometry(position, 1.0)
+            .expect("a presented position has geometry");
+
+        assert_eq!(
+            caret.y, 100.0,
+            "row 5 of the window sits at y=100 in view coordinates"
+        );
+        assert!(caret.height > 0.0, "a caret with no height draws nothing");
+    }
+
+    /// A caret scrolled off screen has no geometry, rather than geometry at
+    /// the nearest visible row.
+    #[test]
+    fn a_position_outside_the_window_has_no_caret_geometry() {
+        let storage = document(100_000);
+        let presented = present_at(&storage, 1_900_000);
+
+        assert!(
+            presented
+                .caret_geometry(
+                    TextPosition {
+                        byte: 0,
+                        affinity: Affinity::Downstream
+                    },
+                    1.0
+                )
+                .is_none(),
+            "byte 0 is far above this window"
         );
     }
 }

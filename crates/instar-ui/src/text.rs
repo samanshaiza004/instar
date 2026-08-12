@@ -290,7 +290,101 @@ pub struct TextLayout {
     shaped_valid: bool,
 }
 
+/// Which side of a boundary a caret is attached to.
+///
+/// Not decoration. The same byte offset sits in two visually different places
+/// at a bidi boundary and at a soft line break, and Parley resolves that with
+/// affinity — so a position reduced to a bare byte offset is a position that
+/// cannot be drawn correctly. It travels with the offset everywhere, including
+/// across the window-origin translation.
+///
+/// Instar's own enum rather than Parley's, for the same reason `TextLayout`
+/// exists: `instar-host` should not name Parley types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Affinity {
+    /// Attached to the character logically after the offset.
+    #[default]
+    Downstream,
+    /// Attached to the character logically before it.
+    Upstream,
+}
+
+impl From<Affinity> for parley::Affinity {
+    fn from(affinity: Affinity) -> Self {
+        match affinity {
+            Affinity::Downstream => Self::Downstream,
+            Affinity::Upstream => Self::Upstream,
+        }
+    }
+}
+
+impl From<parley::Affinity> for Affinity {
+    fn from(affinity: parley::Affinity) -> Self {
+        match affinity {
+            parley::Affinity::Downstream => Self::Downstream,
+            parley::Affinity::Upstream => Self::Upstream,
+        }
+    }
+}
+
+/// A caret position within one layout's text.
+///
+/// The byte offset is **layout-local**: it indexes the string the layout was
+/// built from, not a document. Turning it into a document position is
+/// `instar-host`'s job and the reason `PresentedSegment` remembers where its
+/// text came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextCursor {
+    pub index: usize,
+    pub affinity: Affinity,
+}
+
+/// Where a caret should be drawn, in the layout's own logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaretGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 impl TextLayout {
+    /// The caret position a point falls at.
+    ///
+    /// Coordinates are relative to this layout's own origin, so the caller
+    /// subtracts the segment's origin before asking. Parley resolves the
+    /// cluster, the line, and the writing direction; Instar does not
+    /// reimplement any of that.
+    pub fn cursor_from_point(&self, x: f32, y: f32) -> TextCursor {
+        let cursor = parley::Cursor::from_point(&self.layout, x, y);
+        TextCursor {
+            index: cursor.index(),
+            affinity: cursor.affinity().into(),
+        }
+    }
+
+    /// The caret at a layout-local byte offset.
+    pub fn cursor_from_byte_index(&self, index: usize, affinity: Affinity) -> TextCursor {
+        let cursor = parley::Cursor::from_byte_index(&self.layout, index, affinity.into());
+        TextCursor {
+            index: cursor.index(),
+            affinity: cursor.affinity().into(),
+        }
+    }
+
+    /// Where to draw a caret, in this layout's logical coordinates.
+    pub fn caret_geometry(&self, cursor: TextCursor, width: f32) -> CaretGeometry {
+        let box_ =
+            parley::Cursor::from_byte_index(&self.layout, cursor.index, cursor.affinity.into())
+                .geometry(&self.layout, width);
+        CaretGeometry {
+            x: box_.x0 as f32,
+            y: box_.y0 as f32,
+            width: (box_.x1 - box_.x0) as f32,
+            height: (box_.y1 - box_.y0) as f32,
+        }
+    }
+
     /// Breaks the text into lines at `width`, or unbroken when `None`.
     pub fn break_lines(&mut self, width: Option<f32>) {
         self.layout.break_all_lines(width);

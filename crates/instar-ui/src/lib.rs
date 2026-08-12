@@ -49,8 +49,8 @@ pub use scroll::{
     ScrollState, Scrollbar, ScrollbarPart, ScrollbarStyle, ThumbDrag,
 };
 pub use text::{
-    Alignment, Available, FontFace, FontRole, Glyph, ShapedRun, ShapedText, ShapingStyle,
-    TextContext, TextLayout, TextStats,
+    Affinity, Alignment, Available, CaretGeometry, FontFace, FontRole, Glyph, ShapedRun,
+    ShapedText, ShapingStyle, TextContext, TextCursor, TextLayout, TextStats,
 };
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};

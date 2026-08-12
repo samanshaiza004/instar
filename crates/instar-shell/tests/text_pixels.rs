@@ -13,10 +13,10 @@
 
 use std::sync::Arc;
 
-use instar_host::text_view::{lower, present};
+use instar_host::text_view::{Presentation, lower, present};
 use instar_paint::{Color, PhysicalSize};
 use instar_shell::{Presenter, default_font};
-use instar_text::{TextStorage, TextViewport};
+use instar_text::{Revision, TextStorage, TextViewport};
 use instar_ui::{FontRole, ShapingStyle, TextContext};
 
 const ROW_HEIGHT: f32 = 20.0;
@@ -61,8 +61,18 @@ fn frame_at(storage: &TextStorage, row: usize) -> Vec<u8> {
         .expect("a clamped window is still valid");
 
     let mut context = TextContext::with_monospace_face(Arc::clone(&default_font()));
-    let mut presented = present(&mut context, storage, &window, style(), ROW_HEIGHT, None)
-        .expect("a window is always shapeable");
+    let mut presented = present(
+        &mut context,
+        storage,
+        &window,
+        &Presentation {
+            style: style(),
+            row_height: ROW_HEIGHT,
+            wrap_width: None,
+        },
+        Revision::default(),
+    )
+    .expect("a window is always shapeable");
 
     let scene = lower(
         &mut presented,
