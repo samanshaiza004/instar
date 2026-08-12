@@ -980,14 +980,148 @@ validates the tree, rather than by a later scan that could disagree about which
 nodes are semantically live — which is only expressible once the consumer
 exists.
 
-#### Two regression cases B2e-3 owes
+#### B2e-3, frozen
+
+> **The question:** can one authoritative commit resolve temporary Component
+> Model borrows into stable Instar identities, validate tree and attachment
+> state together, and promote both atomically or neither?
+
+Four identities meet here, which is why it is its own package:
 
 ```text
-the same TextView at a different slot number  ->  attachment unchanged
-a different TextView at the same slot number  ->  attachment changed
+borrow<text-view>   ->  Resource<GuestTextView>  ->  OpaqueResourceKey
+                    ->  TextViewId               ->  NodeKey -> TextViewId
+      transient                                              retained
 ```
 
-Those two prove the slot is commit-local rather than merely documenting it.
+**Nothing that crosses the bridge is a Wasmtime handle.** The runtime resolves
+each borrow far enough to copy out a lease and no further, so a commit request
+carries exactly `GenerationId`, the batch bytes, and `Vec<OpaqueResourceKey>`.
+A `borrow<T>` is non-owning and scoped to the call; letting one reach retained
+state would be retaining something defined not to outlive the call.
+
+##### Order, because it decides which refusal a hostile input gets
+
+```text
+generation screen           wrong generation      -> refused before decode
+opaque key -> TextViewId    stale or unowned lease -> refused before decode
+decode                      malformed batch       -> ProtocolError
+semantic validation         + collect TextAttachmentRefs
+slot resolution             slot >= table.len()   -> semantic refusal
+duplicate validation        two nodes -> one view -> semantic refusal
+tree diff
+attachment diff
+```
+
+Keys resolve *before* decoding, so a bad capability never buys parser work —
+and fault attribution stays clean, because each class of bad input has exactly
+one refusal it can produce.
+
+##### Mutation is impossible until acceptance
+
+```rust
+struct StagedUiCommit {
+    tree: Tree,
+    tree_changes: ChangeSet,
+    attachments: BTreeMap<NodeKey, TextViewId>,
+    attachment_changes: AttachmentChangeSet,
+}
+```
+
+Everything is built into this, and only a complete one is promoted. Not this,
+even with rollback:
+
+```rust
+window.tree = new_tree;
+// ... validate attachments ...
+window.text_attachments = attachments;
+```
+
+There must be no half-promoted state *to* roll back. The fault injection is
+promoting the tree before validating attachments, and the refusal test has to
+catch the half-applied interface.
+
+##### Duplicates: the side table is scratch, the map is law
+
+```text
+text_views = [V7, V7]                       allowed
+text_views with unreferenced entries        allowed
+node 10 -> slot 0, both entries are V7      allowed
+node 10 -> slot 0, node 20 -> slot 1        REFUSED: both resolve to V7
+```
+
+The illegal condition is two live `NodeKey`s attaching one `TextViewId`, not a
+temporary list containing a capability twice. Policing the list would turn a
+WIT argument representation into semantics for no correctness gain. Resolve
+first; validate the staged map.
+
+##### Three slot tests, not two
+
+```text
+A: slot 0 -> V7    B: slot 9 -> V7          attachment diff is a no-op
+A: slot 0 -> V7    B: slot 0 -> V12         attachment changed
+
+A: node 10 -> slot 0 -> V7, node 20 -> slot 1 -> V8
+B: node 10 -> slot 1 -> V7, node 20 -> slot 0 -> V8
+   tree no-op, attachment no-op
+```
+
+The third is the one that proves the *whole table* is positional scratch space,
+rather than that one slot number happens to be allowed to move.
+
+##### The bound, stated precisely
+
+```text
+MAX_TEXT_ATTACHMENTS <= MAX_NODES = 4096
+```
+
+A leaf text view consumes at most one slot, so there can never be more useful
+attachments than nodes. What the claim is:
+
+> Instar refuses `text_views.len() > MAX_TEXT_ATTACHMENTS` on entry and bounds
+> all work after lifting.
+
+What it is **not**: a pre-lift allocation bound. Generated `bindgen!` lifts a
+`list<T>` into an owned Rust collection before the host implementation sees it,
+so the lifting itself is not an Instar-controlled boundary. That belongs in the
+code comment, not only here, because it is exactly the kind of claim that
+drifts into an overclaim.
+
+##### The joined-seam test is not optional
+
+Twice in this phase a unit-level proof made me assume an integration-level one,
+and twice the fault injection found it. So, as a phase rule:
+
+> Every new cross-thread or cross-crate authority check needs one test at the
+> final joined seam, even when both halves have exhaustive unit tests.
+
+B2e-3's is a real guest committing with a borrowed capability, through the
+async commit, the runtime's key extraction, the bridge, lease resolution, slot
+resolution, and atomic promotion — with a live cross-layer authority fault
+injected there. Making `resolve_view_lease` trust a live id without checking
+ownership must refuse the whole guest commit.
+
+##### Implementation order
+
+```text
+first  the staged commit type, and the attachment change set
+then   WIT, borrow resolution, bridge payload, validation refs,
+       slot resolution, host diff
+last   atomic promotion, fault injection, the vertical guest test
+```
+
+##### B2e-3 ends inert
+
+The retained attachment map is correct and does nothing. It does not keep views
+alive, does not participate in focus or hit-testing, and does not feed the B2d
+seam. Those are B2e-4.
+
+```text
+B2e-3   authority, and atomic description
+B2e-4   lifetime, and behaviour
+```
+
+Keeping them apart is what makes each provable.
 
 #### Order
 
