@@ -195,6 +195,18 @@ impl Node {
         }
     }
 
+    /// A text-view surface. A leaf, and carrying no resource identity — see
+    /// [`NodeKind::TextView`].
+    pub fn text_view(key: u32) -> Self {
+        Self {
+            key: NodeKey::first(key),
+            kind: NodeKind::TextView,
+            layout: WireLayout::default(),
+            style: WireStyle::default(),
+            children: Vec::new(),
+        }
+    }
+
     pub fn button(key: u32, label: impl Into<String>) -> Self {
         Self {
             key: NodeKey::first(key),

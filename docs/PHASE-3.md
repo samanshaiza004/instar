@@ -793,8 +793,11 @@ generation screen
   -> atomic retained-tree apply
 ```
 
-The retained tree stores the resolved `TextViewId`. It never stores a
-`Resource<T>` or a handle-table index: Component Model handles are opaque
+The retained host *window state* stores the resolved `TextViewId`, in its
+attachment map. The `instar-ui` tree retains only `NodeKind::TextView`, which
+carries no resource identity at all — B2e-2 settled that by giving the variant
+no fields, so the slot cannot be retained even by accident. Nothing anywhere
+stores a `Resource<T>` or a handle-table index: Component Model handles are opaque
 table-backed capabilities, not stable application identifiers, and the guest's
 table dies with its Store.
 
@@ -962,13 +965,20 @@ duplicate-view validation, attachment ownership, any `TextSystem` access. A
 slot of `65535` is structurally valid bytes and semantically unresolved until
 B2e-3 supplies the handles.
 
-Validation does collect what B2e-3 will need, in protocol vocabulary only:
+B2e-3 introduces attachment-reference collection and its consumer together:
 
 ```rust
 struct TextAttachmentRef { node: NodeKey, slot: u16 }
 ```
 
 `NodeKey` and a slot. Not a `TextViewId`, not a `Resource<GuestTextView>`.
+
+Deliberately *not* added in B2e-2. Nothing consumed it there, and a vocabulary
+term with a producer and no consumer is the shape this project has an
+enforcement test against. It also has to be produced by the same pass that
+validates the tree, rather than by a later scan that could disagree about which
+nodes are semantically live — which is only expressible once the consumer
+exists.
 
 #### Two regression cases B2e-3 owes
 
