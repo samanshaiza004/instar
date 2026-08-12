@@ -898,6 +898,120 @@ Each step gets one responsibility. Combining resources, a protocol bump, a
 borrowed side table and a new concurrency mode into one jump is how a package
 stops being reviewable.
 
+#### The sink, frozen
+
+`instar-kernel` **does** know that the world imports `text-buffer` and
+`text-view` — generated bindings force that, and pretending otherwise would be
+a fiction. What it must not know is what a buffer contains, how a view
+references one, what a selection is, or when a document should die.
+
+The precedent is `CommitSink`, which exists so the kernel can suspend a guest
+call while the thread that owns the retained tree does the actual work:
+
+```rust
+/// A host resource, named without saying what kind of thing it is.
+pub struct OpaqueResourceKey {
+    slot: u32,
+    incarnation: u32,
+}
+
+/// Distinct Rust types, so a buffer cannot be accepted where a view belongs.
+pub struct GuestTextBuffer { key: OpaqueResourceKey }
+pub struct GuestTextView   { key: OpaqueResourceKey }
+
+pub trait TextSink: Send + Sync + 'static {
+    fn submit(&self, request: TextRequest) -> Result<(), TextRequest>;
+}
+```
+
+**`incarnation`, not `generation`.** There are already two unrelated
+generations in this system and naming both the same in bridge code is a defect
+waiting to happen:
+
+```text
+GenerationId          one Wasmtime Store, component instance and guest task
+TextViewId.generation ABA protection for one host resource slot
+```
+
+`instar-host` is the only layer that translates `OpaqueResourceKey` to and from
+`TextBufferId`/`TextViewId`. There is no `instar-kernel -> instar-text` edge.
+
+```text
+guest create-empty-buffer()
+  -> generated host binding
+  -> TextRequest { GenerationId }
+  -> the existing bounded runtime/main bridge
+  -> generation screen
+  -> TextSystem allocates a TextBufferId
+  -> encoded as OpaqueResourceKey
+  -> reply
+  -> ResourceTable.push(GuestTextBuffer { key })
+  -> guest receives own<text-buffer>
+```
+
+#### Three things that are load-bearing rather than incidental
+
+**Never hold Store or table access across the main-thread await.** For
+`create-view`: take the borrowed lease, copy its two `u32`s, release table
+access, *then* marshal. `Accessor` grants Store access *between* await points,
+not across them.
+
+**A failed table push must compensate.** The host resource already exists by
+the time `ResourceTable::push` runs:
+
+```text
+main thread creates the buffer -> reply -> push fails
+  -> release the lease that was just created
+  -> then return the error
+```
+
+Otherwise the failure meant to refuse a resource is what leaks one.
+
+**Store destruction is not the cleanup mechanism.** Wasmtime can run a
+destructor when a guest drops an owned resource, but host resource lifetime
+stays the embedder's problem — and Instar destroys whole Stores on trap and
+restart, where no guest destructor runs at all. So the lease registry is
+generation-aware, and teardown hangs off the terminal path that already
+exists:
+
+```text
+HostEffect::GuestGone { generation, error }   error: None means a clean exit
+  -> Host::on_guest_gone
+  -> release every remaining lease for that generation
+```
+
+> Dropping a Store removes Component Model handles. Instar's generation
+> teardown removes the corresponding host capability leases.
+
+Cross-thread cleanup does **not** go in `Drop for GuestTextView`. A destructor
+doing hidden thread-affine work is the lifecycle coupling this project has
+spent two phases removing.
+
+#### No fallback sink
+
+`CommitSink` keeps batches when nobody is installed, because a headless commit
+log is a meaningful thing. A fake text system is not:
+
+```text
+no TextSink installed  ->  create-empty-buffer returns host-unavailable
+```
+
+Installed once, before any generation runs, exactly as `install_commit_sink` is.
+
+#### `kernel-ui.commit` stays true WIT async
+
+```text
+kernel-ui.commit async-WIT migration
+status: OPEN / no evidence requiring change
+```
+
+It is `async func` today and implemented through `HostWithStore` and
+`Accessor`, which is how the guest suspends while the thread-affine retained-
+tree owner applies the commit. That mechanism is Gate 0-validated, already has
+an explicit single-flight gate bounding its concurrency, and has caused no
+measured problem. Migrating it during B2e would combine a runtime ABI
+experiment with the first resource implementation for no demonstrated gain.
+
 #### B2e-1's question, and its lease lifetimes
 
 > Can a guest acquire and release typed capabilities naming main-thread
@@ -931,15 +1045,22 @@ out of them.
 What B2e-1 must prove, before any tree is involved:
 
 ```text
-create-empty-buffer          -> a real bounded TextBuffer slot
-create-view(buffer)          -> a view referring to that exact buffer
-drop an unattached view      -> the slot returns; reuse advances the generation
-a stale WIT resource         -> cannot reach the view that replaced it
-drop a buffer with a live view -> both remain valid
-MAX_TEXT_BUFFERS exceeded    -> an explicit error, not a panic
-MAX_TEXT_VIEWS exceeded      -> an explicit error
-guest trap / generation death -> leases cleaned, nothing leaked
+create-empty-buffer            -> a real bounded TextBuffer slot
+create-view(buffer)            -> a view referring to that exact buffer
+explicit drop of a view        -> the slot returns; reuse advances the
+                                  internal incarnation
+drop a buffer lease while a
+  view still references it     -> the buffer survives
+a stale opaque key             -> refused by TextSystem, never misapplied
+MAX_TEXT_BUFFERS exceeded      -> an explicit error, not a panic
+MAX_TEXT_VIEWS exceeded        -> an explicit error
+ResourceTable push fails       -> the host lease is released, not leaked
+generation trap or exit        -> every lease returns to baseline
+no sink, or a disconnected one -> an error, never a parked guest
 ```
+
+The last matters as much as the rest: a capability boundary that can hang is
+worse than one that refuses.
 
 The generational allocator matters here: the Component Model gives handle
 safety at the ABI, but once a handle resolves to a `TextViewId`, it is Instar's
