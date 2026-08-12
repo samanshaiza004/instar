@@ -881,6 +881,104 @@ real guest: create-empty-buffer, create-view, commit a TextView node
 criterion for B2e itself: attachment supplies a `TextViewId` to the seam that
 already exists; it does not create a second editor interaction route.
 
+#### The slot is commit-local indirection, not retained identity
+
+> A `TextView` node's `attachment` is an index into *this commit's* borrowed
+> handle table. It is resolved during admission and never retained. What the
+> retained tree holds is the resolved `TextViewId`.
+
+This follows from what a `borrow<T>` is: a loan for the duration of one call,
+and an opaque capability rather than a stable application identifier. Retaining
+the slot number would make both of these wrong:
+
+```text
+commit A   slot 0 -> TextViewId(7, 2)
+commit B   slot 0 -> TextViewId(19, 0)    the slot held still, the resource did not
+
+commit A   slot 0 -> TextViewId(7, 2)
+commit B   slot 4 -> TextViewId(7, 2)     the slot moved, the attachment did not
+```
+
+A diff comparing slots would report a change in the second case and miss one in
+the first. B2e-3 therefore consumes the slot *before* retained composition and
+compares resolved identity.
+
+Which reinforces where things live:
+
+```text
+HostWindow
+├── instar-ui retained tree      NodeKey -> NodeKind::TextView
+└── text attachments             NodeKey -> TextViewId
+```
+
+`instar-ui` needs to know a node *is* a text surface — for layout, hit-testing,
+focusability, clipping. It does not need to store a `TextViewId`, and still
+does not know `instar-text` exists.
+
+#### Changing which view a node shows is not a kind change
+
+```text
+NodeKey(50) TextView(V7)  ->  NodeKey(50) TextView(V12)
+```
+
+The same semantic surface, showing a different document. Classifying that as
+`KindChanged` would delete and recreate the UI node, and take host-local focus
+identity with it — which is exactly wrong for switching documents in an editor
+pane.
+
+Frozen now: **it is not `KindChanged`.** What it *does* invalidate is left open
+until B2e-4 can say what presentation actually depends on the attachment.
+
+#### A `TextView` is a leaf
+
+Children are refused. The inside of the surface is host presentation of an
+attached resource, and there must be one answer to who owns it:
+
+```text
+TextView
+├── a guest Text node?
+├── an overlay button?
+└── host-owned document glyphs?      <- only this
+```
+
+Decoration goes *around* an editor, in a `Stack` or `Column`, not inside it.
+
+#### B2e-2 proves serialization vocabulary and nothing else
+
+```text
+protocol 8 refused, 9 accepted
+the attachment slot round-trips at its intended width
+truncation inside the slot is a ProtocolError, never a panic
+a TextView with children is refused semantically
+a TextView counts toward MAX_NODES like any other node
+same NodeKey: Text -> TextView, Button -> TextView, TextView -> Button
+    are all KindChanged
+unknown node kinds stay refused
+```
+
+Deliberately **not** in B2e-2, because there is no side table yet:
+`attachment < table.len()`, `MAX_TEXT_ATTACHMENTS`, `TextViewId` lookup,
+duplicate-view validation, attachment ownership, any `TextSystem` access. A
+slot of `65535` is structurally valid bytes and semantically unresolved until
+B2e-3 supplies the handles.
+
+Validation does collect what B2e-3 will need, in protocol vocabulary only:
+
+```rust
+struct TextAttachmentRef { node: NodeKey, slot: u16 }
+```
+
+`NodeKey` and a slot. Not a `TextViewId`, not a `Resource<GuestTextView>`.
+
+#### Two regression cases B2e-3 owes
+
+```text
+the same TextView at a different slot number  ->  attachment unchanged
+a different TextView at the same slot number  ->  attachment changed
+```
+
+Those two prove the slot is commit-local rather than merely documenting it.
+
 #### Order
 
 ```text
