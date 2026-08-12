@@ -3,18 +3,34 @@ name = "instar-shell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+autobins = false
 description = "Instar's desktop shell: owns the winit event loop, presents host-lowered PaintScenes through the Vello CPU backend and softbuffer, and runs a real guest. The only crate that links a window, a renderer, and a font at once."
 
 [[bin]]
 name = "instar"
 path = "src/main.rs"
 
+# These are repository benchmarks, not runtime artifacts. Keep them runnable
+# as examples while making the dist app contain only the host executable.
+[[example]]
+name = "overhead"
+path = "src/bin/overhead.rs"
+
+[[example]]
+name = "uibench"
+path = "src/bin/uibench.rs"
+
+[[example]]
+name = "textbench"
+path = "src/bin/textbench.rs"
+
 [dependencies]
 instar-host = { path = "../instar-host" }
 instar-paint = { path = "../instar-paint" }
 instar-window = { path = "../instar-window" }
 
-# The benchmark binary (`src/bin/uibench.rs`) drives the UI tree and the wire
+# The benchmark example (`src/bin/uibench.rs`) drives the UI tree and the wire
 # format directly, so this workspace crate is a dependency of the shell, not
 # just of its test targets.
 instar-ui = { path = "../instar-ui" }
@@ -34,6 +50,13 @@ winit = "=0.30.13"
 # adapter, because the adapter belongs to a native window.
 accesskit = "0.24.1"
 accesskit_winit = "0.33.2"
+
+[dev-dependencies]
+# `textbench` benchmarks the text subsystem and nothing else, so this is a
+# dev-dependency rather than a dependency: the host does not use `instar-text`
+# yet, and putting it here keeps `crop` out of the shipped `instar` binary
+# that package I0 just finished measuring.
+instar-text = { path = "../instar-text" }
 
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }

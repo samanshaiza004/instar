@@ -131,6 +131,10 @@ world kernel {
     import kernel-ui;
     import ops;
 
+    // An optional host capability, in its own package. The kernel world
+    // assembles it; it is not kernel vocabulary. See wit/deps/instar-text.
+    import instar:text/text@0.1.0;
+
     /// The guest's entire program: run until the host says shutdown.
     export run: async func() -> result<_, string>;
 }

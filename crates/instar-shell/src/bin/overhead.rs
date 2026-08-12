@@ -9,7 +9,7 @@
 //! ```
 //!
 //! ```text
-//! cargo run --release --bin overhead
+//! cargo run --release --example overhead
 //! ```
 //!
 //! # Why one process with four checkpoints, and not four processes

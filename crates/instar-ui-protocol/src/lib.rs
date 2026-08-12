@@ -42,7 +42,7 @@ use core::fmt;
 /// Wire format version. Bump only for an incompatible change. The magic
 /// identifies the format; the version byte identifies the revision, so
 /// [`BATCH_MAGIC`] and [`EVENT_MAGIC`] stay put when this changes.
-pub const PROTOCOL_VERSION: u8 = 8;
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Leading bytes of a committed UI batch.
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
@@ -96,6 +96,16 @@ pub mod opcode {
     /// A retained viewport over exactly one content child, with a host-owned
     /// scroll offset the guest cannot see or set.
     pub const NODE_SCROLL: u8 = 6;
+    /// A surface showing a host-owned text view.
+    ///
+    /// Carries an `attachment` slot: an index into *this commit's* borrowed
+    /// handle table, resolved during admission and never retained. It is not a
+    /// resource identity — see `docs/PHASE-3.md`, "The slot is commit-local
+    /// indirection".
+    ///
+    /// A leaf. The inside of the surface is host presentation of the attached
+    /// resource, and there must be one answer to who owns it.
+    pub const NODE_TEXT_VIEW: u8 = 7;
 
     pub const SECTION_END: u8 = 0;
     pub const SECTION_TREE: u8 = 1;
@@ -680,6 +690,12 @@ pub struct WireNode {
     pub flags: u8,
     /// Present for text and button nodes.
     pub text: Option<String>,
+    /// Present for text-view nodes: which entry of this commit's attachment
+    /// table the surface shows.
+    ///
+    /// Commit-local. Nothing downstream retains it; admission resolves it to a
+    /// host resource identity and keeps that instead.
+    pub attachment: Option<u16>,
     pub layout: WireLayout,
     pub style: WireStyle,
     pub child_count: u16,
@@ -1341,6 +1357,45 @@ impl BatchEncoder {
         self
     }
 
+    /// Appends a text-view surface.
+    ///
+    /// Its own method rather than an argument on [`Self::node`], because the
+    /// attachment slot is kind-specific exactly as text is, and threading an
+    /// `Option<u16>` through every call site would put a field on six node
+    /// kinds that cannot carry one.
+    ///
+    /// Always a leaf: the child count is not a parameter because the only
+    /// value the host accepts is zero.
+    pub fn text_view(
+        &mut self,
+        key: NodeKey,
+        flags: u8,
+        attachment: u16,
+        layout: WireLayout,
+    ) -> &mut Self {
+        self.text_view_styled(key, flags, attachment, layout, WireStyle::default())
+    }
+
+    pub fn text_view_styled(
+        &mut self,
+        key: NodeKey,
+        flags: u8,
+        attachment: u16,
+        layout: WireLayout,
+        style: WireStyle,
+    ) -> &mut Self {
+        self.nodes.push(opcode::NODE_TEXT_VIEW);
+        self.nodes.extend_from_slice(&key.id.to_le_bytes());
+        self.nodes.extend_from_slice(&key.generation.to_le_bytes());
+        self.nodes.push(flags);
+        self.nodes.extend_from_slice(&attachment.to_le_bytes());
+        write_layout(&mut self.nodes, layout);
+        write_style(&mut self.nodes, style);
+        self.nodes.extend_from_slice(&0u16.to_le_bytes());
+        self.node_count += 1;
+        self
+    }
+
     pub fn finish(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16 + self.nodes.len());
         out.extend_from_slice(&BATCH_MAGIC);
@@ -1431,7 +1486,8 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             | opcode::NODE_COLUMN
             | opcode::NODE_ROW
             | opcode::NODE_STACK
-            | opcode::NODE_SCROLL => None,
+            | opcode::NODE_SCROLL
+            | opcode::NODE_TEXT_VIEW => None,
             opcode::NODE_TEXT => Some(reader.text("text content")?),
             opcode::NODE_BUTTON => Some(reader.text("button label")?),
             value => {
@@ -1440,6 +1496,12 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
                     value,
                 });
             }
+        };
+        // Kind-dependent, in the same position text occupies: after the
+        // flags, before the layout.
+        let attachment = match kind {
+            opcode::NODE_TEXT_VIEW => Some(reader.u16("text view attachment")?),
+            _ => None,
         };
         let layout = reader.layout("layout")?;
         let style = reader.style("style")?;
@@ -1459,6 +1521,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             key,
             flags: node_flags,
             text,
+            attachment,
             layout,
             style,
             child_count,
@@ -2338,5 +2401,114 @@ mod tests {
                 "byte {offset} is the {context} tag"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod text_view_wire {
+    use super::*;
+
+    /// The slot survives the wire exactly, at every value a `u16` can hold.
+    #[test]
+    fn an_attachment_slot_round_trips() {
+        for slot in [0u16, 1, 255, 256, 4095, u16::MAX] {
+            let mut encoder = BatchEncoder::new();
+            encoder.node(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                1,
+            );
+            encoder.text_view(
+                NodeKey::first(1),
+                flags::ENABLED,
+                slot,
+                WireLayout::default(),
+            );
+            let batch = decode_batch(&encoder.finish()).expect("valid");
+
+            let view = &batch.nodes[1];
+            assert_eq!(view.kind, opcode::NODE_TEXT_VIEW);
+            assert_eq!(view.attachment, Some(slot), "slot {slot} round-trips");
+            assert_eq!(view.child_count, 0, "a text view is a leaf on the wire");
+            assert_eq!(view.text, None, "and carries no text of its own");
+        }
+    }
+
+    /// Nothing but a text view has an attachment.
+    #[test]
+    fn other_kinds_carry_no_attachment() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            1,
+        );
+        encoder.node(
+            opcode::NODE_TEXT,
+            NodeKey::first(1),
+            0,
+            Some("hello"),
+            WireLayout::default(),
+            0,
+        );
+        let batch = decode_batch(&encoder.finish()).expect("valid");
+        assert_eq!(batch.nodes[1].attachment, None);
+    }
+
+    /// A batch cut inside the slot is an error, not a panic.
+    #[test]
+    fn truncation_inside_the_slot_is_a_protocol_error() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            1,
+        );
+        encoder.text_view(NodeKey::first(1), 0, 0x1234, WireLayout::default());
+        let full = encoder.finish();
+
+        // The slot is two bytes; cut between them, and before them.
+        for trim in 1..=6 {
+            let cut = &full[..full.len() - trim];
+            match decode_batch(cut) {
+                Err(_) => {}
+                Ok(_) => panic!("a batch cut {trim} bytes short decoded anyway"),
+            }
+        }
+    }
+
+    /// A protocol this build does not speak is refused by version, before any
+    /// node is looked at.
+    #[test]
+    fn the_previous_protocol_version_is_refused() {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            0,
+        );
+        let mut old = encoder.finish();
+        old[BATCH_MAGIC.len()] = PROTOCOL_VERSION - 1;
+
+        assert!(
+            matches!(
+                decode_batch(&old),
+                Err(ProtocolError::UnsupportedVersion { .. })
+            ),
+            "protocol {} is not this build's",
+            PROTOCOL_VERSION - 1
+        );
     }
 }

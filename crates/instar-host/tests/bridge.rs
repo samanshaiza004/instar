@@ -48,9 +48,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, TerminalOutcome, Wake};
+use instar_host::text_host::TextResourceCounts;
 use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
+use instar_kernel::text_bridge::{TextOperation, TextRefusal, text_request};
 use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
 use instar_ui::{NodeKey, NodeKind};
 use instar_window::{
@@ -1115,5 +1117,137 @@ fn trace_one_warm_click() {
     println!(
         "\nexactly one label changed, so `rebuilt` should be 1. If it is \
          {text_nodes}, the cache is not surviving the commit boundary."
+    );
+}
+
+// ------------------------------------------------- B2e-1b: the joined path
+
+/// The node keys `guests/hostile` gives its text buttons.
+const TEXT_ACQUIRE: NodeKey = NodeKey::first(16);
+const TEXT_RELEASE_VIEW: NodeKey = NodeKey::first(17);
+
+/// Waits until the host's text counts satisfy `done`, or gives up.
+fn await_text(bridge: &mut HostBridge, done: impl Fn(TextResourceCounts) -> bool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        if done(bridge.host().text_resources().counts()) {
+            return true;
+        }
+        bridge.wait(Duration::from_millis(25));
+    }
+    false
+}
+
+/// The whole B2e-1 claim, through a real guest.
+///
+/// Every earlier test in this package proved one half against a hand-built
+/// request. This is the first that goes guest -> WIT import -> kernel sink ->
+/// bounded queue -> generation screen -> TextHost -> TextSystem, and back with
+/// a handle the guest holds.
+#[test]
+fn a_real_guest_acquires_and_releases_text_capabilities() {
+    let (mut bridge, _wakes) = ready();
+    assert_eq!(
+        bridge.host().text_resources().counts(),
+        TextResourceCounts::default(),
+        "nothing exists before the guest asks"
+    );
+
+    click(&mut bridge, TEXT_ACQUIRE);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 2),
+        "a click reached the guest, and its create calls reached TextSystem: {:?}",
+        bridge.host().text_resources().counts()
+    );
+    let counts = bridge.host().text_resources().counts();
+    assert_eq!(counts.guest_buffer_leases, 1);
+    assert_eq!(counts.guest_view_leases, 2);
+    assert_eq!(counts.live_buffers, 1);
+
+    // Dropping one handle in the guest releases exactly one lease. The
+    // generated resource destructor is what carries that across.
+    click(&mut bridge, TEXT_RELEASE_VIEW);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 1),
+        "dropping a guest handle released one view: {:?}",
+        bridge.host().text_resources().counts()
+    );
+    assert_eq!(
+        bridge.host().text_resources().counts().guest_view_leases,
+        1,
+        "and only one"
+    );
+}
+
+/// Teardown is total, on both terminal paths.
+///
+/// Store destruction runs no guest destructors on the trap path, so this is
+/// exactly the case where relying on them would leak everything.
+#[test]
+fn a_dead_generation_returns_every_text_resource() {
+    for mode in ["clean exit", "trap"] {
+        let (mut bridge, _wakes) = ready();
+        click(&mut bridge, TEXT_ACQUIRE);
+        assert!(
+            await_text(&mut bridge, |c| c.live_views == 2),
+            "{mode}: the guest acquired first"
+        );
+
+        // CRASH panics; SILENT stops committing, so a clean exit needs the
+        // guest to return -- FLOOD returns an error from `run`, which is the
+        // clean-exit path this fixture has.
+        click(&mut bridge, if mode == "trap" { CRASH } else { FLOOD });
+        await_guest_gone(&mut bridge);
+
+        assert_eq!(
+            bridge.host().text_resources().counts(),
+            TextResourceCounts::default(),
+            "{mode}: every lease and every resource returned to baseline"
+        );
+    }
+}
+
+/// A text request from a retired generation never reaches `TextSystem`.
+///
+/// Written because the fault injection for it initially passed. The two tests
+/// above acquire *before* terminalization, so no request is ever in flight
+/// against a dead generation, and removing the screening check in
+/// `on_text_request` broke nothing. The race is covered as a unit in
+/// `text_host`; this is the same rule at the joined level, where the queue is
+/// real and the request arrives after the generation is gone.
+#[test]
+fn a_text_request_from_a_dead_generation_allocates_nothing() {
+    let (mut bridge, _wakes) = ready();
+    let live = bridge.generation();
+
+    click(&mut bridge, CRASH);
+    await_guest_gone(&mut bridge);
+    assert_ne!(
+        bridge.generation(),
+        live,
+        "the bridge retired the generation, which is what makes the request stale"
+    );
+
+    let before = bridge.stats().stale_text_requests;
+    let (request, reply) = text_request(live, TextOperation::CreateBuffer);
+    bridge.on_user_event(HostUserEvent::TextRequest {
+        generation: live,
+        request,
+    });
+
+    assert_eq!(
+        bridge.stats().stale_text_requests,
+        before + 1,
+        "the request was screened rather than served"
+    );
+    assert_eq!(
+        reply.blocking_recv().expect("answered"),
+        Err(TextRefusal::StaleGeneration),
+        "and the guest was told, rather than left parked"
+    );
+    assert_eq!(
+        bridge.host().text_resources().counts(),
+        TextResourceCounts::default(),
+        "nothing was allocated on a dead generation's behalf"
     );
 }

@@ -46,6 +46,8 @@
 
 pub mod bridge;
 pub mod present;
+pub mod text_host;
+pub mod text_view;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -398,6 +400,15 @@ pub struct InteractionStats {
 #[derive(Debug)]
 pub struct Host {
     windows: HashMap<WindowId, HostWindow>,
+    /// The text *resource* subsystem and the guest leases onto it.
+    ///
+    /// Distinct from `text`, which is the shared Parley font stack: that is
+    /// presentation machinery, this is documents and who may name them.
+    ///
+    /// Host-global, never per window. A `HostWindow` owns presentation state
+    /// whose meaning is attached to a surface, and a document's lifetime has
+    /// nothing to do with whether a native window exists.
+    text_resources: text_host::TextHost,
     /// How many times Taffy has been entered since the last reset.
     ///
     /// Instrumentation, and the only way to state the H2 acceptance criterion
@@ -446,7 +457,17 @@ impl Host {
             interaction_stats: InteractionStats::default(),
             scenes: SceneBuilder::new(),
             text: TextContext::new(),
+            text_resources: text_host::TextHost::new(),
         }
+    }
+
+    /// The text resource subsystem and its guest leases.
+    pub fn text_resources(&self) -> &text_host::TextHost {
+        &self.text_resources
+    }
+
+    pub fn text_resources_mut(&mut self) -> &mut text_host::TextHost {
+        &mut self.text_resources
     }
 
     /// A host whose Parley font context has the shipped monospace face.
@@ -578,6 +599,11 @@ impl Host {
         // generation's *history* is discarded. This is not a bare
         // `ledger.clear()` on purpose; see
         // `a_dead_generation_leaves_the_ledger_agreeing_with_the_tree_on_screen`.
+        // Every text capability this generation held, released. Keyed by
+        // generation alone: `window_id` is presentation context for the crash
+        // screen below, and has no authority over resource lifetime.
+        self.text_resources.release_generation(generation);
+
         for window in self.windows.values_mut() {
             window.ledger.clear();
             if let Some(tree) = window.tree.as_ref() {

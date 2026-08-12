@@ -42,6 +42,10 @@
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
     world: "kernel",
+    // The world now spans two packages: instar:kernel and the optional
+    // instar:text capability. Without this, types from the second are an
+    // error rather than generated bindings.
+    generate_all,
 });
 
 use instar_ui_protocol::{
@@ -52,6 +56,7 @@ use crate::instar::kernel::kernel_runtime;
 use crate::instar::kernel::kernel_types::{CommitError, CommitResult, RuntimeError};
 use crate::instar::kernel::kernel_ui;
 use crate::instar::kernel::ops;
+use crate::instar::text::text;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -73,6 +78,10 @@ const FLOOD_COMMITS: NodeKey = NodeKey::first(12);
 const SPIN: NodeKey = NodeKey::first(13);
 const GROW: NodeKey = NodeKey::first(14);
 const SLEEP: NodeKey = NodeKey::first(15);
+/// Acquires a text buffer and two views of it, and keeps the handles.
+const TEXT_ACQUIRE: NodeKey = NodeKey::first(16);
+/// Drops one view handle, leaving the rest held.
+const TEXT_RELEASE_VIEW: NodeKey = NodeKey::first(17);
 
 /// How long the bulk operation runs. Long enough that it is unambiguously
 /// still in flight while the gate measures a click round-trip against it.
@@ -143,6 +152,14 @@ struct Hostile {
     grow: bool,
     /// Set to suspend inside a 30s host operation.
     sleep: bool,
+    /// Text capabilities this guest holds.
+    ///
+    /// Held, not used: B2e-1 proves acquisition and release, and there is no
+    /// way to attach a view to the interface yet. What matters is that these
+    /// handles exist, that dropping one tells the host, and that a generation
+    /// ending releases whatever is left.
+    buffers: Vec<text::TextBuffer>,
+    views: Vec<text::TextView>,
     /// When set, replaces the label text for the next normal commit.
     label_override: Option<String>,
 }
@@ -158,7 +175,7 @@ impl Hostile {
         let mut encoder = BatchEncoder::new();
         encoder
             .node(opcode::NODE_ROOT, ROOT, 0, None, container(8, 0), 1)
-            .node(opcode::NODE_COLUMN, COLUMN, 0, None, container(0, 4), 14)
+            .node(opcode::NODE_COLUMN, COLUMN, 0, None, container(0, 4), 16)
             .node(
                 opcode::NODE_TEXT,
                 LABEL,
@@ -264,6 +281,22 @@ impl Hostile {
                 GROW,
                 flags::ENABLED,
                 Some("Grow past policy"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                TEXT_ACQUIRE,
+                flags::ENABLED,
+                Some("Acquire text"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                TEXT_RELEASE_VIEW,
+                flags::ENABLED,
+                Some("Release one view"),
                 WireLayout::default(),
                 0,
             )
@@ -452,6 +485,35 @@ impl Hostile {
                 self.label_override = Some("Sleeping...".to_string());
                 self.sleep = true;
             }
+            // Text capabilities, reached exactly like any other interaction:
+            // a click the host hit-tested and delivered. Nothing about these
+            // is special to the wire format or to the host.
+            WireEvent::Click { node } if node == TEXT_ACQUIRE => {
+                match text::create_empty_buffer() {
+                    Ok(buffer) => {
+                        for _ in 0..2 {
+                            match text::create_view(&buffer) {
+                                Ok(view) => self.views.push(view),
+                                Err(error) => {
+                                    self.label_override = Some(format!("view failed: {error:?}"));
+                                }
+                            }
+                        }
+                        self.label_override =
+                            Some(format!("held {} view(s)", self.views.len()));
+                        self.buffers.push(buffer);
+                    }
+                    Err(error) => {
+                        self.label_override = Some(format!("buffer failed: {error:?}"));
+                    }
+                }
+            }
+            WireEvent::Click { node } if node == TEXT_RELEASE_VIEW => {
+                // Dropping the handle is the release: the generated resource
+                // destructor is what tells the host.
+                self.views.pop();
+                self.label_override = Some(format!("held {} view(s)", self.views.len()));
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
@@ -524,6 +586,8 @@ impl Guest for Component {
             spin: false,
             grow: false,
             sleep: false,
+            buffers: Vec::new(),
+            views: Vec::new(),
             label_override: None,
         };
         hostile.commit().await?;

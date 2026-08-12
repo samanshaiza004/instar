@@ -28,3 +28,4 @@ pub mod engine;
 pub mod resource;
 pub mod runtime;
 pub mod spike;
+pub mod text_bridge;

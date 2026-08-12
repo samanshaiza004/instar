@@ -31,6 +31,16 @@
 pub mod fonts;
 pub mod surface;
 
+/// The headless real-runtime application harness used by Instar's own app
+/// tests.
+///
+/// This is deliberately an internal, hidden module rather than a public test
+/// language or package surface. It exists so application tests can exercise
+/// the same event path as the native shell while the project model is still
+/// being learned.
+#[doc(hidden)]
+pub mod test_harness;
+
 use instar_paint::{PaintBackend, PaintError, PaintScene, PhysicalSize, RenderTarget};
 use instar_render_vello_cpu::VelloCpuBackend;
 

@@ -248,6 +248,36 @@ price until something demonstrates otherwise.
 
 ---
 
+## 5. A `TextView` cannot soft-wrap — DEFERRED
+
+Raised by package B1, not by an application. `TextViewport::visible` maps a
+scroll offset to a row range by arithmetic and one rope lookup per boundary,
+which is why a 10 MiB document costs what a 1 MiB one does. That works because
+one paragraph is one row.
+
+Under soft wrap it is not:
+
+```text
+unwrapped   row N starts at byte_of_line(N)              O(log n)
+wrapped     row N depends on how every paragraph before it broke,
+            which depends on having shaped them
+```
+
+Every editor that wraps large documents keeps an incrementally maintained
+index of visual rows per paragraph, invalidated by edits and by width changes.
+That is a materially different subsystem from anything B1 needed, and building
+it before a caret has ever moved would be inventing machinery for a feature
+nothing has asked for.
+
+**Deferred rather than declined.** Scratchpad's first proof does not need soft
+wrap, and the shape of the answer is known if it does: the row index is the
+thing to build, not a change to the windowing. What would be wrong is to let
+the absence of wrapping quietly become an assumption elsewhere, so
+`TextViewport` takes a row height and states the assumption in its own
+documentation.
+
+---
+
 ## Not in this ledger
 
 Things the Gallery could not do that turned out to be **defects**, not missing

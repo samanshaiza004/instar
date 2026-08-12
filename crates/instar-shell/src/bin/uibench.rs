@@ -1,7 +1,7 @@
 //! Dirty-propagation benchmark: what does one edited text leaf really cost?
 //!
 //! ```text
-//! cargo run --release --bin uibench
+//! cargo run --release --example uibench
 //! ```
 //!
 //! # What this measures

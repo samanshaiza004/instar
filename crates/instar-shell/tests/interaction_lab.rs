@@ -34,39 +34,37 @@
 //! is the deepest the platform allows, and it is stated here rather than
 //! quietly worked around.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use instar_host::HostEffect;
-use instar_host::bridge::{HostBridge, Wake};
-use instar_shell::default_font;
+use instar_shell::test_harness::{RuntimeHarness, launch_component};
 use instar_ui::NodeKey;
-use instar_window::{
-    LogicalSize, WindowId, WindowMetricsChanged, WindowOutput, WindowState, winit_adapter,
-};
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
+use instar_window::{LogicalSize, WindowId, WindowMetricsChanged};
+use winit::event::ElementState;
+use winit::keyboard::NamedKey;
 
 const WINDOW: WindowId = WindowId::from_raw(1);
-const PATIENCE: Duration = Duration::from_secs(5);
 
 const WIDTH: f64 = 480.0;
 const HEIGHT: f64 = 400.0;
 
 // The Gallery's node keys, as a host learns them: off the wire.
 const STALL: NodeKey = NodeKey::first(2);
+const STATUS: NodeKey = NodeKey::first(1);
 const OUTER: NodeKey = NodeKey::first(10);
 const POINTER_TARGET: NodeKey = NodeKey::first(12);
 const DISABLED: NodeKey = NodeKey::first(13);
 const OFFSCREEN: NodeKey = NodeKey::first(15);
 const INNER: NodeKey = NodeKey::first(20);
 
-/// Everything a test drives: the window state the adapter converts against,
-/// and the bridge running the guest.
-struct Lab {
-    state: WindowState,
-    bridge: HostBridge,
+trait GalleryState {
+    fn status(&self) -> String;
+}
+
+impl GalleryState for RuntimeHarness {
+    fn status(&self) -> String {
+        self.read_text(STATUS)
+    }
 }
 
 fn component() -> Vec<u8> {
@@ -88,207 +86,12 @@ fn metrics() -> WindowMetricsChanged {
     }
 }
 
-impl Lab {
-    /// A running Gallery with its opening interface applied.
-    fn open() -> Self {
-        let wake: Wake = Arc::new(|| {});
-        let mut bridge =
-            HostBridge::spawn_with_monospace_face(component(), WINDOW, wake, default_font())
-                .expect("the Gallery guest starts");
-        bridge.on_window_event(WindowOutput::MetricsChanged(metrics()));
-
-        let mut lab = Lab {
-            state: WindowState::new(
-                WINDOW,
-                1.0,
-                instar_window::PhysicalSize {
-                    width: WIDTH as u32,
-                    height: HEIGHT as u32,
-                },
-            ),
-            bridge,
-        };
-        lab.await_commit()
-            .expect("the Gallery commits its interface");
-        lab
-    }
-
-    /// The real path: a winit event, translated, routed.
-    ///
-    /// A translation that yields nothing is not an error — for example,
-    /// `ModifiersChanged` only updates translator state — so this reports
-    /// whether anything was routed.
-    fn send(&mut self, event: WindowEvent) -> Vec<HostEffect> {
-        match winit_adapter::translate(&mut self.state, WINDOW, &event) {
-            Some(output) => self.bridge.on_window_event(output),
-            None => Vec::new(),
-        }
-    }
-
-    /// Keyboard, as deep as winit permits. See the module docs.
-    fn key(&mut self, named: NamedKey, pressed: bool) -> Vec<HostEffect> {
-        let key = winit_adapter::instar_key(&WinitKey::Named(named));
-        let event = self.state.on_key(key, pressed, false);
-        self.bridge.on_window_event(WindowOutput::Key(event))
-    }
-
-    fn press_key(&mut self, named: NamedKey) -> Vec<HostEffect> {
-        let mut effects = self.key(named, true);
-        effects.extend(self.key(named, false));
-        effects
-    }
-
-    fn move_to(&mut self, x: f64, y: f64) -> Vec<HostEffect> {
-        self.send(WindowEvent::CursorMoved {
-            device_id: winit::event::DeviceId::dummy(),
-            position: PhysicalPosition::new(x, y),
-        })
-    }
-
-    fn leave(&mut self) -> Vec<HostEffect> {
-        self.send(WindowEvent::CursorLeft {
-            device_id: winit::event::DeviceId::dummy(),
-        })
-    }
-
-    fn button(&mut self, state: ElementState) -> Vec<HostEffect> {
-        self.send(WindowEvent::MouseInput {
-            device_id: winit::event::DeviceId::dummy(),
-            state,
-            button: MouseButton::Left,
-        })
-    }
-
-    fn click_at(&mut self, x: f64, y: f64) -> Vec<HostEffect> {
-        self.move_to(x, y);
-        let mut effects = self.button(ElementState::Pressed);
-        effects.extend(self.button(ElementState::Released));
-        effects
-    }
-
-    fn wheel_at(&mut self, x: f64, y: f64, lines: f32) -> Vec<HostEffect> {
-        self.move_to(x, y);
-        self.send(WindowEvent::MouseWheel {
-            device_id: winit::event::DeviceId::dummy(),
-            delta: MouseScrollDelta::LineDelta(0.0, lines),
-            phase: winit::event::TouchPhase::Moved,
-        })
-    }
-
-    fn shift(&mut self, held: bool) {
-        let state = if held {
-            ModifiersState::SHIFT
-        } else {
-            ModifiersState::empty()
-        };
-        self.send(WindowEvent::ModifiersChanged(state.into()));
-    }
-
-    fn focus(&mut self, focused: bool) -> Vec<HostEffect> {
-        self.send(WindowEvent::Focused(focused))
-    }
-
-    fn offset_of(&self, viewport: NodeKey) -> i32 {
-        self.bridge
-            .host()
-            .window(WINDOW)
-            .expect("the window")
-            .scroll()
-            .get(viewport)
-            .y
-    }
-
-    fn focused(&self) -> Option<NodeKey> {
-        self.bridge
-            .host()
-            .window(WINDOW)
-            .expect("the window")
-            .focus()
-            .focused()
-    }
-
-    fn focus_ring_shown(&self) -> bool {
-        self.bridge
-            .host()
-            .window(WINDOW)
-            .expect("the window")
-            .focus()
-            .focus_visible()
-    }
-
-    fn hovered(&self) -> Option<(NodeKey, instar_ui::ScrollbarPart)> {
-        self.bridge
-            .host()
-            .window(WINDOW)
-            .expect("the window")
-            .scroll()
-            .hovered()
-    }
-
-    /// The rect a control occupies, in content coordinates.
-    fn rect_of(&self, key: NodeKey) -> instar_ui::Rect {
-        self.bridge
-            .host()
-            .window(WINDOW)
-            .expect("the window")
-            .layout()
-            .expect("layout")
-            .get(key)
-            .unwrap_or_else(|| panic!("{key:?} should be laid out"))
-    }
-
-    /// Where a control is on screen right now, accounting for scroll.
-    fn screen_point_of(&self, key: NodeKey, viewport: NodeKey) -> (f64, f64) {
-        let rect = self.rect_of(key);
-        let offset = self.offset_of(viewport);
-        (
-            f64::from(rect.x + rect.width / 2),
-            f64::from(rect.y + rect.height / 2 - offset),
-        )
-    }
-
-    /// What the guest itself says has happened. The whole round trip.
-    fn status(&self) -> String {
-        let host = self.bridge.host();
-        let window = host.window(WINDOW).expect("the window");
-        let tree = window.tree().expect("a tree");
-        tree.iter()
-            .find(|node| node.key == NodeKey::first(1))
-            .map(|node| match &node.kind {
-                instar_ui::NodeKind::Text { text } => text.clone(),
-                other => panic!("the status node should be text, got {other:?}"),
-            })
-            .expect("the status readout")
-    }
-
-    fn await_commit(&mut self) -> Option<()> {
-        let target = self.bridge.commit_sequence() + 1;
-        let started = Instant::now();
-        while started.elapsed() < PATIENCE {
-            self.bridge.wait(Duration::from_millis(25));
-            if self.bridge.commit_sequence() >= target {
-                return Some(());
-            }
-        }
-        None
-    }
+fn open() -> RuntimeHarness {
+    launch_component(component(), metrics())
 }
 
-/// The Gallery's scrollbar for a viewport, as the host computes it.
-fn scrollbar(lab: &Lab, viewport: NodeKey) -> instar_ui::Scrollbar {
-    let host = lab.bridge.host();
-    let window = host.window(WINDOW).expect("the window");
-    let layout = window.layout().expect("layout");
-    let tree = window.tree().expect("a tree");
-    let content = tree
-        .iter()
-        .find(|node| node.key == viewport)
-        .and_then(|node| node.children.first())
-        .expect("a viewport has one content child");
-    let viewport_rect = layout.get(viewport).expect("the viewport");
-    let content_rect = layout.get(content.key).expect("the content");
-    instar_ui::Scrollbar::for_viewport(viewport_rect, content_rect.height, lab.offset_of(viewport))
-        .expect("the Gallery's viewports all overflow")
+fn scrollbar(lab: &RuntimeHarness, viewport: NodeKey) -> instar_ui::Scrollbar {
+    lab.scrollbar(viewport)
 }
 
 // --- Pointer -----------------------------------------------------------
@@ -299,12 +102,14 @@ fn scrollbar(lab: &Lab, viewport: NodeKey) -> instar_ui::Scrollbar {
 /// event reached the guest, the guest committed, and the host applied it.
 #[test]
 fn a_pointer_click_reaches_the_guest_and_comes_back_as_a_visible_change() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     assert!(lab.status().starts_with("pointer 0"), "{}", lab.status());
+    lab.expect_guest_message_count(0);
 
-    let (x, y) = lab.screen_point_of(POINTER_TARGET, OUTER);
-    lab.click_at(x, y);
-    lab.await_commit().expect("the click reaches the guest");
+    lab.click_node(POINTER_TARGET);
+    lab.expect_guest_message_count(1);
+    lab.await_guest_commit()
+        .expect("the click reaches the guest");
 
     assert!(
         lab.status().starts_with("pointer 1"),
@@ -319,12 +124,12 @@ fn a_pointer_click_reaches_the_guest_and_comes_back_as_a_visible_change() {
 /// focus loss is cancelled, so a later release cannot activate anything.
 #[test]
 fn a_release_after_focus_loss_cannot_activate() {
-    let mut lab = Lab::open();
-    let (x, y) = lab.screen_point_of(POINTER_TARGET, OUTER);
+    let mut lab = open();
+    let (x, y) = lab.screen_point_of(POINTER_TARGET);
 
     lab.move_to(x, y);
     lab.button(ElementState::Pressed);
-    lab.focus(false);
+    lab.set_window_focus(false);
     let effects = lab.button(ElementState::Released);
 
     assert!(
@@ -345,13 +150,13 @@ fn a_release_after_focus_loss_cannot_activate() {
 /// died with the window's focus.
 #[test]
 fn space_up_after_focus_loss_cannot_activate() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     lab.press_key(NamedKey::Tab);
     lab.press_key(NamedKey::Tab);
     assert_eq!(lab.focused(), Some(POINTER_TARGET));
 
     lab.key(NamedKey::Space, true);
-    lab.focus(false);
+    lab.set_window_focus(false);
     let effects = lab.key(NamedKey::Space, false);
 
     assert!(
@@ -373,13 +178,13 @@ fn space_up_after_focus_loss_cannot_activate() {
 /// held again.
 #[test]
 fn focus_loss_forgets_shift_until_it_is_reported_again() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     lab.press_key(NamedKey::Tab);
     assert_eq!(lab.focused(), Some(STALL));
 
-    lab.shift(true);
-    lab.focus(false);
-    lab.focus(true);
+    lab.set_shift(true);
+    lab.set_window_focus(false);
+    lab.set_window_focus(true);
     lab.press_key(NamedKey::Tab);
     assert_eq!(
         lab.focused(),
@@ -388,7 +193,7 @@ fn focus_loss_forgets_shift_until_it_is_reported_again() {
          shift must not have been resurrected"
     );
 
-    lab.shift(true);
+    lab.set_shift(true);
     lab.press_key(NamedKey::Tab);
     assert_eq!(
         lab.focused(),
@@ -401,7 +206,7 @@ fn focus_loss_forgets_shift_until_it_is_reported_again() {
 /// the scrollbar must not continue scrolling the viewport.
 #[test]
 fn cursor_left_cancels_a_thumb_drag() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let bar = scrollbar(&lab, OUTER);
     let thumb_x = f64::from(bar.thumb.x + bar.thumb.width / 2);
     let thumb_y = f64::from(bar.thumb.y + 2);
@@ -409,13 +214,13 @@ fn cursor_left_cancels_a_thumb_drag() {
     lab.move_to(thumb_x, thumb_y);
     lab.button(ElementState::Pressed);
     lab.move_to(thumb_x, thumb_y + 40.0);
-    let dragged = lab.offset_of(OUTER);
+    let dragged = lab.scroll_offset(OUTER);
     assert!(dragged > 0, "the drag is live before the pointer leaves");
 
-    lab.leave();
+    lab.leave_window();
     lab.move_to(thumb_x, thumb_y + 80.0);
     assert_eq!(
-        lab.offset_of(OUTER),
+        lab.scroll_offset(OUTER),
         dragged,
         "the drag cannot continue after CursorLeft"
     );
@@ -427,7 +232,7 @@ fn cursor_left_cancels_a_thumb_drag() {
 /// is no longer over the window.
 #[test]
 fn cursor_left_removes_scrollbar_hover() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let bar = scrollbar(&lab, OUTER);
 
     lab.move_to(f64::from(bar.thumb.x + 2), f64::from(bar.thumb.y + 2));
@@ -436,7 +241,7 @@ fn cursor_left_removes_scrollbar_hover() {
         "hover is present before the pointer leaves"
     );
 
-    lab.leave();
+    lab.leave_window();
     assert_eq!(
         lab.hovered(),
         None,
@@ -447,11 +252,11 @@ fn cursor_left_removes_scrollbar_hover() {
 /// A disabled control refuses the same click, at the same coordinates.
 #[test]
 fn a_disabled_control_refuses_a_click_that_would_otherwise_land() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let before = lab.status();
+    lab.expect_guest_message_count(0);
 
-    let (x, y) = lab.screen_point_of(DISABLED, OUTER);
-    let effects = lab.click_at(x, y);
+    let effects = lab.click_node(DISABLED);
 
     assert!(
         !effects
@@ -459,6 +264,7 @@ fn a_disabled_control_refuses_a_click_that_would_otherwise_land() {
             .any(|effect| matches!(effect, HostEffect::SendToGuest(_))),
         "a disabled control must not reach the guest at all"
     );
+    lab.expect_guest_message_count(0);
     assert_eq!(lab.status(), before);
 }
 
@@ -467,14 +273,14 @@ fn a_disabled_control_refuses_a_click_that_would_otherwise_land() {
 /// A wheel notch, through the real adapter, visibly moves the viewport.
 #[test]
 fn a_wheel_moves_the_viewport_it_is_over() {
-    let mut lab = Lab::open();
-    assert_eq!(lab.offset_of(OUTER), 0);
+    let mut lab = open();
+    assert_eq!(lab.scroll_offset(OUTER), 0);
 
     // Below the inner viewport, so this is unambiguously the outer one.
-    lab.wheel_at(WIDTH / 2.0, HEIGHT - 20.0, -3.0);
+    lab.wheel(WIDTH / 2.0, HEIGHT - 20.0, -3.0);
 
     assert!(
-        lab.offset_of(OUTER) > 0,
+        lab.scroll_offset(OUTER) > 0,
         "three notches down should have scrolled the outer viewport"
     );
 }
@@ -485,22 +291,22 @@ fn a_wheel_moves_the_viewport_it_is_over() {
 /// correct until a nested one exists, which is why the Gallery has one.
 #[test]
 fn a_wheel_over_a_nested_viewport_bubbles_its_residual_outward() {
-    let mut lab = Lab::open();
-    let (x, y) = lab.screen_point_of(INNER, OUTER);
+    let mut lab = open();
+    let (x, y) = lab.screen_point_of(INNER);
 
     // Far more than the inner viewport can absorb.
-    lab.wheel_at(x, y, -50.0);
-    let inner = lab.offset_of(INNER);
+    lab.wheel(x, y, -50.0);
+    let inner = lab.scroll_offset(INNER);
     assert!(inner > 0, "the inner viewport should have scrolled");
 
-    lab.wheel_at(x, y, -50.0);
+    lab.wheel(x, y, -50.0);
     assert_eq!(
-        lab.offset_of(INNER),
+        lab.scroll_offset(INNER),
         inner,
         "the inner viewport is at its limit"
     );
     assert!(
-        lab.offset_of(OUTER) > 0,
+        lab.scroll_offset(OUTER) > 0,
         "so the residual must reach the outer one rather than being swallowed"
     );
 }
@@ -512,17 +318,21 @@ fn a_wheel_over_a_nested_viewport_bubbles_its_residual_outward() {
 /// noticed that no cursor move ever arrived.
 #[test]
 fn dragging_the_scrollbar_thumb_moves_the_content() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let bar = scrollbar(&lab, OUTER);
     let thumb_x = f64::from(bar.thumb.x + bar.thumb.width / 2);
     let thumb_y = f64::from(bar.thumb.y + 2);
 
     lab.move_to(thumb_x, thumb_y);
     lab.button(ElementState::Pressed);
-    assert_eq!(lab.offset_of(OUTER), 0, "the press alone scrolls nothing");
+    assert_eq!(
+        lab.scroll_offset(OUTER),
+        0,
+        "the press alone scrolls nothing"
+    );
 
     lab.move_to(thumb_x, thumb_y + 40.0);
-    let dragged = lab.offset_of(OUTER);
+    let dragged = lab.scroll_offset(OUTER);
     assert!(
         dragged > 0,
         "dragging the thumb down must move the content: offset is still \
@@ -531,15 +341,15 @@ fn dragging_the_scrollbar_thumb_moves_the_content() {
 
     lab.move_to(thumb_x, thumb_y + 80.0);
     assert!(
-        lab.offset_of(OUTER) > dragged,
+        lab.scroll_offset(OUTER) > dragged,
         "and it must keep tracking, rather than moving once and sticking"
     );
 
     lab.button(ElementState::Released);
-    let settled = lab.offset_of(OUTER);
+    let settled = lab.scroll_offset(OUTER);
     lab.move_to(thumb_x, thumb_y + 200.0);
     assert_eq!(
-        lab.offset_of(OUTER),
+        lab.scroll_offset(OUTER),
         settled,
         "and stop tracking once the button is released"
     );
@@ -550,7 +360,7 @@ fn dragging_the_scrollbar_thumb_moves_the_content() {
 /// Tab moves focus and shows the ring.
 #[test]
 fn tab_moves_focus_forward_and_shows_the_ring() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     assert_eq!(lab.focused(), None);
     assert!(!lab.focus_ring_shown(), "nothing is focused to begin with");
 
@@ -581,12 +391,12 @@ fn tab_moves_focus_forward_and_shows_the_ring() {
 /// the key it modifies, or focus can only ever go forwards.
 #[test]
 fn shift_tab_traverses_backwards() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     lab.press_key(NamedKey::Tab);
     lab.press_key(NamedKey::Tab);
     assert_eq!(lab.focused(), Some(POINTER_TARGET));
 
-    lab.shift(true);
+    lab.set_shift(true);
     lab.press_key(NamedKey::Tab);
     assert_eq!(
         lab.focused(),
@@ -594,7 +404,7 @@ fn shift_tab_traverses_backwards() {
         "shift must still be held when the key arrives"
     );
 
-    lab.shift(false);
+    lab.set_shift(false);
     lab.press_key(NamedKey::Tab);
     assert_eq!(
         lab.focused(),
@@ -610,14 +420,14 @@ fn enter_and_space_activate_the_focused_control() {
         (NamedKey::Enter, "pointer 1"),
         (NamedKey::Space, "pointer 1"),
     ] {
-        let mut lab = Lab::open();
+        let mut lab = open();
         lab.press_key(NamedKey::Tab);
         lab.press_key(NamedKey::Tab);
         assert_eq!(lab.focused(), Some(POINTER_TARGET));
 
         lab.press_key(key);
-        lab.await_commit()
-            .unwrap_or_else(|| panic!("{key:?} should have reached the guest"));
+        lab.await_guest_commit()
+            .unwrap_or_else(|error| panic!("{key:?} should have reached the guest: {error}"));
         assert!(
             lab.status().starts_with(expected),
             "{key:?} did not activate the focused control: {}",
@@ -629,8 +439,8 @@ fn enter_and_space_activate_the_focused_control() {
 /// Traversal reaches a control that is not on screen, and reveals it.
 #[test]
 fn tabbing_to_an_offscreen_control_scrolls_it_into_view() {
-    let mut lab = Lab::open();
-    assert_eq!(lab.offset_of(OUTER), 0);
+    let mut lab = open();
+    assert_eq!(lab.scroll_offset(OUTER), 0);
 
     // Forward until the last control has focus.
     for _ in 0..12 {
@@ -645,13 +455,14 @@ fn tabbing_to_an_offscreen_control_scrolls_it_into_view() {
         "traversal should reach the offscreen control"
     );
     assert!(
-        lab.offset_of(OUTER) > 0,
+        lab.scroll_offset(OUTER) > 0,
         "and reaching it must bring it into view"
     );
 
     // And it is genuinely reachable now, not merely focused.
     lab.press_key(NamedKey::Enter);
-    lab.await_commit().expect("the guest hears the activation");
+    lab.await_guest_commit()
+        .expect("the guest hears the activation");
     assert!(
         lab.status().contains("offscreen 1"),
         "the revealed control should activate like any other: {}",
@@ -667,23 +478,20 @@ fn tabbing_to_an_offscreen_control_scrolls_it_into_view() {
 /// parallel implementation, it is a third adapter onto one system.
 #[test]
 fn an_accessibility_action_produces_the_same_effects_as_the_other_sources() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let target = accesskit::NodeId(OFFSCREEN.to_accesskit_id());
 
-    lab.bridge
-        .on_accessibility_action(accesskit::Action::ScrollIntoView, target);
+    lab.on_accessibility_action(accesskit::Action::ScrollIntoView, target);
     assert!(
-        lab.offset_of(OUTER) > 0,
+        lab.scroll_offset(OUTER) > 0,
         "ScrollIntoView must run the same reveal Tab does"
     );
 
-    lab.bridge
-        .on_accessibility_action(accesskit::Action::Focus, target);
+    lab.on_accessibility_action(accesskit::Action::Focus, target);
     assert_eq!(lab.focused(), Some(OFFSCREEN));
 
-    lab.bridge
-        .on_accessibility_action(accesskit::Action::Click, target);
-    lab.await_commit()
+    lab.on_accessibility_action(accesskit::Action::Click, target);
+    lab.await_guest_commit()
         .expect("an accessibility activation reaches the guest");
     assert!(
         lab.status().contains("offscreen 1"),
@@ -701,18 +509,15 @@ fn an_accessibility_action_produces_the_same_effects_as_the_other_sources() {
 /// the guest genuinely is not running.
 #[test]
 fn native_interaction_survives_a_blocked_guest() {
-    let mut lab = Lab::open();
+    let mut lab = open();
     let before = lab.status();
 
-    let (x, y) = lab.screen_point_of(STALL, OUTER);
-    lab.click_at(x, y);
+    let started = lab.stall_guest(STALL);
     // No `await_commit`: the guest is busy, which is the point.
 
-    let started = Instant::now();
-
     // Wheel.
-    lab.wheel_at(WIDTH / 2.0, HEIGHT - 20.0, -3.0);
-    let scrolled = lab.offset_of(OUTER);
+    lab.wheel(WIDTH / 2.0, HEIGHT - 20.0, -3.0);
+    let scrolled = lab.scroll_offset(OUTER);
     assert!(
         scrolled > 0,
         "the wheel must work while the guest is blocked"
@@ -726,7 +531,7 @@ fn native_interaction_survives_a_blocked_guest() {
     lab.button(ElementState::Pressed);
     lab.move_to(thumb_x, thumb_y + 30.0);
     assert!(
-        lab.offset_of(OUTER) != scrolled,
+        lab.scroll_offset(OUTER) != scrolled,
         "and so must the scrollbar thumb"
     );
     lab.button(ElementState::Released);
@@ -764,7 +569,7 @@ fn native_interaction_survives_a_blocked_guest() {
     );
 
     // And the queued consequence arrives once the guest wakes.
-    lab.await_commit()
+    lab.await_guest_commit()
         .expect("the stalled guest eventually commits");
     assert!(
         lab.status().contains("stalls 1"),

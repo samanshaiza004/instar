@@ -707,6 +707,63 @@ mod tests {
         );
     }
 
+    /// A text view is a kind like any other, in both directions.
+    ///
+    /// The baseline for B2e-3's much subtler rule. Once a node can carry an
+    /// attachment, "same key, different resource" must be *accepted* — the same
+    /// surface showing a different document, with focus and host state intact.
+    /// This locks the case that stays a refusal, so the two cannot be confused
+    /// while the second is being built.
+    #[test]
+    fn reusing_a_key_across_a_text_view_is_refused_in_both_directions() {
+        let text = snapshot(vec![Node::text(5, "hello")]);
+        let button = snapshot(vec![Node::button(5, "press")]);
+        let view = snapshot(vec![Node::text_view(5)]);
+
+        assert_eq!(
+            diff(Some(&text), &view),
+            Err(TreeError::KindChanged {
+                key: NodeKey::first(5),
+                was: "text",
+                now: "text view",
+            })
+        );
+        assert_eq!(
+            diff(Some(&button), &view),
+            Err(TreeError::KindChanged {
+                key: NodeKey::first(5),
+                was: "button",
+                now: "text view",
+            })
+        );
+        assert_eq!(
+            diff(Some(&view), &button),
+            Err(TreeError::KindChanged {
+                key: NodeKey::first(5),
+                was: "text view",
+                now: "button",
+            }),
+            "and leaving a text view is a kind change too"
+        );
+    }
+
+    /// Two commits of the same text-view node are not a change.
+    ///
+    /// The control for the above, and the thing B2e-3 builds on: a text view
+    /// carries no resource identity, so nothing about the *node* differs
+    /// between commits that attach different documents to it. The attachment
+    /// diff is a separate answer, and it does not exist yet.
+    #[test]
+    fn recommitting_the_same_text_view_is_not_a_change() {
+        let first = snapshot(vec![Node::text_view(5)]);
+        let second = snapshot(vec![Node::text_view(5)]);
+
+        assert!(
+            diff(Some(&first), &second).is_ok(),
+            "the same surface committed twice is the same surface"
+        );
+    }
+
     /// Row and Stack are kinds like any other: their names must reach
     /// `KindChanged` so a guest that swaps a container for a container is told
     /// which one it used to be.

@@ -133,6 +133,13 @@ fn build(
     }
 
     match &node.kind {
+        // No label, no actions, no text-range semantics — yet. AccessKit has
+        // `MultilineTextInput`, and having a role is not the same as having an
+        // accessible editor: value, selection and text ranges need B3 and B4
+        // to have established what editing does. Advertising an action here
+        // would promise behaviour that does not exist, which is the rule the
+        // button arm below is written to.
+        NodeKind::TextView => {}
         NodeKind::Text { text } => access.set_label(text.clone()),
         NodeKind::Button { label, enabled } => {
             access.set_label(label.clone());
@@ -194,6 +201,9 @@ fn role_of(kind: &NodeKind) -> Role {
         NodeKind::Column | NodeKind::Row | NodeKind::Stack => Role::GenericContainer,
         NodeKind::Text { .. } => Role::Label,
         NodeKind::Button { .. } => Role::Button,
+        // The role is honest about what the surface is. What it exposes about
+        // its contents is B3/B4's to fill in.
+        NodeKind::TextView => Role::MultilineTextInput,
         NodeKind::Scroll => Role::ScrollView,
     }
 }

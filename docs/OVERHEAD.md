@@ -12,7 +12,7 @@ What each layer of Instar costs, measured rather than estimated (WP9).
 `crates/instar-shell/src/bin/overhead.rs`, run as:
 
 ```bash
-cargo run --release --bin overhead
+cargo run --release --example overhead
 ```
 
 Four stages in **one process**, each measured at a checkpoint:

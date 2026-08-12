@@ -386,6 +386,12 @@ impl SceneBuilder {
             | NodeKind::Row
             | NodeKind::Stack
             | NodeKind::Scroll => {}
+            // Nothing yet. A text view's contents are drawn from its attached
+            // resource through the B2d presentation path, and nothing is
+            // attached until B2e-4 -- so what a guest gets today is whatever
+            // surface it asked for and an empty box. Painting a placeholder
+            // would be the host inventing appearance.
+            NodeKind::TextView => {}
             NodeKind::Text { .. } => {
                 let foreground = node.style.paint.foreground.map(paint_color);
                 if let Some(shaped) = layout.text(node.key) {
@@ -717,7 +723,7 @@ fn scene(
 /// Fonts are deduplicated across the whole scene by [`instar_ui::FontFace::key`],
 /// and each run indexes the scene's table. `FontFace::data` is an `Arc<[u8]>`,
 /// so this is a refcount bump, never a copy of font bytes.
-fn push_shaped(
+pub(crate) fn push_shaped(
     commands: &mut Vec<PaintCommand>,
     fonts: &mut Vec<FontResource>,
     font_ids: &mut HashMap<u64, FontId>,
