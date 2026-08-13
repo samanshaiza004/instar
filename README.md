@@ -5,6 +5,10 @@ application components. Applications describe semantic retained UI through a
 typed WIT contract; the host owns rendering, input, and the boundary around
 every guest turn.
 
+[Website](https://instar.samanshaiza.com/) ·
+[Install guide](https://instar.samanshaiza.com/docs/getting-started/install.html) ·
+[Documentation](https://instar.samanshaiza.com/docs/)
+
 > **Status: early. Phase 1 complete; not stable.**
 >
 > Instar runs a real WebAssembly component in a real window: a guest that sits
@@ -106,7 +110,8 @@ cargo build --release --manifest-path guests/counter/Cargo.toml --target wasm32-
 ```
 
 ```bash
-cargo run --release -- run guests/counter/target/wasm32-wasip2/release/counter.wasm
+cargo run --release --package instar-shell --bin instar -- run \
+  guests/counter/target/wasm32-wasip2/release/counter.wasm
 ```
 
 A window with a counter, a reset, and a button that crashes the guest on

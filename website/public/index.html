@@ -1,159 +1,180 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Youth</title>
-<meta name="description" content="Youth is a native host for untrusted, architecture-independent WebAssembly application components.">
-<style>
-  :root {
-    color-scheme: light dark;
-    --bg: #ffffff;
-    --fg: #1a1a1a;
-    --muted: #5a5a5a;
-    --border: #e2e2e2;
-    --code-bg: #f4f4f4;
-    --accent: #6d28d9;
-    --badge-bg: #f2eefc;
-    --badge-fg: #5b21b6;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f0f11;
-      --fg: #ededed;
-      --muted: #a3a3a3;
-      --border: #2a2a2e;
-      --code-bg: #1a1a1d;
-      --accent: #a78bfa;
-      --badge-bg: #241a38;
-      --badge-fg: #c4b5fd;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--fg);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    line-height: 1.6;
-  }
-  main {
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 4rem 1.5rem 6rem;
-  }
-  h1 {
-    font-size: 2.25rem;
-    margin: 0 0 0.5rem;
-    letter-spacing: -0.02em;
-  }
-  .badge {
-    display: inline-block;
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-    color: var(--badge-fg);
-    background: var(--badge-bg);
-    border-radius: 999px;
-    padding: 0.2rem 0.65rem;
-    margin-bottom: 1.25rem;
-  }
-  p.lede {
-    font-size: 1.1rem;
-    color: var(--muted);
-    max-width: 56ch;
-  }
-  .actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    margin: 2rem 0;
-  }
-  .actions a {
-    display: inline-block;
-    padding: 0.6rem 1.1rem;
-    border-radius: 8px;
-    text-decoration: none;
-    font-weight: 600;
-    font-size: 0.95rem;
-    border: 1px solid var(--border);
-    color: var(--fg);
-  }
-  .actions a.primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  section {
-    margin-top: 3rem;
-  }
-  h2 {
-    font-size: 1.1rem;
-    margin-bottom: 0.75rem;
-  }
-  pre {
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 1rem 1.1rem;
-    overflow-x: auto;
-    font-size: 0.9rem;
-  }
-  code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  .note {
-    font-size: 0.9rem;
-    color: var(--muted);
-  }
-  footer {
-    margin-top: 4rem;
-    padding-top: 1.5rem;
-    border-top: 1px solid var(--border);
-    font-size: 0.85rem;
-    color: var(--muted);
-  }
-  footer a { color: var(--muted); }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ff5a00">
+  <title>Instar — native host for WebAssembly applications</title>
+  <meta name="description" content="Instar runs WebAssembly Component Model applications in a native window. The guest describes meaning; the host owns geometry, input, accessibility, and pixels.">
+  <link rel="stylesheet" href="/assets/site.css">
+  <script defer src="/assets/site.js"></script>
 </head>
 <body>
-<main>
-  <span class="badge">Developer Preview</span>
-  <h1>Youth</h1>
-  <p class="lede">
-    A native host for untrusted, architecture-independent WebAssembly
-    application components. Applications describe semantic retained UI
-    through a typed WIT contract; the host owns rendering, input, durable
-    state, and the transaction boundary around every guest turn.
-  </p>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page-shell">
+    <header class="masthead">
+      <a class="wordmark" href="/" aria-label="Instar home">INSTAR<span aria-hidden="true">✦</span></a>
+      <form class="site-search" action="/docs/" method="get">
+        <label for="site-q">SEARCH:</label>
+        <input id="site-q" name="search" type="search">
+        <button type="submit">GO</button>
+      </form>
+      <div class="utility-links">
+        <a href="https://github.com/samanshaiza004/instar">⌁ SOURCE</a>
+        <strong>PROTOCOL 9</strong>
+      </div>
+    </header>
 
-  <div class="actions">
-    <a class="primary" href="/docs/">Documentation</a>
-    <a href="https://github.com/samanshaiza004/youth">GitHub</a>
+    <nav class="channel-nav" aria-label="Primary">
+      <a class="active" href="/docs/getting-started/install.html">▸ START</a>
+      <span>EXPLORE:</span>
+      <a href="/docs/getting-started/first-run.html">▸ FIRST RUN</a>
+      <a href="/docs/getting-started/build-a-guest.html">▸ BUILD A GUEST</a>
+      <a href="/docs/concepts/runtime-model.html">▸ RUNTIME</a>
+      <a href="/docs/reference/cli.html">▸ CLI</a>
+      <a href="/docs/reference/distribution.html">▸ DOWNLOADS</a>
+    </nav>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <img src="/assets/runtime-core.jpg" alt="An abstract orange crystalline core crossing blue circuitry and silver mesh">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <p class="eyebrow">NATIVE HOST / WASM COMPONENTS</p>
+          <h1 id="hero-title"><span>run the guest.</span><br>own the machine.</h1>
+          <p>Instar lets a WebAssembly component describe a semantic interface while the native host keeps authority over layout, input, accessibility, rendering, and failure.</p>
+        </div>
+        <aside class="hero-news">
+          <h2>what’s active</h2>
+          <p><b>Phase 3:</b> host-owned text resources are under construction.</p>
+          <p><b>Today:</b> counter, calculator, gallery, scrolling, focus, accessibility, and crash containment work.</p>
+          <a href="/docs/project/status.html">Read project status ▸</a>
+        </aside>
+      </section>
+
+      <section class="module-deck" aria-label="Explore Instar">
+        <article class="portal-card portal-card-start">
+          <h2>START</h2>
+          <p class="card-kicker">instar / new user</p>
+          <div class="card-image crop-core"></div>
+          <h3>Get a native host running</h3>
+          <p>Install the binary, build the included counter component, and open a real native window.</p>
+          <ul class="tiny-links">
+            <li><a href="/docs/getting-started/install.html">Install Instar</a></li>
+            <li><a href="/docs/getting-started/first-run.html">First run</a></li>
+            <li><a href="/docs/getting-started/verify.html">Verify a download</a></li>
+          </ul>
+          <footer>macOS | Linux | Windows</footer>
+        </article>
+
+        <article class="portal-card portal-card-build">
+          <h2>BUILD</h2>
+          <p class="card-kicker">guest / component</p>
+          <div class="mini-diagram" aria-label="Guest snapshot to host diagram">
+            <span>GUEST</span><b>→</b><span>SNAPSHOT</span><b>→</b><span>HOST</span>
+          </div>
+          <h3>Describe meaning, not pixels</h3>
+          <p>A guest sends retained UI snapshots and waits for semantic events. It never receives a framebuffer.</p>
+          <ul class="tiny-links">
+            <li><a href="/docs/getting-started/build-a-guest.html">Build a guest</a></li>
+            <li><a href="/docs/reference/ui-vocabulary.html">UI vocabulary</a></li>
+            <li><a href="/docs/reference/wit.html">WIT contract</a></li>
+          </ul>
+          <footer>Rust | wasm32-wasip2 | WIT</footer>
+        </article>
+
+        <article class="portal-card portal-card-learn">
+          <h2>UNDERSTAND</h2>
+          <p class="card-kicker">host / authority</p>
+          <div class="card-image crop-mesh"></div>
+          <h3>One boundary, held all the way down</h3>
+          <p>The host owns geometry and transient interaction. A guest can fail without taking the native surface with it.</p>
+          <ul class="tiny-links">
+            <li><a href="/docs/concepts/runtime-model.html">Runtime model</a></li>
+            <li><a href="/docs/concepts/host-owned-ui.html">Host-owned UI</a></li>
+            <li><a href="/docs/concepts/architecture.html">Architecture map</a></li>
+          </ul>
+          <footer>zero idle polling | bounded queues</footer>
+        </article>
+
+        <article class="portal-card portal-card-download">
+          <h2>DOWNLOAD</h2>
+          <p class="card-kicker">latest / release</p>
+          <div class="download-command">
+            <code>curl -fsSL https://instar.samanshaiza.com/install | sh</code>
+            <button type="button" data-copy="curl -fsSL https://instar.samanshaiza.com/install | sh">COPY</button>
+          </div>
+          <p>The installer selects your platform, verifies the release checksum, and places <code>instar</code> in Cargo’s bin directory.</p>
+          <ul class="tiny-links columns">
+            <li><a href="/docs/reference/distribution.html#windows">Windows PowerShell</a></li>
+            <li><a href="/docs/getting-started/verify.html">Checksums</a></li>
+            <li><a href="/docs/getting-started/verify.html#attestations">Attestations</a></li>
+            <li><a href="https://github.com/samanshaiza004/instar/releases">Release archive</a></li>
+          </ul>
+          <footer>developer preview / no stability promise</footer>
+        </article>
+      </section>
+
+      <section class="dispatch-grid">
+        <article class="dispatch dispatch-orange">
+          <div class="dispatch-label">01 / WHY INSTAR</div>
+          <h2>Idle means idle.</h2>
+          <p>A suspended guest costs no periodic polls. The host wakes it for an event; independent async operations still make progress.</p>
+          <a href="/docs/concepts/runtime-model.html">Open runtime notes ▸</a>
+        </article>
+        <article class="dispatch dispatch-blue">
+          <div class="dispatch-label">02 / NATIVE BY DEFAULT</div>
+          <h2>The window is not in Wasm.</h2>
+          <p>Winit, layout, hit-testing, AccessKit, text shaping, CPU rendering, and presentation stay native and host-owned.</p>
+          <a href="/docs/concepts/host-owned-ui.html">See the ownership split ▸</a>
+        </article>
+        <article class="dispatch dispatch-yellow">
+          <div class="dispatch-label">03 / SMALL SURFACE</div>
+          <h2>One command on purpose.</h2>
+          <p><code>instar run &lt;component.wasm&gt;</code> is the entire CLI. Project formats and packaging conventions remain deliberately unclaimed.</p>
+          <a href="/docs/reference/cli.html">Read the CLI reference ▸</a>
+        </article>
+      </section>
+
+      <section class="status-ribbon" aria-label="Current technical facts">
+        <span><b>HOST:</b> macOS / Linux / Windows</span>
+        <span><b>GUEST:</b> wasm32-wasip2</span>
+        <span><b>RUNTIME:</b> Wasmtime 47.0.3</span>
+        <span><b>RUST:</b> 1.97.1</span>
+        <span><b>LICENSE:</b> MIT OR Apache-2.0</span>
+      </section>
+
+      <section class="lower-index">
+        <div>
+          <h2><span>NEW USER</span> QUICK INDEX</h2>
+          <a href="/docs/getting-started/requirements.html">System requirements</a>
+          <a href="/docs/getting-started/install.html">Installation</a>
+          <a href="/docs/getting-started/first-run.html">Run the counter</a>
+          <a href="/docs/getting-started/build-a-guest.html">Write a component</a>
+          <a href="/docs/reference/troubleshooting.html">Troubleshooting</a>
+        </div>
+        <div>
+          <h2><span>DEVELOPER</span> TECHNICAL INDEX</h2>
+          <a href="/docs/concepts/architecture.html">Crate architecture</a>
+          <a href="/docs/reference/ui-vocabulary.html">Semantic UI vocabulary</a>
+          <a href="/docs/reference/wit.html">WIT imports and exports</a>
+          <a href="/docs/development/testing.html">Tests and gates</a>
+          <a href="/docs/development/contributing.html">Contributing</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <nav aria-label="Footer">
+        <a href="/docs/">Documentation</a>
+        <a href="https://github.com/samanshaiza004/instar">Source</a>
+        <a href="https://github.com/samanshaiza004/instar/issues">Issues</a>
+        <a href="/docs/project/status.html">Project status</a>
+        <a href="/docs/reference/distribution.html">Downloads</a>
+        <a href="https://github.com/samanshaiza004/instar/blob/master/LICENSE-MIT">License</a>
+      </nav>
+      <p>© 2026 Instar contributors. Experimental software. Built for components that wake only when there is work to do.</p>
+    </footer>
   </div>
-
-  <section>
-    <h2>Try it</h2>
-    <pre><code>cargo install youth-cli --git https://github.com/samanshaiza004/youth
-youth doctor
-youth new tally
-cd tally &amp;&amp; youth dev</code></pre>
-    <p class="note">
-      The project name derives the stable app ID <code>dev.youth.tally</code>;
-      add <code>--id</code> when you need a different identity. The ID selects
-      durable state and is not a display name.
-      <br>
-      Requires a Rust toolchain with the <code>wasm32-wasip2</code> target;
-      <code>youth doctor</code> checks and tells you what's missing. A
-      packaged installer (<code>curl | sh</code>, no Rust toolchain to
-      build the CLI itself) is planned for the first tagged release.
-    </p>
-  </section>
-
-  <footer>
-    <a href="https://github.com/samanshaiza004/youth">samanshaiza004/youth</a>
-  </footer>
-</main>
 </body>
 </html>
