@@ -320,38 +320,30 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
         return Ok(());
     }
 
-    if old.layout != new.layout {
-        changes.layout_changed.push(new.key);
-    }
+    let text_style_changed = old.style.text != new.style.text;
+    let text_align_changed = old.style.text_layout != new.style.text_layout;
+    let paint_changed = old.style.paint != new.style.paint;
+    let cursor_changed = old.style.cursor != new.style.cursor;
 
     // Style is compared per group, never as a whole. Comparing `old.style !=
     // new.style` and reporting one category would be the mistake this split
     // exists to prevent -- the three groups cost completely different things,
     // and the wire keeps them apart precisely so this can read the category
     // rather than re-derive it field by field.
-    if old.style.text != new.style.text {
+    if text_style_changed {
         changes.text_style_changed.push(new.key);
-        // A different face, size or weight measures differently.
-        changes.layout_changed.push(new.key);
     }
-    if old.style.text_layout != new.style.text_layout {
+    if text_align_changed {
         // And *not* `layout_changed`: alignment moves glyphs within a box
         // whose size it cannot alter, so Taffy has nothing to recompute.
         changes.text_align_changed.push(new.key);
     }
-    if old.style.paint != new.style.paint {
-        changes.paint_changed.push(new.key);
-    }
-    if old.style.cursor != new.style.cursor {
+    if cursor_changed {
         changes.cursor_changed.push(new.key);
     }
 
-    match (&old.kind, &new.kind) {
-        (NodeKind::Text { text: was }, NodeKind::Text { text: now }) if was != now => {
-            changes.text_changed.push(new.key);
-            // Re-shaping can produce a different intrinsic size.
-            changes.layout_changed.push(new.key);
-        }
+    let (text_changed, enabled_changed) = match (&old.kind, &new.kind) {
+        (NodeKind::Text { text: was }, NodeKind::Text { text: now }) => (was != now, false),
         (
             NodeKind::Button {
                 label: was,
@@ -361,25 +353,36 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
                 label: now,
                 enabled: now_enabled,
             },
-        ) => {
-            if was != now {
-                changes.text_changed.push(new.key);
-                changes.layout_changed.push(new.key);
-            }
-            if was_enabled != now_enabled {
-                changes.enabled_changed.push(new.key);
-            }
-        }
-        _ => {}
+        ) => (was != now, was_enabled != now_enabled),
+        _ => (false, false),
+    };
+
+    let structure_changed = old
+        .children
+        .iter()
+        .map(|child| child.key)
+        .ne(new.children.iter().map(|child| child.key));
+
+    if text_changed {
+        changes.text_changed.push(new.key);
+    }
+    if enabled_changed {
+        changes.enabled_changed.push(new.key);
+    }
+    if structure_changed {
+        changes.structure_changed.push(new.key);
     }
 
-    let old_children: Vec<NodeKey> = old.children.iter().map(|child| child.key).collect();
-    let new_children: Vec<NodeKey> = new.children.iter().map(|child| child.key).collect();
-    if old_children != new_children {
-        changes.structure_changed.push(new.key);
-        if !changes.layout_changed.contains(&new.key) {
-            changes.layout_changed.push(new.key);
-        }
+    // A text style or content change can alter intrinsic size; structure and
+    // explicit layout changes alter geometry directly. Decide each category
+    // once, then append its key once.
+    let layout_changed =
+        old.layout != new.layout || text_style_changed || text_changed || structure_changed;
+    if layout_changed {
+        changes.layout_changed.push(new.key);
+    }
+    if paint_changed {
+        changes.paint_changed.push(new.key);
     }
 
     Ok(())
@@ -626,6 +629,24 @@ mod tests {
                 "layout delta {index} is geometry intent and needs no re-shaping"
             );
         }
+    }
+
+    #[test]
+    fn a_node_is_reported_once_per_change_category_even_when_multiple_causes_apply() {
+        let previous = snapshot(vec![Node::text(2, "before")]);
+        let next = snapshot(vec![
+            Node::text(2, "after")
+                .with_layout(padded(12))
+                .with_font_size(20)
+                .with_foreground(instar_ui_protocol::WireColor::opaque(255, 0, 0)),
+        ]);
+
+        let changes = diff(Some(&previous), &next).unwrap();
+
+        assert_eq!(changes.layout_changed, vec![NodeKey::first(2)]);
+        assert_eq!(changes.paint_changed, vec![NodeKey::first(2)]);
+        assert_eq!(changes.text_changed, vec![NodeKey::first(2)]);
+        assert_eq!(changes.text_style_changed, vec![NodeKey::first(2)]);
     }
 
     #[test]
