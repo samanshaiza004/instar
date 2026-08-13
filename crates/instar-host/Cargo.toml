@@ -18,6 +18,8 @@ instar-window = { path = "../instar-window" }
 # `instar-ui -> instar-text` absent.
 instar-text = { path = "../instar-text" }
 
+unicode-segmentation = "1.13.3"
+
 # Paint *intent* only: scene types, no renderer. This crate is the layer that
 # bridges logical presentation to physical rendering (docs/PHASE-1.md), so
 # lowering a laid-out tree to a PaintScene belongs here -- but choosing a

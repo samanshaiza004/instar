@@ -38,7 +38,10 @@ use instar_text::{
     Revision, Selection, ShapingWindow, TextAffinity, TextPosition, TextStorage, TextViewId,
     TextViewport,
 };
-use instar_ui::{Affinity, CaretGeometry, LineHeight, ShapingStyle, TextContext, TextLayout};
+use instar_ui::{
+    Affinity, CaretGeometry, LineHeight, ShapingStyle, TextContext, TextCursor, TextLayout,
+};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A document position's affinity, as the shaping layer names it.
 ///
@@ -168,6 +171,70 @@ impl PresentedSegment {
 #[derive(Debug)]
 pub struct PresentedText {
     pub segments: Vec<PresentedSegment>,
+}
+
+/// Builds a transient composition projection over the already visible rows.
+/// Canonical storage is never changed: only rows intersecting the target are
+/// rebuilt, and the composition payload is capped before shaping.
+#[allow(clippy::too_many_arguments)]
+pub fn present_preedit(
+    context: &mut TextContext,
+    storage: &TextStorage,
+    base: &PresentedText,
+    target: Selection,
+    preedit: &str,
+    style: ShapingStyle,
+    row_height: f32,
+    revision: Revision,
+) -> Result<PresentedText, instar_text::TextError> {
+    let target_range = target.range();
+    let mut inserted = false;
+    let bounded = &preedit[..preedit
+        .char_indices()
+        .take_while(|(i, _)| *i <= instar_text::MAX_SHAPED_PARAGRAPH_BYTES)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
+        .min(preedit.len())];
+    let mut segments = Vec::with_capacity(base.segments.len());
+    for source in &base.segments {
+        let bytes = source.buffer_range.clone();
+        let text = storage.slice(bytes.clone())?.materialize();
+        let intersects = bytes.start < target_range.end && target_range.start < bytes.end;
+        let projected = if intersects && !inserted {
+            inserted = true;
+            let before = target_range
+                .start
+                .saturating_sub(bytes.start)
+                .min(text.len());
+            let after = target_range.end.saturating_sub(bytes.start).min(text.len());
+            format!("{}{}{}", &text[..before], bounded, &text[after..])
+        } else if intersects {
+            let after = target_range.end.saturating_sub(bytes.start).min(text.len());
+            text[after..].to_string()
+        } else {
+            text
+        };
+        for (line, line_text) in projected.split('\n').enumerate() {
+            let mut layout = context.shape_keyless_with_line_height(
+                line_text,
+                style,
+                LineHeight::FontSizeRelative(1.4),
+            );
+            layout.break_lines(None);
+            segments.push(PresentedSegment {
+                buffer_range: bytes.clone(),
+                row: source.row + line,
+                truncated: source.truncated,
+                origin_x: source.origin_x,
+                origin_y: source.origin_y + line as f32 * row_height,
+                buffer_revision: revision,
+                layout,
+            });
+        }
+    }
+    let _ = row_height;
+    Ok(PresentedText { segments })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,6 +704,18 @@ pub struct TextPaint {
     pub caret: Option<TextPosition>,
     pub selection: Option<Selection>,
     pub revision: Revision,
+    pub composition: Option<CompositionPaint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompositionPaint {
+    pub start_row: usize,
+    pub end_row: usize,
+    pub first_start: usize,
+    pub last_end: usize,
+    pub cursor_row: usize,
+    pub cursor_offset: usize,
+    pub color: Color,
 }
 
 /// Lowers a presented window to drawing commands.
@@ -682,6 +761,7 @@ pub fn lower(presented: &mut PresentedText, frame: &Frame) -> PaintScene {
             caret: frame.caret,
             selection: frame.selection,
             revision: frame.revision,
+            composition: None,
         },
         &mut commands,
         &mut fonts,
@@ -763,6 +843,70 @@ pub fn push_text(
             color: paint.caret_color,
         });
     }
+
+    if let Some(composition) = paint.composition {
+        let mut rects = Vec::new();
+        for segment in &presented.segments {
+            if !(composition.start_row..=composition.end_row).contains(&segment.row) {
+                continue;
+            }
+            let start = if segment.row == composition.start_row {
+                composition.first_start
+            } else {
+                0
+            };
+            let end = if segment.row == composition.end_row {
+                composition.last_end
+            } else {
+                usize::MAX
+            };
+            let anchor = TextCursor {
+                index: start,
+                affinity: Affinity::Downstream,
+            };
+            let focus = TextCursor {
+                index: end,
+                affinity: Affinity::Upstream,
+            };
+            segment
+                .layout
+                .selection_geometry_with(anchor, focus, |geometry| {
+                    rects.push(physical(
+                        geometry.x + paint.origin_x,
+                        geometry.y + paint.origin_y + geometry.height - 1.0,
+                        geometry.width.max(1.0),
+                        1.0,
+                        paint.scale,
+                    ));
+                });
+        }
+        commands.extend(rects.into_iter().map(|rect| PaintCommand::FillRect {
+            rect,
+            color: composition.color,
+        }));
+        for segment in &presented.segments {
+            if segment.row == composition.cursor_row {
+                let geometry = segment.layout.caret_geometry(
+                    TextCursor {
+                        index: composition.cursor_offset,
+                        affinity: Affinity::Downstream,
+                    },
+                    CARET_WIDTH,
+                );
+                commands.push(PaintCommand::FillRect {
+                    rect: physical(
+                        geometry.x + paint.origin_x,
+                        geometry.y + paint.origin_y,
+                        geometry.width,
+                        geometry.height,
+                        paint.scale,
+                    ),
+                    color: composition.color,
+                });
+                break;
+            }
+        }
+    }
 }
 
 /// A logical rectangle in physical pixels, never narrower than one.
@@ -827,7 +971,21 @@ pub fn line_bounds(storage: &TextStorage, byte: usize) -> (usize, usize) {
 /// the position, so an enormous document never materializes wholesale just to
 /// move one caret.
 pub fn previous_grapheme(storage: &TextStorage, byte: usize) -> usize {
-    storage.previous_grapheme_boundary(byte).unwrap_or(byte)
+    if byte == 0 {
+        return 0;
+    }
+    let start = byte.saturating_sub(instar_text::MAX_SHAPED_PARAGRAPH_BYTES);
+    let text = storage
+        .slice(start..byte)
+        .ok()
+        .map(|s| s.materialize())
+        .unwrap_or_default();
+    start
+        + text
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
 }
 
 /// The byte offset one grapheme after `byte`.
@@ -836,7 +994,20 @@ pub fn previous_grapheme(storage: &TextStorage, byte: usize) -> usize {
 /// break, which is exactly what `ArrowRight` crosses and what `Delete` removes
 /// to join lines.
 pub fn next_grapheme(storage: &TextStorage, byte: usize) -> usize {
-    storage.next_grapheme_boundary(byte).unwrap_or(byte)
+    if byte >= storage.len_bytes() {
+        return byte;
+    }
+    let end = (byte + instar_text::MAX_SHAPED_PARAGRAPH_BYTES).min(storage.len_bytes());
+    let text = storage
+        .slice(byte..end)
+        .ok()
+        .map(|s| s.materialize())
+        .unwrap_or_default();
+    byte + text
+        .grapheme_indices(true)
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
 }
 
 /// The byte range `Backspace` should delete at an empty selection.

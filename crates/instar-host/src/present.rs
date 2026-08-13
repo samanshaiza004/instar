@@ -155,6 +155,7 @@ pub struct TextSurfaceFrame<'a> {
     pub caret: Option<TextPosition>,
     pub selection: Option<Selection>,
     pub revision: Revision,
+    pub composition: Option<crate::text_view::CompositionPaint>,
 }
 
 /// The most trap text the crash surface will retain and draw.
@@ -455,6 +456,7 @@ impl SceneBuilder {
                             caret: frame.caret,
                             selection: frame.selection,
                             revision: frame.revision,
+                            composition: frame.composition,
                         },
                         commands,
                         fonts,

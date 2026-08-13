@@ -1596,6 +1596,7 @@ dependencies = [
  "instar-ui-protocol",
  "instar-window",
  "tokio",
+ "unicode-segmentation",
  "wasmtime",
 ]
 

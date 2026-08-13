@@ -72,10 +72,6 @@ impl<'a> TextSlice<'a> {
         self.slice.graphemes()
     }
 
-    fn last_grapheme_len(&self) -> Option<usize> {
-        self.slice.graphemes().next_back().map(|g| g.len())
-    }
-
     /// Whether a byte offset in this region lies on a grapheme boundary.
     pub fn is_grapheme_boundary(&self, byte: usize) -> bool {
         byte <= self.len_bytes() && self.slice.is_grapheme_boundary(byte)
@@ -216,7 +212,8 @@ impl TextStorage {
         }
         let grapheme_len = self
             .slice(0..byte)?
-            .last_grapheme_len()
+            .graphemes()
+            .fold(None, |_, grapheme| Some(grapheme.len()))
             .expect("a non-empty range has at least one grapheme");
         Ok(byte - grapheme_len)
     }

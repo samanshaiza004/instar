@@ -884,6 +884,20 @@ impl Host {
                         };
                         let selection = view.selection();
                         let frame_selection = (!selection.is_empty()).then_some(selection);
+                        let composition = window.composition.target.map(|target| {
+                            let start = target.range().start;
+                            let preedit_len =
+                                window.composition.preedit.as_ref().map_or(0, String::len);
+                            crate::text_view::CompositionPaint {
+                                start_row: 0,
+                                end_row: 0,
+                                first_start: start,
+                                last_end: start + preedit_len,
+                                cursor_row: 0,
+                                cursor_offset: start + preedit_len,
+                                color: self.scenes.theme().text_caret,
+                            }
+                        });
                         let revision = surface.revision;
                         frames.push(TextSurfaceFrame {
                             node: *key,
@@ -891,6 +905,7 @@ impl Host {
                             caret: Some(selection.head),
                             selection: frame_selection,
                             revision,
+                            composition,
                         });
                     }
                     self.scenes.app_scene_with_text(
@@ -1276,6 +1291,45 @@ impl Host {
                     text.is_char_boundary(*start) && text.is_char_boundary(*end)
                 })
         });
+        self.refresh_all_text_surfaces(window_id);
+        let composition = self.windows.get(&window_id).and_then(|window| {
+            let key = window.focus.focused()?;
+            let view = *window.text_attachments.get(&key)?;
+            let target = window.composition.target?;
+            let preedit = window.composition.preedit.as_deref()?;
+            Some((key, view, target, preedit.to_owned()))
+        });
+        if let Some((key, view, target, preedit)) = composition
+            && let Some(window) = self.windows.get_mut(&window_id)
+            && let Some(surface) = window.text_surfaces.get_mut(&key)
+        {
+            let _ = view;
+            let Some(view_state) = self.text_resources.system().view(surface.view).ok() else {
+                return Vec::new();
+            };
+            let Some(buffer) = self
+                .text_resources
+                .system()
+                .buffer(view_state.buffer())
+                .ok()
+            else {
+                return Vec::new();
+            };
+            let projected = text_view::present_preedit(
+                &mut self.text,
+                buffer.text(),
+                &surface.presentation,
+                target,
+                &preedit,
+                instar_ui::ShapingStyle::default(),
+                surface.viewport.row_height,
+                surface.revision,
+            )
+            .ok();
+            if let Some(projected) = projected {
+                surface.presentation = projected;
+            }
+        }
         self.rebuild_scene(window_id);
         vec![HostEffect::Render { window: window_id }]
     }
