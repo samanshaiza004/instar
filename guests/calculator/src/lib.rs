@@ -350,7 +350,7 @@ impl Calculator {
     async fn commit(&mut self) -> Result<(), String> {
         let (bytes, routes) = self.view();
         self.routes = Some(routes);
-        kernel_ui::commit(bytes)
+        kernel_ui::commit(bytes, Vec::new())
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))

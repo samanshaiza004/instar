@@ -46,6 +46,12 @@ wasmtime = { version = "47.0.3", default-features = false, features = [
 accesskit = "0.24.1"
 
 [dev-dependencies]
+# B2e-3a's attachment-bound test asserts
+# `instar_kernel::text_bridge::MAX_TEXT_ATTACHMENTS ==
+# instar_ui_protocol::limits::MAX_NODES`. instar-host is the only crate where
+# both sides are visible, which is exactly why the kernel hard-codes its 4096
+# instead of naming the protocol bound.
+instar-ui-protocol = { path = "../instar-ui-protocol" }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [build-dependencies]

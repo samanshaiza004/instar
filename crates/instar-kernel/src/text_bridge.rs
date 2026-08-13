@@ -45,6 +45,34 @@ use tokio::sync::oneshot;
 
 use crate::runtime::GenerationId;
 
+/// The largest attachment side table a commit may carry.
+///
+/// This is the maximum *useful* attachment-table cardinality: a valid
+/// snapshot has at most `MAX_NODES` nodes and every text view refers to at
+/// most one slot, so no valid tree can reference more than `MAX_NODES`
+/// distinct slots; entries beyond that cannot contribute, so Instar refuses
+/// them to bound resolution work.
+///
+/// Unreferenced and duplicate entries remain legal *within* the bound. The
+/// table is a guest-supplied side table, not a projection of the wire tree:
+/// it may name nothing, and it may name the same text view many times.
+///
+/// It is therefore a policy on table size, NOT a theorem falling out of wire
+/// validity — a one-node tree supplying 4097 entries is meaningful under
+/// Instar's semantics and is refused by this rule alone.
+///
+/// The check occurs AFTER Component Model list lifting: generated `bindgen!`
+/// materializes a `list<T>` into an owned Rust collection before the host
+/// impl is entered, so the bound governs Instar's own work; it is NOT a claim
+/// that the guest cannot cause the canonical ABI to lift a larger argument
+/// first.
+///
+/// The literal 4096 cannot reference `MAX_NODES` directly: `instar-kernel`
+/// must not depend on `instar-ui-protocol` (see the forbidden-dependency note
+/// in its Cargo.toml description). The relationship is asserted in
+/// `instar-host` instead (see tests).
+pub const MAX_TEXT_ATTACHMENTS: usize = 4_096;
+
 /// A host resource, named without saying what kind of thing it is.
 ///
 /// Deliberately not `TextBufferId` or `TextViewId`: those are `instar-text`
@@ -99,6 +127,26 @@ pub enum TextRefusal {
     TooManyViews(u32),
     /// The key named nothing this generation can reach.
     NoSuchResource,
+}
+
+/// Why a commit's text-view attachments were refused.
+///
+/// A different family from [`TextRefusal`]: that is about text-resource
+/// requests, this is about the side table a commit carries. The kernel can
+/// name the table and its rules without being able to resolve a single key;
+/// `instar-host` performs the actual resolution in later phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentRefusal {
+    /// The side table exceeded [`MAX_TEXT_ATTACHMENTS`].
+    TooManyAttachments,
+    /// The key failed to resolve to a lease this generation owns — a stale
+    /// incarnation or cross-generation use, not merely an unknown name.
+    UnavailableTextView,
+    /// The entry named a slot outside the side table it indexes into.
+    AttachmentOutOfRange,
+    /// Two live NodeKeys reached one TextViewId. Duplicate side-table entries
+    /// are legal; this is the illegal duplicate-owner state.
+    TextViewAlreadyAttached,
 }
 
 /// What the text subsystem did.

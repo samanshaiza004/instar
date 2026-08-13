@@ -1,30 +1,69 @@
 #!/usr/bin/env sh
-# Placeholder for `curl -fsSL https://youth.samanshaiza.com/install | sh`.
-#
-# Youth has not cut its first packaged release yet -- no prebuilt binaries,
-# no `dist`-published installer. That's planned after the Scratchpad MVP
-# ships and 0.1.0 release prep is done (see docs/DISTRIBUTION.md in the
-# repository). This script deliberately does not attempt an install; it
-# exits non-zero so nothing downstream mistakes it for a success.
+# Stable website entry point for the cargo-dist generated Instar installer.
 set -eu
 
-cat <<'BANNER'
-Youth CLI -- no packaged install yet
-=====================================
+REPOSITORY="samanshaiza004/instar"
+INSTALLER="instar-shell-installer.sh"
+BASE_URL="${INSTAR_INSTALLER_GITHUB_BASE_URL:-https://github.com}"
+INSTALLER_URL="${BASE_URL}/${REPOSITORY}/releases/latest/download/${INSTALLER}"
 
-This script is a placeholder. Youth doesn't have a tagged release with
-prebuilt binaries yet.
+say() {
+  printf '%s\n' "$*" >&2
+}
 
-For now, build from source (requires a Rust toolchain with the
-wasm32-wasip2 target -- run `youth doctor` after installing to check):
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    say "instar installer: required command not found: $1"
+    exit 1
+  }
+}
 
-  cargo install youth-cli --git https://github.com/samanshaiza004/youth
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin|Linux) ;;
+  MINGW*|MSYS*|CYGWIN*)
+    say "instar installer: use the Windows PowerShell installer:"
+    say "  irm https://github.com/${REPOSITORY}/releases/latest/download/instar-shell-installer.ps1 | iex"
+    exit 1
+    ;;
+  *)
+    say "instar installer: this installer supports macOS and Linux."
+    exit 1
+    ;;
+esac
 
-Docs: https://youth.samanshaiza.com/docs/
-Repo: https://github.com/samanshaiza004/youth
+need curl
 
-Once the first packaged release ships, this script will install a
-prebuilt binary for your platform, the same way rustup or Homebrew do.
-BANNER
+tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t instar-install)
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
-exit 1
+say "instar installer: fetching the latest release installer..."
+http_code=$(curl --proto '=https' --tlsv1.2 -sSLo "$tmp_dir/$INSTALLER" \
+  -w '%{http_code}' "$INSTALLER_URL") || {
+  say "instar installer: could not reach GitHub Releases."
+  say "Check your network, then retry."
+  exit 1
+}
+
+if [ "$http_code" = "404" ]; then
+  say "instar installer: no tagged Instar binary release exists yet."
+  say "Build the current developer preview from source:"
+  say ""
+  say "  git clone https://github.com/${REPOSITORY}.git"
+  say "  cd instar"
+  say "  cargo install --locked --path crates/instar-shell"
+  say ""
+  say "Guide: https://instar.samanshaiza.com/docs/development/build-from-source.html"
+  exit 1
+fi
+
+if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+  say "instar installer: GitHub returned HTTP $http_code for $INSTALLER_URL"
+  exit 1
+fi
+
+chmod +x "$tmp_dir/$INSTALLER"
+say "instar installer: handing off to the release-pinned cargo-dist installer."
+sh "$tmp_dir/$INSTALLER" "$@"

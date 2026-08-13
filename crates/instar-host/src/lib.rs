@@ -44,19 +44,23 @@
 
 #![forbid(unsafe_code)]
 
+mod attachment;
 pub mod bridge;
 pub mod present;
 pub mod text_host;
 pub mod text_view;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::attachment::{StagedUiCommit, UiCommitRefusal, ValidatedUiCommit};
 use instar_kernel::runtime::GenerationId;
+use instar_kernel::text_bridge::{AttachmentRefusal, OpaqueResourceKey};
 use instar_paint::PaintScene;
+use instar_text::TextViewId;
 use instar_ui::{
-    FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart,
-    ScrollbarStyle, TextContext, TreeError, UiAction, Viewport,
+    DecodedUiSnapshot, FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState,
+    ScrollbarPart, ScrollbarStyle, TextAttachmentRef, TextContext, TreeError, UiAction, Viewport,
 };
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
@@ -191,6 +195,13 @@ pub struct HostWindow {
     /// Where each retained viewport is scrolled to. Host-owned: no guest sets
     /// one, and none can read one.
     scroll: ScrollState,
+    /// Which `TextViewId` each text-view node in the retained tree shows.
+    ///
+    /// Resolved during admission and held beside the tree: the tree itself
+    /// deliberately carries no resource identity (see
+    /// [`instar_ui::NodeKind::TextView`]), and the slots a commit used are
+    /// commit-local and gone by the time this map exists.
+    text_attachments: BTreeMap<NodeKey, TextViewId>,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -217,6 +228,11 @@ impl HostWindow {
         self.tree.as_ref()
     }
 
+    /// The text-view attachments of the retained tree, by node.
+    pub fn text_attachments(&self) -> &BTreeMap<NodeKey, TextViewId> {
+        &self.text_attachments
+    }
+
     /// The version of the retained UI state.
     ///
     /// Incremented only when an accepted snapshot actually changed the tree;
@@ -226,6 +242,19 @@ impl HostWindow {
     /// accepted commit.
     pub fn tree_revision(&self) -> u64 {
         self.tree_revision
+    }
+
+    /// Installs a staged snapshot and advances the tree revision.
+    ///
+    /// Infallible by construction: a [`StagedUiCommit`] has already passed
+    /// every check that can refuse, so promotion has nothing left to report.
+    /// It owns the two assignments that make the retained UI state — the tree
+    /// and the attachment map — so no other path can update one without the
+    /// other.
+    pub(crate) fn promote_ui_commit(&mut self, staged: StagedUiCommit) {
+        self.tree_revision += 1;
+        self.tree = Some(staged.tree);
+        self.text_attachments = staged.attachments;
     }
 
     /// The paint intent to present, if there is any that may be shown.
@@ -470,6 +499,62 @@ impl Host {
         &mut self.text_resources
     }
 
+    /// Resolves a commit's attachment side table, positionally.
+    ///
+    /// Each key resolves through
+    /// [`TextHost::resolve_view_lease`](text_host::TextHost::resolve_view_lease),
+    /// which checks ownership before identity — so a live view this
+    /// generation does not lease, or a stale incarnation, is refused here
+    /// exactly as it would be for a text operation. The result is positional
+    /// scratch: slot `i` names `resolved[i]`. Duplicate entries and
+    /// unreferenced entries are both legal; policing them would turn a WIT
+    /// argument representation into semantics for no correctness gain.
+    pub fn resolve_attachment_table(
+        &self,
+        generation: GenerationId,
+        keys: &[OpaqueResourceKey],
+    ) -> Result<Vec<TextViewId>, AttachmentRefusal> {
+        keys.iter()
+            .map(|key| {
+                self.text_resources
+                    .resolve_view_lease(generation, *key)
+                    .map_err(|_| AttachmentRefusal::UnavailableTextView)
+            })
+            .collect()
+    }
+
+    /// Turns the decoded attachment refs into the retained map, against an
+    /// already-resolved side table.
+    ///
+    /// Steps 4 and 5 of the frozen order, and they live here rather than in
+    /// the bridge for a reason the tests make sharp: the permutation
+    /// regression has to prove that *this* loop ignores slot numbers, and a
+    /// test that rebuilt the map itself would prove only that its own
+    /// arithmetic ignores them.
+    ///
+    /// Uniqueness compares resolved [`TextViewId`]s and nothing else. The same
+    /// `NodeKey` may name the same view while the opaque lease representation
+    /// differs purely because of how the guest supplied the borrow — WIT
+    /// resource handles are opaque, carry dynamic borrow state, and are not
+    /// retained equality tokens.
+    pub fn resolve_attachments(
+        refs: &[TextAttachmentRef],
+        resolved: &[TextViewId],
+    ) -> Result<BTreeMap<NodeKey, TextViewId>, AttachmentRefusal> {
+        let mut attachments = BTreeMap::new();
+        let mut seen = HashSet::new();
+        for attachment in refs {
+            let Some(view) = resolved.get(attachment.slot as usize).copied() else {
+                return Err(AttachmentRefusal::AttachmentOutOfRange);
+            };
+            if !seen.insert(view) {
+                return Err(AttachmentRefusal::TextViewAlreadyAttached);
+            }
+            attachments.insert(attachment.node, view);
+        }
+        Ok(attachments)
+    }
+
     /// A host whose Parley font context has the shipped monospace face.
     pub fn with_monospace_face(face: Arc<[u8]>) -> Self {
         Self {
@@ -591,8 +676,8 @@ impl Host {
         // > tree can become interactive.
         //
         // A cleared ledger beside a retained `window.tree` is a desync: an
-        // identical re-commit takes the no-op path in `apply_tree` and never
-        // reaches `ledger.apply`, so those ids would stay unknown to the
+        // identical re-commit takes the no-op path in `apply_ui_commit` and
+        // never reaches `ledger.apply`, so those ids would stay unknown to the
         // ledger while remaining live, and the first removal-then-reuse of one
         // would be accepted at generation 0 — the hole the ledger exists to
         // close, reopened by the ledger's own reset. Only the dead
@@ -869,20 +954,76 @@ impl Host {
     /// Decoding and semantic validation are `instar-ui`'s; a rejected batch is
     /// returned as an error rather than applied, so a malformed commit leaves
     /// the previous interface standing instead of blanking the window.
+    ///
+    /// This entry point carries no side table, so an empty resolved table is
+    /// what makes any slot fail: a text-view node naming slot 0 trips the
+    /// same `slot >= table.len()` check as a slot far past the end, and the
+    /// host reports that as `AttachmentOutOfRange`. It is deliberately not a
+    /// special-case refusal: the rule is that each class of bad input has
+    /// exactly one refusal it can produce, and "this commit carried no
+    /// capabilities" is not a third class — it is an empty capability list.
     pub fn on_guest_commit(
         &mut self,
         window_id: WindowId,
         batch: &[u8],
-    ) -> Result<Vec<HostEffect>, TreeError> {
-        self.apply_tree(window_id, Tree::decode(batch)?)
+    ) -> Result<Vec<HostEffect>, UiCommitRefusal> {
+        let snapshot = DecodedUiSnapshot::decode(batch).map_err(UiCommitRefusal::Tree)?;
+        self.apply_ui_commit(window_id, snapshot, &[])
     }
 
-    /// Installs an already-decoded, already-validated snapshot.
+    /// The fallible pre-promotion half: diff the new tree against the
+    /// retained one and refuse kind changes.
     ///
-    /// Split from [`Host::on_guest_commit`] because the two-thread bridge must
-    /// decode at a specific point in a normative sequence — after the
-    /// generation check, before anything is mutated — and so cannot use a
-    /// function that does both at once.
+    /// `attachment_refs` are carried, not resolved: resolution happens before
+    /// this in [`Host::apply_ui_commit`]'s normative order.
+    fn validate_ui_commit(
+        &mut self,
+        window_id: WindowId,
+        tree: Tree,
+        attachment_refs: Vec<TextAttachmentRef>,
+    ) -> Result<ValidatedUiCommit, TreeError> {
+        let window = self.windows.entry(window_id).or_default();
+        let tree_changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
+        Ok(ValidatedUiCommit {
+            tree,
+            tree_changes,
+            attachment_refs,
+        })
+    }
+
+    /// The fallible staging half: accept the snapshot's id lifecycle and
+    /// compute the attachment diff.
+    ///
+    /// This is the last place a refusal is possible. [`StagedUiCommit`] says
+    /// so, and [`HostWindow::promote_ui_commit`] takes it without a `Result`.
+    fn stage_ui_commit(
+        &mut self,
+        window_id: WindowId,
+        validated: ValidatedUiCommit,
+        attachments: BTreeMap<NodeKey, TextViewId>,
+    ) -> Result<StagedUiCommit, TreeError> {
+        let window = self.windows.entry(window_id).or_default();
+        window.ledger.validate(&validated.tree)?;
+        let attachment_changes =
+            attachment::AttachmentChangeSet::diff(&window.text_attachments, &attachments);
+        Ok(StagedUiCommit {
+            tree: validated.tree,
+            tree_changes: validated.tree_changes,
+            attachments,
+            attachment_changes,
+        })
+    }
+
+    /// The one authoritative UI-commit path in production.
+    ///
+    /// Takes a decoded snapshot plus its already-resolved side table, and runs
+    /// the frozen admission order: attachment resolution and uniqueness
+    /// first, then the tree diff, then ledger validation and the attachment
+    /// diff, then the infallible promotion. The caller decides when the
+    /// snapshot is decoded: [`Host::on_guest_commit`] decodes first because
+    /// it has nothing else to screen, while the two-thread bridge decodes at a
+    /// specific point in a normative sequence — after the generation check,
+    /// before anything is mutated — and hands the result here.
     ///
     /// # The snapshot is diffed, not swapped
     ///
@@ -899,19 +1040,47 @@ impl Host {
     /// previous interface standing exactly as a refused decode does, which is
     /// the property the whole commit path is built around. The promotion below
     /// is still one assignment after all validation.
-    pub fn apply_tree(
+    ///
+    /// Resolution comes before the diff, so an attachment refusal — a slot
+    /// out of range, a view already attached elsewhere — also leaves
+    /// everything standing: every operation capable of refusing runs before
+    /// the first mutation.
+    pub fn apply_ui_commit(
         &mut self,
         window_id: WindowId,
-        tree: Tree,
-    ) -> Result<Vec<HostEffect>, TreeError> {
-        let window = self.windows.entry(window_id).or_default();
+        snapshot: DecodedUiSnapshot,
+        resolved: &[TextViewId],
+    ) -> Result<Vec<HostEffect>, UiCommitRefusal> {
+        // Steps 4-5: slot resolution and uniqueness, against the resolved
+        // side table the caller has already screened.
+        let attachments = Host::resolve_attachments(&snapshot.text_attachments, resolved)
+            .map_err(UiCommitRefusal::Attachment)?;
+        // Step 6: the tree diff can still refuse.
+        let validated = self
+            .validate_ui_commit(window_id, snapshot.tree, snapshot.text_attachments)
+            .map_err(UiCommitRefusal::Tree)?;
+        // Steps 7-8: ledger validation and the attachment diff, the last
+        // places a refusal is possible.
+        let staged = self
+            .stage_ui_commit(window_id, validated, attachments)
+            .map_err(UiCommitRefusal::Tree)?;
+        Ok(self.apply_staged_commit(window_id, staged))
+    }
 
-        // Before the mutation, so a refusal costs the previous interface
-        // nothing. The ledger check sits beside the diff for the same reason:
-        // a snapshot that reuses a retired id must leave the previous
-        // interface standing exactly as a refused diff does.
-        let changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
-        window.ledger.validate(&tree)?;
+    /// The infallible half of UI admission: everything after the last
+    /// refusal, in the order `apply_ui_commit` always uses.
+    ///
+    /// The staged commit cannot fail, so this returns effects rather than a
+    /// `Result`. The no-op early return sits here, after staging, exactly as
+    /// it always sat after the diff and ledger validation: a guest
+    /// re-committing an identical interface is an ordinary shape, and it
+    /// should cost the decode and nothing else.
+    fn apply_staged_commit(
+        &mut self,
+        window_id: WindowId,
+        staged: StagedUiCommit,
+    ) -> Vec<HostEffect> {
+        let window = self.windows.entry(window_id).or_default();
 
         // A guest re-committing an identical interface is an ordinary shape —
         // it is what an event the guest decided to ignore looks like from
@@ -919,8 +1088,14 @@ impl Host {
         // scene, no frame.
         // (An opening commit always reports its nodes as created, so this
         // cannot swallow a guest's first interface.)
-        if changes.is_empty() {
-            return Ok(Vec::new());
+        //
+        // **Both** diffs, because a commit can be a no-op for the tree and not
+        // for the attachments: the same `TextView` node showing a different
+        // document sends byte-identical tree bytes with a different side
+        // table. Gating on the tree diff alone would drop that change on the
+        // floor while telling the guest the commit was accepted.
+        if staged.tree_changes.is_empty() && staged.attachment_changes.is_empty() {
+            return Vec::new();
         }
 
         // Validation ran above the early return, so a no-op commit cannot
@@ -928,27 +1103,29 @@ impl Host {
         // snapshot has identical live keys, so applying would only redo a
         // no-op, and the no-op commit keeps costing the decode and nothing
         // else.
-        window.ledger.apply(&tree);
-
-        // A snapshot that survived the diff is a new version of the retained
-        // tree. The guest-visible commit sequence advances on every accepted
-        // commit; this is the host's separate value for whether the state
-        // actually changed, and the one caches key off.
-        window.tree_revision += 1;
+        let needs_layout = staged.tree_changes.needs_layout();
+        let needs_text_finalize = staged.tree_changes.needs_text_finalize();
+        window.ledger.apply(&staged.tree);
 
         // Before the new snapshot becomes interactive: any transient state
         // referring to a node the guest removed is retired. A press that
         // outlived its node would otherwise be completable against whatever
         // reused its key. See `Interaction::retire`.
-        window.interaction.retire(&changes.removed);
-        self.text.retire(&changes.removed);
+        window.interaction.retire(&staged.tree_changes.removed);
+        self.text.retire(&staged.tree_changes.removed);
         // Deletion destroys a viewport's offset; hiding does not. This is the
         // deletion half, and it sits with the other retirements for the same
         // reason -- state that outlives the node it describes eventually
         // lands on something else.
-        window.scroll.retire(&changes.removed);
+        window.scroll.retire(&staged.tree_changes.removed);
 
-        window.tree = Some(tree);
+        // A snapshot that survived the diff is a new version of the retained
+        // tree. The promotion owns the two assignments that make the retained
+        // UI state -- the tree and the attachment map -- and advances the
+        // revision. The guest-visible commit sequence advances on every
+        // accepted commit; the revision is the host's separate value for
+        // whether the state actually changed, and the one caches key off.
+        window.promote_ui_commit(staged);
         // And any state referring to a node the guest *hid*, which the diff
         // does not report as removed because it is still in the tree. Runs
         // after the promotion rather than before it, because the question is
@@ -977,10 +1154,10 @@ impl Host {
         // unchanged width happens to reuse rather than re-extract today, that
         // is a property of the cache's internals rather than of this path.
         // Not entering it at all cannot regress.
-        if changes.needs_layout() {
+        if needs_layout {
             self.layout_passes += 1;
             window.recompute_layout(&mut self.text, self.scrollbars);
-        } else if changes.needs_text_finalize() {
+        } else if needs_text_finalize {
             // Alignment moved and geometry did not. Finalization normally
             // happens inside a layout pass because that is where the final
             // width is known -- but every width here is still correct, so
@@ -1002,12 +1179,12 @@ impl Host {
 
         let window = self.windows.entry(window_id).or_default();
         if window.metrics.is_ready() {
-            Ok(vec![HostEffect::Render { window: window_id }])
+            vec![HostEffect::Render { window: window_id }]
         } else {
             // Nothing to draw against yet; remember that something wants
             // drawing once there is.
             window.redraw_pending = true;
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 
@@ -1586,6 +1763,8 @@ mod tests {
     use super::*;
     use crate::bridge::{HostBridge, HostUserEvent, Wake};
     use instar_kernel::bridge::commit_request;
+    use instar_kernel::text_bridge::{OpaqueResourceKey, TextAnswer, TextOperation, text_request};
+    use instar_text::TextViewId;
     use instar_ui::protocol::{BatchEncoder, NodeKey, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, PhysicalSize, PointerButton};
     use std::time::{Duration, Instant};
@@ -1679,6 +1858,27 @@ mod tests {
         (
             f64::from(rect.x + rect.width / 2),
             f64::from(rect.y + rect.height / 2),
+        )
+    }
+
+    /// Commits a hand-built tree through the one authoritative path.
+    ///
+    /// Test-only shorthand: wraps the tree in a [`DecodedUiSnapshot`] with no
+    /// attachments and an empty resolved side table, so a test that only
+    /// cares about the tree exercises exactly the production admission
+    /// sequence instead of a second tree-only path.
+    fn commit_tree(
+        host: &mut Host,
+        window: WindowId,
+        tree: Tree,
+    ) -> Result<Vec<HostEffect>, UiCommitRefusal> {
+        host.apply_ui_commit(
+            window,
+            DecodedUiSnapshot {
+                tree,
+                text_attachments: Vec::new(),
+            },
+            &[],
         )
     }
 
@@ -2012,7 +2212,7 @@ mod tests {
 
     /// Delivers a batch as if the guest had just committed it.
     fn deliver(bridge: &mut HostBridge, batch: Vec<u8>) {
-        let (request, _reply) = commit_request(bridge.generation(), batch);
+        let (request, _reply) = commit_request(bridge.generation(), batch, Vec::new());
         bridge.on_user_event(HostUserEvent::UiCommit {
             generation: bridge.generation(),
             request,
@@ -2116,7 +2316,10 @@ mod tests {
         let refused = host.on_guest_commit(WINDOW, &kind_swapped_batch());
 
         assert!(
-            matches!(refused, Err(TreeError::KindChanged { .. })),
+            matches!(
+                refused,
+                Err(UiCommitRefusal::Tree(TreeError::KindChanged { .. }))
+            ),
             "expected a KindChanged refusal, got {refused:?}"
         );
         assert_eq!(
@@ -2281,7 +2484,7 @@ mod tests {
     #[test]
     fn tab_moves_focus_and_tells_the_guest_nothing() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
 
         let effects = host.handle(key(instar_window::Key::Tab, false));
         assert_eq!(focused(&host), Some(NodeKey::first(91)));
@@ -2315,7 +2518,7 @@ mod tests {
     #[test]
     fn moving_focus_enters_neither_layout_nor_shaping() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         let before = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
@@ -2349,7 +2552,7 @@ mod tests {
     #[test]
     fn a_click_moves_focus_without_showing_the_keyboard_ring() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         host.handle(key(instar_window::Key::Tab, false));
         assert!(host.window(WINDOW).unwrap().focus.focus_visible());
 
@@ -2405,11 +2608,11 @@ mod tests {
             ),
         ] {
             let mut host = ready_host();
-            host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+            commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
             host.handle(key(instar_window::Key::Tab, false));
             assert_eq!(focused(&host), Some(NodeKey::first(91)));
 
-            host.apply_tree(WINDOW, tree).expect("valid");
+            commit_tree(&mut host, WINDOW, tree).expect("valid");
             assert_eq!(
                 focused(&host),
                 None,
@@ -2442,17 +2645,18 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(0)).expect("valid");
         host.handle(key(instar_window::Key::Tab, false));
         assert_eq!(focused(&host), Some(NodeKey::new(93, 0)));
 
         // Gone, then back at a new generation.
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::text(94, "gap")])),
         )
         .expect("valid");
-        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(1)).expect("valid");
 
         assert_eq!(
             focused(&host),
@@ -2503,8 +2707,7 @@ mod tests {
     #[test]
     fn traversal_reveals_an_offscreen_control() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, offscreen_focus_fixture())
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, offscreen_focus_fixture()).expect("valid");
         assert_eq!(
             host.window(WINDOW)
                 .unwrap()
@@ -2543,7 +2746,7 @@ mod tests {
     fn revealing_something_already_visible_changes_nothing() {
         use instar_ui::Node;
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         let _ = Node::text(0, "");
 
         host.handle(key(instar_window::Key::Tab, false));
@@ -2602,7 +2805,7 @@ mod tests {
         ));
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, tree).expect("valid");
+        commit_tree(&mut host, WINDOW, tree).expect("valid");
         host.handle(key(instar_window::Key::Tab, false));
 
         let window = host.window(WINDOW).unwrap();
@@ -2635,7 +2838,8 @@ mod tests {
     fn a_hidden_target_is_not_revealable() {
         use instar_ui::{Node, WireAlign, WireLayout, WireSize};
         let mut host = ready_host();
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(
                 0,
@@ -2680,7 +2884,7 @@ mod tests {
     #[test]
     fn the_focus_ring_is_drawn_only_when_focus_is_visible() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         let ring = host.theme().focus_ring;
         let has_ring =
             |host: &Host| {
@@ -2718,8 +2922,7 @@ mod tests {
     #[test]
     fn tab_focus_and_reveal_complete_while_the_guest_is_blocked() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, offscreen_focus_fixture())
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, offscreen_focus_fixture()).expect("valid");
 
         let stalled_until = Instant::now() + Duration::from_millis(100);
         let effects = host.handle(key(instar_window::Key::Tab, false));
@@ -2786,7 +2989,7 @@ mod tests {
         // fixture, and the node ids below are the guest's own.
         let mut host = Host::new();
         host.handle(WindowOutput::MetricsChanged(metrics(1.0)));
-        host.apply_tree(WINDOW, gallery_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, gallery_fixture()).expect("valid");
 
         let update = host.accessibility_update(WINDOW).expect("a tree");
         let find = |key: NodeKey| {
@@ -2879,8 +3082,7 @@ mod tests {
     #[test]
     fn a_basis_change_enters_layout_and_moves_the_rectangles() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, keypad_row(instar_ui::WireBasis::Auto))
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, keypad_row(instar_ui::WireBasis::Auto)).expect("valid");
         let width = |host: &Host, id: u32| {
             host.window(WINDOW)
                 .and_then(HostWindow::layout)
@@ -2895,8 +3097,12 @@ mod tests {
         );
 
         host.reset_text_stats();
-        host.apply_tree(WINDOW, keypad_row(instar_ui::WireBasis::Fixed(0)))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            keypad_row(instar_ui::WireBasis::Fixed(0)),
+        )
+        .expect("valid");
 
         assert_eq!(
             host.layout_passes(),
@@ -2942,8 +3148,12 @@ mod tests {
     #[test]
     fn an_alignment_only_change_realigns_and_nothing_else() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::Start))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            aligned_tree(instar_ui::WireTextAlign::Start),
+        )
+        .expect("valid");
         let before = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
@@ -2951,8 +3161,12 @@ mod tests {
             .expect("the readout is laid out");
 
         host.reset_text_stats();
-        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            aligned_tree(instar_ui::WireTextAlign::End),
+        )
+        .expect("valid");
         let stats = host.text_stats();
 
         assert_eq!(
@@ -2989,12 +3203,20 @@ mod tests {
     #[test]
     fn an_unchanged_alignment_does_nothing_at_all() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            aligned_tree(instar_ui::WireTextAlign::End),
+        )
+        .expect("valid");
 
         host.reset_text_stats();
-        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            aligned_tree(instar_ui::WireTextAlign::End),
+        )
+        .expect("valid");
         let stats = host.text_stats();
         assert_eq!(
             (
@@ -3017,8 +3239,12 @@ mod tests {
     #[test]
     fn a_width_change_reapplies_alignment_to_the_new_lines() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, aligned_tree(instar_ui::WireTextAlign::End))
-            .expect("valid");
+        commit_tree(
+            &mut host,
+            WINDOW,
+            aligned_tree(instar_ui::WireTextAlign::End),
+        )
+        .expect("valid");
 
         host.reset_text_stats();
         host.handle(WindowOutput::MetricsChanged(WindowMetricsChanged {
@@ -3048,8 +3274,7 @@ mod tests {
 
     fn host_for_actions() -> Host {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, offscreen_focus_fixture())
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, offscreen_focus_fixture()).expect("valid");
         host
     }
 
@@ -3125,7 +3350,7 @@ mod tests {
     fn the_host_offers_an_accessibility_update_only_when_something_changed() {
         use instar_ui::{Node, WireColor};
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
 
         assert!(
             host.accessibility_update(WINDOW).is_some(),
@@ -3137,7 +3362,8 @@ mod tests {
         );
 
         // Paint-only, carried all the way out to the boundary.
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(
                 0,
@@ -3176,7 +3402,7 @@ mod tests {
     #[test]
     fn no_accessibility_update_is_offered_while_geometry_is_invalid() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         host.accessibility_update(WINDOW).expect("the initial tree");
 
         host.handle(key(instar_window::Key::Tab, false));
@@ -3194,7 +3420,7 @@ mod tests {
     #[test]
     fn activation_resends_the_whole_tree_even_though_nothing_changed() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         let first = host.accessibility_update(WINDOW).expect("the initial tree");
         assert!(!first.nodes.is_empty());
         assert!(host.accessibility_update(WINDOW).is_none(), "drained");
@@ -3233,7 +3459,7 @@ mod tests {
 
         // Pointer.
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         let rect = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
@@ -3259,7 +3485,7 @@ mod tests {
 
         // Accessibility.
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         host.reset_interaction_stats();
         let invoked =
             host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::first(91)));
@@ -3278,8 +3504,7 @@ mod tests {
     #[test]
     fn an_accessibility_focus_uses_the_same_focus_machinery() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, offscreen_focus_fixture())
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, offscreen_focus_fixture()).expect("valid");
         host.reset_interaction_stats();
 
         let effects =
@@ -3319,8 +3544,7 @@ mod tests {
     #[test]
     fn scroll_into_view_routes_into_the_reveal_primitive() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, offscreen_focus_fixture())
-            .expect("valid");
+        commit_tree(&mut host, WINDOW, offscreen_focus_fixture()).expect("valid");
         host.reset_interaction_stats();
 
         host.on_accessibility_action(
@@ -3365,14 +3589,15 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(0)).expect("valid");
         // Gone, then back at a new generation.
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::text(96, "gap")])),
         )
         .expect("valid");
-        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(1)).expect("valid");
 
         let stale =
             host.on_accessibility_action(WINDOW, accesskit::Action::Click, ak(NodeKey::new(95, 0)));
@@ -3413,7 +3638,8 @@ mod tests {
     fn a_disabled_button_refuses_every_adapter_equally() {
         use instar_ui::Node;
         let mut host = ready_host();
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::button(97, "off").disabled()])),
         )
@@ -3446,7 +3672,7 @@ mod tests {
     /// Focus already on button 91.
     fn keyboard_host() -> Host {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, focus_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, focus_fixture()).expect("valid");
         host.handle(key(instar_window::Key::Tab, false));
         host
     }
@@ -3551,7 +3777,8 @@ mod tests {
         let mut host = keyboard_host();
         host.handle(key_event(instar_window::Key::Space, true, false));
 
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(
                 0,
@@ -3589,7 +3816,7 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, with_generation(0)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(0)).expect("valid");
         host.handle(key(instar_window::Key::Tab, false));
         host.handle(key_event(instar_window::Key::Space, true, false));
         assert_eq!(
@@ -3597,12 +3824,13 @@ mod tests {
             Some(NodeKey::new(93, 0))
         );
 
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::text(94, "gap")])),
         )
         .expect("valid");
-        host.apply_tree(WINDOW, with_generation(1)).expect("valid");
+        commit_tree(&mut host, WINDOW, with_generation(1)).expect("valid");
 
         let up = host.handle(key_event(instar_window::Key::Space, false, false));
         assert!(
@@ -3733,7 +3961,7 @@ mod tests {
 
     fn scrolled_host() -> Host {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, scroll_fixture()).expect("valid");
+        commit_tree(&mut host, WINDOW, scroll_fixture()).expect("valid");
         host
     }
 
@@ -3775,7 +4003,8 @@ mod tests {
     fn content_that_fits_has_no_scrollbar_at_all() {
         use instar_ui::{Node, WireLayout, WireSize};
         let mut host = ready_host();
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(
                 0,
@@ -4102,7 +4331,7 @@ mod tests {
             ],
         ));
         let mut host = ready_host();
-        host.apply_tree(WINDOW, tree).expect("valid");
+        commit_tree(&mut host, WINDOW, tree).expect("valid");
 
         let window = host.window(WINDOW).unwrap();
         let layout = window.layout().unwrap();
@@ -4167,7 +4396,8 @@ mod tests {
         ));
         assert!(host.window(WINDOW).unwrap().scroll.dragging().is_some());
 
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::text(80, "gone")])),
         )
@@ -4465,13 +4695,12 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, build(None)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(None)).expect("valid tree");
 
         // From here on, nothing about the text itself changes.
         host.reset_text_stats();
         let red = WireColor::opaque(255, 0, 0);
-        host.apply_tree(WINDOW, build(Some(red)))
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(Some(red))).expect("valid tree");
 
         let stats = host.text_stats();
         assert_eq!(
@@ -4520,10 +4749,10 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, build(14)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(14)).expect("valid tree");
 
         host.reset_text_stats();
-        host.apply_tree(WINDOW, build(24)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(24)).expect("valid tree");
 
         let stats = host.text_stats();
         assert!(
@@ -4546,16 +4775,14 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, build(WireCursor::Default))
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(WireCursor::Default)).expect("valid tree");
         let before = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
             .and_then(|l| l.get(NodeKey::first(32)));
 
         host.reset_text_stats();
-        host.apply_tree(WINDOW, build(WireCursor::Pointer))
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(WireCursor::Pointer)).expect("valid tree");
 
         let stats = host.text_stats();
         assert_eq!(
@@ -4609,8 +4836,7 @@ mod tests {
     #[test]
     fn nothing_a_bordered_node_paints_leaves_its_layout_rect() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, bordered_tree())
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, bordered_tree()).expect("valid tree");
 
         let bounds = host
             .window(WINDOW)
@@ -4654,8 +4880,7 @@ mod tests {
     #[test]
     fn hit_test_bounds_are_the_visible_outer_bounds() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, bordered_tree())
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, bordered_tree()).expect("valid tree");
 
         let window = host.window(WINDOW).unwrap();
         let layout = window.layout().unwrap();
@@ -4717,7 +4942,7 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, build(0)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(0)).expect("valid tree");
         let bounds = host
             .window(WINDOW)
             .and_then(HostWindow::layout)
@@ -4742,7 +4967,7 @@ mod tests {
         };
         assert_eq!(strokes(&host), 0, "a zero-width border emits no stroke");
 
-        host.apply_tree(WINDOW, build(4)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(4)).expect("valid tree");
         assert_eq!(strokes(&host), 1, "a real one does");
         assert_eq!(
             host.window(WINDOW)
@@ -4809,8 +5034,7 @@ mod tests {
     #[test]
     fn a_wheel_scrolls_the_view_without_the_guest_hearing_anything() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, scrollable_tree())
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, scrollable_tree()).expect("valid tree");
 
         let target = NodeKey::first(13);
         assert_eq!(
@@ -4895,8 +5119,7 @@ mod tests {
     #[test]
     fn scrolling_past_the_end_produces_neither_a_guest_event_nor_a_frame() {
         let mut host = ready_host();
-        host.apply_tree(WINDOW, scrollable_tree())
-            .expect("valid tree");
+        commit_tree(&mut host, WINDOW, scrollable_tree()).expect("valid tree");
 
         // 500 of content in a 100 viewport leaves 400 to scroll.
         host.handle(wheel(5.0, 50.0, 400.0));
@@ -4969,7 +5192,7 @@ mod tests {
         ));
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, tree).expect("valid tree");
+        commit_tree(&mut host, WINDOW, tree).expect("valid tree");
 
         let inner = NodeKey::first(22);
         let outer = NodeKey::first(20);
@@ -4993,10 +5216,10 @@ mod tests {
 
     /// A viewport whose content shrank must not keep pointing past the end.
     ///
-    /// Driven through `apply_tree` rather than by calling the clamp directly,
-    /// because the property is about *ordering* — the offset is confined
-    /// before the new snapshot is lowered and acknowledged, not at some later
-    /// convenient moment.
+    /// Driven through `apply_ui_commit` rather than by calling the clamp
+    /// directly, because the property is about *ordering* — the offset is
+    /// confined before the new snapshot is lowered and acknowledged, not at
+    /// some later convenient moment.
     #[test]
     fn shrinking_content_clamps_a_retained_offset() {
         use instar_ui::{Node, ScrollOffset, WireLayout, WireSize};
@@ -5021,7 +5244,7 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, build(500)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(500)).expect("valid tree");
 
         let window = host.windows.get_mut(&WINDOW).unwrap();
         window
@@ -5034,7 +5257,7 @@ mod tests {
         );
 
         // The same viewport over content that now barely overflows it.
-        host.apply_tree(WINDOW, build(150)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(150)).expect("valid tree");
         assert_eq!(
             host.window(WINDOW)
                 .unwrap()
@@ -5046,7 +5269,7 @@ mod tests {
              pulled back to it"
         );
 
-        host.apply_tree(WINDOW, build(80)).expect("valid tree");
+        commit_tree(&mut host, WINDOW, build(80)).expect("valid tree");
         assert_eq!(
             host.window(WINDOW)
                 .unwrap()
@@ -5083,7 +5306,7 @@ mod tests {
         };
 
         let mut host = ready_host();
-        host.apply_tree(WINDOW, with_scroll()).expect("valid tree");
+        commit_tree(&mut host, WINDOW, with_scroll()).expect("valid tree");
         host.windows
             .get_mut(&WINDOW)
             .unwrap()
@@ -5093,7 +5316,7 @@ mod tests {
         // A commit that changes something else entirely leaves the offset be.
         let mut kept = with_scroll();
         kept.root.children.push(Node::text(12, "sibling"));
-        host.apply_tree(WINDOW, kept).expect("valid tree");
+        commit_tree(&mut host, WINDOW, kept).expect("valid tree");
         assert_eq!(
             host.window(WINDOW)
                 .unwrap()
@@ -5104,7 +5327,8 @@ mod tests {
             "a commit that leaves the viewport alive preserves its offset"
         );
 
-        host.apply_tree(
+        commit_tree(
+            &mut host,
             WINDOW,
             Tree::new(Node::root(0, vec![Node::text(12, "gone")])),
         )
@@ -5130,10 +5354,10 @@ mod tests {
         let before = host.window(WINDOW).unwrap().tree().cloned();
         assert_eq!(
             host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
-            Err(TreeError::GenerationNotAdvanced {
+            Err(UiCommitRefusal::Tree(TreeError::GenerationNotAdvanced {
                 key: NodeKey::first(7),
                 retired: 0,
-            }),
+            })),
             "a stale event for id 7 names a node the ledger has retired"
         );
         assert_eq!(
@@ -5151,7 +5375,7 @@ mod tests {
     /// The window keeps showing the last interface after a guest exits, so the
     /// ids in it are still live as far as everything else is concerned. If
     /// `on_guest_gone` merely emptied the ledger, an identical re-commit would
-    /// take the no-op path in `apply_tree` and never reach `ledger.apply` —
+    /// take the no-op path in `apply_ui_commit` and never reach `ledger.apply` —
     /// leaving those ids unknown, and the first removal-then-reuse accepted at
     /// generation 0, which is the exact hole the ledger exists to close.
     #[test]
@@ -5170,10 +5394,10 @@ mod tests {
 
         assert_eq!(
             host.on_guest_commit(WINDOW, &batch_with_button_7(0)),
-            Err(TreeError::GenerationNotAdvanced {
+            Err(UiCommitRefusal::Tree(TreeError::GenerationNotAdvanced {
                 key: NodeKey::first(7),
                 retired: 0,
-            }),
+            })),
             "id 7 was live in the tree the dead generation left on screen, so \
              reusing it must still require a higher generation"
         );
@@ -5434,5 +5658,197 @@ mod tests {
             "doubling the scale factor while the logical size is unchanged must \
              not move anything: instar-ui never sees DPI"
         );
+    }
+
+    // --- Text-view attachments (B2e-3b) ---
+
+    /// Opens one buffer and one view for `GEN1`, registering both leases.
+    fn create_view(host: &mut Host) -> OpaqueResourceKey {
+        let mut serve = |operation: TextOperation| {
+            let (request, wait) = text_request(GEN1, operation);
+            let screened = request.screen(GEN1).expect("current generation");
+            host.text_resources_mut().serve(screened);
+            wait.blocking_recv().expect("answered")
+        };
+
+        let buffer = match serve(TextOperation::CreateBuffer) {
+            Ok(TextAnswer::Created(key)) => key,
+            other => panic!("expected a buffer, got {other:?}"),
+        };
+        match serve(TextOperation::CreateView { buffer }) {
+            Ok(TextAnswer::Created(key)) => key,
+            other => panic!("expected a view, got {other:?}"),
+        }
+    }
+
+    /// A root whose text-view children name the given slots.
+    fn attachment_batch(nodes: &[(u32, u16)]) -> Vec<u8> {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            nodes.len() as u16,
+        );
+        for (id, slot) in nodes {
+            encoder.text_view(
+                NodeKey::first(*id),
+                flags::ENABLED,
+                *slot,
+                WireLayout::default(),
+            );
+        }
+        encoder.finish()
+    }
+
+    /// Stages a commit exactly as the bridge's normative order would, with
+    /// every key assumed to resolve, and returns the staged commit plus the
+    /// resolved map.
+    fn stage_with_attachments(
+        host: &mut Host,
+        batch: &[u8],
+        keys: &[OpaqueResourceKey],
+    ) -> (StagedUiCommit, BTreeMap<NodeKey, TextViewId>) {
+        let snapshot = DecodedUiSnapshot::decode(batch).expect("batch decodes");
+        let resolved = host
+            .resolve_attachment_table(GEN1, keys)
+            .expect("every key is leased to the generation");
+        // Production's own slot resolution, not a reimplementation of it.
+        // Rebuilding the map here would leave the permutation regression below
+        // proving something about this helper rather than about the host.
+        let attachments = Host::resolve_attachments(&snapshot.text_attachments, &resolved)
+            .expect("slots are in range and no view is claimed twice");
+        let validated = host
+            .validate_ui_commit(WINDOW, snapshot.tree, snapshot.text_attachments)
+            .expect("the tree diff accepts");
+        let staged = host
+            .stage_ui_commit(WINDOW, validated, attachments.clone())
+            .expect("the ledger accepts");
+        (staged, attachments)
+    }
+
+    /// The tableless entry point refuses a text view rather than stripping it.
+    ///
+    /// `on_guest_commit` carries no capabilities, so the resolved table is
+    /// empty and any slot fails the `slot >= table.len()` check — slot 0 is
+    /// already past a zero-length table, exactly the rule a slot far past the
+    /// end would trip. This is deliberately not a special case for "no side
+    /// table": the rule is that each class of bad input has exactly one
+    /// refusal it can produce, and an empty capability list is the same
+    /// `AttachmentOutOfRange` class as a slot that names nothing.
+    #[test]
+    fn a_text_view_without_a_side_table_is_refused_not_stripped() {
+        let mut host = Host::new();
+        let batch = attachment_batch(&[(10, 0)]);
+
+        assert!(matches!(
+            host.on_guest_commit(WINDOW, &batch),
+            Err(UiCommitRefusal::Attachment(
+                AttachmentRefusal::AttachmentOutOfRange
+            ))
+        ));
+        assert!(
+            host.window(WINDOW).is_none_or(|w| w.tree().is_none()),
+            "and the refusal left no tree behind"
+        );
+    }
+
+    /// A: slot 0 -> V7, B: slot 9 -> V7. The attachment diff is EMPTY.
+    ///
+    /// The slot is commit-local scratch: what survived into the retained map
+    /// is `node10 -> V7` in both commits, so a diff that looked at slots
+    /// would report a change that never happened.
+    #[test]
+    fn a_moving_slot_that_resolves_to_the_same_view_diffs_to_nothing() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let a = attachment_batch(&[(10, 0)]);
+        let b = attachment_batch(&[(10, 9)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        // B's table is ten entries long so slot 9 can name V7; the other nine
+        // entries are unreferenced scratch, which is legal.
+        let (staged_b, map_b) = stage_with_attachments(&mut host, &b, &[v7; 10]);
+        assert!(
+            staged_b.tree_changes.is_empty(),
+            "the tree is identical; only the slot moved"
+        );
+        assert_eq!(
+            staged_b.attachment_changes,
+            attachment::AttachmentChangeSet::default(),
+            "slot 0 and slot 9 both resolve to V7, so nothing changed in the \
+             only representation admission retains"
+        );
+        assert_eq!(
+            map_b.get(&NodeKey::first(10)),
+            Some(&TextViewId {
+                id: 0,
+                generation: 0
+            }),
+            "and the retained map really does still name V7"
+        );
+    }
+
+    /// A: slot 0 -> V7, B: slot 0 -> V12. The attachment diff CHANGED.
+    #[test]
+    fn the_same_node_now_naming_a_different_view_is_replaced() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let v12 = create_view(&mut host);
+        let a = attachment_batch(&[(10, 0)]);
+        let b = attachment_batch(&[(10, 0)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        let (staged_b, _) = stage_with_attachments(&mut host, &b, &[v12]);
+        assert_eq!(
+            staged_b.attachment_changes.replaced,
+            vec![NodeKey::first(10)],
+            "node10 now names V12 instead of V7"
+        );
+        assert!(staged_b.attachment_changes.attached.is_empty());
+        assert!(staged_b.attachment_changes.detached.is_empty());
+    }
+
+    /// The permutation: the same two nodes keep the same two views while both
+    /// slots move. Tree diff EMPTY, attachment diff EMPTY.
+    ///
+    /// This is the case that makes the table's positional scratch semantics
+    /// unavoidable: a single moving slot only proves one slot may move, while
+    /// swapping both proves the whole table is positional scratch space. Any
+    /// code comparing slot numbers or side-table positions must fail it.
+    #[test]
+    fn swapping_every_slot_still_diff_to_nothing() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let v8 = create_view(&mut host);
+        let v7_id = host.resolve_attachment_table(GEN1, &[v7]).unwrap()[0];
+        let v8_id = host.resolve_attachment_table(GEN1, &[v8]).unwrap()[0];
+        let a = attachment_batch(&[(10, 0), (20, 1)]);
+        let b = attachment_batch(&[(10, 1), (20, 0)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7, v8]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        // B swaps the table order too: slot 1 now names V7 and slot 0 names
+        // V8, so both nodes keep the same view while every position moved.
+        let (staged_b, map_b) = stage_with_attachments(&mut host, &b, &[v8, v7]);
+        assert!(
+            staged_b.tree_changes.is_empty(),
+            "the tree is identical; only the slot assignment moved"
+        );
+        assert_eq!(
+            staged_b.attachment_changes,
+            attachment::AttachmentChangeSet::default(),
+            "node10 still names V7 and node20 still names V8, so no NodeKey \
+             was attached, detached, or replaced"
+        );
+        assert_eq!(map_b.get(&NodeKey::first(10)), Some(&v7_id));
+        assert_eq!(map_b.get(&NodeKey::first(20)), Some(&v8_id));
     }
 }

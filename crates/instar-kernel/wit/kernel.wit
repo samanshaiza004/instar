@@ -30,6 +30,11 @@ interface kernel-types {
     variant commit-error {
         /// The batch failed to decode or validate.
         invalid-batch(string),
+        /// One of the commit's text-view attachments was refused, before any
+        /// tree work happened. The payload is the attachment subsystem's own
+        /// validation taxonomy rather than a flat error case; see
+        /// `attachment-error` for why it is nested.
+        invalid-attachment(attachment-error),
         /// Another commit from this generation is still outstanding, so this
         /// one is refused without being queued. The guest should retry after
         /// the earlier commit resolves.
@@ -48,6 +53,50 @@ interface kernel-types {
         /// If that owner disappears mid-flight the guest must be told, rather
         /// than left parked on a reply that is never coming.
         host-unavailable,
+    }
+
+    /// Why one of a commit's text-view attachments was refused.
+    ///
+    /// A nested family rather than four more top-level `commit-error` cases,
+    /// because this is one subsystem's validation taxonomy: every variant
+    /// exists because of the attachment side table, and flattening them into
+    /// the top-level API beside `commit-in-progress` and `host-unavailable`
+    /// would turn the commit error surface into one long list of unrelated
+    /// rules. The nested case keeps "the commit itself" separate from "the
+    /// text-view attachments this commit carried".
+    ///
+    /// No variant carries a slot number, key, or count: the refusal is about
+    /// the side table as a whole, and the host's job is to tell the guest
+    /// *which* family of rule it tripped, not to hand the guest back enough
+    /// to re-derive the failure.
+    variant attachment-error {
+        /// The side table is larger than the maximum useful cardinality.
+        ///
+        /// A valid snapshot has at most MAX_NODES nodes and every text view
+        /// refers to at most one slot, so no valid tree can reference more
+        /// than MAX_NODES distinct slots; entries beyond that cannot
+        /// contribute, so Instar refuses them to bound resolution work. This
+        /// is a policy on table size, not a theorem falling out of wire
+        /// validity.
+        too-many-attachments,
+        /// The side-table entry exists, but the key fails to resolve to a
+        /// lease this generation owns.
+        ///
+        /// The name is deliberately not "unknown text view": this covers a
+        /// stale incarnation and cross-generation use, where the key still
+        /// names a slot the host knows about, just not one this generation's
+        /// side table may reach.
+        unavailable-text-view,
+        /// The entry named a slot outside the side table it is supposed to
+        /// index into.
+        attachment-out-of-range,
+        /// Two live NodeKeys reached one TextViewId.
+        ///
+        /// Duplicate side-table entries like `[V7, V7]` are legal -- a single
+        /// text view may be attached in several places. What is illegal is
+        /// two *different* live NodeKeys naming the same TextViewId, which is
+        /// the state this refusal exists to catch.
+        text-view-already-attached,
     }
 
     record commit-result {
@@ -91,10 +140,21 @@ interface kernel-runtime {
 /// thread that owns the tree, applies it atomically, and replies. Suspending a
 /// concurrent guest call while the host does work elsewhere is exactly what
 /// the Component Model's async support is for.
+///
+/// As of B2e-3a, `instar:kernel` also `use`s `instar:text`: the kernel world
+/// already assembles that package (the `instar:text/text` import below), and
+/// carrying a capability through a commit is the first place kernel vocabulary
+/// references text's vocabulary too. The commit keeps the side table as a list
+/// of borrowed `text-view` handles, transported alongside the batch and
+/// resolved only by the host that owns both the tree and the text subsystem.
 interface kernel-ui {
     use kernel-types.{commit-result, commit-error};
+    use instar:text/text@0.1.0.{text-view};
 
-    commit: async func(batch: list<u8>) -> result<commit-result, commit-error>;
+    commit: async func(
+        batch: list<u8>,
+        text-views: list<borrow<text-view>>,
+    ) -> result<commit-result, commit-error>;
 }
 
 /// Host-owned long-running operations.
