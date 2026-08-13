@@ -1552,3 +1552,364 @@ Completion evidence: `cargo test -p instar-text`, `cargo test -p instar-ui`,
 `cargo check -p instar-shell` pass in the workspace. The production harness
 observes retained attachments, resource counts, selection/revision, and scene
 state without adding a routing or promotion test path.
+
+---
+
+## Package C — revision and edit synchronization, frozen
+
+> **The question:** can host-local edits stay immediate while guest and host
+> converge deterministically under delay, conflict, desynchronization, and
+> generation teardown?
+
+Not *restart*. C cannot prove same-document restart recovery, and the reason is
+recorded below rather than glossed.
+
+Frozen before implementation, as B was. Nothing from D–H starts alongside it:
+this is where the two-authority text model proves itself or breaks.
+
+### `next-edit` is `async func`. The other four are not.
+
+The WIT already encodes the rule, and C must not break it:
+
+```text
+async func    next-event, commit, await-op    suspend on an external event
+func          start, cancel, create-*         bounded; the guest blocks inside
+```
+
+Marking a plain import async in `bindgen!` makes only the *host implementation*
+async — to WebAssembly the call is still blocking, so the guest task is parked
+and can do nothing else meanwhile. A guest must be able to await an edit and a
+UI event concurrently, which makes this the first `instar:text` function that
+has to be `async func` in the WIT itself.
+
+```wit
+next-edit: async func(buffer: borrow<text-buffer>)
+    -> result<edit-notification, text-error>;
+
+create-buffer:  func(contents: string)            -> result<text-buffer, text-error>;
+apply-edits:    func(buffer: borrow<text-buffer>,
+                     expected-revision: u64,
+                     edits: list<text-edit>)      -> result<apply-outcome, text-error>;
+read-range:     func(buffer: borrow<text-buffer>,
+                     start: u64, end: u64)        -> result<range-contents, text-error>;
+resynchronize:  func(buffer: borrow<text-buffer>) -> result<snapshot, text-error>;
+
+variant edit-notification {
+    edits(list<applied-edit>),
+    desynchronized(u64),        // latest revision
+}
+
+variant apply-outcome {
+    applied(u64),               // new revision
+    conflict(u64),              // current revision
+}
+```
+
+`conflict` is an outcome, not a `text-error`. A guest that loses a race is
+told, and being told is ordinary.
+
+### The sync state machine
+
+Per `(GenerationId, TextBufferId)` — the keying `GenerationLeases` already
+uses, because a generation's death must take its synchronization state and
+nothing else.
+
+```text
+Synchronized   { queue: VecDeque<AppliedEdit>, queued_bytes }
+Desynchronized { latest_revision }
+```
+
+```text
+host-local edit, synchronized     -> admit, or collapse
+host-local edit, desynchronized   -> enqueue nothing; move latest_revision only
+next-edit, queue non-empty        -> drain a bounded batch
+next-edit, queue empty, synced    -> suspend
+next-edit, desynchronized         -> Desynchronized { latest_revision }
+```
+
+**Collapse immediately; never coalesce.** A spanning edit covering `min..max`
+of a backlog is frequently most of the document anyway, and it destroys the
+exact granularity Tree-sitter and every other incremental consumer exists to
+use. One incremental path plus one snapshot recovery path is fewer algorithms
+than an incremental path, a synthetic-edit path, and a recovery path.
+
+While desynchronized the host holds one revision number, whatever the guest is
+doing. That is what makes an arbitrarily stalled guest survivable.
+
+#### The bound is checked before the allocation
+
+Normative, because "push, then check" allocates precisely the memory the bound
+exists to prevent:
+
+```text
+prospective_count = queue.len() + 1
+prospective_bytes = queued_bytes.checked_add(edit.replacement.len())
+
+exceeds either  ->  clear the queue, become Desynchronized, and never clone
+                    or push the replacement
+otherwise       ->  push
+```
+
+#### Both bounds, because one is not a bound
+
+```text
+MAX_PENDING_EDITS        entries
+MAX_PENDING_EDIT_BYTES   summed replacement length
+```
+
+A count-only ceiling is defeated by one paste or one IME commit; a byte-only
+ceiling is defeated by ten thousand keystrokes. Neither is the bound; the pair
+is. The same pair, inbound, bounds an `apply-edits` batch — a million empty
+replacements defeats a byte-only limit from the other direction.
+
+#### Consuming the marker does not clear it
+
+The rule that closes the race, and the one most likely to be got wrong:
+
+```text
+guest receives Desynchronized { 42 }   -> still desynchronized
+guest resynchronizes                   -> host atomically snapshots at R
+                                          and re-arms the queue at R
+edit R -> R+1                          -> queued normally
+```
+
+If draining the marker re-armed the queue, every edit between the drain and the
+guest's read would be lost in silence, and the guest would believe itself
+synchronized at a revision it had never read. **Recovery is a property of the
+read, not of the delivery.**
+
+#### `read-range` is strictly observational
+
+It never re-arms, and it is not the recovery mechanism. The hazard is invisible
+until it corrupts a document:
+
+```text
+guest canonical @ 5
+host edits 5 -> 6 -> 7          both queued
+guest apply-edits(expected=5)   -> conflict(7)
+guest read-range(...)           -> bytes @ 7
+queue still holds 5->6, 6->7
+```
+
+A guest that adopted revision 7 from that read and then drained the queue would
+apply both edits a second time. So after `conflict` a guest either drains
+`next-edit` until it has caught up, **or** calls `resynchronize`.
+
+`resynchronize` is therefore legal while synchronized too, and does the same
+three things in both states:
+
+```text
+snapshot the rope at R
+discard pending notifications through R
+establish R as the new sync base
+```
+
+One snapshot mechanism serves queue overflow and "I would rather not replay
+this backlog" alike. No acknowledgement protocol is needed, and the recovery
+path is exercised routinely rather than only after a fault.
+
+#### Bootstrap establishes a baseline, not an edit
+
+> `create-buffer(contents)` establishes a baseline revision. It generates no
+> edit notification and no journal entry.
+
+The guest supplied the bytes; reporting them back is the host telling the guest
+its own text as news, and a journal entry would make the document's first state
+undoable into an empty buffer it never had. Born `Synchronized` with an empty
+queue; `create-empty-buffer` is the same rule at `Revision(0)`.
+
+#### Guest edits are not echoed to their source generation
+
+Echoing would oblige every guest to filter its own edits back out to avoid
+double-applying — a correctness burden on every guest, forever, to save one bit
+of origin in the host. A buffer is reachable by exactly one generation, so
+origin is binary and cheap.
+
+The batch is atomic: `conflict` applies nothing, exactly as a refused UI commit
+promotes nothing.
+
+#### One outstanding `next-edit` per (generation, buffer)
+
+A second is a deterministic refusal, not two futures racing one queue. The
+mechanism exists already: `begin_commit`'s semaphore and `CommitPermit` are the
+same shape, and `commit-in-progress` is the same refusal.
+
+Teardown drops the waiter without leaking sync state, and B2e-3a's rule binds
+unchanged — **resolve the borrow to a stable `TextBufferId` before
+suspending.** Nothing table-derived may be retained across the await.
+
+### Transfer, and the ceiling it forces
+
+A bounded single-shot resync implies a bounded document, or C has a state it
+cannot leave:
+
+```text
+create a 10 MiB document, edit it up to 20 MiB
+queue overflows      -> Desynchronized
+resynchronize()      -> cannot return 20 MiB.  Stuck, permanently.
+```
+
+So, frozen together:
+
+```text
+MAX_TEXT_BUFFER_BYTES <= MAX_TEXT_TRANSFER_BYTES
+```
+
+`MAX_TEXT_BUFFER_BYTES` is enforced on **every** mutation — `apply-edits` and
+host-local edits alike — not only at bootstrap. 16 or 32 MiB is ample against
+the 1–10 MiB target `textbench` already exercises. Later evidence can replace
+the ceiling with chunked transfer; until then the ceiling is what makes
+recovery total.
+
+#### The snapshot is cloned on the text thread and materialized off it
+
+Not "one copy": a rope clone, then a materialization, then a Canonical ABI
+transfer.
+
+```text
+text-owner thread   clone the Rope (O(1), structurally shared)
+                    capture revision R, re-arm sync state at R
+                    reply with the snapshot
+runtime thread      materialize UTF-8, lower into the guest
+```
+
+Holding the presentation thread while building a 10 MiB `String` would stall
+the window in order to serve a recovery — the exact failure the architecture
+claims not to have. `crop::Rope` and `TextStorage` are both `Send`, verified by
+compile-time assertion before this was frozen, so the split is available.
+
+Deferred chunking stays cheap for the same reason: a future chunked resync can
+pin a snapshot at R and serve ranges while the live rope moves on.
+
+#### Hostcall fuel is containment, not the API limit
+
+B2e-3's close-out recorded that `MAX_TEXT_ATTACHMENTS` bounds Instar's work
+*after* Canonical ABI lifting and cannot bound the lift itself, and that
+`runtime.rs` installs the limiter and epoch deadline and nothing else. C is
+where that audit is owed, because `create-buffer(contents)` and `apply-edits`
+are the first calls handing the host megabytes.
+
+`Store::set_hostcall_fuel` bounds host allocation while lifting guest→host, is
+reset per host call, corresponds roughly to transferred bytes, and defaults to
+128 MiB. It does **not** constrain host→guest — so it protects bootstrap and
+`apply-edits`, while `MAX_TEXT_BUFFER_BYTES` is what protects `resynchronize`.
+The two interlock; neither replaces the other.
+
+```text
+canonical ABI fuel   containment against absurd pre-lift input
+Instar limits        precise API policy, and a typed refusal
+```
+
+### Generation teardown, and what C does not answer
+
+A new generation cannot inherit handles: leases die with the generation, and
+there is no API to acquire a buffer that already exists. A restarted guest does
+not resume a session — it creates a buffer and bootstraps it.
+
+```text
+sync state is per (generation, buffer), and dies with the generation
+any buffer a new generation can name starts Synchronized at its baseline
+a dead generation's apply-edits is refused by the existing generation screen
+```
+
+What C does **not** add is re-acquisition of a buffer that outlived its
+generation. B2e-4 made retained attachments counted owners, so an attached view
+can keep a document alive with no guest able to name it. That is
+resource-acquisition rather than synchronization, and inventing an API for it
+inside the package about convergence would repeat the mistake B2e-0 avoided
+when it refused to design synchronization inside a resource constructor.
+
+Named here so it is a known hole rather than a discovered one — and it is why
+the question above says *teardown* and not *restart*.
+
+### Order, and the mutants each package owes
+
+`a0866d8`'s rule binds: every lifetime or authority invariant gets its mutant
+written first, and the test is accepted only after the mutant has been observed
+failing.
+
+```text
+C1  the sync state machine       host-only Rust, no WIT
+C2  next-edit                    async func, kernel bridge, delivery
+C3  apply-edits and conflict
+C4  transfer: create-buffer(contents), read-range, resynchronize
+C5  convergence, workload stalls, teardown
+```
+
+C1 is deliberately pure Rust with no guest in it, so the state machine is
+exhaustively testable before a suspension point exists — the split B2e-1 used
+for its kernel and host halves.
+
+```text
+C1  bound checked after the push             the allocation the bound prevents
+    only the count bounded                   one 1 MiB paste stays queued
+    only the bytes bounded                   ten thousand keystrokes stay queued
+    desync still enqueues                    host cost grows with the stall
+    desync forgets latest_revision           resync re-arms at the wrong point
+    collapse keeps the queue head            partial history claims to be whole
+
+C2  next-edit declared plain func            no guest can await UI and edits at once
+    suspends while desynchronized            a stalled guest never hears it is behind
+    marker cleared on delivery               the re-arm race, silently
+    batch drains past its bound              one call returns the whole backlog
+    a second waiter admitted                 two futures race one queue
+    borrow retained across the await         a Store-derived handle outlives its call
+
+C3  conflict applies a prefix                a refused batch mutated the document
+    expected_revision unchecked              applied to text that moved underneath
+    guest edits echoed to their origin       every guest double-applies its own
+    inbound batch unbounded                  a million empty edits, or one huge one
+
+C4  resynchronize re-arms non-atomically     edits between read and re-arm are lost
+    read-range re-arms                       a conflict re-read discards the queue
+    read-range used as recovery              the double-application hazard, shipped
+    ceiling checked only at bootstrap        edits grow past what resync can return
+    snapshot materialized on the text thread a recovery stalls the window
+    bootstrap emits an edit                  the guest hears its own text as news
+    bootstrap records a journal entry        undo reaches a document that never was
+```
+
+#### C5 is workload-based, not time-based
+
+"A 500 ms stall stays synchronized" is not the invariant, and the earlier note
+in *Out of scope for B* should be read as shorthand for this. A 500 ms stall
+containing a 20 MiB paste must desynchronize; a twenty-minute stall with no
+edits must cost nothing.
+
+```text
+a typing workload under both bounds        -> incremental, no desync
+that workload plus one entry               -> desync
+that workload plus one byte past the cap   -> desync
+an arbitrarily long stall with zero edits  -> zero queue growth
+```
+
+A build where only some of those pass is a build where the bounds mean nothing.
+
+`cargo-mutants`, scoped to the C modules, as the close-out frames it: it finds
+the unmutated branches *around* these, not these.
+
+#### The closure gate
+
+Driven through a real guest and the real bridge, as B2e-3c's seam test is.
+`guests/hostile` is the natural home — it already owns deliberate misbehaviour
+and already holds text capabilities.
+
+```text
+non-empty bootstrap
+  -> host-local typing and guest apply-edits concurrently
+  -> a conflict, refused, then resolved by draining
+  -> a second conflict, resolved by resynchronize instead
+  -> a workload past the bounds, desynchronized
+  -> resynchronize, re-armed
+  -> convergence: host replica and guest document byte-identical at a
+     revision both agree on
+```
+
+Gate 3 of the four stops being theoretical here:
+
+```text
+1  input-to-pixel latency stays host-local and low        B
+2  a stalled guest does not stall caret, selection, IME   B
+3  host and guest converge after edits and conflicts      <- C
+4  1-10 MB documents do not create pathological costs     A / D
+```
