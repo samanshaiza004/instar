@@ -360,7 +360,7 @@ impl Hostile {
         // has stopped speaking has stopped speaking.
         self.mode = Mode::Normal;
 
-        match kernel_ui::commit(batch).await {
+        match kernel_ui::commit(batch, Vec::new()).await {
             Ok(_) => Ok(()),
             // A rejection is *not* an error here. The host refusing a batch is
             // a normal outcome the guest is told about, and a guest that fell
@@ -381,7 +381,10 @@ impl Hostile {
     async fn flood_commits(&self) -> String {
         let mut pending: Vec<Option<PendingCommit>> = Vec::with_capacity(CONCURRENT_COMMITS);
         for _ in 0..CONCURRENT_COMMITS {
-            pending.push(Some(Box::pin(kernel_ui::commit(self.encode()))));
+            pending.push(Some(Box::pin(kernel_ui::commit(
+                self.encode(),
+                Vec::new(),
+            ))));
         }
         let outcome = JoinCommits {
             pending,

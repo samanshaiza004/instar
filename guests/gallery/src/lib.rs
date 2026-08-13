@@ -682,7 +682,7 @@ impl Gallery {
     }
 
     async fn commit(&self) -> Result<(), String> {
-        kernel_ui::commit(self.encode())
+        kernel_ui::commit(self.encode(), Vec::new())
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))

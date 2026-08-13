@@ -460,7 +460,11 @@ fn an_invalid_commit_changes_nothing() {
     let before = label(&bridge);
     let commit_sequence = bridge.commit_sequence();
 
-    let (request, reply) = commit_request(bridge.generation(), b"not a batch at all".to_vec());
+    let (request, reply) = commit_request(
+        bridge.generation(),
+        b"not a batch at all".to_vec(),
+        Vec::new(),
+    );
     let effects = bridge.on_user_event(HostUserEvent::UiCommit {
         generation: bridge.generation(),
         request,
@@ -673,7 +677,11 @@ fn a_trap_stops_an_in_flight_commit_from_mutating_anything() {
     // A commit from the live generation, held back rather than delivered --
     // the state a batch is in between leaving the runtime thread and being
     // applied.
-    let (request, reply) = commit_request(generation, foreign_batch("applied after the trap"));
+    let (request, reply) = commit_request(
+        generation,
+        foreign_batch("applied after the trap"),
+        Vec::new(),
+    );
 
     click(&mut bridge, CRASH);
     let started = Instant::now();
@@ -771,7 +779,7 @@ fn an_old_generation_commit_is_rejected_before_decoding() {
         "with no guest running, no generation is current"
     );
 
-    let (request, reply) = commit_request(old, b"\xff\xff\xff undecodable".to_vec());
+    let (request, reply) = commit_request(old, b"\xff\xff\xff undecodable".to_vec(), Vec::new());
     let before = label(&bridge);
     bridge.on_user_event(HostUserEvent::UiCommit {
         generation: old,

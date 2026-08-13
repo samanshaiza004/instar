@@ -2012,7 +2012,7 @@ mod tests {
 
     /// Delivers a batch as if the guest had just committed it.
     fn deliver(bridge: &mut HostBridge, batch: Vec<u8>) {
-        let (request, _reply) = commit_request(bridge.generation(), batch);
+        let (request, _reply) = commit_request(bridge.generation(), batch, Vec::new());
         bridge.on_user_event(HostUserEvent::UiCommit {
             generation: bridge.generation(),
             request,

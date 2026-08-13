@@ -112,7 +112,7 @@ impl Counter {
     /// Suspends until the host has accepted this interface as something it can
     /// show. Resuming means layout succeeded, not merely that the bytes parsed.
     async fn commit(&self) -> Result<(), String> {
-        kernel_ui::commit(self.encode())
+        kernel_ui::commit(self.encode(), Vec::new())
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))

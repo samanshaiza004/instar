@@ -1245,7 +1245,7 @@ mod tests {
     fn queued_commit(batch: Vec<u8>) -> HostUserEvent {
         HostUserEvent::UiCommit {
             generation: GEN,
-            request: commit_request(GEN, batch).0,
+            request: commit_request(GEN, batch, Vec::new()).0,
         }
     }
 

@@ -32,7 +32,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bridge::{CommitRejection, CommitSink};
 use crate::resource::{EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy};
-use crate::text_bridge::{GuestTextBuffer, GuestTextView};
+use crate::text_bridge::{GuestTextBuffer, GuestTextView, MAX_TEXT_ATTACHMENTS, OpaqueResourceKey};
 
 wasmtime::component::bindgen!({
     path: "wit",
@@ -53,7 +53,9 @@ wasmtime::component::bindgen!({
     },
 });
 
-use instar::kernel::kernel_types::{CommitError, CommitResult, OpError, RuntimeError};
+use instar::kernel::kernel_types::{
+    AttachmentError, CommitError, CommitResult, OpError, RuntimeError,
+};
 
 /// Identifies one guest generation: one `Store`, one component instance, one
 /// guest task. Monotonic and never reused, so a stale message can always be
@@ -166,6 +168,25 @@ impl OperationRegistry {
         }
         ids.len()
     }
+}
+
+/// Proof that a commit has passed the two cheap gates.
+///
+/// Owning this value encodes that the stale and overlap checks have already
+/// passed: the generation was current when it was minted and this generation's
+/// commit slot was acquired. `commit_batch` therefore needs no gate of its
+/// own, and a later edit cannot silently move expensive work (decoding,
+/// attachment extraction) ahead of the gate by writing a fresh
+/// `commit_batch` call that skips `begin_commit`.
+///
+/// The type exists for that ordering, not for taste: the semaphore permit is
+/// just RAII on its own, and the generation is rechecked separately on the
+/// main thread anyway. What the wrapper adds is that the two checks become a
+/// single unit a caller either has or does not have.
+#[derive(Debug)]
+pub struct CommitPermit {
+    /// Held for its `Drop`, never read.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Host state shared across generations.
@@ -332,29 +353,30 @@ impl SharedKernel {
         self.commit_sink.get().is_some()
     }
 
-    /// Answers one guest `commit` call.
+    /// Runs the two cheap gates every commit must pass before any work is
+    /// done on its behalf.
     ///
-    /// The generation check happens twice on purpose. Here it is the cheap
-    /// local one, so a superseded guest's batch never crosses a thread at all.
-    /// The main thread checks again on arrival, because by then the answer may
-    /// have changed — a generation can be torn down while its commit is in
-    /// flight, and `docs/PHASE-1.md` makes that second check the *first* thing
-    /// the main thread does.
-    async fn commit_batch(
+    /// Order is fixed and load-bearing: a superseded generation is refused
+    /// before it can consume its successor's commit slot, and an overlapping
+    /// commit is refused before its batch, its attachment count, or any of
+    /// its handles can make the host spend work. The returned [`CommitPermit`]
+    /// is what makes a later edit unable to run the expensive parts ahead of
+    /// these gates.
+    fn begin_commit(
         &self,
         generation: GenerationId,
-        commit_slot: Arc<tokio::sync::Semaphore>,
-        batch: Vec<u8>,
-    ) -> Result<CommitResult, CommitError> {
+        commit_slot: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<CommitPermit, CommitError> {
         if !self.is_current(generation) {
             self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
             return Err(CommitError::StaleGeneration);
         }
 
-        // Single-flight gate. The permit is RAII: it is released when this
-        // future completes, is rejected, is cancelled, or is dropped -- so a
-        // later sequential commit can always proceed after the first resolves.
-        let _commit_permit = match commit_slot.try_acquire_owned() {
+        // Single-flight gate. The permit is RAII: it is released when the
+        // commit future completes, is rejected, is cancelled, or is dropped --
+        // so a later sequential commit can always proceed after the first
+        // resolves.
+        let permit = match Arc::clone(commit_slot).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 self.commit_in_progress_rejections
@@ -362,12 +384,39 @@ impl SharedKernel {
                 return Err(CommitError::CommitInProgress);
             }
         };
+        Ok(CommitPermit { _permit: permit })
+    }
+
+    /// Answers one guest `commit` call.
+    ///
+    /// The generation check happens twice on purpose. `begin_commit` already
+    /// passed it, so the batch could reach this thread at all; it is
+    /// rechecked here because by then the answer may have changed — a
+    /// generation can be torn down while its commit is in flight, and
+    /// `docs/PHASE-1.md` makes the main thread's arrival check the *first*
+    /// thing it does. The permit argument is what keeps this method unable to
+    /// run the expensive parts before either gate.
+    async fn commit_batch(
+        &self,
+        _permit: CommitPermit,
+        generation: GenerationId,
+        text_views: Vec<OpaqueResourceKey>,
+        batch: Vec<u8>,
+    ) -> Result<CommitResult, CommitError> {
+        if !self.is_current(generation) {
+            self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
+            return Err(CommitError::StaleGeneration);
+        }
 
         let Some(sink) = self.commit_sink.get() else {
             // No owner installed: keep the batch here so a headless caller can
-            // read back what the guest said. Note this log is *not* written on
-            // the sink path — a host that owns the tree does not need the
-            // kernel hoarding every batch it was ever handed.
+            // read back what the guest said. The attachment keys are ignored
+            // because a headless commit log has no TextHost to resolve them
+            // against — the side table is meaningful only to whoever owns both
+            // the tree and the text subsystem, and this path has neither. Note
+            // this log is *not* written on the sink path — a host that owns
+            // the tree does not need the kernel hoarding every batch it was
+            // ever handed.
             let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
             self.commits
                 .lock()
@@ -376,7 +425,7 @@ impl SharedKernel {
             return Ok(CommitResult { revision });
         };
 
-        let (request, reply) = crate::bridge::commit_request(generation, batch);
+        let (request, reply) = crate::bridge::commit_request(generation, batch, text_views);
         if sink.submit(request).is_err() {
             // The request came back, so nobody took ownership of answering it.
             // Dropping it here is the answer.
@@ -386,6 +435,9 @@ impl SharedKernel {
         match reply.await {
             Ok(Ok(revision)) => Ok(CommitResult { revision }),
             Ok(Err(CommitRejection::Invalid(reason))) => Err(CommitError::InvalidBatch(reason)),
+            Ok(Err(CommitRejection::Attachment(refusal))) => {
+                Err(CommitError::InvalidAttachment(refusal.into()))
+            }
             Ok(Err(CommitRejection::StaleGeneration)) => {
                 self.stale_commits_rejected.fetch_add(1, Ordering::SeqCst);
                 Err(CommitError::StaleGeneration)
@@ -466,6 +518,18 @@ impl From<crate::text_bridge::TextRefusal> for instar::text::text_types::TextErr
             // A guest whose generation died while a request was in flight is
             // told the host could not serve it, not that its handle was bad.
             TextRefusal::StaleGeneration | TextRefusal::HostUnavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl From<crate::text_bridge::AttachmentRefusal> for AttachmentError {
+    fn from(refusal: crate::text_bridge::AttachmentRefusal) -> Self {
+        use crate::text_bridge::AttachmentRefusal;
+        match refusal {
+            AttachmentRefusal::TooManyAttachments => Self::TooManyAttachments,
+            AttachmentRefusal::UnavailableTextView => Self::UnavailableTextView,
+            AttachmentRefusal::AttachmentOutOfRange => Self::AttachmentOutOfRange,
+            AttachmentRefusal::TextViewAlreadyAttached => Self::TextViewAlreadyAttached,
         }
     }
 }
@@ -606,22 +670,74 @@ impl instar::text::text::HostTextView for GenerationState {
 impl instar::kernel::kernel_ui::HostWithStore<GenerationState>
     for wasmtime::component::HasSelf<GenerationState>
 {
+    /// Committing suspends the guest (WP7B1), and now carries a side table of
+    /// borrowed text-view handles alongside the batch.
+    ///
+    /// Ordering is the point (B2e-3a). The generation preflight and the
+    /// single-flight gate run first, before anything derived from the table.
+    /// Then the attachment-count bound is checked, and only then are the
+    /// handles turned into opaque keys. Every table-derived borrow dies inside
+    /// the second `accessor.with`; nothing but tiny keys crosses the await,
+    /// and a borrowed handle is never `table.delete`d.
     fn commit(
         accessor: &wasmtime::component::Accessor<GenerationState, Self>,
         batch: Vec<u8>,
+        text_views: Vec<Resource<GuestTextView>>,
     ) -> impl std::future::Future<Output = wasmtime::Result<Result<CommitResult, CommitError>>> + Send
     {
-        let (kernel, generation, commit_slot) = accessor.with(|mut access| {
-            let state = access.get();
-            (
-                Arc::clone(&state.kernel),
-                state.generation,
-                Arc::clone(&state.commit_slot),
-            )
-        });
-
-        async move { Ok(kernel.commit_batch(generation, commit_slot, batch).await) }
+        Box::pin(commit_impl(accessor, batch, text_views))
     }
+}
+
+/// The body of `commit`, as a plain async function so the early refusals can
+/// `return` without juggling boxed futures.
+async fn commit_impl(
+    accessor: &wasmtime::component::Accessor<
+        GenerationState,
+        wasmtime::component::HasSelf<GenerationState>,
+    >,
+    batch: Vec<u8>,
+    text_views: Vec<Resource<GuestTextView>>,
+) -> wasmtime::Result<Result<CommitResult, CommitError>> {
+    // O(1). No per-handle work: just the kernel, the generation, and the
+    // commit slot that gates it.
+    let (kernel, generation, commit_slot) = accessor.with(|mut access| {
+        let state = access.get();
+        (
+            Arc::clone(&state.kernel),
+            state.generation,
+            Arc::clone(&state.commit_slot),
+        )
+    });
+
+    let permit = match kernel.begin_commit(generation, &commit_slot) {
+        Ok(permit) => permit,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    // Count before iterating, and before the second accessor entry. The
+    // bound is what makes the extraction below bounded work rather than
+    // "how large an argument a guest managed to lift".
+    if text_views.len() > MAX_TEXT_ATTACHMENTS {
+        return Ok(Err(CommitError::InvalidAttachment(
+            AttachmentError::TooManyAttachments,
+        )));
+    }
+
+    // Second entry, now bounded. Every table-derived borrow dies with this
+    // closure: copy the tiny opaque key out, and only the keys survive.
+    let keys = match accessor.with(|mut access| {
+        let table = &access.get().table;
+        text_views
+            .iter()
+            .map(|handle| table.get(handle).map(|lease| lease.key).map_err(Into::into))
+            .collect::<wasmtime::Result<Vec<_>>>()
+    }) {
+        Ok(keys) => keys,
+        Err(error) => return Err(error),
+    };
+
+    Ok(kernel.commit_batch(permit, generation, keys, batch).await)
 }
 
 impl instar::kernel::kernel_runtime::HostWithStore<GenerationState>
@@ -1044,6 +1160,56 @@ mod tests {
         (kernel, sink)
     }
 
+    /// A generation state with no guest behind it: no component, no event
+    /// loop, just the host side of a `commit` call.
+    fn inert_state(
+        kernel: Arc<SharedKernel>,
+        generation: GenerationId,
+        commit_slot: Arc<tokio::sync::Semaphore>,
+    ) -> GenerationState {
+        let (_, events_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_CAPACITY);
+        GenerationState {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            kernel,
+            generation,
+            commit_slot,
+            events: Arc::new(tokio::sync::Mutex::new(events_rx)),
+            limits: MeasuredLimiter::new(&ResourcePolicy::instar_default(), Arc::default()),
+        }
+    }
+
+    /// Handles that name nothing: every index is far outside an empty table,
+    /// so any code that touches the table on the way to a refusal would trap
+    /// instead of answering with the bound verdict.
+    fn unresolvable_view_handles(count: usize) -> Vec<Resource<GuestTextView>> {
+        (0..count)
+            .map(|i| Resource::new_borrow(i as u32 + 10_000))
+            .collect()
+    }
+
+    /// Drives the real `HostWithStore::commit` implementation, the same path
+    /// a guest's call enters, from an inert store.
+    async fn call_host_commit(
+        state: GenerationState,
+        text_views: Vec<Resource<GuestTextView>>,
+    ) -> wasmtime::Result<Result<CommitResult, CommitError>> {
+        let engine = crate::engine::configured_engine().expect("engine");
+        let mut store = Store::new(&engine, state);
+        let outcome = store
+            .run_concurrent(async move |accessor| {
+                <wasmtime::component::HasSelf<GenerationState>
+                        as instar::kernel::kernel_ui::HostWithStore<GenerationState>>::commit(
+                        accessor,
+                        b"batch".to_vec(),
+                        text_views,
+                    )
+                    .await
+            })
+            .await?;
+        outcome
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_commits_are_single_flight_and_the_slot_releases() {
         let (kernel, sink) = kernel_with_sink();
@@ -1054,8 +1220,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(1), &slot)
+                    .expect("the first commit passes the gates");
                 kernel
-                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .commit_batch(permit, GenerationId(1), Vec::new(), b"first".to_vec())
                     .await
             }
         });
@@ -1064,9 +1233,7 @@ mod tests {
 
         // The second attempt must fail immediately, before any request is
         // created or enqueued.
-        let second = kernel
-            .commit_batch(GenerationId(1), Arc::clone(&slot), b"second".to_vec())
-            .await;
+        let second = kernel.begin_commit(GenerationId(1), &slot);
         assert!(
             matches!(second, Err(CommitError::CommitInProgress)),
             "the concurrent attempt must fail as commit-in-progress, got {second:?}"
@@ -1091,8 +1258,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(1), &slot)
+                    .expect("the slot is free after the first commit resolves");
                 kernel
-                    .commit_batch(GenerationId(1), slot, b"third".to_vec())
+                    .commit_batch(permit, GenerationId(1), Vec::new(), b"third".to_vec())
                     .await
             }
         });
@@ -1122,8 +1292,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(1), &slot)
+                    .expect("the first commit passes the gates");
                 kernel
-                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .commit_batch(permit, GenerationId(1), Vec::new(), b"first".to_vec())
                     .await
             }
         });
@@ -1139,8 +1312,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(1), &slot)
+                    .expect("the slot is released when the first commit is dropped");
                 kernel
-                    .commit_batch(GenerationId(1), slot, b"second".to_vec())
+                    .commit_batch(permit, GenerationId(1), Vec::new(), b"second".to_vec())
                     .await
             }
         });
@@ -1170,8 +1346,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&first_slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(1), &slot)
+                    .expect("gen1 passes the gates");
                 kernel
-                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .commit_batch(permit, GenerationId(1), Vec::new(), b"first".to_vec())
                     .await
             }
         });
@@ -1184,8 +1363,11 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&second_slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(2), &slot)
+                    .expect("gen2 is current and has its own free slot");
                 kernel
-                    .commit_batch(GenerationId(2), slot, b"second".to_vec())
+                    .commit_batch(permit, GenerationId(2), Vec::new(), b"second".to_vec())
                     .await
             }
         });
@@ -1219,20 +1401,17 @@ mod tests {
             let kernel = Arc::clone(&kernel);
             let slot = Arc::clone(&current_slot);
             async move {
+                let permit = kernel
+                    .begin_commit(GenerationId(2), &slot)
+                    .expect("gen2 is current");
                 kernel
-                    .commit_batch(GenerationId(2), slot, b"current".to_vec())
+                    .commit_batch(permit, GenerationId(2), Vec::new(), b"current".to_vec())
                     .await
             }
         });
         let held = sink.wait_for_one().await;
 
-        let stale = kernel
-            .commit_batch(
-                GenerationId(1),
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                b"stale".to_vec(),
-            )
-            .await;
+        let stale = kernel.begin_commit(GenerationId(1), &Arc::new(tokio::sync::Semaphore::new(1)));
         assert!(
             matches!(stale, Err(CommitError::StaleGeneration)),
             "the stale commit must be rejected as stale, got {stale:?}"
@@ -1246,5 +1425,151 @@ mod tests {
 
         drop(held);
         occupied.abort();
+    }
+
+    /// Ordering, held the way B2e-3a says it must be: a stale generation is
+    /// refused before the attachment-count gate can even be reached.
+    ///
+    /// The commit carries [`MAX_TEXT_ATTACHMENTS`] + 1 handles that are not
+    /// in the resource table. If the host counted first, or extracted first,
+    /// the answer would be `TooManyAttachments` or a table trap; the
+    /// `StaleGeneration` verdict is only possible when the generation
+    /// preflight genuinely runs first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_generation_precedes_the_attachment_bound() {
+        let kernel = Arc::new(SharedKernel::default());
+        kernel.current.store(2, Ordering::SeqCst);
+
+        let result = call_host_commit(
+            inert_state(
+                Arc::clone(&kernel),
+                GenerationId(1),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            ),
+            unresolvable_view_handles(MAX_TEXT_ATTACHMENTS + 1),
+        )
+        .await
+        .expect("the host method answers with a verdict, not a trap");
+
+        assert!(
+            matches!(result, Err(CommitError::StaleGeneration)),
+            "the stale generation must win over the oversized side table, got {result:?}"
+        );
+        assert_eq!(kernel.stale_commits_rejected(), 1);
+        assert_eq!(
+            kernel.commit_single_flight_rejections(),
+            0,
+            "a dead generation must not consume a live generation's slot"
+        );
+    }
+
+    /// Ordering, second gate: an outstanding commit is refused before the
+    /// attachment-count gate is reached.
+    ///
+    /// The slot is held the way an in-flight commit would hold it. The side
+    /// table again carries more than [`MAX_TEXT_ATTACHMENTS`] unresolvable
+    /// handles; `CommitInProgress` is only possible when the single-flight
+    /// gate runs before counting or extracting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_outstanding_commit_precedes_the_attachment_bound() {
+        let kernel = Arc::new(SharedKernel::default());
+        kernel.current.store(1, Ordering::SeqCst);
+        let slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = Arc::clone(&slot)
+            .try_acquire_owned()
+            .expect("the slot is free before the test holds it");
+
+        let result = call_host_commit(
+            inert_state(Arc::clone(&kernel), GenerationId(1), slot),
+            unresolvable_view_handles(MAX_TEXT_ATTACHMENTS + 1),
+        )
+        .await
+        .expect("the host method answers with a verdict, not a trap");
+
+        assert!(
+            matches!(result, Err(CommitError::CommitInProgress)),
+            "the outstanding commit must win over the oversized side table, got {result:?}"
+        );
+        assert_eq!(kernel.commit_single_flight_rejections(), 1);
+        assert_eq!(
+            kernel.stale_commits_rejected(),
+            0,
+            "this is a live generation, not a stale one"
+        );
+    }
+
+    /// Containment: an oversized side table is refused with NO resource-table
+    /// access at all.
+    ///
+    /// Every handle in the table is deliberately unresolvable. A host that
+    /// touched the table before the bound check would trap or report a
+    /// different refusal; only a count check that runs first can answer
+    /// `TooManyAttachments` while every handle still points nowhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_side_table_is_refused_without_table_access() {
+        let kernel = Arc::new(SharedKernel::default());
+        kernel.current.store(1, Ordering::SeqCst);
+
+        let result = call_host_commit(
+            inert_state(
+                Arc::clone(&kernel),
+                GenerationId(1),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            ),
+            unresolvable_view_handles(MAX_TEXT_ATTACHMENTS + 1),
+        )
+        .await
+        .expect("the host method answers with a verdict, not a trap");
+
+        assert!(
+            matches!(
+                result,
+                Err(CommitError::InvalidAttachment(
+                    AttachmentError::TooManyAttachments
+                ))
+            ),
+            "the count check must refuse before any handle is resolved, got {result:?}"
+        );
+    }
+
+    /// The bound is exactly that: 4096 entries pass it and reach the commit
+    /// path. The handles here are real table entries so the extraction after
+    /// the guard can succeed, and the headless log receives the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_boundary_count_passes_the_guard() {
+        let kernel = Arc::new(SharedKernel::default());
+        kernel.current.store(1, Ordering::SeqCst);
+        let mut state = inert_state(
+            Arc::clone(&kernel),
+            GenerationId(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let handles = (0..MAX_TEXT_ATTACHMENTS)
+            .map(|i| {
+                state
+                    .table
+                    .push(GuestTextView {
+                        key: OpaqueResourceKey {
+                            slot: i as u32,
+                            incarnation: 0,
+                        },
+                    })
+                    .expect("the empty table accepts the test's own leases")
+            })
+            .collect::<Vec<_>>();
+
+        let result = call_host_commit(state, handles)
+            .await
+            .expect("the host method answers with a verdict, not a trap");
+
+        assert!(
+            matches!(result, Ok(CommitResult { revision: 1 })),
+            "4096 entries must pass the guard and reach the headless commit log, got {result:?}"
+        );
+        assert_eq!(
+            kernel.commits().len(),
+            1,
+            "the headless path records exactly the one commit"
+        );
     }
 }

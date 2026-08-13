@@ -1592,6 +1592,7 @@ dependencies = [
  "instar-paint",
  "instar-text",
  "instar-ui",
+ "instar-ui-protocol",
  "instar-window",
  "tokio",
  "wasmtime",
