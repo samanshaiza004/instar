@@ -48,6 +48,7 @@ mod attachment;
 pub mod bridge;
 pub mod present;
 pub mod text_host;
+pub mod text_sync;
 pub mod text_view;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1359,7 +1360,6 @@ impl Host {
         };
         let Ok(applied) = self
             .text_resources
-            .system_mut()
             .apply_edit(view, TextEdit::replace(selection.range(), text))
         else {
             return Vec::new();
@@ -2436,11 +2436,7 @@ impl Host {
             }
             _ => None,
         }?;
-        let applied = self
-            .text_resources
-            .system_mut()
-            .apply_edit(view, edit)
-            .ok()?;
+        let applied = self.text_resources.apply_edit(view, edit).ok()?;
         if let Ok(view_state) = self.text_resources.system_mut().view_mut(view) {
             view_state.set_selection(Selection::at(applied.edit.resulting_end()));
         }

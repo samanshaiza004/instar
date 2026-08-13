@@ -38,7 +38,12 @@ use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{
     OpaqueResourceKey, ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
 };
-use instar_text::{MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextSystem, TextViewId};
+use instar_text::{
+    AppliedEdit, MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextEdit, TextError, TextSystem,
+    TextViewId,
+};
+
+use crate::text_sync::SyncState;
 
 /// What one guest generation currently holds.
 #[derive(Debug, Default)]
@@ -81,6 +86,15 @@ pub struct TextHost {
     /// must not silently kill a document another surface (or a future one)
     /// still shows.
     retained_views: HashMap<TextViewId, usize>,
+    /// What each generation still owes each buffer it can name (C1).
+    ///
+    /// Keyed by the pair, because synchronization is a fact about a
+    /// *relationship* rather than about either side: the buffer outlives the
+    /// generation, and the generation may name several buffers. Entries are
+    /// born with the buffer and die with the generation, which is why they sit
+    /// here beside the leases rather than inside `TextSystem` -- the text
+    /// model has no idea a guest exists.
+    sync: HashMap<(GenerationId, TextBufferId), SyncState>,
 }
 
 /// A `TextBufferId` and an [`OpaqueResourceKey`] are the same two numbers.
@@ -210,6 +224,48 @@ impl TextHost {
         true
     }
 
+    /// Applies a host-local edit and tells every generation that owes the
+    /// buffer about it.
+    ///
+    /// **The only edit path.** Callers do not reach `system_mut().apply_edit`
+    /// directly, because "every host-local edit is recorded" then rests on
+    /// each of them remembering to record it — and B4 already added two edit
+    /// sites, with more owed to package E. Routing through here makes the
+    /// recording structural: a new caller gets it without knowing it exists.
+    ///
+    /// Recording happens after the edit is applied, and only for an edit that
+    /// was applied: a refused edit moved no revision and owes no notification.
+    pub fn apply_edit(
+        &mut self,
+        view: TextViewId,
+        edit: TextEdit,
+    ) -> Result<AppliedEdit, TextError> {
+        let applied = self.system.apply_edit(view, edit)?;
+        let Ok(buffer) = self.system.view(view).map(|state| state.buffer()) else {
+            return Ok(applied);
+        };
+        for ((_, owed), state) in self.sync.iter_mut() {
+            if *owed == buffer {
+                state.record(&applied);
+            }
+        }
+        Ok(applied)
+    }
+
+    /// What one generation still owes on one buffer. Read-only: the state is
+    /// advanced by [`TextHost::apply_edit`] and by nothing else.
+    pub fn sync_state(&self, generation: GenerationId, buffer: TextBufferId) -> Option<&SyncState> {
+        self.sync.get(&(generation, buffer))
+    }
+
+    /// How many (generation, buffer) synchronization relationships exist.
+    ///
+    /// The counter teardown tests assert a return to baseline against, in the
+    /// same spirit as [`TextResourceCounts`].
+    pub fn sync_relationships(&self) -> usize {
+        self.sync.len()
+    }
+
     /// A key this generation is allowed to use, as a buffer id.
     pub fn resolve_buffer_lease(
         &self,
@@ -267,6 +323,12 @@ impl TextHost {
                         .or_default()
                         .buffers
                         .insert(id);
+                    // Born synchronized at the baseline: the guest knows an
+                    // empty document is empty. Bootstrap establishes a
+                    // revision, never an edit.
+                    let baseline = self.system.revision(id).unwrap_or_default();
+                    self.sync
+                        .insert((generation, id), SyncState::synchronized(baseline));
                     request.answer(TextAnswer::Created(buffer_key(id)));
                 }
                 Err(_) => request.refuse(TextRefusal::TooManyBuffers(MAX_TEXT_BUFFERS as u32)),
@@ -366,6 +428,10 @@ impl TextHost {
     fn release_generation_leases(&mut self, generation: GenerationId) {
         self.leases.remove(&generation);
         self.leases.retain(|_, leases| !leases.is_empty());
+        // Synchronization state is a fact about the relationship, so it dies
+        // with the generation and not with the buffer. A surviving document
+        // owes a dead guest nothing.
+        self.sync.retain(|(owner, _), _| *owner != generation);
     }
 
     /// Destroys every text resource nothing owns any more, and nothing else.
@@ -450,6 +516,98 @@ mod tests {
             Ok(TextAnswer::Created(key)) => key,
             other => panic!("expected a view, got {other:?}"),
         }
+    }
+
+    /// Every host-local edit reaches the generation that owes the buffer.
+    ///
+    /// The mutant this exists for is a new edit site calling
+    /// `system_mut().apply_edit` directly and skipping the queue -- which is
+    /// why `TextHost::apply_edit` is the only edit path rather than a
+    /// convenience over one.
+    #[test]
+    fn a_host_local_edit_is_owed_to_the_generation_that_holds_the_buffer() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        assert_eq!(
+            host.sync_state(G17, id)
+                .expect("born with the buffer")
+                .queued(),
+            0,
+            "a fresh buffer owes nothing"
+        );
+
+        host.apply_edit(view, TextEdit::insert(0, "hello"))
+            .expect("the edit applies");
+
+        let state = host.sync_state(G17, id).expect("still owed");
+        assert_eq!(state.queued(), 1);
+        assert_eq!(state.queued_bytes(), 5);
+        assert!(state.is_synchronized());
+    }
+
+    /// A refused edit owes nothing, because it moved nothing.
+    #[test]
+    fn a_refused_edit_queues_no_notification() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        assert!(
+            host.apply_edit(view, TextEdit::delete(4..9)).is_err(),
+            "the buffer is empty, so that range does not exist"
+        );
+        assert_eq!(host.sync_state(G17, id).expect("present").queued(), 0);
+    }
+
+    /// Synchronization state is a fact about a relationship, so it dies with
+    /// the generation -- not with the document, which outlives it.
+    #[test]
+    fn a_dead_generation_owes_nothing_and_leaks_nothing() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let leased = host.resolve_view_lease(G17, view).expect("leased");
+        host.apply_edit(leased, TextEdit::insert(0, "hello"))
+            .expect("applies");
+        assert_eq!(host.sync_relationships(), 1);
+
+        host.release_generation(G17);
+
+        assert_eq!(
+            host.sync_relationships(),
+            0,
+            "a surviving document owes a dead guest nothing"
+        );
+        assert_eq!(host.counts(), TextResourceCounts::default());
+    }
+
+    /// One generation's edits are not owed to another's relationship.
+    #[test]
+    fn each_generation_owes_only_the_buffers_it_holds() {
+        let mut host = TextHost::new();
+        let seventeen = create_buffer(&mut host, G17);
+        let eighteen = create_buffer(&mut host, G18);
+        let view = create_view(&mut host, G17, seventeen);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+
+        host.apply_edit(view, TextEdit::insert(0, "hi"))
+            .expect("applies");
+
+        assert_eq!(
+            host.sync_state(G17, buffer_id(seventeen)).unwrap().queued(),
+            1
+        );
+        assert_eq!(
+            host.sync_state(G18, buffer_id(eighteen)).unwrap().queued(),
+            0,
+            "a different buffer, and a different relationship"
+        );
     }
 
     #[test]
