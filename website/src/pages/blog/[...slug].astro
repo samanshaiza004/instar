@@ -1,0 +1,29 @@
+---
+import { getCollection, render } from 'astro:content';
+import PortalLayout from '../../layouts/PortalLayout.astro';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog', ({ data }) => !data.draft);
+  return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+
+<PortalLayout title={`${post.data.title} — Instar`} description={post.data.description} channel="BLOG">
+  <article class="blog-post">
+    <header class="blog-post-head">
+      <p class="page-kicker">{post.data.version ?? 'PROJECT NOTE'} / {post.data.date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })}</p>
+      <h1>{post.data.title}</h1>
+      <p>{post.data.description}</p>
+    </header>
+    <div class="blog-post-body">
+      <Content />
+    </div>
+    <footer class="blog-post-foot">
+      <a href="/blog">← All project notes</a>
+      <a href="/docs/project/status">Current project status ▸</a>
+    </footer>
+  </article>
+</PortalLayout>

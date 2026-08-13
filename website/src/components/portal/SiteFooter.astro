@@ -1,0 +1,21 @@
+---
+import { footerLinks, jumpTargets } from '../../data/site';
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <nav aria-label="Footer">
+    {footerLinks.map((link) => <a href={link.href}>{link.label}</a>)}
+    <span class="jump-menu">
+      <label for="jump-to">JUMP TO:</label>
+      <select id="jump-to" data-jump>
+      <option value="">Select a page…</option>
+        {jumpTargets.map((target) => <option value={target.href}>{target.label}</option>)}
+      </select>
+    </span>
+  </nav>
+  <p class="colophon">
+    © {year} Instar contributors. Experimental software, no stability promise. Built for components
+    that wake only when there is work to do.
+  </p>
+</footer>

@@ -1,0 +1,9 @@
+---
+import { facts } from '../../data/site';
+---
+
+<section class="status-ribbon" aria-label="Current technical facts">
+  {facts.map((fact) => (
+    <span><b>{fact.label}:</b> {fact.value}</span>
+  ))}
+</section>

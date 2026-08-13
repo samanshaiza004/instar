@@ -3,13 +3,116 @@
   # Keep the command and publish path relative to that directory so the
   # dashboard configuration and this file agree.
   base = "website"
-  command = "bash build.sh"
+  command = "npm run build"
   publish = "dist"
 
+[build.environment]
+  NODE_VERSION = "22"
+
+# Stable installer entry points. `/install` is the documented short form; the
+# scripts themselves are static files in website/public/.
 [[redirects]]
   from = "/install"
   to = "/install.sh"
   status = 200
+
+# The guide moved from mdBook to Starlight, which serves clean URLs. Keep every
+# published `.html` address working: these were linked from READMEs, from the
+# installer's own error output, and from anywhere else outside this repository.
+[[redirects]]
+  from = "/docs/index.html"
+  to = "/docs/"
+  status = 301
+
+[[redirects]]
+  from = "/docs/getting-started/requirements.html"
+  to = "/docs/getting-started/requirements"
+  status = 301
+
+[[redirects]]
+  from = "/docs/getting-started/install.html"
+  to = "/docs/getting-started/install"
+  status = 301
+
+[[redirects]]
+  from = "/docs/getting-started/first-run.html"
+  to = "/docs/getting-started/first-run"
+  status = 301
+
+[[redirects]]
+  from = "/docs/getting-started/build-a-guest.html"
+  to = "/docs/getting-started/build-a-guest"
+  status = 301
+
+[[redirects]]
+  from = "/docs/getting-started/verify.html"
+  to = "/docs/getting-started/verify"
+  status = 301
+
+[[redirects]]
+  from = "/docs/concepts/runtime-model.html"
+  to = "/docs/concepts/runtime-model"
+  status = 301
+
+[[redirects]]
+  from = "/docs/concepts/host-owned-ui.html"
+  to = "/docs/concepts/host-owned-ui"
+  status = 301
+
+[[redirects]]
+  from = "/docs/concepts/architecture.html"
+  to = "/docs/concepts/architecture"
+  status = 301
+
+[[redirects]]
+  from = "/docs/concepts/failure-and-recovery.html"
+  to = "/docs/concepts/failure-and-recovery"
+  status = 301
+
+[[redirects]]
+  from = "/docs/reference/cli.html"
+  to = "/docs/reference/cli"
+  status = 301
+
+[[redirects]]
+  from = "/docs/reference/ui-vocabulary.html"
+  to = "/docs/reference/ui-vocabulary"
+  status = 301
+
+[[redirects]]
+  from = "/docs/reference/wit.html"
+  to = "/docs/reference/wit"
+  status = 301
+
+[[redirects]]
+  from = "/docs/reference/distribution.html"
+  to = "/docs/reference/distribution"
+  status = 301
+
+[[redirects]]
+  from = "/docs/reference/troubleshooting.html"
+  to = "/docs/reference/troubleshooting"
+  status = 301
+
+[[redirects]]
+  from = "/docs/development/build-from-source.html"
+  to = "/docs/development/build-from-source"
+  status = 301
+
+[[redirects]]
+  from = "/docs/development/testing.html"
+  to = "/docs/development/testing"
+  status = 301
+
+[[redirects]]
+  from = "/docs/development/contributing.html"
+  to = "/docs/development/contributing"
+  status = 301
+
+[[redirects]]
+  from = "/docs/project/status.html"
+  to = "/docs/project/status"
+  status = 301
 
 [[headers]]
   for = "/install.sh"
@@ -19,10 +122,25 @@
     X-Content-Type-Options = "nosniff"
 
 [[headers]]
+  for = "/install.ps1"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"
+    Cache-Control = "public, max-age=300"
+    X-Content-Type-Options = "nosniff"
+
+[[headers]]
   for = "/*"
   [headers.values]
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
     Permissions-Policy = "camera=(), microphone=(), geolocation=()"
-    # mdBook uses small inline boot scripts for theme and search state.
-    Content-Security-Policy = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'"
+    # Astro and Starlight ship hashed assets from this origin plus a few small
+    # inline boot scripts (theme selection, search shortcut). Pagefind compiles
+    # a WebAssembly index in the browser, which needs 'wasm-unsafe-eval'.
+    Content-Security-Policy = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'"
+
+# Astro emits content-hashed assets, so they can be cached indefinitely.
+[[headers]]
+  for = "/_astro/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

@@ -1,0 +1,145 @@
+---
+import PortalLayout from '../layouts/PortalLayout.astro';
+import { site } from '../data/site';
+
+const targets = [
+  { platform: 'macOS Apple Silicon', target: 'aarch64-apple-darwin', archive: '.tar.xz' },
+  { platform: 'macOS Intel', target: 'x86_64-apple-darwin', archive: '.tar.xz' },
+  { platform: 'Linux x86_64 glibc', target: 'x86_64-unknown-linux-gnu', archive: '.tar.xz' },
+  { platform: 'Windows x86_64 MSVC', target: 'x86_64-pc-windows-msvc', archive: '.zip' },
+];
+---
+
+<PortalLayout
+  title="Downloads — Instar"
+  description="Install the Instar native host on macOS, Linux, or Windows, verify the archive, or build the developer preview from source."
+  channel="DOWNLOADS"
+>
+  <section class="page-head">
+    <div>
+      <h1>get the host.</h1>
+      <p>
+        One executable, four targets, two installer scripts. Everything else in this project is a
+        library or a guest.
+      </p>
+    </div>
+    <img src="/assets/tile-pebbles.jpg" alt="" width="360" height="192" />
+  </section>
+
+  <div class="slab">
+    <h2>01 / INSTALL</h2>
+    <div class="slab-body">
+      <div class="note">
+        <b>Developer preview.</b> No tagged binary release has been published yet. Both scripts
+        detect that case and print the source-build instructions instead of failing obscurely.
+      </div>
+
+      <div class="two-up">
+        <div>
+          <h3>macOS and Linux</h3>
+          <div class="command-box">
+            <code>{site.installCommand}</code>
+            <button class="button-orange" type="button" data-copy={site.installCommand}>COPY</button>
+          </div>
+          <p>
+            Delegates to the cargo-dist installer from the latest release, which selects your
+            architecture and installs <code>instar</code> under Cargo's bin directory.
+          </p>
+        </div>
+
+        <div>
+          <h3>Windows PowerShell</h3>
+          <div class="command-box">
+            <code>{site.installCommandWindows}</code>
+            <button class="button-orange" type="button" data-copy={site.installCommandWindows}>
+              COPY
+            </button>
+          </div>
+          <p>
+            Places <code>instar.exe</code> in Cargo's bin directory. Requires PowerShell 5 or newer.
+          </p>
+        </div>
+      </div>
+
+      <h3>Read the script before you run it</h3>
+      <pre class="snippet">curl -fsSL https://instar.samanshaiza.com/install -o install.sh
+less install.sh
+sh install.sh</pre>
+      <p>
+        The stable entry points are <a href="/install.sh">/install.sh</a> and
+        <a href="/install.ps1">/install.ps1</a>. Neither installs anything itself — they fetch the
+        installer published with the latest release and hand off to it.
+      </p>
+    </div>
+  </div>
+
+  <div class="slab">
+    <h2>02 / TARGETS</h2>
+    <div class="slab-body">
+      <table class="grid">
+        <caption>RELEASE ARCHIVES — instar-shell</caption>
+        <thead>
+          <tr><th>Platform</th><th>Rust target</th><th>Archive</th></tr>
+        </thead>
+        <tbody>
+          {targets.map((row) => (
+            <tr>
+              <td>{row.platform}</td>
+              <td><code>{row.target}</code></td>
+              <td><code>{row.archive}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p>
+        Guest <code>.wasm</code> components are not bundled with the host. Repository benchmarks and
+        test executables are not release artifacts.{' '}
+        <a href="/docs/reference/distribution">Distribution reference ▸</a>
+      </p>
+    </div>
+  </div>
+
+  <div class="slab">
+    <h2>03 / VERIFY</h2>
+    <div class="slab-body">
+      <p>
+        Every archive ships a detached SHA-256, appears in <code>sha256.sum</code>, and carries a
+        GitHub artifact attestation. The two answer different questions.
+      </p>
+      <table class="grid">
+        <thead>
+          <tr><th>Question</th><th>Answered by</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Did these bytes change in transit?</td><td>SHA-256 digest</td></tr>
+          <tr><td>Were these bytes produced by Instar's release workflow?</td><td>GitHub attestation</td></tr>
+        </tbody>
+      </table>
+      <pre class="snippet">gh attestation verify \
+  instar-shell-x86_64-unknown-linux-gnu.tar.xz \
+  --repo samanshaiza004/instar</pre>
+      <p><a href="/docs/getting-started/verify">Full verification guide ▸</a></p>
+    </div>
+  </div>
+
+  <div class="slab">
+    <h2>04 / BUILD FROM SOURCE</h2>
+    <div class="slab-body">
+      <p>
+        Until the first tag, this is the honest path. It needs the pinned Rust toolchain, which
+        rustup activates from the checkout automatically.
+      </p>
+      <pre class="snippet">git clone https://github.com/samanshaiza004/instar.git
+cd instar
+cargo install --locked --path crates/instar-shell</pre>
+      <ul class="tiny-links tiny-links--columns">
+        <li><a href="/docs/getting-started/requirements">System requirements</a></li>
+        <li><a href="/docs/development/build-from-source">Build from source</a></li>
+        <li><a href="/docs/getting-started/first-run">Run the counter</a></li>
+        <li><a href="/docs/reference/troubleshooting">Troubleshooting</a></li>
+        <li><a href={site.releases}>Release archive</a></li>
+        <li><a href={site.repository}>Source repository</a></li>
+      </ul>
+    </div>
+  </div>
+</PortalLayout>

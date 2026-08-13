@@ -1,0 +1,304 @@
+/*
+ * Starlight, dressed as the portal.
+ *
+ * The documentation keeps Starlight's layout and behaviour — it has to stay a
+ * usable reference — but takes the portal's palette, its 1px rules, its dense
+ * Verdana type, and its orange-arrow link marks. Where the front page is a
+ * magazine cover, this is the inside pages: same ink, more words.
+ */
+
+:root {
+  --instar-orange: #ff5a00;
+  --instar-orange-dark: #dd3d00;
+  --instar-blue: #003c88;
+  --instar-ice: #d7e9f5;
+  --instar-yellow: #ffd21f;
+  --instar-rule: #7d9bb1;
+
+  --sl-font: Verdana, Geneva, Arial, Helvetica, sans-serif;
+  --sl-font-mono: "Courier New", Courier, monospace;
+
+  --sl-text-base: 0.8125rem;
+  --sl-line-height: 1.6;
+  --sl-content-width: 48rem;
+  --sl-nav-height: 3.5rem;
+  --sl-radius-small: 0;
+  --sl-radius-medium: 0;
+  --sl-radius-large: 0;
+}
+
+/* Light: paper, ink, and the portal's ice-blue chrome. */
+:root[data-theme='light'] {
+  --sl-color-accent-low: #dbe9f6;
+  --sl-color-accent: #0053b8;
+  --sl-color-accent-high: #00306e;
+  --sl-color-white: #07192e;
+  --sl-color-gray-1: #0d2237;
+  --sl-color-gray-2: #2c4256;
+  --sl-color-gray-3: #52697c;
+  --sl-color-gray-4: #7d94a6;
+  --sl-color-gray-5: #b9cbd8;
+  --sl-color-gray-6: #e5edf3;
+  --sl-color-gray-7: #f2f6f9;
+  --sl-color-black: #ffffff;
+  --sl-color-hairline: #b7c9d6;
+  --sl-color-hairline-light: #cfdde7;
+  --sl-color-bg-nav: #ffffff;
+  --sl-color-bg-sidebar: #f6f9fb;
+  --sl-color-bg-inline-code: #e9f1f7;
+  --sl-color-text-accent: #0053b8;
+}
+
+/* Dark: the same page after hours. Orange survives; the ice goes navy. */
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #062544;
+  --sl-color-accent: #2f7fd0;
+  --sl-color-accent-high: #b8d6f2;
+  --sl-color-white: #f2f7fb;
+  --sl-color-gray-1: #e2ebf3;
+  --sl-color-gray-2: #c2d2e0;
+  --sl-color-gray-3: #91a7ba;
+  --sl-color-gray-4: #5d798f;
+  --sl-color-gray-5: #3a4f63;
+  --sl-color-gray-6: #1d2c3b;
+  --sl-color-gray-7: #16222e;
+  --sl-color-black: #0b1620;
+  --sl-color-hairline: #33475a;
+  --sl-color-hairline-light: #2a3c4d;
+  --sl-color-bg-nav: #0b1620;
+  --sl-color-bg-sidebar: #101d29;
+  --sl-color-bg-inline-code: #1b2c3c;
+  --sl-color-text-accent: #6fb0e8;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chrome                                                              */
+/* ------------------------------------------------------------------ */
+
+/* The header wears the brand bar rather than a neutral surface. */
+.header {
+  border-bottom: 1px solid #111;
+  background: var(--sl-color-bg-nav);
+  box-shadow: inset 0 -3px 0 var(--instar-orange);
+}
+
+.header .sl-flex {
+  gap: 0.75rem;
+}
+
+:root[data-theme='dark'] .header {
+  border-bottom-color: #000;
+}
+
+.sidebar-pane {
+  border-inline-end: 1px solid var(--sl-color-hairline);
+  background: var(--sl-color-bg-sidebar);
+}
+
+.sidebar-content {
+  font-family: Verdana, Geneva, Arial, Helvetica, sans-serif;
+}
+
+/* Sidebar groups are labelled like a printed contents page. */
+.sidebar-content summary,
+.sidebar-content > ul > li > details > summary,
+.sidebar-content .large {
+  font-size: 0.6875rem !important;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--instar-orange-dark);
+}
+
+:root[data-theme='dark'] .sidebar-content .large {
+  color: #ff8341;
+}
+
+.sidebar-content a {
+  font-size: 0.75rem;
+  padding-block: 0.25rem;
+  border-inline-start: 1px solid var(--sl-color-hairline-light);
+}
+
+/* Starlight's default current-page treatment is inverted text on an accent
+   fill; this swaps it for an ice-blue block with an orange marker, so the
+   colour must be restated or the label inherits the inverted (invisible) one. */
+.sidebar-content a[aria-current='page'] {
+  color: var(--sl-color-white);
+  background: var(--sl-color-accent-low);
+  border-inline-start-color: var(--instar-orange);
+  border-inline-start-width: 3px;
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------------------ */
+/* Content                                                             */
+/* ------------------------------------------------------------------ */
+
+.sl-markdown-content {
+  font-size: 0.8125rem;
+}
+
+.sl-markdown-content h1,
+.content-panel h1 {
+  margin-bottom: 1.25rem;
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--instar-rule);
+  font-family: Arial, Helvetica, sans-serif;
+  font-weight: 900;
+  letter-spacing: -1px;
+  font-size: 1.9rem;
+  line-height: 1.05;
+}
+
+.sl-markdown-content h2 {
+  margin-top: 2rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 1.2rem;
+  letter-spacing: -0.4px;
+}
+
+.sl-markdown-content h2::before {
+  content: "▸ ";
+  color: var(--instar-orange);
+}
+
+.sl-markdown-content h3 {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 1rem;
+  letter-spacing: -0.2px;
+}
+
+.sl-markdown-content h4 {
+  font-size: 0.8125rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--instar-orange-dark);
+}
+
+:root[data-theme='dark'] .sl-markdown-content h4 {
+  color: #ff8341;
+}
+
+/* Tables carry a lot of this documentation's weight: keep them tight,
+   ruled, and headed in ice blue. */
+.sl-markdown-content table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+}
+
+.sl-markdown-content th,
+.sl-markdown-content td {
+  border: 1px solid var(--sl-color-hairline);
+  padding: 0.3rem 0.5rem;
+  vertical-align: top;
+}
+
+.sl-markdown-content th {
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sl-markdown-content blockquote {
+  border-inline-start: 4px solid var(--instar-orange);
+  background: var(--sl-color-gray-7);
+  padding: 0.5rem 0.75rem;
+  font-style: normal;
+}
+
+.sl-markdown-content :not(pre) > code {
+  border: 1px solid var(--sl-color-hairline-light);
+  padding: 0.05em 0.3em;
+  font-size: 0.75rem;
+}
+
+.sl-markdown-content a {
+  text-underline-offset: 2px;
+}
+
+/* Expressive Code blocks lose their rounded, floating look. */
+.expressive-code .frame pre,
+.expressive-code .frame .header {
+  border-radius: 0 !important;
+}
+
+.expressive-code .frame {
+  --ec-brdRad: 0;
+  --ec-frm-edActTabIndBrdCol: var(--instar-orange);
+  --ec-frm-frameBoxShdCssVal: none;
+}
+
+/* Cards and asides pick up the portal's flat, ruled treatment. */
+.card,
+.starlight-aside {
+  border-radius: 0;
+  border: 1px solid var(--sl-color-hairline);
+}
+
+.card {
+  box-shadow: 2px 2px 0 var(--sl-color-hairline-light);
+}
+
+.starlight-aside--note {
+  border-inline-start: 4px solid var(--instar-blue);
+}
+
+.starlight-aside--tip {
+  border-inline-start: 4px solid #0f8a4a;
+}
+
+.starlight-aside--caution {
+  border-inline-start: 4px solid var(--instar-yellow);
+}
+
+.starlight-aside--danger {
+  border-inline-start: 4px solid var(--instar-orange-dark);
+}
+
+.card .title {
+  font-family: Arial, Helvetica, sans-serif;
+  letter-spacing: -0.2px;
+}
+
+/* Pagination, search field, and the rest of the small chrome. */
+.pagination-links a {
+  border-radius: 0;
+  border-color: var(--sl-color-hairline);
+}
+
+.pagination-links a:hover {
+  border-color: var(--instar-orange);
+}
+
+site-search button[data-open-modal] {
+  border-radius: 0;
+}
+
+/* A page-top rule that mirrors the front page's channel strip. */
+.content-panel + .content-panel {
+  border-top: 1px solid var(--sl-color-hairline);
+}
+
+/* Starlight's mobile shell becomes a single portal column. Keep the guide
+   compact and bordered instead of letting the default rounded cards dominate. */
+@media (max-width: 50rem) {
+  .header {
+    box-shadow: inset 0 -3px 0 var(--instar-orange);
+  }
+
+  .sl-markdown-content {
+    font-size: 0.75rem;
+  }
+
+  .sl-markdown-content h1,
+  .content-panel h1 {
+    font-size: 1.65rem;
+  }
+}

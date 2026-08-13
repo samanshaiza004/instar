@@ -1,0 +1,73 @@
+---
+import '../styles/portal.css';
+import Masthead from '../components/portal/Masthead.astro';
+import ChannelNav from '../components/portal/ChannelNav.astro';
+import SiteFooter from '../components/portal/SiteFooter.astro';
+import { site } from '../data/site';
+
+interface Props {
+  title: string;
+  description?: string;
+  /** Channel label to mark as current in the strip. */
+  channel?: string;
+}
+
+const { title, description = site.description, channel } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site ?? 'https://instar.samanshaiza.com');
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ff5a00" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical.href} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical.href} />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page-shell">
+      <Masthead />
+      <ChannelNav current={channel} />
+      <main id="main">
+        <slot />
+      </main>
+      <SiteFooter />
+    </div>
+    <script>
+      // Copy-to-clipboard for the install command boxes. Kept to one delegated
+      // listener so any number of command boxes cost one handler.
+      document.addEventListener('click', async (event) => {
+        const target = event.target as HTMLElement | null;
+        const button = target?.closest<HTMLButtonElement>('[data-copy]');
+        if (!button) return;
+        const original = button.textContent;
+        try {
+          await navigator.clipboard.writeText(button.dataset.copy ?? '');
+          button.textContent = 'COPIED';
+        } catch {
+          button.textContent = 'SELECT';
+        }
+        window.setTimeout(() => {
+          button.textContent = original;
+        }, 1400);
+      });
+
+      // The footer "jump to" menu navigates on change, the way a portal
+      // dropdown did before anyone had a router.
+      document.querySelectorAll<HTMLSelectElement>('[data-jump]').forEach((select) => {
+        select.addEventListener('change', () => {
+          if (select.value) window.location.href = select.value;
+        });
+      });
+    </script>
+  </body>
+</html>

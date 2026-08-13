@@ -1,0 +1,41 @@
+---
+import PortalLayout from '../../layouts/PortalLayout.astro';
+import { getCollection } from 'astro:content';
+
+const posts = (await getCollection('blog', ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
+);
+---
+
+<PortalLayout
+  title="Blog — Instar"
+  description="Project notes, release posts, and design decisions from the Instar native WebAssembly host."
+  channel="BLOG"
+>
+  <section class="page-head blog-head">
+    <div>
+      <p class="page-kicker">PROJECT NOTES / INSTAR</p>
+      <h1>the instar log.</h1>
+      <p>Release notes, architecture notes, and field reports from the native host.</p>
+    </div>
+    <img src="/assets/tile-towel.jpg" alt="" width="360" height="192" />
+  </section>
+
+  <section class="blog-list" aria-label="Blog posts">
+    {posts.map((post, index) => (
+      <article class:list={['blog-entry', { 'blog-entry--featured': index === 0 }]}>
+        <div class="blog-entry-meta">
+          <time datetime={post.data.date.toISOString()}>
+            {post.data.date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' })}
+          </time>
+          {post.data.version && <span>{post.data.version}</span>}
+        </div>
+        <div>
+          <h2><a href={`/blog/${post.id}`}>{post.data.title}</a></h2>
+          <p>{post.data.description}</p>
+          <a class="blog-read" href={`/blog/${post.id}`}>Read post ▸</a>
+        </div>
+      </article>
+    ))}
+  </section>
+</PortalLayout>

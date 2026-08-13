@@ -1,11 +1,16 @@
 #!/usr/bin/env sh
 # Stable website entry point for the cargo-dist generated Instar installer.
+#
+# Published at https://instar.samanshaiza.com/install (and /install.sh) so that
+# a link in a README does not go stale at the next tag: this script always
+# delegates to whatever the latest GitHub release generated.
 set -eu
 
 REPOSITORY="samanshaiza004/instar"
 INSTALLER="instar-shell-installer.sh"
 BASE_URL="${INSTAR_INSTALLER_GITHUB_BASE_URL:-https://github.com}"
 INSTALLER_URL="${BASE_URL}/${REPOSITORY}/releases/latest/download/${INSTALLER}"
+SITE="https://instar.samanshaiza.com"
 
 say() {
   printf '%s\n' "$*" >&2
@@ -22,11 +27,12 @@ case "$(uname -s 2>/dev/null || true)" in
   Darwin|Linux) ;;
   MINGW*|MSYS*|CYGWIN*)
     say "instar installer: use the Windows PowerShell installer:"
-    say "  irm https://github.com/${REPOSITORY}/releases/latest/download/instar-shell-installer.ps1 | iex"
+    say "  irm ${SITE}/install.ps1 | iex"
     exit 1
     ;;
   *)
     say "instar installer: this installer supports macOS and Linux."
+    say "Build from source instead: ${SITE}/docs/development/build-from-source/"
     exit 1
     ;;
 esac
@@ -55,7 +61,7 @@ if [ "$http_code" = "404" ]; then
   say "  cd instar"
   say "  cargo install --locked --path crates/instar-shell"
   say ""
-  say "Guide: https://instar.samanshaiza.com/docs/development/build-from-source.html"
+  say "Guide: ${SITE}/docs/development/build-from-source/"
   exit 1
 fi
 

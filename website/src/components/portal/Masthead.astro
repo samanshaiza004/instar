@@ -1,0 +1,20 @@
+---
+import { site } from '../../data/site';
+---
+
+<header class="masthead">
+  <a class="wordmark" href="/" aria-label="Instar home">INSTAR<span class="spark" aria-hidden="true">✦</span></a>
+
+  <form class="site-search" action="/docs/" method="get">
+    <label for="site-q">SEARCH:</label>
+    <input id="site-q" name="q" type="search" autocomplete="off" />
+    <button class="button-orange" type="submit">GO</button>
+  </form>
+
+  <div class="utility-links">
+    <a href={site.repository}>⌁ SOURCE</a>
+    <a href="/docs/project/status">STATUS</a>
+    <a href="/blog">BLOG</a>
+    <strong class="protocol-stamp">PROTOCOL {site.protocolVersion}</strong>
+  </div>
+</header>

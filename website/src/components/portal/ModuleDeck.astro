@@ -1,0 +1,75 @@
+---
+import { site } from '../../data/site';
+---
+
+<section class="module-deck" aria-label="Explore Instar">
+  <article class="portal-card portal-card--start">
+    <h2>START</h2>
+    <p class="kicker">instar / new user</p>
+    <img class="card-image" src="/assets/tile-sea.jpg" alt="" width="360" height="192" loading="lazy" />
+    <h3>Get a native host running</h3>
+    <p>Install the binary, build the included counter component, and open a real native window.</p>
+    <ul class="tiny-links">
+      <li><a href="/docs/getting-started/requirements">System requirements</a></li>
+      <li><a href="/docs/getting-started/install">Install Instar</a></li>
+      <li><a href="/docs/getting-started/first-run">First run</a></li>
+      <li><a href="/docs/getting-started/verify">Verify a download</a></li>
+    </ul>
+    <footer>macOS | Linux | Windows</footer>
+  </article>
+
+  <article class="portal-card portal-card--build">
+    <h2>BUILD</h2>
+    <p class="kicker">guest / component</p>
+    <div class="mini-diagram" role="img" aria-label="Guest sends a snapshot to the host, the host sends events back">
+      <img src="/assets/tile-hair.jpg" alt="" width="360" height="192" loading="lazy" />
+      <span>GUEST</span><b>→</b><span>SNAPSHOT</span><b>→</b><span>HOST</span>
+    </div>
+    <h3>Describe meaning, not pixels</h3>
+    <p>A guest commits retained UI snapshots and waits for semantic events. It never receives a framebuffer.</p>
+    <ul class="tiny-links">
+      <li><a href="/docs/getting-started/build-a-guest">Build a guest</a></li>
+      <li><a href="/docs/reference/ui-vocabulary">UI vocabulary</a></li>
+      <li><a href="/docs/reference/protocol">Wire protocol</a></li>
+      <li><a href="/docs/reference/wit">WIT contract</a></li>
+    </ul>
+    <footer>Rust | wasm32-wasip2 | WIT</footer>
+  </article>
+
+  <article class="portal-card portal-card--learn">
+    <h2>UNDERSTAND</h2>
+    <p class="kicker">host / authority</p>
+    <img class="card-image" src="/assets/tile-pebbles.jpg" alt="" width="360" height="192" loading="lazy" />
+    <h3>One boundary, held all the way down</h3>
+    <p>The host owns geometry and transient interaction. A guest can fail without taking the native surface with it.</p>
+    <ul class="tiny-links">
+      <li><a href="/docs/concepts/runtime-model">Runtime model</a></li>
+      <li><a href="/docs/concepts/host-owned-ui">Host-owned UI</a></li>
+      <li><a href="/docs/concepts/architecture">Architecture map</a></li>
+      <li><a href="/docs/concepts/failure-and-recovery">Failure model</a></li>
+    </ul>
+    <footer>zero idle polling | bounded queues</footer>
+  </article>
+
+  <article class="portal-card portal-card--download">
+    <h2>DOWNLOAD</h2>
+    <p class="kicker">latest / release</p>
+    <div class="command-box">
+      <code>{site.installCommand}</code>
+      <button class="button-orange" type="button" data-copy={site.installCommand}>COPY</button>
+    </div>
+    <p>
+      The installer picks your platform, verifies the release checksum, and places <code>instar</code>
+      in Cargo’s bin directory.
+    </p>
+    <ul class="tiny-links tiny-links--columns">
+      <li><a href="/downloads">All downloads</a></li>
+      <li><a href="/docs/reference/distribution#windows">Windows PowerShell</a></li>
+      <li><a href="/docs/getting-started/verify">Checksums</a></li>
+      <li><a href="/docs/getting-started/verify#attestations">Attestations</a></li>
+      <li><a href={site.releases}>Release archive</a></li>
+      <li><a href="/docs/development/build-from-source">Build from source</a></li>
+    </ul>
+    <footer>developer preview / no stability promise</footer>
+  </article>
+</section>
