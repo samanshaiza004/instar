@@ -68,7 +68,7 @@ use instar_paint::PhysicalSize as PaintSize;
 use instar_shell::{Presenter, default_font};
 use instar_ui::ScrollState;
 use instar_ui::protocol::decode_batch;
-use instar_ui::{ChangeSet, Node, NodeKind, TextContext, Tree, Viewport, diff};
+use instar_ui::{ChangeSet, DecodedUiSnapshot, Node, NodeKind, TextContext, Tree, Viewport, diff};
 use instar_window::{LogicalSize, PhysicalSize as WindowSize, WindowId, WindowMetricsChanged};
 
 const WINDOW: WindowId = WindowId::from_raw(1);
@@ -453,7 +453,9 @@ fn measure(
             checksum += batch.nodes.len();
 
             let started = Instant::now();
-            let tree = Tree::from_wire(&batch).expect("the benchmark's own tree validates");
+            let tree = DecodedUiSnapshot::from_wire(&batch)
+                .expect("the benchmark's own tree validates")
+                .tree;
             layers.validate.baseline.push(started.elapsed());
             checksum += tree.iter().count();
 
@@ -482,7 +484,9 @@ fn measure(
             checksum += batch.nodes.len();
 
             let started = Instant::now();
-            let changed_tree = Tree::from_wire(&batch).expect("the benchmark's own tree validates");
+            let changed_tree = DecodedUiSnapshot::from_wire(&batch)
+                .expect("the benchmark's own tree validates")
+                .tree;
             layers.validate.change.push(started.elapsed());
             checksum += changed_tree.iter().count();
 
@@ -568,7 +572,7 @@ fn measure(
             "wire",
             "validate",
             &layers.validate,
-            "instar_ui::Tree::from_wire, microseconds",
+            "instar_ui::DecodedUiSnapshot::from_wire, microseconds",
         );
     } else {
         let what = format!(
@@ -691,7 +695,9 @@ fn measure_shape_matrix(
             checksum += batch.nodes.len();
 
             let started = Instant::now();
-            let tree = Tree::from_wire(&batch).expect("the benchmark's own tree validates");
+            let tree = DecodedUiSnapshot::from_wire(&batch)
+                .expect("the benchmark's own tree validates")
+                .tree;
             layers.validate.baseline.push(started.elapsed());
             checksum += tree.iter().count();
 
@@ -717,7 +723,9 @@ fn measure_shape_matrix(
             checksum += batch.nodes.len();
 
             let started = Instant::now();
-            let changed_tree = Tree::from_wire(&batch).expect("the benchmark's own tree validates");
+            let changed_tree = DecodedUiSnapshot::from_wire(&batch)
+                .expect("the benchmark's own tree validates")
+                .tree;
             layers.validate.change.push(started.elapsed());
             checksum += changed_tree.iter().count();
 
@@ -752,7 +760,7 @@ fn measure_shape_matrix(
             (
                 "validate",
                 &layers.validate,
-                "instar_ui::Tree::from_wire, microseconds",
+                "instar_ui::DecodedUiSnapshot::from_wire, microseconds",
             ),
             (
                 "diff",

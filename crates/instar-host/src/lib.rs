@@ -44,19 +44,23 @@
 
 #![forbid(unsafe_code)]
 
+mod attachment;
 pub mod bridge;
 pub mod present;
 pub mod text_host;
 pub mod text_view;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::attachment::{StagedUiCommit, ValidatedUiCommit};
 use instar_kernel::runtime::GenerationId;
+use instar_kernel::text_bridge::{AttachmentRefusal, OpaqueResourceKey};
 use instar_paint::PaintScene;
+use instar_text::TextViewId;
 use instar_ui::{
-    FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState, ScrollbarPart,
-    ScrollbarStyle, TextContext, TreeError, UiAction, Viewport,
+    DecodedUiSnapshot, FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState,
+    ScrollbarPart, ScrollbarStyle, TextAttachmentRef, TextContext, TreeError, UiAction, Viewport,
 };
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
@@ -191,6 +195,13 @@ pub struct HostWindow {
     /// Where each retained viewport is scrolled to. Host-owned: no guest sets
     /// one, and none can read one.
     scroll: ScrollState,
+    /// Which `TextViewId` each text-view node in the retained tree shows.
+    ///
+    /// Resolved during admission and held beside the tree: the tree itself
+    /// deliberately carries no resource identity (see
+    /// [`instar_ui::NodeKind::TextView`]), and the slots a commit used are
+    /// commit-local and gone by the time this map exists.
+    text_attachments: BTreeMap<NodeKey, TextViewId>,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -217,6 +228,11 @@ impl HostWindow {
         self.tree.as_ref()
     }
 
+    /// The text-view attachments of the retained tree, by node.
+    pub fn text_attachments(&self) -> &BTreeMap<NodeKey, TextViewId> {
+        &self.text_attachments
+    }
+
     /// The version of the retained UI state.
     ///
     /// Incremented only when an accepted snapshot actually changed the tree;
@@ -226,6 +242,19 @@ impl HostWindow {
     /// accepted commit.
     pub fn tree_revision(&self) -> u64 {
         self.tree_revision
+    }
+
+    /// Installs a staged snapshot and advances the tree revision.
+    ///
+    /// Infallible by construction: a [`StagedUiCommit`] has already passed
+    /// every check that can refuse, so promotion has nothing left to report.
+    /// It owns the two assignments that make the retained UI state — the tree
+    /// and the attachment map — so no other path can update one without the
+    /// other.
+    pub(crate) fn promote_ui_commit(&mut self, staged: StagedUiCommit) {
+        self.tree_revision += 1;
+        self.tree = Some(staged.tree);
+        self.text_attachments = staged.attachments;
     }
 
     /// The paint intent to present, if there is any that may be shown.
@@ -468,6 +497,62 @@ impl Host {
 
     pub fn text_resources_mut(&mut self) -> &mut text_host::TextHost {
         &mut self.text_resources
+    }
+
+    /// Resolves a commit's attachment side table, positionally.
+    ///
+    /// Each key resolves through
+    /// [`TextHost::resolve_view_lease`](text_host::TextHost::resolve_view_lease),
+    /// which checks ownership before identity — so a live view this
+    /// generation does not lease, or a stale incarnation, is refused here
+    /// exactly as it would be for a text operation. The result is positional
+    /// scratch: slot `i` names `resolved[i]`. Duplicate entries and
+    /// unreferenced entries are both legal; policing them would turn a WIT
+    /// argument representation into semantics for no correctness gain.
+    pub fn resolve_attachment_table(
+        &self,
+        generation: GenerationId,
+        keys: &[OpaqueResourceKey],
+    ) -> Result<Vec<TextViewId>, AttachmentRefusal> {
+        keys.iter()
+            .map(|key| {
+                self.text_resources
+                    .resolve_view_lease(generation, *key)
+                    .map_err(|_| AttachmentRefusal::UnavailableTextView)
+            })
+            .collect()
+    }
+
+    /// Turns the decoded attachment refs into the retained map, against an
+    /// already-resolved side table.
+    ///
+    /// Steps 4 and 5 of the frozen order, and they live here rather than in
+    /// the bridge for a reason the tests make sharp: the permutation
+    /// regression has to prove that *this* loop ignores slot numbers, and a
+    /// test that rebuilt the map itself would prove only that its own
+    /// arithmetic ignores them.
+    ///
+    /// Uniqueness compares resolved [`TextViewId`]s and nothing else. The same
+    /// `NodeKey` may name the same view while the opaque lease representation
+    /// differs purely because of how the guest supplied the borrow — WIT
+    /// resource handles are opaque, carry dynamic borrow state, and are not
+    /// retained equality tokens.
+    pub fn resolve_attachments(
+        refs: &[TextAttachmentRef],
+        resolved: &[TextViewId],
+    ) -> Result<BTreeMap<NodeKey, TextViewId>, AttachmentRefusal> {
+        let mut attachments = BTreeMap::new();
+        let mut seen = HashSet::new();
+        for attachment in refs {
+            let Some(view) = resolved.get(attachment.slot as usize).copied() else {
+                return Err(AttachmentRefusal::AttachmentOutOfRange);
+            };
+            if !seen.insert(view) {
+                return Err(AttachmentRefusal::TextViewAlreadyAttached);
+            }
+            attachments.insert(attachment.node, view);
+        }
+        Ok(attachments)
     }
 
     /// A host whose Parley font context has the shipped monospace face.
@@ -874,7 +959,62 @@ impl Host {
         window_id: WindowId,
         batch: &[u8],
     ) -> Result<Vec<HostEffect>, TreeError> {
-        self.apply_tree(window_id, Tree::decode(batch)?)
+        let snapshot = DecodedUiSnapshot::decode(batch)?;
+        // This entry point has no side table, so a slot here names nothing.
+        // Refusing is the point: silently keeping the node and dropping the
+        // attachment would retain a text surface the guest believes is showing
+        // a document. The bridge path is the one that carries capabilities.
+        if let Some(attachment) = snapshot.text_attachments.first() {
+            return Err(TreeError::AttachmentWithoutTable {
+                key: attachment.node,
+                slot: attachment.slot,
+            });
+        }
+        self.apply_tree(window_id, snapshot.tree)
+    }
+
+    /// The fallible pre-promotion half: diff the new tree against the
+    /// retained one and refuse kind changes.
+    ///
+    /// `attachment_refs` are carried, not resolved: resolution happens before
+    /// this in the bridge's normative order, and `apply_tree` stages with an
+    /// empty table and therefore an empty ref list.
+    fn validate_ui_commit(
+        &mut self,
+        window_id: WindowId,
+        tree: Tree,
+        attachment_refs: Vec<TextAttachmentRef>,
+    ) -> Result<ValidatedUiCommit, TreeError> {
+        let window = self.windows.entry(window_id).or_default();
+        let tree_changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
+        Ok(ValidatedUiCommit {
+            tree,
+            tree_changes,
+            attachment_refs,
+        })
+    }
+
+    /// The fallible staging half: accept the snapshot's id lifecycle and
+    /// compute the attachment diff.
+    ///
+    /// This is the last place a refusal is possible. [`StagedUiCommit`] says
+    /// so, and [`HostWindow::promote_ui_commit`] takes it without a `Result`.
+    fn stage_ui_commit(
+        &mut self,
+        window_id: WindowId,
+        validated: ValidatedUiCommit,
+        attachments: BTreeMap<NodeKey, TextViewId>,
+    ) -> Result<StagedUiCommit, TreeError> {
+        let window = self.windows.entry(window_id).or_default();
+        window.ledger.validate(&validated.tree)?;
+        let attachment_changes =
+            attachment::AttachmentChangeSet::diff(&window.text_attachments, &attachments);
+        Ok(StagedUiCommit {
+            tree: validated.tree,
+            tree_changes: validated.tree_changes,
+            attachments,
+            attachment_changes,
+        })
     }
 
     /// Installs an already-decoded, already-validated snapshot.
@@ -904,14 +1044,28 @@ impl Host {
         window_id: WindowId,
         tree: Tree,
     ) -> Result<Vec<HostEffect>, TreeError> {
-        let window = self.windows.entry(window_id).or_default();
+        // Stage with an empty attachment table: the bridge path stages with
+        // resolved attachments, and this entry point keeps its existing
+        // behaviour until 3c replaces it.
+        let validated = self.validate_ui_commit(window_id, tree, Vec::new())?;
+        let staged = self.stage_ui_commit(window_id, validated, BTreeMap::new())?;
+        Ok(self.apply_staged_commit(window_id, staged))
+    }
 
-        // Before the mutation, so a refusal costs the previous interface
-        // nothing. The ledger check sits beside the diff for the same reason:
-        // a snapshot that reuses a retired id must leave the previous
-        // interface standing exactly as a refused diff does.
-        let changes = instar_ui::diff(window.tree.as_ref(), &tree)?;
-        window.ledger.validate(&tree)?;
+    /// The infallible half of UI admission: everything after the last
+    /// refusal, in the order `apply_tree` always used.
+    ///
+    /// The staged commit cannot fail, so this returns effects rather than a
+    /// `Result`. The no-op early return sits here, after staging, exactly as
+    /// it always sat after the diff and ledger validation: a guest
+    /// re-committing an identical interface is an ordinary shape, and it
+    /// should cost the decode and nothing else.
+    fn apply_staged_commit(
+        &mut self,
+        window_id: WindowId,
+        staged: StagedUiCommit,
+    ) -> Vec<HostEffect> {
+        let window = self.windows.entry(window_id).or_default();
 
         // A guest re-committing an identical interface is an ordinary shape —
         // it is what an event the guest decided to ignore looks like from
@@ -919,8 +1073,14 @@ impl Host {
         // scene, no frame.
         // (An opening commit always reports its nodes as created, so this
         // cannot swallow a guest's first interface.)
-        if changes.is_empty() {
-            return Ok(Vec::new());
+        //
+        // **Both** diffs, because a commit can be a no-op for the tree and not
+        // for the attachments: the same `TextView` node showing a different
+        // document sends byte-identical tree bytes with a different side
+        // table. Gating on the tree diff alone would drop that change on the
+        // floor while telling the guest the commit was accepted.
+        if staged.tree_changes.is_empty() && staged.attachment_changes.is_empty() {
+            return Vec::new();
         }
 
         // Validation ran above the early return, so a no-op commit cannot
@@ -928,27 +1088,29 @@ impl Host {
         // snapshot has identical live keys, so applying would only redo a
         // no-op, and the no-op commit keeps costing the decode and nothing
         // else.
-        window.ledger.apply(&tree);
-
-        // A snapshot that survived the diff is a new version of the retained
-        // tree. The guest-visible commit sequence advances on every accepted
-        // commit; this is the host's separate value for whether the state
-        // actually changed, and the one caches key off.
-        window.tree_revision += 1;
+        let needs_layout = staged.tree_changes.needs_layout();
+        let needs_text_finalize = staged.tree_changes.needs_text_finalize();
+        window.ledger.apply(&staged.tree);
 
         // Before the new snapshot becomes interactive: any transient state
         // referring to a node the guest removed is retired. A press that
         // outlived its node would otherwise be completable against whatever
         // reused its key. See `Interaction::retire`.
-        window.interaction.retire(&changes.removed);
-        self.text.retire(&changes.removed);
+        window.interaction.retire(&staged.tree_changes.removed);
+        self.text.retire(&staged.tree_changes.removed);
         // Deletion destroys a viewport's offset; hiding does not. This is the
         // deletion half, and it sits with the other retirements for the same
         // reason -- state that outlives the node it describes eventually
         // lands on something else.
-        window.scroll.retire(&changes.removed);
+        window.scroll.retire(&staged.tree_changes.removed);
 
-        window.tree = Some(tree);
+        // A snapshot that survived the diff is a new version of the retained
+        // tree. The promotion owns the two assignments that make the retained
+        // UI state -- the tree and the attachment map -- and advances the
+        // revision. The guest-visible commit sequence advances on every
+        // accepted commit; the revision is the host's separate value for
+        // whether the state actually changed, and the one caches key off.
+        window.promote_ui_commit(staged);
         // And any state referring to a node the guest *hid*, which the diff
         // does not report as removed because it is still in the tree. Runs
         // after the promotion rather than before it, because the question is
@@ -977,10 +1139,10 @@ impl Host {
         // unchanged width happens to reuse rather than re-extract today, that
         // is a property of the cache's internals rather than of this path.
         // Not entering it at all cannot regress.
-        if changes.needs_layout() {
+        if needs_layout {
             self.layout_passes += 1;
             window.recompute_layout(&mut self.text, self.scrollbars);
-        } else if changes.needs_text_finalize() {
+        } else if needs_text_finalize {
             // Alignment moved and geometry did not. Finalization normally
             // happens inside a layout pass because that is where the final
             // width is known -- but every width here is still correct, so
@@ -1002,12 +1164,12 @@ impl Host {
 
         let window = self.windows.entry(window_id).or_default();
         if window.metrics.is_ready() {
-            Ok(vec![HostEffect::Render { window: window_id }])
+            vec![HostEffect::Render { window: window_id }]
         } else {
             // Nothing to draw against yet; remember that something wants
             // drawing once there is.
             window.redraw_pending = true;
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 
@@ -1586,6 +1748,8 @@ mod tests {
     use super::*;
     use crate::bridge::{HostBridge, HostUserEvent, Wake};
     use instar_kernel::bridge::commit_request;
+    use instar_kernel::text_bridge::{OpaqueResourceKey, TextAnswer, TextOperation, text_request};
+    use instar_text::TextViewId;
     use instar_ui::protocol::{BatchEncoder, NodeKey, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, PhysicalSize, PointerButton};
     use std::time::{Duration, Instant};
@@ -5434,5 +5598,192 @@ mod tests {
             "doubling the scale factor while the logical size is unchanged must \
              not move anything: instar-ui never sees DPI"
         );
+    }
+
+    // --- Text-view attachments (B2e-3b) ---
+
+    /// Opens one buffer and one view for `GEN1`, registering both leases.
+    fn create_view(host: &mut Host) -> OpaqueResourceKey {
+        let mut serve = |operation: TextOperation| {
+            let (request, wait) = text_request(GEN1, operation);
+            let screened = request.screen(GEN1).expect("current generation");
+            host.text_resources_mut().serve(screened);
+            wait.blocking_recv().expect("answered")
+        };
+
+        let buffer = match serve(TextOperation::CreateBuffer) {
+            Ok(TextAnswer::Created(key)) => key,
+            other => panic!("expected a buffer, got {other:?}"),
+        };
+        match serve(TextOperation::CreateView { buffer }) {
+            Ok(TextAnswer::Created(key)) => key,
+            other => panic!("expected a view, got {other:?}"),
+        }
+    }
+
+    /// A root whose text-view children name the given slots.
+    fn attachment_batch(nodes: &[(u32, u16)]) -> Vec<u8> {
+        let mut encoder = BatchEncoder::new();
+        encoder.node(
+            opcode::NODE_ROOT,
+            NodeKey::first(0),
+            0,
+            None,
+            WireLayout::default(),
+            nodes.len() as u16,
+        );
+        for (id, slot) in nodes {
+            encoder.text_view(
+                NodeKey::first(*id),
+                flags::ENABLED,
+                *slot,
+                WireLayout::default(),
+            );
+        }
+        encoder.finish()
+    }
+
+    /// Stages a commit exactly as the bridge's normative order would, with
+    /// every key assumed to resolve, and returns the staged commit plus the
+    /// resolved map.
+    fn stage_with_attachments(
+        host: &mut Host,
+        batch: &[u8],
+        keys: &[OpaqueResourceKey],
+    ) -> (StagedUiCommit, BTreeMap<NodeKey, TextViewId>) {
+        let snapshot = DecodedUiSnapshot::decode(batch).expect("batch decodes");
+        let resolved = host
+            .resolve_attachment_table(GEN1, keys)
+            .expect("every key is leased to the generation");
+        // Production's own slot resolution, not a reimplementation of it.
+        // Rebuilding the map here would leave the permutation regression below
+        // proving something about this helper rather than about the host.
+        let attachments = Host::resolve_attachments(&snapshot.text_attachments, &resolved)
+            .expect("slots are in range and no view is claimed twice");
+        let validated = host
+            .validate_ui_commit(WINDOW, snapshot.tree, snapshot.text_attachments)
+            .expect("the tree diff accepts");
+        let staged = host
+            .stage_ui_commit(WINDOW, validated, attachments.clone())
+            .expect("the ledger accepts");
+        (staged, attachments)
+    }
+
+    /// The tableless entry point refuses a text view rather than stripping it.
+    ///
+    /// `on_guest_commit` carries no capabilities, so a slot names nothing.
+    /// Admitting the tree with the attachment quietly dropped would retain a
+    /// text surface the guest believes is showing a document, and leave no
+    /// record that it ever named one.
+    #[test]
+    fn a_text_view_without_a_side_table_is_refused_not_stripped() {
+        let mut host = Host::new();
+        let batch = attachment_batch(&[(10, 0)]);
+
+        assert!(matches!(
+            host.on_guest_commit(WINDOW, &batch),
+            Err(TreeError::AttachmentWithoutTable { slot: 0, .. })
+        ));
+        assert!(
+            host.window(WINDOW).is_none_or(|w| w.tree().is_none()),
+            "and the refusal left no tree behind"
+        );
+    }
+
+    /// A: slot 0 -> V7, B: slot 9 -> V7. The attachment diff is EMPTY.
+    ///
+    /// The slot is commit-local scratch: what survived into the retained map
+    /// is `node10 -> V7` in both commits, so a diff that looked at slots
+    /// would report a change that never happened.
+    #[test]
+    fn a_moving_slot_that_resolves_to_the_same_view_diffs_to_nothing() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let a = attachment_batch(&[(10, 0)]);
+        let b = attachment_batch(&[(10, 9)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        // B's table is ten entries long so slot 9 can name V7; the other nine
+        // entries are unreferenced scratch, which is legal.
+        let (staged_b, map_b) = stage_with_attachments(&mut host, &b, &[v7; 10]);
+        assert!(
+            staged_b.tree_changes.is_empty(),
+            "the tree is identical; only the slot moved"
+        );
+        assert_eq!(
+            staged_b.attachment_changes,
+            attachment::AttachmentChangeSet::default(),
+            "slot 0 and slot 9 both resolve to V7, so nothing changed in the \
+             only representation admission retains"
+        );
+        assert_eq!(
+            map_b.get(&NodeKey::first(10)),
+            Some(&TextViewId {
+                id: 0,
+                generation: 0
+            }),
+            "and the retained map really does still name V7"
+        );
+    }
+
+    /// A: slot 0 -> V7, B: slot 0 -> V12. The attachment diff CHANGED.
+    #[test]
+    fn the_same_node_now_naming_a_different_view_is_replaced() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let v12 = create_view(&mut host);
+        let a = attachment_batch(&[(10, 0)]);
+        let b = attachment_batch(&[(10, 0)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        let (staged_b, _) = stage_with_attachments(&mut host, &b, &[v12]);
+        assert_eq!(
+            staged_b.attachment_changes.replaced,
+            vec![NodeKey::first(10)],
+            "node10 now names V12 instead of V7"
+        );
+        assert!(staged_b.attachment_changes.attached.is_empty());
+        assert!(staged_b.attachment_changes.detached.is_empty());
+    }
+
+    /// The permutation: the same two nodes keep the same two views while both
+    /// slots move. Tree diff EMPTY, attachment diff EMPTY.
+    ///
+    /// This is the case that makes the table's positional scratch semantics
+    /// unavoidable: a single moving slot only proves one slot may move, while
+    /// swapping both proves the whole table is positional scratch space. Any
+    /// code comparing slot numbers or side-table positions must fail it.
+    #[test]
+    fn swapping_every_slot_still_diff_to_nothing() {
+        let mut host = Host::new();
+        let v7 = create_view(&mut host);
+        let v8 = create_view(&mut host);
+        let v7_id = host.resolve_attachment_table(GEN1, &[v7]).unwrap()[0];
+        let v8_id = host.resolve_attachment_table(GEN1, &[v8]).unwrap()[0];
+        let a = attachment_batch(&[(10, 0), (20, 1)]);
+        let b = attachment_batch(&[(10, 1), (20, 0)]);
+
+        let (staged_a, _) = stage_with_attachments(&mut host, &a, &[v7, v8]);
+        host.apply_staged_commit(WINDOW, staged_a);
+
+        // B swaps the table order too: slot 1 now names V7 and slot 0 names
+        // V8, so both nodes keep the same view while every position moved.
+        let (staged_b, map_b) = stage_with_attachments(&mut host, &b, &[v8, v7]);
+        assert!(
+            staged_b.tree_changes.is_empty(),
+            "the tree is identical; only the slot assignment moved"
+        );
+        assert_eq!(
+            staged_b.attachment_changes,
+            attachment::AttachmentChangeSet::default(),
+            "node10 still names V7 and node20 still names V8, so no NodeKey \
+             was attached, detached, or replaced"
+        );
+        assert_eq!(map_b.get(&NodeKey::first(10)), Some(&v7_id));
+        assert_eq!(map_b.get(&NodeKey::first(20)), Some(&v8_id));
     }
 }

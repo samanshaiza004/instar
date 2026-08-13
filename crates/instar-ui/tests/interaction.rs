@@ -19,8 +19,8 @@ use std::time::Duration;
 use instar_kernel::runtime::{GenerationHandle, Runtime, RuntimeGeneration};
 use instar_ui::protocol::decode_batch;
 use instar_ui::{
-    LayoutSnapshot, NodeKey, NodeKind, ProtocolError, TextContext, Tree, TreeError, UiAction,
-    Viewport,
+    DecodedUiSnapshot, LayoutSnapshot, NodeKey, NodeKind, ProtocolError, TextContext, Tree,
+    TreeError, UiAction, Viewport,
 };
 
 macro_rules! run_for {
@@ -60,6 +60,12 @@ async fn started() -> (Runtime, RuntimeGeneration, GenerationHandle) {
 /// `WindowMetricsChanged`; nothing here needs a real window.
 const VIEWPORT: Viewport = Viewport::new(400.0, 300.0);
 
+/// Decodes a committed snapshot and keeps only the tree; the attachment refs
+/// are not what these interaction tests drive.
+fn decode_tree(bytes: &[u8]) -> Result<Tree, TreeError> {
+    DecodedUiSnapshot::decode(bytes).map(|snapshot| snapshot.tree)
+}
+
 /// The tree the guest most recently committed, plus the geometry *the host*
 /// computed for it.
 ///
@@ -68,8 +74,7 @@ const VIEWPORT: Viewport = Viewport::new(400.0, 300.0);
 fn latest(kernel: &instar_kernel::runtime::SharedKernel) -> (Tree, LayoutSnapshot) {
     let commits = kernel.commits();
     let (_, bytes) = commits.last().expect("guest has committed at least once");
-    let batch = decode_batch(bytes).expect("guest commits a decodable batch");
-    let tree = Tree::from_wire(&batch).expect("guest commits a meaningful tree");
+    let tree = decode_tree(bytes).expect("guest commits a meaningful tree");
     let mut text = TextContext::new();
     let layout = tree.layout(&mut text, VIEWPORT);
     (tree, layout)
@@ -296,7 +301,7 @@ fn decode_errors_are_public() {
     // Wire failures and semantic failures stay distinguishable from the
     // integration surface, which is the whole reason they are separate types.
     assert!(matches!(
-        Tree::decode(b"nope"),
+        decode_tree(b"nope"),
         Err(TreeError::Protocol(ProtocolError::BadMagic))
     ));
 }

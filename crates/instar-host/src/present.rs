@@ -776,6 +776,7 @@ pub(crate) fn push_shaped(
 mod tests {
     use super::*;
     use instar_paint::PaintSceneError;
+    use instar_ui::DecodedUiSnapshot;
     use instar_ui::Viewport;
     use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, WindowId};
@@ -784,6 +785,10 @@ mod tests {
     const LABEL: NodeKey = NodeKey::first(2);
     const BUTTON: NodeKey = NodeKey::first(3);
     const DISABLED: NodeKey = NodeKey::first(4);
+
+    fn decode_tree(bytes: &[u8]) -> Result<Tree, instar_ui::TreeError> {
+        DecodedUiSnapshot::decode(bytes).map(|snapshot| snapshot.tree)
+    }
 
     fn metrics(scale: f64) -> WindowMetricsChanged {
         WindowMetricsChanged {
@@ -833,7 +838,7 @@ mod tests {
                 WireLayout::default(),
                 0,
             );
-        Tree::decode(&encoder.finish()).expect("the fixture batch is valid")
+        decode_tree(&encoder.finish()).expect("the fixture batch is valid")
     }
 
     fn scene(scale: f64, pressed: Option<NodeKey>) -> PaintScene {

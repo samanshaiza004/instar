@@ -55,6 +55,30 @@ pub use text::{
 
 use instar_ui_protocol::{BatchEncoder, WireBatch, WireEvent, WireNode, flags, opcode};
 
+/// A text-view node's attachment, as the wire expressed it.
+///
+/// Commit-local by construction: the slot indexes this commit's side table,
+/// and nothing downstream retains it. Admission resolves it to a host
+/// resource identity and keeps that instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextAttachmentRef {
+    pub node: NodeKey,
+    pub slot: u16,
+}
+
+/// What one commit's bytes decoded to.
+///
+/// Exactly one parser exists, and it returns everything the bytes said. Now
+/// that the wire carries semantic attachment references, a parser that
+/// silently discards them could decode `TextView(slot = 9)` into a [`Tree`]
+/// that has forgotten slot 9 existed — and the tree would compare equal to
+/// one that never had an attachment at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedUiSnapshot {
+    pub tree: Tree,
+    pub text_attachments: Vec<TextAttachmentRef>,
+}
+
 /// What a node is, semantically. Presentation is not described here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
@@ -372,6 +396,16 @@ pub enum TreeError {
     /// than putting the toolbar inside the editor.
     #[error("{key} is a text view with {children} children; a text view is a leaf")]
     TextViewArity { key: NodeKey, children: usize },
+    /// A text view arrived through an entry point that carries no side table.
+    ///
+    /// A slot only means something against the capabilities supplied with the
+    /// same commit, so a batch containing a text view cannot be admitted by a
+    /// path that has no table to resolve it against. The refusal is explicit
+    /// because the alternative — dropping the attachment and keeping the node
+    /// — would retain a text surface showing nothing, with no record that the
+    /// guest had named a document at all.
+    #[error("{key} names attachment slot {slot}, but this commit carries no side table")]
+    AttachmentWithoutTable { key: NodeKey, slot: u16 },
     /// A node stated a flex basis where it is not a flex item.
     ///
     /// `basis` describes how a node participates in **its parent's** layout,
@@ -409,13 +443,14 @@ pub struct Tree {
     pub root: Node,
 }
 
-impl Tree {
-    pub fn new(root: Node) -> Self {
-        Self { root }
-    }
-
-    /// Assembles a tree from a decoded wire batch, applying semantic rules the
-    /// protocol layer deliberately does not.
+impl DecodedUiSnapshot {
+    /// Assembles a snapshot from a decoded wire batch, applying semantic
+    /// rules the protocol layer deliberately does not.
+    ///
+    /// The attachment refs are collected inside assembly, not by a later scan
+    /// over `batch.nodes`: only nodes that are actually assembled are
+    /// semantically live, and a separate scan could disagree about which
+    /// those are.
     pub fn from_wire(batch: &WireBatch) -> Result<Self, TreeError> {
         if batch.nodes.is_empty() {
             return Err(TreeError::Empty);
@@ -467,7 +502,8 @@ impl Tree {
             }
         }
         let mut cursor = 0usize;
-        let root = assemble(&batch.nodes, &mut cursor)?;
+        let mut text_attachments = Vec::new();
+        let root = assemble(&batch.nodes, &mut cursor, &mut text_attachments)?;
         // Checked after assembly, unlike the rules above, because it is the
         // only one that needs a node's *parent*.
         if root.layout.basis != WireBasis::Auto {
@@ -477,12 +513,21 @@ impl Tree {
             });
         }
         check_basis(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            tree: Tree { root },
+            text_attachments,
+        })
     }
 
     /// Decodes and assembles in one step.
     pub fn decode(bytes: &[u8]) -> Result<Self, TreeError> {
         Self::from_wire(&instar_ui_protocol::decode_batch(bytes)?)
+    }
+}
+
+impl Tree {
+    pub fn new(root: Node) -> Self {
+        Self { root }
     }
 
     /// Encodes this tree, with no layout section.
@@ -585,7 +630,11 @@ fn check_basis(node: &Node) -> Result<(), TreeError> {
     Ok(())
 }
 
-fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
+fn assemble(
+    nodes: &[WireNode],
+    cursor: &mut usize,
+    text_attachments: &mut Vec<TextAttachmentRef>,
+) -> Result<Node, TreeError> {
     let wire = nodes.get(*cursor).ok_or(TreeError::Empty)?;
     *cursor += 1;
 
@@ -602,11 +651,25 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
             label: wire.text.clone().unwrap_or_default(),
             enabled: wire.is_enabled(),
         },
-        // The attachment slot is deliberately dropped here. It is
-        // commit-local: `instar-host` reads it off the `WireBatch` during
-        // admission and keeps the resolved identity, so retaining the index
-        // would be retaining the wrong thing.
-        opcode::NODE_TEXT_VIEW => NodeKind::TextView,
+        // The slot is reported alongside the node and then deliberately
+        // dropped from the tree itself. It is commit-local: `instar-host`
+        // resolves it during admission and keeps the resource identity, so
+        // retaining the index on the node would be retaining the wrong thing.
+        // Collecting the ref here rather than by a later scan is what makes
+        // the refs agree with the assembled tree — see
+        // [`DecodedUiSnapshot::from_wire`].
+        opcode::NODE_TEXT_VIEW => {
+            let slot = wire
+                .attachment
+                .ok_or(TreeError::Protocol(ProtocolError::Truncated {
+                    while_reading: "text view attachment",
+                }))?;
+            text_attachments.push(TextAttachmentRef {
+                node: wire.key,
+                slot,
+            });
+            NodeKind::TextView
+        }
         // Unreachable via `decode_batch`, which rejects unknown kinds; handled
         // rather than panicked because `from_wire` is public and a caller may
         // hand-build a `WireBatch`.
@@ -620,7 +683,7 @@ fn assemble(nodes: &[WireNode], cursor: &mut usize) -> Result<Node, TreeError> {
 
     let mut children = Vec::with_capacity(wire.child_count as usize);
     for _ in 0..wire.child_count {
-        children.push(assemble(nodes, cursor)?);
+        children.push(assemble(nodes, cursor, text_attachments)?);
     }
 
     Ok(Node {
@@ -838,6 +901,12 @@ mod tests {
 
     const VIEWPORT: Viewport = Viewport::new(400.0, 300.0);
 
+    /// Decodes a snapshot and keeps only the tree, for tests that do not care
+    /// about attachment refs.
+    fn decode_tree(bytes: &[u8]) -> Result<Tree, TreeError> {
+        DecodedUiSnapshot::decode(bytes).map(|snapshot| snapshot.tree)
+    }
+
     fn layout(tree: &Tree) -> LayoutSnapshot {
         let mut text = TextContext::new();
         tree.layout(&mut text, VIEWPORT)
@@ -846,7 +915,7 @@ mod tests {
     #[test]
     fn round_trips_through_the_wire() {
         let tree = sample();
-        assert_eq!(Tree::decode(&tree.encode()).unwrap(), tree);
+        assert_eq!(decode_tree(&tree.encode()).unwrap(), tree);
     }
 
     /// The exit gate for WP7A: the guest provides zero geometry, and the host
@@ -1839,7 +1908,7 @@ mod tests {
         ));
         assert!(
             matches!(
-                Tree::decode(&in_a_stack.encode()),
+                decode_tree(&in_a_stack.encode()),
                 Err(TreeError::BasisWithoutFlexParent { key, parent: "stack" })
                     if key == NodeKey::first(2)
             ),
@@ -1857,7 +1926,7 @@ mod tests {
         ));
         assert!(
             matches!(
-                Tree::decode(&container_in_a_stack.encode()),
+                decode_tree(&container_in_a_stack.encode()),
                 Err(TreeError::BasisWithoutFlexParent { key, .. }) if key == NodeKey::first(2)
             ),
             "being a flex container says nothing about how the node itself \
@@ -1870,7 +1939,7 @@ mod tests {
             vec![Node::row(1, vec![with_basis(Node::button(2, "key"))])],
         ));
         assert!(
-            Tree::decode(&in_a_row.encode()).is_ok(),
+            decode_tree(&in_a_row.encode()).is_ok(),
             "a row child is a flex item, so a basis means something"
         );
 
@@ -1879,7 +1948,7 @@ mod tests {
             0,
             vec![Node::scroll(1, with_basis(Node::column(2, vec![])))],
         ));
-        assert!(Tree::decode(&in_a_scroll.encode()).is_ok());
+        assert!(decode_tree(&in_a_scroll.encode()).is_ok());
     }
 
     #[test]
@@ -1983,7 +2052,7 @@ mod tests {
                 0,
             );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::DuplicateKey(NodeKey::first(1)))
         );
     }
@@ -2011,7 +2080,7 @@ mod tests {
                 0,
             );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::DuplicateKey(NodeKey::new(1, 1)))
         );
     }
@@ -2028,7 +2097,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::BadRoot("column"))
         );
     }
@@ -2045,7 +2114,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::BadRoot("row"))
         );
     }
@@ -2062,7 +2131,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::BadRoot("stack"))
         );
     }
@@ -2088,7 +2157,7 @@ mod tests {
                 0,
             );
         assert_eq!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::NestedRoot(NodeKey::first(1)))
         );
     }
@@ -2096,7 +2165,7 @@ mod tests {
     #[test]
     fn wire_errors_surface_as_protocol_errors() {
         assert!(matches!(
-            Tree::decode(b"nope"),
+            decode_tree(b"nope"),
             Err(TreeError::Protocol(ProtocolError::BadMagic))
         ));
     }
@@ -2388,6 +2457,10 @@ mod text_view_tree {
     const ROOT: NodeKey = NodeKey::first(0);
     const VIEW: NodeKey = NodeKey::first(1);
 
+    fn decode_tree(bytes: &[u8]) -> Result<Tree, TreeError> {
+        DecodedUiSnapshot::decode(bytes).map(|snapshot| snapshot.tree)
+    }
+
     fn batch(slot: u16) -> Vec<u8> {
         let mut encoder = BatchEncoder::new();
         encoder.node(opcode::NODE_ROOT, ROOT, 0, None, WireLayout::default(), 1);
@@ -2398,13 +2471,28 @@ mod text_view_tree {
     /// A text view decodes to a kind that carries no resource identity.
     #[test]
     fn a_text_view_decodes_without_its_attachment() {
-        let tree = Tree::decode(&batch(3)).expect("valid");
+        let tree = decode_tree(&batch(3)).expect("valid");
         let view = tree.find(VIEW).expect("present");
 
         assert_eq!(view.kind, NodeKind::TextView);
         assert!(
             view.children.is_empty(),
             "and it is a leaf in the retained tree too"
+        );
+    }
+
+    /// The parser returns the attachment refs the bytes said, slot and all.
+    #[test]
+    fn attachments_survive_into_the_decoded_snapshot() {
+        let snapshot = DecodedUiSnapshot::decode(&batch(9)).expect("valid");
+
+        assert_eq!(
+            snapshot.text_attachments,
+            vec![TextAttachmentRef {
+                node: VIEW,
+                slot: 9
+            }],
+            "slot 9 must not be discarded by the one parser that reads it"
         );
     }
 
@@ -2416,12 +2504,12 @@ mod text_view_tree {
     /// different in the next commit.
     #[test]
     fn the_retained_tree_holds_no_attachment_slot() {
-        let three = Tree::decode(&batch(3)).expect("valid");
+        let three = decode_tree(&batch(3)).expect("valid");
 
         let mut encoder = BatchEncoder::new();
         encoder.node(opcode::NODE_ROOT, ROOT, 0, None, WireLayout::default(), 1);
         encoder.text_view(VIEW, flags::ENABLED, 9, WireLayout::default());
-        let nine = Tree::decode(&encoder.finish()).expect("valid");
+        let nine = decode_tree(&encoder.finish()).expect("valid");
 
         assert_eq!(
             three.find(VIEW).unwrap().kind,
@@ -2442,12 +2530,29 @@ mod text_view_tree {
         wire.nodes[1].child_count = 2;
         // The root still claims one child, so the tree is otherwise coherent.
         assert!(matches!(
-            Tree::from_wire(&wire),
+            DecodedUiSnapshot::from_wire(&wire).map(|snapshot| snapshot.tree),
             Err(TreeError::TextViewArity {
                 key: VIEW,
                 children: 2
             })
         ));
+    }
+
+    /// Only assembled nodes are live, so an orphan text view in a hand-built
+    /// batch must not contribute an attachment ref.
+    #[test]
+    fn an_unassembled_text_view_leaves_no_attachment_ref() {
+        let mut wire =
+            instar_ui_protocol::decode_batch(&batch(3)).expect("the honest batch decodes");
+        wire.nodes[0].child_count = 0;
+
+        let snapshot = DecodedUiSnapshot::from_wire(&wire).expect("a root is still a tree");
+
+        assert_eq!(snapshot.tree.find(VIEW), None, "the text view is an orphan");
+        assert!(
+            snapshot.text_attachments.is_empty(),
+            "refs come from assembly, not from a later scan over the flat batch"
+        );
     }
 
     /// A text view cannot be the root: the root is the window, and a window is
@@ -2457,7 +2562,7 @@ mod text_view_tree {
         let mut encoder = BatchEncoder::new();
         encoder.text_view(ROOT, flags::ENABLED, 0, WireLayout::default());
         assert!(matches!(
-            Tree::decode(&encoder.finish()),
+            decode_tree(&encoder.finish()),
             Err(TreeError::BadRoot("text view"))
         ));
     }
