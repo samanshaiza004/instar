@@ -54,13 +54,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::attachment::{StagedUiCommit, UiCommitRefusal, ValidatedUiCommit};
+use crate::present::TextSurfaceFrame;
+use crate::text_view::{HostTextSurface, TextInteraction, TextPointerOutcome};
 use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{AttachmentRefusal, OpaqueResourceKey};
 use instar_paint::PaintScene;
-use instar_text::TextViewId;
+pub use instar_text::TextViewId;
+use instar_text::TextViewport;
+use instar_text::{Selection, TextEdit};
 use instar_ui::{
-    DecodedUiSnapshot, FocusMove, FocusState, Interaction, KeyLedger, ScrollOffset, ScrollState,
-    ScrollbarPart, ScrollbarStyle, TextAttachmentRef, TextContext, TreeError, UiAction, Viewport,
+    DecodedUiSnapshot, FocusMove, FocusState, Interaction, KeyLedger, NodeKind, ScrollOffset,
+    ScrollState, ScrollbarPart, ScrollbarStyle, TextAttachmentRef, TextContext, TreeError,
+    UiAction, Viewport, WireOverflow, rect_contains, rect_intersection,
 };
 use instar_window::{
     LogicalPoint, PointerState, RawPointerEvent, RawScrollEvent, ScrollDelta, WindowId,
@@ -159,6 +164,11 @@ pub enum HostEffect {
     SendToGuest(Vec<u8>),
     /// Render this window's current layout.
     Render { window: WindowId },
+    ConfigureIme {
+        window: WindowId,
+        enabled: bool,
+        cursor_area: Option<ImeCursorArea>,
+    },
     /// The guest generation ended — it trapped, or its `run` returned.
     ///
     /// WP7B2 turns this into a crash screen. WP7B1's only obligation is that
@@ -170,6 +180,21 @@ pub enum HostEffect {
     },
     /// Exit the application.
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImeCursorArea {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TextComposition {
+    preedit: Option<String>,
+    cursor_range: Option<(usize, usize)>,
+    target: Option<Selection>,
 }
 
 /// Per-window host state.
@@ -202,6 +227,13 @@ pub struct HostWindow {
     /// [`instar_ui::NodeKind::TextView`]), and the slots a commit used are
     /// commit-local and gone by the time this map exists.
     text_attachments: BTreeMap<NodeKey, TextViewId>,
+    /// One presented window per attached text-view node, rebuilt whenever the
+    /// tree, geometry, attachment, buffer revision or text scroll changes.
+    text_surfaces: BTreeMap<NodeKey, HostTextSurface>,
+    /// An in-progress pointer drag on one of those surfaces.
+    text_interaction: TextInteraction,
+    composition: TextComposition,
+    ime_configuration: Option<(bool, Option<ImeCursorArea>)>,
     /// A redraw asked for while blocked, to be serviced once ready.
     redraw_pending: bool,
     /// Updated even while blocked; acted on only when ready.
@@ -231,6 +263,11 @@ impl HostWindow {
     /// The text-view attachments of the retained tree, by node.
     pub fn text_attachments(&self) -> &BTreeMap<NodeKey, TextViewId> {
         &self.text_attachments
+    }
+
+    /// The host's presented text surfaces, by the node each is attached to.
+    pub fn text_surfaces(&self) -> &BTreeMap<NodeKey, HostTextSurface> {
+        &self.text_surfaces
     }
 
     /// The version of the retained UI state.
@@ -378,6 +415,179 @@ fn scroll_extents(
         );
     }
     extents
+}
+
+/// A node's rect in window coordinates: absolute layout rect minus every
+/// ancestor viewport's scroll offset.
+fn visual_rect(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+    scroll: &ScrollState,
+    key: NodeKey,
+) -> Option<Rect> {
+    find_visual_rect(&tree.root, layout, scroll, key, ScrollOffset::ZERO)
+}
+
+/// The window-space origin of a node's visual rect.
+fn visual_origin(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+    scroll: &ScrollState,
+    key: NodeKey,
+) -> Option<(f32, f32)> {
+    let rect = visual_rect(tree, layout, scroll, key)?;
+    Some((rect.x as f32, rect.y as f32))
+}
+
+fn find_visual_rect(
+    node: &instar_ui::Node,
+    layout: &LayoutSnapshot,
+    scroll: &ScrollState,
+    key: NodeKey,
+    translation: ScrollOffset,
+) -> Option<Rect> {
+    if !instar_ui::is_presented(node) {
+        return None;
+    }
+    let rect = layout.get(node.key)?;
+    if node.key == key {
+        return Some(Rect::new(
+            rect.x - translation.x,
+            rect.y - translation.y,
+            rect.width,
+            rect.height,
+        ));
+    }
+    let child_translation = match node.kind {
+        NodeKind::Scroll => {
+            let offset = scroll.get(node.key);
+            ScrollOffset::new(translation.x + offset.x, translation.y + offset.y)
+        }
+        _ => translation,
+    };
+    for child in &node.children {
+        if let Some(found) = find_visual_rect(child, layout, scroll, key, child_translation) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The deepest text-view node under a window point.
+///
+/// The retained-UI hit-test deliberately does not claim `TextView` nodes —
+/// their contents are host-owned and `instar-ui` has no attachment map — so
+/// the host answers the same clip-then-translate question with its own
+/// attachment-aware walk. This is the B2e focus/hit routing: the UI decides
+/// everything else, and the host follows the node to its `TextViewId`.
+fn hit_text_view(
+    tree: &Tree,
+    layout: &LayoutSnapshot,
+    scroll: &ScrollState,
+    x: i32,
+    y: i32,
+) -> Option<NodeKey> {
+    hit_text_view_node(&tree.root, layout, scroll, x, y, None)
+}
+
+fn hit_text_view_node(
+    node: &instar_ui::Node,
+    layout: &LayoutSnapshot,
+    scroll: &ScrollState,
+    x: i32,
+    y: i32,
+    clip: Option<Rect>,
+) -> Option<NodeKey> {
+    if !instar_ui::is_presented(node) {
+        return None;
+    }
+    let rect = layout.get(node.key)?;
+    let clips = node.layout.overflow == WireOverflow::Clip || matches!(node.kind, NodeKind::Scroll);
+    let clip = if clips {
+        Some(match clip {
+            Some(outer) => rect_intersection(outer, rect),
+            None => rect,
+        })
+    } else {
+        clip
+    };
+    if let Some(clip) = clip
+        && !rect_contains(clip, x, y)
+    {
+        return None;
+    }
+    let (x, y, clip) = match node.kind {
+        NodeKind::Scroll => {
+            let offset = scroll.get(node.key);
+            (
+                x + offset.x,
+                y + offset.y,
+                clip.map(|clip| {
+                    Rect::new(
+                        clip.x + offset.x,
+                        clip.y + offset.y,
+                        clip.width,
+                        clip.height,
+                    )
+                }),
+            )
+        }
+        _ => (x, y, clip),
+    };
+    for child in node.children.iter().rev() {
+        if let Some(hit) = hit_text_view_node(child, layout, scroll, x, y, clip) {
+            return Some(hit);
+        }
+    }
+    if matches!(node.kind, NodeKind::TextView) && rect_contains(rect, x, y) {
+        Some(node.key)
+    } else {
+        None
+    }
+}
+
+/// Shapes one attached view's visible window.
+///
+/// Unwrapped by design: `TextViewport`'s row arithmetic is built on uniform
+/// rows, and B1's scope decision defers wrapped row indexing. The style and
+/// row height are host chrome, like the caret.
+fn present_surface(
+    text: &mut TextContext,
+    resources: &text_host::TextHost,
+    view: TextViewId,
+    rect: Rect,
+) -> Option<HostTextSurface> {
+    let (buffer, scroll_y) = {
+        let view_state = resources.system().view(view).ok()?;
+        (view_state.buffer(), view_state.scroll_y())
+    };
+    let storage = resources.system().buffer(buffer).ok()?.text();
+    let style = instar_ui::ShapingStyle::default();
+    let row_height =
+        TextContext::resolve_line_height(style, instar_ui::LineHeight::FontSizeRelative(1.4));
+    let viewport = TextViewport::new(rect.height as f32, row_height);
+    let shaping = viewport.visible(storage, scroll_y).ok()?;
+    let revision = resources.system().revision(buffer).ok()?;
+    let presentation = text_view::present(
+        text,
+        storage,
+        &shaping,
+        &text_view::Presentation { style, row_height },
+        revision,
+    )
+    .ok()?;
+    Some(HostTextSurface {
+        view,
+        viewport,
+        presentation,
+        revision,
+    })
+}
+
+/// The vertical scroll extent of one uniform-row text view, in pixels.
+fn text_scroll_extent(storage: &instar_text::TextStorage, viewport: TextViewport) -> i32 {
+    let rows = text_view::presented_rows(storage) as f32;
+    ((rows * viewport.row_height - viewport.height).max(0.0)) as i32
 }
 
 /// A semantic thing to do to a node, independent of what asked for it.
@@ -594,6 +804,46 @@ impl Host {
         self.scenes.theme()
     }
 
+    /// Rebuilds every attached text surface for a window.
+    ///
+    /// Called when the tree, its geometry or its attachment table changed.
+    /// Each surface is bounded by its own `TextViewport`, so the cost is
+    /// proportional to what is on screen, not to what the document contains.
+    fn refresh_all_text_surfaces(&mut self, window_id: WindowId) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref()) else {
+            window.text_surfaces.clear();
+            return;
+        };
+
+        let mut next = BTreeMap::new();
+        for node in tree.iter() {
+            if !matches!(node.kind, NodeKind::TextView) {
+                continue;
+            }
+            let Some(rect) = layout.get(node.key) else {
+                continue;
+            };
+            let Some(view) = window.text_attachments.get(&node.key).copied() else {
+                continue;
+            };
+            if let Some(surface) = present_surface(&mut self.text, &self.text_resources, view, rect)
+            {
+                next.insert(node.key, surface);
+            }
+        }
+
+        // A surface that disappeared must retire any drag that owns its view.
+        for (key, view) in &window.text_attachments {
+            if !next.contains_key(key) {
+                window.text_interaction.retire_view(*view);
+            }
+        }
+        window.text_surfaces = next;
+    }
+
     /// Re-lowers a window's paint intent from whatever is current.
     ///
     /// The single place a [`PaintScene`] is produced, so the rule that a scene
@@ -622,20 +872,44 @@ impl Host {
                 .scenes
                 .crash_scene(&mut self.text, *generation, message, metrics),
             PresentationState::App => match (window.tree.as_ref(), window.layout.as_ref()) {
-                (Some(tree), Some(layout)) => self.scenes.app_scene_focused(
-                    tree,
-                    layout,
-                    &window.scroll,
-                    metrics,
-                    window.interaction.pressed(),
-                    // `focus_visible` gates the ring, not `focused`: a control
-                    // reached by clicking is focused without being ringed.
-                    window
-                        .focus
-                        .focus_visible()
-                        .then(|| window.focus.focused())
-                        .flatten(),
-                ),
+                (Some(tree), Some(layout)) => {
+                    let mut frames: Vec<TextSurfaceFrame<'_>> = Vec::new();
+                    for (key, surface) in window.text_surfaces.iter_mut() {
+                        if visual_rect(tree, layout, &window.scroll, *key).is_none() {
+                            continue;
+                        }
+                        let Some(view) = self.text_resources.system().view(surface.view).ok()
+                        else {
+                            continue;
+                        };
+                        let selection = view.selection();
+                        let frame_selection = (!selection.is_empty()).then_some(selection);
+                        let revision = surface.revision;
+                        frames.push(TextSurfaceFrame {
+                            node: *key,
+                            surface,
+                            caret: Some(selection.head),
+                            selection: frame_selection,
+                            revision,
+                        });
+                    }
+                    self.scenes.app_scene_with_text(
+                        tree,
+                        layout,
+                        &window.scroll,
+                        metrics,
+                        window.interaction.pressed(),
+                        // `focus_visible` gates the ring, not `focused`: a
+                        // control reached by clicking is focused without being
+                        // ringed.
+                        window
+                            .focus
+                            .focus_visible()
+                            .then(|| window.focus.focused())
+                            .flatten(),
+                        &mut frames,
+                    )
+                }
                 // Ready, but the guest has not committed anything yet. An
                 // empty background beats an unpainted buffer, which on most
                 // platforms is whatever was in memory.
@@ -734,6 +1008,7 @@ impl Host {
                 window.recompute_layout(&mut self.text, scrollbars);
                 window.clamp_scroll();
             }
+            self.refresh_all_text_surfaces(window_id);
             self.rebuild_scene(window_id);
         }
     }
@@ -946,6 +1221,169 @@ impl Host {
             // Close policy lives here, not in the window layer. A host with a
             // guest to consult could ask it first; this one exits.
             WindowOutput::CloseRequested { .. } => vec![HostEffect::Exit],
+            WindowOutput::ImeEnabled { window_id } | WindowOutput::ImeDisabled { window_id } => {
+                self.on_ime_disabled(window_id)
+            }
+            WindowOutput::ImePreedit {
+                window_id,
+                text,
+                cursor_range,
+            } => self.on_ime_preedit(window_id, text, cursor_range),
+            WindowOutput::ImeCommit { window_id, text } => self.on_ime_commit(window_id, text),
+        }
+    }
+
+    fn on_ime_disabled(&mut self, window_id: WindowId) -> Vec<HostEffect> {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.composition = TextComposition::default();
+            window.ime_configuration = None;
+        }
+        vec![HostEffect::ConfigureIme {
+            window: window_id,
+            enabled: false,
+            cursor_area: None,
+        }]
+    }
+
+    fn on_ime_preedit(
+        &mut self,
+        window_id: WindowId,
+        text: String,
+        cursor_range: Option<(usize, usize)>,
+    ) -> Vec<HostEffect> {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return Vec::new();
+        };
+        let Some(key) = window.focus.focused() else {
+            return Vec::new();
+        };
+        let Some(view) = window.text_attachments.get(&key).copied() else {
+            return Vec::new();
+        };
+        if !text.is_empty() && window.composition.target.is_none() {
+            window.composition.target = self
+                .text_resources
+                .system()
+                .view(view)
+                .ok()
+                .map(|v| v.selection());
+        }
+        window.composition.preedit = (!text.is_empty()).then_some(text);
+        window.composition.cursor_range = cursor_range.filter(|(start, end)| {
+            *start <= *end
+                && *end <= window.composition.preedit.as_ref().map_or(0, String::len)
+                && window.composition.preedit.as_ref().is_some_and(|text| {
+                    text.is_char_boundary(*start) && text.is_char_boundary(*end)
+                })
+        });
+        self.rebuild_scene(window_id);
+        vec![HostEffect::Render { window: window_id }]
+    }
+
+    fn on_ime_commit(&mut self, window_id: WindowId, text: String) -> Vec<HostEffect> {
+        let (view, selection) = {
+            let Some(window) = self.windows.get(&window_id) else {
+                return Vec::new();
+            };
+            let Some(key) = window.focus.focused() else {
+                return Vec::new();
+            };
+            let Some(view) = window.text_attachments.get(&key).copied() else {
+                return Vec::new();
+            };
+            let selection = window.composition.target.or_else(|| {
+                self.text_resources
+                    .system()
+                    .view(view)
+                    .ok()
+                    .map(|v| v.selection())
+            });
+            let Some(selection) = selection else {
+                return Vec::new();
+            };
+            (view, selection)
+        };
+        let Ok(applied) = self
+            .text_resources
+            .system_mut()
+            .apply_edit(view, TextEdit::replace(selection.range(), text))
+        else {
+            return Vec::new();
+        };
+        if let Ok(state) = self.text_resources.system_mut().view_mut(view) {
+            state.set_selection(Selection::at(applied.edit.resulting_end()));
+        }
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.composition = TextComposition::default();
+            window.text_interaction.cancel();
+        }
+        self.refresh_all_text_surfaces(window_id);
+        self.rebuild_scene(window_id);
+        vec![HostEffect::Render { window: window_id }]
+    }
+
+    fn sync_ime_configuration(&mut self, window_id: WindowId) -> Vec<HostEffect> {
+        let desired = {
+            let Some(window) = self.windows.get(&window_id) else {
+                return Vec::new();
+            };
+            if let Some(key) = window.focus.focused() {
+                if let Some(view) = window.text_attachments.get(&key).copied() {
+                    if let (Some(surface), Some(tree), Some(layout)) = (
+                        window.text_surfaces.get(&key),
+                        window.tree.as_ref(),
+                        window.layout.as_ref(),
+                    ) {
+                        if let Ok(state) = self.text_resources.system().view(view) {
+                            if let Some(origin) = visual_origin(tree, layout, &window.scroll, key)
+                                && let Some(caret) = surface.presentation.caret_geometry(
+                                    state.selection().head,
+                                    1.0,
+                                    surface.revision,
+                                )
+                            {
+                                (
+                                    true,
+                                    Some(ImeCursorArea {
+                                        x: (origin.0 + caret.x) as i32,
+                                        y: (origin.1 + caret.y) as i32,
+                                        width: caret.width.max(1.0) as u32,
+                                        height: caret.height.max(1.0) as u32,
+                                    }),
+                                )
+                            } else {
+                                (true, None)
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (true, None)
+                    }
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            }
+        };
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return Vec::new();
+        };
+        if window.ime_configuration == Some(desired) {
+            return Vec::new();
+        }
+        window.ime_configuration = Some(desired);
+        vec![HostEffect::ConfigureIme {
+            window: window_id,
+            enabled: desired.0,
+            cursor_area: desired.1,
+        }]
+    }
+
+    fn cancel_ime(&mut self, window_id: WindowId) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.composition = TextComposition::default();
         }
     }
 
@@ -1055,6 +1493,16 @@ impl Host {
         // side table the caller has already screened.
         let attachments = Host::resolve_attachments(&snapshot.text_attachments, resolved)
             .map_err(UiCommitRefusal::Attachment)?;
+        if self.windows.iter().any(|(other_id, other)| {
+            *other_id != window_id
+                && attachments
+                    .values()
+                    .any(|view| other.text_attachments.values().any(|held| held == view))
+        }) {
+            return Err(UiCommitRefusal::Attachment(
+                AttachmentRefusal::TextViewAlreadyAttached,
+            ));
+        }
         // Step 6: the tree diff can still refuse.
         let validated = self
             .validate_ui_commit(window_id, snapshot.tree, snapshot.text_attachments)
@@ -1080,8 +1528,6 @@ impl Host {
         window_id: WindowId,
         staged: StagedUiCommit,
     ) -> Vec<HostEffect> {
-        let window = self.windows.entry(window_id).or_default();
-
         // A guest re-committing an identical interface is an ordinary shape —
         // it is what an event the guest decided to ignore looks like from
         // here. It should cost the decode and nothing else: no layout, no
@@ -1098,6 +1544,40 @@ impl Host {
             return Vec::new();
         }
 
+        // Attachment ownership is transferred only after staging has proved
+        // every identity live. Retain replacements first, then release the
+        // old map, so a replacement cannot transiently destroy its view.
+        let old_attachments = self
+            .windows
+            .get(&window_id)
+            .map(|window| window.text_attachments.clone())
+            .unwrap_or_default();
+        for key in staged
+            .attachment_changes
+            .attached
+            .iter()
+            .chain(staged.attachment_changes.replaced.iter())
+        {
+            let view = staged.attachments[key];
+            assert!(
+                self.text_resources.retain_view_attachment(view),
+                "staged attachment must name a live TextView"
+            );
+        }
+        for key in staged
+            .attachment_changes
+            .detached
+            .iter()
+            .chain(staged.attachment_changes.replaced.iter())
+        {
+            let view = old_attachments[key];
+            assert!(
+                self.text_resources.release_view_attachment(view),
+                "retained attachment must have an ownership count"
+            );
+        }
+
+        let window = self.windows.entry(window_id).or_default();
         // Validation ran above the early return, so a no-op commit cannot
         // dodge the lifecycle rules. `apply` sits after it: an identical
         // snapshot has identical live keys, so applying would only redo a
@@ -1105,6 +1585,8 @@ impl Host {
         // else.
         let needs_layout = staged.tree_changes.needs_layout();
         let needs_text_finalize = staged.tree_changes.needs_text_finalize();
+        let refresh_text_surfaces =
+            needs_layout || needs_text_finalize || !staged.attachment_changes.is_empty();
         window.ledger.apply(&staged.tree);
 
         // Before the new snapshot becomes interactive: any transient state
@@ -1126,6 +1608,9 @@ impl Host {
         // accepted commit; the revision is the host's separate value for
         // whether the state actually changed, and the one caches key off.
         window.promote_ui_commit(staged);
+        self.text_resources.collect_unowned_resources();
+
+        let window = self.windows.entry(window_id).or_default();
         // And any state referring to a node the guest *hid*, which the diff
         // does not report as removed because it is still in the tree. Runs
         // after the promotion rather than before it, because the question is
@@ -1172,6 +1657,9 @@ impl Host {
         // shrank must not leave a viewport showing a region that is no longer
         // there.
         window.clamp_scroll();
+        if refresh_text_surfaces {
+            self.refresh_all_text_surfaces(window_id);
+        }
         // Lowered here rather than on the next frame callback: the caller is
         // about to tell a guest its interface was accepted, and "accepted"
         // should mean the host has everything it needs to show it.
@@ -1199,6 +1687,7 @@ impl Host {
         self.layout_passes += 1;
         window.recompute_layout(&mut self.text, self.scrollbars);
         let wanted = window.redraw_pending || window.layout.is_some();
+        self.refresh_all_text_surfaces(window_id);
         self.rebuild_scene(window_id);
 
         let window = self.windows.entry(window_id).or_default();
@@ -1211,6 +1700,7 @@ impl Host {
     }
 
     fn on_metrics_invalidated(&mut self, window_id: WindowId) -> Vec<HostEffect> {
+        self.cancel_ime(window_id);
         let window = self.windows.entry(window_id).or_default();
         window.metrics.block();
         // A press recorded against the old geometry must not be completable
@@ -1224,6 +1714,10 @@ impl Host {
         // be somewhere else.
         window.scroll.cancel_drag();
         window.scroll.set_hovered(None);
+        // A text drag and a presented text surface describe geometry that is
+        // about to be replaced; both go with it.
+        window.text_interaction.cancel();
+        window.text_surfaces.clear();
         // And the lowered scene goes with it, for the same reason: its
         // rectangles are physical, and they were computed for a window that
         // has since changed size or scale.
@@ -1253,6 +1747,13 @@ impl Host {
         // so letting the content see the same press would activate whatever is
         // underneath the scrollbar.
         if let Some(effects) = self.on_scrollbar_pointer(event, x, y) {
+            return effects;
+        }
+
+        // Text views are interactive leaves the retained-UI hit-test does not
+        // claim, so the host routes them by its own attachment map. The B2d
+        // pointer seam is the only way a selection changes from here.
+        if let Some(effects) = self.on_text_pointer(event, x, y) {
             return effects;
         }
 
@@ -1309,6 +1810,77 @@ impl Host {
         effects
     }
 
+    /// Routes a pointer event to an attached text surface, when one owns it.
+    ///
+    /// A live text drag owns the pointer wherever it goes, exactly like a
+    /// scrollbar thumb drag. A press must land on a text-view node; that is
+    /// the focus/hit half of B2e-4, and it follows the attachment to the same
+    /// `handle_pointer` seam B2d proved.
+    fn on_text_pointer(
+        &mut self,
+        event: RawPointerEvent,
+        x: i32,
+        y: i32,
+    ) -> Option<Vec<HostEffect>> {
+        let window_id = event.window_id;
+        let handled = {
+            let window = self.windows.get_mut(&window_id)?;
+            let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref()) else {
+                return None;
+            };
+
+            let captured = window.text_interaction.captured_view();
+            let (key, origin, view) = if let Some(view) = captured {
+                let key = window
+                    .text_attachments
+                    .iter()
+                    .find_map(|(key, attached)| (*attached == view).then_some(*key))?;
+                let origin = visual_origin(tree, layout, &window.scroll, key)?;
+                (key, origin, view)
+            } else if event.state == PointerState::Pressed {
+                let key = hit_text_view(tree, layout, &window.scroll, x, y)?;
+                let view = *window.text_attachments.get(&key)?;
+                let origin = visual_origin(tree, layout, &window.scroll, key)?;
+                if !window.text_surfaces.contains_key(&key) {
+                    return None;
+                }
+                (key, origin, view)
+            } else {
+                return None;
+            };
+
+            let surface = window.text_surfaces.get_mut(&key)?;
+            let outcome = text_view::handle_pointer(
+                &mut window.text_interaction,
+                surface,
+                origin,
+                &WindowOutput::Pointer(event),
+            );
+            let changed = match outcome {
+                TextPointerOutcome::SelectionChanged(selection) => {
+                    if let Ok(view_state) = self.text_resources.system_mut().view_mut(view) {
+                        view_state.set_selection(selection);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                TextPointerOutcome::CaptureReleased => true,
+                TextPointerOutcome::Ignored => return Some(Vec::new()),
+            };
+            if event.state == PointerState::Pressed {
+                window.focus.focus_by_pointer(Some(key));
+            }
+            changed
+        };
+
+        if !handled {
+            return Some(Vec::new());
+        }
+        self.rebuild_scene(window_id);
+        Some(vec![HostEffect::Render { window: window_id }])
+    }
+
     /// A wheel or touchpad scroll.
     ///
     /// The whole response is host-local: find the viewports under the pointer,
@@ -1318,6 +1890,49 @@ impl Host {
     /// path not to exist rather than for a test to keep watch over one that
     /// does.
     fn on_scroll(&mut self, event: RawScrollEvent) -> Vec<HostEffect> {
+        let (x, y) = event.logical_pos.round();
+        let delta = match event.delta {
+            ScrollDelta::Logical { x, y } => instar_ui::ScrollDeltaPixels::new(x, y),
+            ScrollDelta::Lines { x, y } => instar_ui::ScrollDeltaPixels::new(
+                x * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+                y * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
+            ),
+        };
+        if let Some(window) = self.windows.get(&event.window_id)
+            && window.metrics.usable().is_some()
+            && let (Some(tree), Some(layout)) = (window.tree.as_ref(), window.layout.as_ref())
+            && let Some(key) = hit_text_view(tree, layout, &window.scroll, x, y)
+            && let Some(view) = window.text_attachments.get(&key).copied()
+        {
+            let Some(view_state) = self.text_resources.system().view(view).ok() else {
+                return Vec::new();
+            };
+            let old = view_state.scroll_y();
+            let Some(surface) = window.text_surfaces.get(&key) else {
+                return Vec::new();
+            };
+            let extent = self
+                .text_resources
+                .system()
+                .buffer(view_state.buffer())
+                .ok()
+                .map(|buffer| text_scroll_extent(buffer.text(), surface.viewport));
+            if let Some(extent) = extent {
+                let next = (old - delta.y.round() as i32).clamp(0, extent);
+                if next != old {
+                    if let Ok(view_state) = self.text_resources.system_mut().view_mut(view) {
+                        view_state.set_scroll_y(next);
+                    } else {
+                        return Vec::new();
+                    }
+                    self.refresh_all_text_surfaces(event.window_id);
+                    self.rebuild_scene(event.window_id);
+                    return vec![HostEffect::Render {
+                        window: event.window_id,
+                    }];
+                }
+            }
+        }
         let Some(window) = self.windows.get_mut(&event.window_id) else {
             return Vec::new();
         };
@@ -1329,17 +1944,6 @@ impl Host {
             window.layout.as_ref(),
         ) else {
             return Vec::new();
-        };
-
-        let (x, y) = event.logical_pos.round();
-        let delta = match event.delta {
-            ScrollDelta::Logical { x, y } => instar_ui::ScrollDeltaPixels::new(x, y),
-            // A count becomes a distance here, where how far a line is is a UI
-            // policy question rather than a windowing fact.
-            ScrollDelta::Lines { x, y } => instar_ui::ScrollDeltaPixels::new(
-                x * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
-                y * instar_ui::scroll::LOGICAL_PIXELS_PER_LINE,
-            ),
         };
 
         let extents = scroll_extents(tree, layout);
@@ -1580,6 +2184,7 @@ impl Host {
         if focused {
             return Vec::new();
         }
+        self.cancel_ime(window_id);
         let Some(window) = self.windows.get_mut(&window_id) else {
             return Vec::new();
         };
@@ -1618,6 +2223,9 @@ impl Host {
     fn on_key(&mut self, event: instar_window::RawKeyEvent) -> Vec<HostEffect> {
         if !event.pressed {
             return self.on_key_release(event);
+        }
+        if let Some(effects) = self.on_text_key(event) {
+            return effects;
         }
         let Some(window) = self.windows.get_mut(&event.window_id) else {
             return Vec::new();
@@ -1702,6 +2310,96 @@ impl Host {
             window: event.window_id,
         });
         effects
+    }
+
+    fn on_text_key(&mut self, event: instar_window::RawKeyEvent) -> Option<Vec<HostEffect>> {
+        let command = match event.key {
+            instar_window::Key::ArrowLeft => Some(text_view::EditCommand::Left),
+            instar_window::Key::ArrowRight => Some(text_view::EditCommand::Right),
+            instar_window::Key::Home => Some(text_view::EditCommand::Home),
+            instar_window::Key::End => Some(text_view::EditCommand::End),
+            _ => None,
+        };
+        let (_key, view, selection, surface) = {
+            let window = self.windows.get(&event.window_id)?;
+            if window.metrics.usable().is_none() {
+                return Some(Vec::new());
+            }
+            let key = window.focus.focused()?;
+            let view = *window.text_attachments.get(&key)?;
+            let selection = self.text_resources.system().view(view).ok()?.selection();
+            let surface = window.text_surfaces.get(&key)?;
+            (key, view, selection, surface)
+        };
+        if let Some(command) = command {
+            let next =
+                text_view::move_selection(&surface.presentation, selection, command, event.shift);
+            if next != selection {
+                if let Ok(view_state) = self.text_resources.system_mut().view_mut(view) {
+                    view_state.set_selection(next);
+                }
+                if let Some(window) = self.windows.get_mut(&event.window_id) {
+                    window.text_interaction.cancel();
+                }
+                self.refresh_all_text_surfaces(event.window_id);
+                self.rebuild_scene(event.window_id);
+                return Some(vec![HostEffect::Render {
+                    window: event.window_id,
+                }]);
+            }
+            return Some(Vec::new());
+        }
+        let edit = match event.key {
+            instar_window::Key::Backspace => {
+                if !selection.is_empty() {
+                    Some(TextEdit::delete(selection.range()))
+                } else {
+                    text_view::backspace_range(
+                        self.text_resources
+                            .system()
+                            .buffer(self.text_resources.system().view(view).ok()?.buffer())
+                            .ok()?
+                            .text(),
+                        selection.head.byte,
+                    )
+                    .map(TextEdit::delete)
+                }
+            }
+            instar_window::Key::Delete => {
+                if !selection.is_empty() {
+                    Some(TextEdit::delete(selection.range()))
+                } else {
+                    text_view::delete_range(
+                        self.text_resources
+                            .system()
+                            .buffer(self.text_resources.system().view(view).ok()?.buffer())
+                            .ok()?
+                            .text(),
+                        selection.head.byte,
+                    )
+                    .map(TextEdit::delete)
+                }
+            }
+            _ => None,
+        }?;
+        let applied = self
+            .text_resources
+            .system_mut()
+            .apply_edit(view, edit)
+            .ok()?;
+        if let Ok(view_state) = self.text_resources.system_mut().view_mut(view) {
+            view_state.set_selection(Selection::at(applied.edit.resulting_end()));
+        }
+        if let Some(window) = self.windows.get_mut(&event.window_id) {
+            window.text_interaction.cancel();
+        }
+        self.refresh_all_text_surfaces(event.window_id);
+        self.rebuild_scene(event.window_id);
+        let mut effects = vec![HostEffect::Render {
+            window: event.window_id,
+        }];
+        effects.extend(self.sync_ime_configuration(event.window_id));
+        Some(effects)
     }
 
     /// A key coming up. Only Space means anything so far.

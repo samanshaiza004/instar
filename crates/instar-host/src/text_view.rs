@@ -33,12 +33,12 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use instar_paint::{Color, PaintCommand, PaintScene, PhysicalSize};
+use instar_paint::{Color, FontId, FontResource, PaintCommand, PaintScene, PhysicalSize};
 use instar_text::{
     Revision, Selection, ShapingWindow, TextAffinity, TextPosition, TextStorage, TextViewId,
     TextViewport,
 };
-use instar_ui::{Affinity, CaretGeometry, ShapingStyle, TextContext, TextLayout};
+use instar_ui::{Affinity, CaretGeometry, LineHeight, ShapingStyle, TextContext, TextLayout};
 
 /// A document position's affinity, as the shaping layer names it.
 ///
@@ -117,6 +117,7 @@ pub mod instrument {
 }
 
 /// One shaped row of a document, and where in the document it came from.
+#[derive(Debug)]
 pub struct PresentedSegment {
     /// The byte range of the buffer this was shaped from.
     ///
@@ -164,8 +165,59 @@ impl PresentedSegment {
 }
 
 /// Everything one frame of one view draws.
+#[derive(Debug)]
 pub struct PresentedText {
     pub segments: Vec<PresentedSegment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditCommand {
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// Applies a host-local navigation command through the already-shaped segment.
+/// Row transitions remain document-owned; visual movement inside a row is
+/// delegated to the opaque TextLayout/Parley seam.
+pub fn move_selection(
+    presented: &PresentedText,
+    selection: Selection,
+    command: EditCommand,
+    extend: bool,
+) -> Selection {
+    let head = selection.head;
+    let Some(segment) = presented.segment_at(head.byte) else {
+        return selection;
+    };
+    let Some(local) = segment.buffer_to_local(head.byte) else {
+        return selection;
+    };
+    let cursor = instar_ui::TextCursor {
+        index: local,
+        affinity: layout_affinity(head.affinity),
+    };
+    let moved = match command {
+        EditCommand::Left => {
+            segment
+                .layout
+                .selection_previous_visual(instar_ui::TextSelection::new(cursor, cursor), extend)
+                .focus
+        }
+        EditCommand::Right => {
+            segment
+                .layout
+                .selection_next_visual(instar_ui::TextSelection::new(cursor, cursor), extend)
+                .focus
+        }
+        EditCommand::Home => segment.layout.cursor_hard_line_start(cursor),
+        EditCommand::End => segment.layout.cursor_hard_line_end(cursor),
+    };
+    selection.extend_to(TextPosition::with_affinity(
+        segment.local_to_buffer(moved.index).unwrap_or(head.byte),
+        document_affinity(moved.affinity),
+    ))
 }
 
 impl PresentedText {
@@ -364,9 +416,14 @@ pub struct Presentation {
     pub style: ShapingStyle,
     /// Logical pixels per row.
     pub row_height: f32,
-    /// Width to wrap at, or `None` for one line per paragraph.
-    pub wrap_width: Option<f32>,
 }
+
+/// The logical height of one presented text row.
+///
+/// Host chrome, like the caret width and the focus ring: a guest describes an
+/// editor surface, never its typography. Uniform rows are also what
+/// `instar-text`'s `TextViewport` arithmetic is built on.
+pub const TEXT_ROW_HEIGHT: f32 = 20.0;
 
 /// Shapes exactly the window `instar-text` chose, and nothing else.
 ///
@@ -390,8 +447,12 @@ pub fn present(
         let bytes = without_trailing_newline(storage, paragraph.bytes.clone())?;
         let text = storage.slice(bytes.clone())?.materialize();
 
-        let mut layout = context.shape_keyless(&text, presentation.style);
-        layout.break_lines(presentation.wrap_width);
+        let mut layout = context.shape_keyless_with_line_height(
+            &text,
+            presentation.style,
+            LineHeight::FontSizeRelative(1.4),
+        );
+        layout.break_lines(None);
 
         segments.push(PresentedSegment {
             row: paragraph.row,
@@ -559,6 +620,25 @@ pub struct Frame {
     pub revision: Revision,
 }
 
+/// What [`push_text`] needs to draw one presented view into an existing scene.
+///
+/// Split from [`Frame`] because a text view embedded in the semantic tree is
+/// painted by `present::SceneBuilder` between the same push/pop of the shared
+/// scene's command list and font table — it has an origin where it sits in the
+/// window, but no surface of its own to own.
+#[derive(Debug, Clone, Copy)]
+pub struct TextPaint {
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub scale: f32,
+    pub ink: Color,
+    pub caret_color: Color,
+    pub selection_color: Color,
+    pub caret: Option<TextPosition>,
+    pub selection: Option<Selection>,
+    pub revision: Revision,
+}
+
 /// Lowers a presented window to drawing commands.
 ///
 /// Reuses `present::push_shaped`, which is the same routine every `Text` node
@@ -588,19 +668,59 @@ pub fn lower(presented: &mut PresentedText, frame: &Frame) -> PaintScene {
             ),
         },
     ];
-    // Selection first, so it sits *behind* the glyphs. The order here is the
-    // whole of the focus-ring lesson: a command that exists is not a thing
-    // that is visible, and a highlight painted over its own text is a
-    // highlight that hides it.
-    if let Some(selection) = frame.selection {
-        let scale = frame.scale;
-        let colour = frame.selection_color;
+    let mut fonts = Vec::new();
+    let mut font_ids = HashMap::new();
+    push_text(
+        presented,
+        &TextPaint {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale: frame.scale,
+            ink: frame.ink,
+            caret_color: frame.caret_color,
+            selection_color: frame.selection_color,
+            caret: frame.caret,
+            selection: frame.selection,
+            revision: frame.revision,
+        },
+        &mut commands,
+        &mut fonts,
+        &mut font_ids,
+    );
+
+    commands.push(PaintCommand::PopClip);
+
+    PaintScene {
+        size: frame.surface,
+        commands,
+        masks: Vec::new(),
+        fonts,
+        images: Vec::new(),
+    }
+}
+
+/// Appends one presented view's selection, glyphs and caret to a scene.
+///
+/// The shared half of [`lower`] and the semantic-tree path in `present.rs`.
+/// Selection is emitted first so it sits behind the glyphs, and the caret
+/// after them so it is not painted under its own text. All coordinates are
+/// translated from view-local to window space by `paint.origin`.
+pub fn push_text(
+    presented: &mut PresentedText,
+    paint: &TextPaint,
+    commands: &mut Vec<PaintCommand>,
+    fonts: &mut Vec<FontResource>,
+    font_ids: &mut HashMap<u64, FontId>,
+) {
+    if let Some(selection) = paint.selection {
+        let scale = paint.scale;
+        let colour = paint.selection_color;
         let mut rects = Vec::new();
         for segment in &presented.segments {
             presented.selection_geometry_with(segment, selection, |geometry| {
                 rects.push(physical(
-                    geometry.x,
-                    geometry.y,
+                    geometry.x + paint.origin_x,
+                    geometry.y + paint.origin_y,
                     geometry.width,
                     geometry.height,
                     scale,
@@ -613,48 +733,35 @@ pub fn lower(presented: &mut PresentedText, frame: &Frame) -> PaintScene {
         }));
     }
 
-    let mut fonts = Vec::new();
-    let mut font_ids = HashMap::new();
-
     for segment in &mut presented.segments {
-        let origin = (segment.origin_x, segment.origin_y);
+        let origin = (
+            segment.origin_x + paint.origin_x,
+            segment.origin_y + paint.origin_y,
+        );
         crate::present::push_shaped(
-            &mut commands,
-            &mut fonts,
-            &mut font_ids,
+            commands,
+            fonts,
+            font_ids,
             segment.layout.shaped(),
             origin,
-            frame.scale,
-            frame.ink,
+            paint.scale,
+            paint.ink,
         );
     }
 
-    // After the glyphs, so a caret inside a glyph's ink is visible rather than
-    // painted under it. The focus ring cost this project a package by being
-    // emitted first and then covered.
-    if let Some(position) = frame.caret
-        && let Some(geometry) = presented.caret_geometry(position, CARET_WIDTH, frame.revision)
+    if let Some(position) = paint.caret
+        && let Some(geometry) = presented.caret_geometry(position, CARET_WIDTH, paint.revision)
     {
         commands.push(PaintCommand::FillRect {
             rect: physical(
-                geometry.x,
-                geometry.y,
+                geometry.x + paint.origin_x,
+                geometry.y + paint.origin_y,
                 geometry.width,
                 geometry.height,
-                frame.scale,
+                paint.scale,
             ),
-            color: frame.caret_color,
+            color: paint.caret_color,
         });
-    }
-
-    commands.push(PaintCommand::PopClip);
-
-    PaintScene {
-        size: frame.surface,
-        commands,
-        masks: Vec::new(),
-        fonts,
-        images: Vec::new(),
     }
 }
 
@@ -693,6 +800,63 @@ fn without_trailing_newline(
     Ok(range.start..end)
 }
 
+/// The byte bounds of the line containing `byte`, for caret movement.
+///
+/// `end` is the last byte of the line *before* its line break, or the end of
+/// the document on the final line, so `End` and `Backspace` never leave a
+/// caret standing on a newline that belongs to the row above it.
+pub fn line_bounds(storage: &TextStorage, byte: usize) -> (usize, usize) {
+    let line = storage.line_of_byte(byte).unwrap_or(0);
+    let start = storage.byte_of_line(line).unwrap_or(0);
+    let end = if line + 1 < storage.len_lines() {
+        storage
+            .byte_of_line(line + 1)
+            .unwrap_or(storage.len_bytes())
+            .saturating_sub(1)
+    } else {
+        storage.len_bytes()
+    };
+    (start, end.max(start))
+}
+
+/// The byte offset where the grapheme before `byte` begins.
+///
+/// Edits and caret moves operate on extended grapheme clusters, so a caret
+/// cannot land inside a combining sequence or a ZWJ emoji. Segmentation runs
+/// over a window of at most [`instar_text::MAX_SHAPED_PARAGRAPH_BYTES`] around
+/// the position, so an enormous document never materializes wholesale just to
+/// move one caret.
+pub fn previous_grapheme(storage: &TextStorage, byte: usize) -> usize {
+    storage.previous_grapheme_boundary(byte).unwrap_or(byte)
+}
+
+/// The byte offset one grapheme after `byte`.
+///
+/// Not line-bounded: at the end of a line the next grapheme is the line
+/// break, which is exactly what `ArrowRight` crosses and what `Delete` removes
+/// to join lines.
+pub fn next_grapheme(storage: &TextStorage, byte: usize) -> usize {
+    storage.next_grapheme_boundary(byte).unwrap_or(byte)
+}
+
+/// The byte range `Backspace` should delete at an empty selection.
+pub fn backspace_range(storage: &TextStorage, byte: usize) -> Option<Range<usize>> {
+    let start = previous_grapheme(storage, byte);
+    (start != byte).then_some(start..byte)
+}
+
+/// The byte range `Delete` should delete at an empty selection.
+pub fn delete_range(storage: &TextStorage, byte: usize) -> Option<Range<usize>> {
+    let end = next_grapheme(storage, byte);
+    (end != byte).then_some(byte..end)
+}
+
+/// How many uniform rows a document presents, including the synthetic row an
+/// empty buffer gets so a caret has somewhere to stand.
+pub fn presented_rows(storage: &TextStorage) -> usize {
+    storage.len_lines().max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +877,6 @@ mod tests {
             &Presentation {
                 style: ShapingStyle::default(),
                 row_height: 20.0,
-                wrap_width: None,
             },
             Revision::default(),
         )
@@ -805,7 +968,6 @@ mod tests {
                 &Presentation {
                     style: ShapingStyle::default(),
                     row_height: 20.0,
-                    wrap_width: None,
                 },
                 Revision::default(),
             )
@@ -883,7 +1045,6 @@ mod tests {
             &Presentation {
                 style: ShapingStyle::default(),
                 row_height: 20.0,
-                wrap_width: None,
             },
             Revision::default(),
         )
@@ -1366,6 +1527,56 @@ mod tests {
         assert!(caret.height > 0.0, "and a line box to occupy");
         assert_eq!(caret.y, 0.0);
     }
+
+    // ------------------------------------------- B3: grapheme boundaries
+
+    /// A combining mark belongs to its base character, so `Backspace` must
+    /// delete the whole cluster rather than leaving a dangling mark.
+    #[test]
+    fn previous_grapheme_skips_combining_marks() {
+        let storage = TextStorage::from_text("e\u{301}x\n");
+
+        assert_eq!(previous_grapheme(&storage, 3), 0);
+        assert_eq!(previous_grapheme(&storage, 4), 3, "then one plain char");
+    }
+
+    /// An emoji ZWJ sequence is one cluster in both directions.
+    #[test]
+    fn grapheme_movement_crosses_a_zwj_sequence_atomically() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let storage = TextStorage::from_text(&format!("{family}z\n"));
+        let bytes = family.len(); // before the trailing 'z\n'
+
+        assert_eq!(next_grapheme(&storage, 0), bytes);
+        assert_eq!(previous_grapheme(&storage, bytes), 0);
+    }
+
+    /// `End` and `Home` bound the line, and the line break belongs to the row
+    /// above rather than to the caret.
+    #[test]
+    fn line_bounds_stop_before_the_line_break() {
+        let storage = TextStorage::from_text("abc\r\ndef");
+        assert_eq!(line_bounds(&storage, 0), (0, 4));
+        assert_eq!(line_bounds(&storage, 7), (5, 8));
+    }
+
+    /// Delete helpers refuse to invent a range at the edges of a line.
+    #[test]
+    fn delete_ranges_stop_at_line_edges() {
+        let storage = TextStorage::from_text("ab\ncd\n");
+        assert_eq!(backspace_range(&storage, 0), None);
+        assert_eq!(backspace_range(&storage, 4), Some(3..4));
+        assert_eq!(
+            delete_range(&storage, 2),
+            Some(2..3),
+            "at the end of a line, Delete removes the line break"
+        );
+        assert_eq!(
+            delete_range(&storage, 5),
+            Some(5..6),
+            "and the document end is a plain end, not an invented range"
+        );
+    }
 }
 
 // ------------------------------------------------- the host text-input seam
@@ -1387,12 +1598,10 @@ mod tests {
 /// path below is production code that B2e will call with a view it looked up
 /// from a node, rather than test-only editor logic that would then have to be
 /// written twice.
+#[derive(Debug)]
 pub struct HostTextSurface {
     pub view: TextViewId,
     pub viewport: TextViewport,
-    /// Where the surface sits in the window, in logical pixels.
-    pub origin_x: f32,
-    pub origin_y: f32,
     pub presentation: PresentedText,
     /// The revision `presentation` was built from.
     pub revision: Revision,
@@ -1427,13 +1636,14 @@ pub enum TextPointerOutcome {
 pub fn handle_pointer(
     interaction: &mut TextInteraction,
     surface: &HostTextSurface,
+    origin: (f32, f32),
     output: &instar_window::WindowOutput,
 ) -> TextPointerOutcome {
     use instar_window::{PointerState, WindowOutput};
 
     match output {
         WindowOutput::Pointer(event) if event.state == PointerState::Pressed => {
-            let Some(position) = surface.position_at(event.logical_pos) else {
+            let Some(position) = surface.position_at(event.logical_pos, origin) else {
                 return TextPointerOutcome::Ignored;
             };
             let selection = interaction.press(surface.view, position, surface.revision);
@@ -1452,7 +1662,7 @@ pub fn handle_pointer(
             // this surface. Capture means the drag owns the view until it
             // ends, and a selection that stopped extending when the pointer
             // wandered would be a drag that gives up halfway.
-            let Some(position) = surface.position_at(event.logical_pos) else {
+            let Some(position) = surface.position_at(event.logical_pos, origin) else {
                 return TextPointerOutcome::Ignored;
             };
             match interaction.drag_to(position, surface.revision) {
@@ -1483,9 +1693,13 @@ pub fn handle_pointer(
 impl HostTextSurface {
     /// A window-space point as a document position, or `None` when the point
     /// is outside this surface.
-    fn position_at(&self, point: instar_window::LogicalPoint) -> Option<TextPosition> {
-        let x = point.x as f32 - self.origin_x;
-        let y = point.y as f32 - self.origin_y;
+    fn position_at(
+        &self,
+        point: instar_window::LogicalPoint,
+        origin: (f32, f32),
+    ) -> Option<TextPosition> {
+        let x = point.x as f32 - origin.0;
+        let y = point.y as f32 - origin.1;
         if x < 0.0 || y < 0.0 || y > self.viewport.height {
             return None;
         }

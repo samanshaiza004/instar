@@ -92,7 +92,6 @@ impl Lab {
                     wrap: false,
                 },
                 row_height: ROW_HEIGHT,
-                wrap_width: None,
             },
             revision,
         )
@@ -111,8 +110,6 @@ impl Lab {
             surface: HostTextSurface {
                 view,
                 viewport,
-                origin_x: 0.0,
-                origin_y: 0.0,
                 presentation,
                 revision,
             },
@@ -126,7 +123,7 @@ impl Lab {
         let Some(output) = winit_adapter::translate(&mut self.state, WINDOW, &event) else {
             return TextPointerOutcome::Ignored;
         };
-        let outcome = handle_pointer(&mut self.interaction, &self.surface, &output);
+        let outcome = handle_pointer(&mut self.interaction, &self.surface, (0.0, 0.0), &output);
         if let TextPointerOutcome::SelectionChanged(selection) = outcome {
             self.system
                 .view_mut(self.surface.view)

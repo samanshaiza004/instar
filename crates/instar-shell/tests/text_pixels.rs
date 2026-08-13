@@ -78,7 +78,6 @@ fn frame_with_caret(storage: &TextStorage, row: usize, caret: Option<TextPositio
         &Presentation {
             style: style(),
             row_height: ROW_HEIGHT,
-            wrap_width: None,
         },
         Revision::default(),
     )
@@ -253,7 +252,6 @@ fn a_caret_below_the_viewport_does_not_leak_into_the_frame() {
             &Presentation {
                 style: style(),
                 row_height: ROW_HEIGHT,
-                wrap_width: None,
             },
             Revision::default(),
         )
@@ -325,7 +323,6 @@ fn a_stale_revision_draws_no_caret() {
         &Presentation {
             style: style(),
             row_height: ROW_HEIGHT,
-            wrap_width: None,
         },
         Revision::default(),
     )
@@ -384,7 +381,6 @@ fn a_caret_survives_a_fractional_display_scale() {
             &Presentation {
                 style: style(),
                 row_height: ROW_HEIGHT,
-                wrap_width: None,
             },
             Revision::default(),
         )
@@ -445,7 +441,6 @@ fn selection_frame(selection: Option<Selection>) -> Vec<u8> {
         &Presentation {
             style: style(),
             row_height: ROW_HEIGHT,
-            wrap_width: None,
         },
         Revision::default(),
     )

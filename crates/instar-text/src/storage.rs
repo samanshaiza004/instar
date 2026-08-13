@@ -62,6 +62,25 @@ impl<'a> TextSlice<'a> {
         self.len_bytes() == 0
     }
 
+    /// The region as a sequence of extended grapheme clusters.
+    ///
+    /// `crop` returns `Cow` because a cluster may straddle a rope chunk; the
+    /// common case borrows the rope without allocating. Nothing here
+    /// materializes the region, which is the same promise every other
+    /// borrowed view makes.
+    pub fn graphemes(&self) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
+        self.slice.graphemes()
+    }
+
+    fn last_grapheme_len(&self) -> Option<usize> {
+        self.slice.graphemes().next_back().map(|g| g.len())
+    }
+
+    /// Whether a byte offset in this region lies on a grapheme boundary.
+    pub fn is_grapheme_boundary(&self, byte: usize) -> bool {
+        byte <= self.len_bytes() && self.slice.is_grapheme_boundary(byte)
+    }
+
     /// The region in chunks, never as one allocation.
     pub fn chunks(&self) -> impl Iterator<Item = &'a str> {
         self.slice.chunks()
@@ -156,6 +175,52 @@ impl TextStorage {
         byte <= self.len_bytes() && self.rope.is_char_boundary(byte)
     }
 
+    /// Whether a byte offset is a grapheme cluster boundary.
+    ///
+    /// Every grapheme boundary is a UTF-8 character boundary; the reverse is
+    /// not true (a combining mark begins on its own character boundary but
+    /// inside the base character's cluster). `false` for an out-of-bounds
+    /// offset, like [`Self::is_char_boundary`].
+    pub fn is_grapheme_boundary(&self, byte: usize) -> bool {
+        byte <= self.len_bytes() && self.rope.is_grapheme_boundary(byte)
+    }
+
+    /// The next grapheme cluster boundary strictly after `byte`.
+    ///
+    /// `Ok(byte)` at the end of the document, so a caret at the end moves
+    /// nowhere rather than erroring. Refused when `byte` is out of bounds,
+    /// not a character boundary, or inside a cluster — the last is the
+    /// position this helper exists to move *from*, and silently snapping
+    /// would pretend a mid-cluster caret was real.
+    pub fn next_grapheme_boundary(&self, byte: usize) -> Result<usize, TextError> {
+        self.check_grapheme_position(byte)?;
+        if byte == self.len_bytes() {
+            return Ok(byte);
+        }
+        let grapheme = self
+            .slice(byte..self.len_bytes())?
+            .graphemes()
+            .next()
+            .expect("a non-empty range has at least one grapheme");
+        Ok(byte + grapheme.len())
+    }
+
+    /// The previous grapheme cluster boundary at or before `byte`.
+    ///
+    /// `Ok(0)` at the start of the document, mirroring
+    /// [`Self::next_grapheme_boundary`]'s stationary end.
+    pub fn previous_grapheme_boundary(&self, byte: usize) -> Result<usize, TextError> {
+        self.check_grapheme_position(byte)?;
+        if byte == 0 {
+            return Ok(0);
+        }
+        let grapheme_len = self
+            .slice(0..byte)?
+            .last_grapheme_len()
+            .expect("a non-empty range has at least one grapheme");
+        Ok(byte - grapheme_len)
+    }
+
     /// The line a byte offset falls on.
     pub fn line_of_byte(&self, byte: usize) -> Result<usize, TextError> {
         self.check(byte..byte)?;
@@ -182,6 +247,24 @@ impl TextStorage {
             if !self.rope.is_char_boundary(offset) {
                 return Err(TextError::NotACharBoundary { byte: offset });
             }
+        }
+        Ok(())
+    }
+
+    fn check_grapheme_position(&self, byte: usize) -> Result<(), TextError> {
+        let len = self.len_bytes();
+        if byte > len {
+            return Err(TextError::RangeOutOfBounds {
+                start: byte,
+                end: byte,
+                len,
+            });
+        }
+        if !self.rope.is_char_boundary(byte) {
+            return Err(TextError::NotACharBoundary { byte });
+        }
+        if !self.rope.is_grapheme_boundary(byte) {
+            return Err(TextError::NotAGraphemeBoundary { byte });
         }
         Ok(())
     }
@@ -354,5 +437,85 @@ mod tests {
             slice.chunks().map(str::len).sum::<usize>() == 10,
             "chunks cover the slice and nothing else"
         );
+    }
+
+    /// Extended grapheme clusters are the unit a caret moves by, and they are
+    /// not characters: `\r\n` is one cluster, a regional flag is two code
+    /// points, and a combining mark joins its base.
+    #[test]
+    fn a_slice_enumerates_extended_grapheme_clusters() {
+        let storage = TextStorage::from_text("a\r\n🐻‍❄️e\u{301}");
+        let clusters: Vec<String> = storage
+            .slice(0..storage.len_bytes())
+            .unwrap()
+            .graphemes()
+            .map(|cluster| cluster.into_owned())
+            .collect();
+        assert_eq!(clusters, ["a", "\r\n", "🐻‍❄️", "e\u{301}"]);
+    }
+
+    #[test]
+    fn grapheme_boundaries_are_finer_than_character_boundaries() {
+        let storage = TextStorage::from_text("a\r\n🐻‍❄️e\u{301}");
+        assert!(storage.is_grapheme_boundary(0));
+        assert!(storage.is_grapheme_boundary(1), "after 'a'");
+        assert!(
+            !storage.is_grapheme_boundary(2),
+            "between \\r and \\n is not a boundary"
+        );
+        assert!(storage.is_grapheme_boundary(3), "after \\r\\n");
+        let bear = "🐻‍❄️".len();
+        assert!(
+            !storage.is_grapheme_boundary(3 + 2),
+            "inside the flag/ZWJ cluster"
+        );
+        assert!(storage.is_grapheme_boundary(3 + bear));
+        assert!(
+            !storage.is_grapheme_boundary(storage.len_bytes() - 1),
+            "inside 'e' + combining acute"
+        );
+        assert!(storage.is_grapheme_boundary(storage.len_bytes()));
+        assert!(!storage.is_grapheme_boundary(storage.len_bytes() + 1));
+    }
+
+    #[test]
+    fn next_and_previous_grapheme_boundaries_walk_the_document() {
+        let storage = TextStorage::from_text("a\r\nb");
+        let boundaries = [0, 1, 3, 4];
+        for (index, boundary) in boundaries.iter().copied().enumerate() {
+            assert_eq!(
+                storage.next_grapheme_boundary(boundary).unwrap(),
+                *boundaries.get(index + 1).unwrap_or(&boundary),
+                "next is stationary at the end"
+            );
+            assert_eq!(
+                storage.previous_grapheme_boundary(boundary).unwrap(),
+                *boundaries.get(index.saturating_sub(1)).unwrap_or(&boundary),
+                "previous is stationary at the start"
+            );
+        }
+        assert_eq!(storage.next_grapheme_boundary(4).unwrap(), 4);
+        assert_eq!(storage.previous_grapheme_boundary(0).unwrap(), 0);
+    }
+
+    /// A mid-cluster caret is not a position this subsystem has, and the
+    /// helpers say so rather than silently snapping to one side of it.
+    #[test]
+    fn grapheme_helpers_refuse_non_boundaries() {
+        let storage = TextStorage::from_text("é\r\n");
+        // 'é' occupies bytes 0..2; byte 1 is inside it.
+        assert!(matches!(
+            storage.next_grapheme_boundary(1),
+            Err(TextError::NotACharBoundary { byte: 1 })
+        ));
+        // Between \r and \n is a character boundary but not a grapheme one.
+        assert!(matches!(
+            storage.previous_grapheme_boundary(3),
+            Err(TextError::NotAGraphemeBoundary { byte: 3 })
+        ));
+        assert!(matches!(
+            storage.next_grapheme_boundary(99),
+            Err(TextError::RangeOutOfBounds { .. })
+        ));
     }
 }

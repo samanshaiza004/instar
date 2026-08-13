@@ -147,8 +147,6 @@ impl Selection {
 pub struct TextView {
     buffer: TextBufferId,
     selection: Selection,
-    /// Wrap width in logical pixels. `None` is "do not wrap".
-    wrap_width: Option<f32>,
     /// Scroll offset in logical pixels, host-owned exactly as a `Scroll` node's
     /// is.
     scroll_y: i32,
@@ -159,7 +157,6 @@ impl TextView {
         Self {
             buffer,
             selection: Selection::default(),
-            wrap_width: None,
             scroll_y: 0,
         }
     }
@@ -192,14 +189,6 @@ impl TextView {
 
     pub fn set_caret_position(&mut self, position: TextPosition) {
         self.selection = Selection::from_position(position);
-    }
-
-    pub fn wrap_width(&self) -> Option<f32> {
-        self.wrap_width
-    }
-
-    pub fn set_wrap_width(&mut self, width: Option<f32>) {
-        self.wrap_width = width;
     }
 
     pub fn scroll_y(&self) -> i32 {

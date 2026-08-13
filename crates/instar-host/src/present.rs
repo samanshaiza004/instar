@@ -47,11 +47,14 @@ use instar_paint::{
     AffineTransform, Color, FontId, FontKey, FontResource, GlyphPosition, GlyphRun, PaintCommand,
     PaintScene, PhysicalSize, Rect,
 };
+use instar_text::{Revision, Selection, TextPosition};
 use instar_ui::{
     Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ScrollOffset, ScrollState,
     ScrollbarPart, ShapedText, ShapingStyle, TextContext, Tree,
 };
 use instar_window::WindowMetricsChanged;
+
+use crate::text_view::{HostTextSurface, TextPaint};
 
 /// What the window is showing.
 ///
@@ -97,6 +100,9 @@ pub struct Theme {
     pub scrollbar_thumb_hover: Color,
     pub scrollbar_thumb_active: Color,
     pub focus_ring: Color,
+    /// The caret and selection highlight of a host-presented text view.
+    pub text_caret: Color,
+    pub text_selection: Color,
     pub crash_background: Color,
     pub crash_text: Color,
 }
@@ -122,6 +128,13 @@ impl Default for Theme {
             scrollbar_thumb_hover: Color::opaque(0x74, 0x74, 0x82),
             scrollbar_thumb_active: Color::opaque(0x8e, 0x8e, 0x9c),
             focus_ring: Color::opaque(0x6c, 0xa8, 0xff),
+            text_caret: Color::opaque(0xf0, 0xf0, 0xf4),
+            text_selection: Color {
+                r: 0x6c,
+                g: 0xa8,
+                b: 0xff,
+                a: 90,
+            },
             // Deliberately unlike anything the app palette can produce. A
             // crash screen that could be mistaken for a running app is a
             // crash screen that gets ignored.
@@ -129,6 +142,19 @@ impl Default for Theme {
             crash_text: Color::opaque(0xff, 0xd8, 0xd8),
         }
     }
+}
+
+/// One attached text view, positioned for the scene's paint pass.
+///
+/// The scene builder owns no text resources: the host reads the view's caret
+/// and selection into this frame and hands them over, so the paint pass stays
+/// a pure function of geometry and already-settled interaction state.
+pub struct TextSurfaceFrame<'a> {
+    pub node: NodeKey,
+    pub surface: &'a mut HostTextSurface,
+    pub caret: Option<TextPosition>,
+    pub selection: Option<Selection>,
+    pub revision: Revision,
 }
 
 /// The most trap text the crash surface will retain and draw.
@@ -247,6 +273,44 @@ impl SceneBuilder {
         self.theme = theme;
     }
 
+    /// Lowers the guest's interface, including every attached text surface.
+    ///
+    /// The text views are painted at their node's place in the tree, inside
+    /// the node's own clip, so a caret cannot leak out of an editor box any
+    /// more than it can leak out of a scrolled viewport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_scene_with_text(
+        &self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        metrics: &WindowMetricsChanged,
+        pressed: Option<instar_ui::NodeKey>,
+        focus_ring: Option<instar_ui::NodeKey>,
+        text_frames: &mut [TextSurfaceFrame<'_>],
+    ) -> PaintScene {
+        let scale = metrics.scale_factor as f32;
+        let mut commands = vec![PaintCommand::Clear {
+            color: self.theme.background,
+        }];
+        let mut fonts = Vec::new();
+        let mut font_ids = HashMap::new();
+        self.paint_node(
+            &tree.root,
+            layout,
+            scroll,
+            ScrollOffset::ZERO,
+            pressed,
+            focus_ring,
+            text_frames,
+            scale,
+            &mut commands,
+            &mut fonts,
+            &mut font_ids,
+        );
+        scene(metrics, commands, fonts)
+    }
+
     /// Lowers the guest's interface to paint intent.
     ///
     /// `metrics` must be usable — [`crate::MetricsState::usable`] is the only
@@ -278,25 +342,7 @@ impl SceneBuilder {
         pressed: Option<instar_ui::NodeKey>,
         focus_ring: Option<instar_ui::NodeKey>,
     ) -> PaintScene {
-        let scale = metrics.scale_factor as f32;
-        let mut commands = vec![PaintCommand::Clear {
-            color: self.theme.background,
-        }];
-        let mut fonts = Vec::new();
-        let mut font_ids = HashMap::new();
-        self.paint_node(
-            &tree.root,
-            layout,
-            scroll,
-            ScrollOffset::ZERO,
-            pressed,
-            focus_ring,
-            scale,
-            &mut commands,
-            &mut fonts,
-            &mut font_ids,
-        );
-        scene(metrics, commands, fonts)
+        self.app_scene_with_text(tree, layout, scroll, metrics, pressed, focus_ring, &mut [])
     }
 
     /// Emits one node and its subtree, in paint order.
@@ -322,6 +368,7 @@ impl SceneBuilder {
         translation: ScrollOffset,
         pressed: Option<instar_ui::NodeKey>,
         focus_ring: Option<instar_ui::NodeKey>,
+        text_frames: &mut [TextSurfaceFrame<'_>],
         scale: f32,
         commands: &mut Vec<PaintCommand>,
         fonts: &mut Vec<FontResource>,
@@ -386,12 +433,36 @@ impl SceneBuilder {
             | NodeKind::Row
             | NodeKind::Stack
             | NodeKind::Scroll => {}
-            // Nothing yet. A text view's contents are drawn from its attached
-            // resource through the B2d presentation path, and nothing is
-            // attached until B2e-4 -- so what a guest gets today is whatever
-            // surface it asked for and an empty box. Painting a placeholder
-            // would be the host inventing appearance.
-            NodeKind::TextView => {}
+            // A text view's contents are drawn from its attached resource
+            // through the B2d presentation path. The frame was built from the
+            // attachment by the host; the node itself still carries no
+            // resource identity. The node's own clip keeps a caret from
+            // leaking past the editor box.
+            NodeKind::TextView => {
+                commands.push(PaintCommand::PushClip {
+                    rect: physical(rect, scale),
+                });
+                if let Some(frame) = text_frames.iter_mut().find(|f| f.node == node.key) {
+                    crate::text_view::push_text(
+                        &mut frame.surface.presentation,
+                        &TextPaint {
+                            origin_x: rect.x as f32,
+                            origin_y: rect.y as f32,
+                            scale,
+                            ink: self.theme.text,
+                            caret_color: self.theme.text_caret,
+                            selection_color: self.theme.text_selection,
+                            caret: frame.caret,
+                            selection: frame.selection,
+                            revision: frame.revision,
+                        },
+                        commands,
+                        fonts,
+                        font_ids,
+                    );
+                }
+                commands.push(PaintCommand::PopClip);
+            }
             NodeKind::Text { .. } => {
                 let foreground = node.style.paint.foreground.map(paint_color);
                 if let Some(shaped) = layout.text(node.key) {
@@ -497,6 +568,7 @@ impl SceneBuilder {
                 child_translation,
                 pressed,
                 focus_ring,
+                text_frames,
                 scale,
                 commands,
                 fonts,

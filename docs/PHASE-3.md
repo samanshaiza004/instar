@@ -1527,3 +1527,28 @@ pending batches, session epoch, conflict handling, recovery, and the 500 ms
 stalled guest — and it gets them against a text stack whose presentation and
 input are already known to work, so a bad typing experience there is a
 synchronization defect rather than an ambiguous one.
+
+### Package B completion (B2e-4 through B4)
+
+Package B is host-local and deliberately does not add a guest edit protocol or
+an application/package format. TextView presentation is strictly unwrapped:
+one hard document line is one row, with the shared Parley-derived
+`FontSizeRelative(1.4)` row height used for shaping, viewport arithmetic,
+scrolling, and candidate geometry. Crop owns grapheme and CRLF storage facts;
+Parley remains behind `instar-ui::TextLayout` for visual cursor semantics.
+
+Retained attachments are counted owners. Admission enforces global
+`TextViewId` uniqueness across windows, replacement retains the new view before
+releasing the old one, and generation teardown removes only guest leases.
+Pointer, focus, wheel chaining, and command editing are host-local and never
+send guest events. IME state separates transient preedit from its saved target;
+the empty-preedit-before-commit sequence is preserved, invalid cursor metadata
+only hides the composition cursor, and commit without a preedit replaces the
+current selection. Native configuration is deduplicated and disabled across
+the metrics barrier.
+
+Completion evidence: `cargo test -p instar-text`, `cargo test -p instar-ui`,
+`cargo test -p instar-window`, `cargo test -p instar-host --lib`, and
+`cargo check -p instar-shell` pass in the workspace. The production harness
+observes retained attachments, resource counts, selection/revision, and scene
+state without adding a routing or promotion test path.

@@ -201,15 +201,22 @@ pub struct RawScrollEvent {
 /// The keys Instar's retained UI vocabulary responds to.
 ///
 /// Deliberately not a general keyboard mapping. These are the keys that mean
-/// something to a button and to focus traversal; character input, editing
-/// shortcuts and IME belong to Phase 3's text service, which needs a far
-/// richer contract than an enum.
+/// something to a button, to focus traversal, and to the text commands an
+/// editor cares about. Character input and IME are not keys: they arrive as
+/// [`WindowOutput::ImePreedit`] and [`WindowOutput::ImeCommit`], carrying the
+/// full string a text service needs rather than a key name to decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Tab,
     Enter,
     Space,
     Escape,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    Backspace,
+    Delete,
     /// Anything else. Carried so the host can see that a key happened without
     /// this crate growing an opinion about what it was.
     Other,
@@ -250,7 +257,11 @@ pub struct WindowMetricsChanged {
 }
 
 /// Everything this crate emits upward.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy`: the IME variants own the full composition or committed string,
+/// because a text service needs the payload itself, not a reference into a
+/// winit event that will be dropped when translation returns.
+#[derive(Debug, Clone, PartialEq)]
 pub enum WindowOutput {
     Pointer(RawPointerEvent),
     /// The pointer moved, with no button transition.
@@ -271,6 +282,39 @@ pub enum WindowOutput {
     },
     Scroll(RawScrollEvent),
     Key(RawKeyEvent),
+    /// The platform's IME input session became active for this window.
+    ///
+    /// After this, [`WindowOutput::ImePreedit`] and
+    /// [`WindowOutput::ImeCommit`] may arrive; the host should treat
+    /// subsequent text as composition rather than ordinary key events.
+    ImeEnabled {
+        window_id: WindowId,
+    },
+    /// The IME's current composition changed.
+    ///
+    /// `text` is the entire preedit string, owned so the host keeps it for as
+    /// long as the composition does. `cursor_range` is winit's byte-wise range
+    /// within that string: `None` means the platform did not report a caret,
+    /// and equal bounds are a caret rather than a selection. An empty `text`
+    /// clears the composition.
+    ImePreedit {
+        window_id: WindowId,
+        text: String,
+        cursor_range: Option<(usize, usize)>,
+    },
+    /// Text the platform wants inserted at the caret.
+    ///
+    /// The whole committed string, so a multi-character composition result or
+    /// paste crosses the seam in one piece. Committed text is an edit; preedit
+    /// is presentation.
+    ImeCommit {
+        window_id: WindowId,
+        text: String,
+    },
+    /// The platform's IME input session ended for this window.
+    ImeDisabled {
+        window_id: WindowId,
+    },
     MetricsChanged(WindowMetricsChanged),
     /// The window's presentation geometry is temporarily unusable.
     ///

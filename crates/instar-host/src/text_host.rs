@@ -5,7 +5,7 @@
 //! ```text
 //! GenerationId  owns  guest capability leases     dies with the Store
 //! TextSystem    owns  the native resources        outlives any guest
-//! HostWindow    owns  presentation attachments    B2e-4, not yet
+//! HostWindow    owns  presentation attachments    B2e-4: retained
 //! ```
 //!
 //! This registry is **host-global and keyed by generation**, never per window.
@@ -59,6 +59,10 @@ impl GenerationLeases {
 pub struct TextResourceCounts {
     pub guest_buffer_leases: usize,
     pub guest_view_leases: usize,
+    /// Retained view attachments, counting duplicates. B2e-4 makes each of
+    /// them a second owner, so this count can stay nonzero after every guest
+    /// lease is gone.
+    pub retained_view_attachments: usize,
     pub live_buffers: usize,
     pub live_views: usize,
 }
@@ -68,6 +72,15 @@ pub struct TextResourceCounts {
 pub struct TextHost {
     system: TextSystem,
     leases: HashMap<GenerationId, GenerationLeases>,
+    /// The retained `NodeKey -> TextViewId` map's views, as a second owner.
+    ///
+    /// A reference count, because the same view may be attached at several
+    /// retained nodes (or by several windows) and each attachment must be
+    /// released once before the view may be reclaimed. Keyed by view identity,
+    /// not by window: the registry is host-global, and a window going away
+    /// must not silently kill a document another surface (or a future one)
+    /// still shows.
+    retained_views: HashMap<TextViewId, usize>,
 }
 
 /// A `TextBufferId` and an [`OpaqueResourceKey`] are the same two numbers.
@@ -120,9 +133,81 @@ impl TextHost {
         TextResourceCounts {
             guest_buffer_leases: self.leases.values().map(|l| l.buffers.len()).sum(),
             guest_view_leases: self.leases.values().map(|l| l.views.len()).sum(),
+            retained_view_attachments: self.retained_views.values().sum(),
             live_buffers: self.system.live_buffers(),
             live_views: self.system.live_views(),
         }
+    }
+
+    /// How many retained attachments exist, counting duplicates.
+    pub fn retained_view_attachments(&self) -> usize {
+        self.retained_views.values().sum()
+    }
+
+    /// Records that the retained UI tree attaches `id`.
+    ///
+    /// This is the second owner the lifetime law states: a view lives while a
+    /// guest lease names it **or** a retained attachment does. Each call is
+    /// one attachment, so a view attached at two nodes is retained twice and
+    /// must be released twice. Returns `false` without recording anything when
+    /// `id` is not a live view, so a stale or invented identity cannot be
+    /// turned into an owner that would hide a leak.
+    pub fn retain_view_attachment(&mut self, id: TextViewId) -> bool {
+        if self.system.view(id).is_err() {
+            return false;
+        }
+        *self.retained_views.entry(id).or_insert(0) += 1;
+        true
+    }
+
+    /// Drops one retained attachment.
+    ///
+    /// The view survives if a guest lease (or another retained attachment)
+    /// still names it; otherwise collection reclaims it and anything it was
+    /// keeping alive. Returns whether one retained attachment actually
+    /// existed to drop, and never underflows: a release without a matching
+    /// retain is a no-op.
+    pub fn release_view_attachment(&mut self, id: TextViewId) -> bool {
+        let Some(count) = self.retained_views.get_mut(&id) else {
+            return false;
+        };
+        if *count == 1 {
+            self.retained_views.remove(&id);
+        } else {
+            *count -= 1;
+        }
+        self.collect_unowned_resources();
+        true
+    }
+
+    /// Atomically moves a retained attachment from `old` to `new`.
+    ///
+    /// The new view is acquired **before** the old one is released, so a
+    /// replacement cannot destroy the old view in the interval between the
+    /// two — the `V7 leaving / V12 arriving` intermediate state the frozen
+    /// mutants forbid. Returns `false` without changing anything if `new` is
+    /// not a live view.
+    pub fn replace_view_attachment(
+        &mut self,
+        old: Option<TextViewId>,
+        new: Option<TextViewId>,
+    ) -> bool {
+        let Some(new) = new else {
+            if let Some(old) = old {
+                self.release_view_attachment(old);
+            }
+            return true;
+        };
+        if old == Some(new) {
+            return true;
+        }
+        if !self.retain_view_attachment(new) {
+            return false;
+        }
+        if let Some(old) = old {
+            self.release_view_attachment(old);
+        }
+        true
     }
 
     /// A key this generation is allowed to use, as a buffer id.
@@ -237,7 +322,14 @@ impl TextHost {
         if let Some(leases) = self.leases.get_mut(&generation) {
             leases.views.remove(&id);
         }
-        self.system.close_view(id);
+
+        // B2e-4: a retained UI attachment is a second owner. Dropping the
+        // guest lease must not kill a view the retained tree still shows.
+        let still_owned = self.leases.values().any(|l| l.views.contains(&id))
+            || self.retained_views.contains_key(&id);
+        if !still_owned {
+            self.system.close_view(id);
+        }
 
         // The buffer may have been kept alive only by this view. Nobody holds
         // a lease on it and nothing views it, so it goes too.
@@ -266,26 +358,32 @@ impl TextHost {
     /// Forgets what a generation held. Destroys nothing.
     ///
     /// Split from collection deliberately. Today the two always run together,
-    /// so the split buys nothing yet — but B2e-4 adds retained UI attachment as
-    /// a second owner of a view, and it changes only the *ownership predicate*
-    /// below. Without the split it would instead be rewriting a function whose
-    /// name says a generation's death destroys documents, which is precisely
-    /// the thing B2e exists to disprove.
+    /// so the split buys nothing yet — but B2e-4 added retained UI attachment
+    /// as a second owner of a view, and it changes only the *ownership
+    /// predicate* below. Without the split it would instead be rewriting a
+    /// function whose name says a generation's death destroys documents,
+    /// which is precisely the thing B2e exists to disprove.
     fn release_generation_leases(&mut self, generation: GenerationId) {
         self.leases.remove(&generation);
         self.leases.retain(|_, leases| !leases.is_empty());
     }
 
-    /// Destroys every text resource nothing owns any more.
+    /// Destroys every text resource nothing owns any more, and nothing else.
     ///
-    /// The ownership predicate, and the whole of what B2e-4 will extend:
+    /// The ownership predicate, and the whole of what B2e-4 extends:
     ///
     /// ```text
     /// a view    is owned while a guest lease names it
-    ///           B2e-4 adds: or a retained UI attachment does
+    ///           or a retained UI attachment does
     /// a buffer  is owned while a guest lease names it, or a live view does
     /// ```
-    fn collect_unowned_resources(&mut self) {
+    ///
+    /// Runs after every path that can remove an owner: a guest release, an
+    /// attachment detach, a replacement, or a generation teardown. Each of
+    /// those paths decrements its own ownership first, so collection is a
+    /// pure "what has no owner left?" pass that cannot itself forget to
+    /// decrement.
+    pub fn collect_unowned_resources(&mut self) {
         let leased_views: HashSet<TextViewId> = self
             .leases
             .values()
@@ -294,7 +392,7 @@ impl TextHost {
         let unowned: Vec<TextViewId> = self
             .system
             .views()
-            .filter(|id| !leased_views.contains(id))
+            .filter(|id| !leased_views.contains(id) && !self.retained_views.contains_key(id))
             .collect();
         for id in unowned {
             self.system.close_view(id);
@@ -574,5 +672,195 @@ mod tests {
             Err(TextRefusal::NoSuchResource)
         );
         assert_eq!(host.counts().live_views, 0, "and nothing was allocated");
+    }
+
+    /// The first half of B2e-4's view-lifetime OR: dropping the guest lease
+    /// does not kill an attached view.
+    #[test]
+    fn a_retained_attachment_keeps_a_view_alive_after_its_guest_lease_goes() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view_id = host.resolve_view_lease(G17, view).expect("leased");
+
+        assert!(host.retain_view_attachment(view_id));
+        assert_eq!(host.counts().retained_view_attachments, 1);
+
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
+            Ok(TextAnswer::Released)
+        );
+
+        let counts = host.counts();
+        assert_eq!(counts.guest_view_leases, 0, "the lease is gone");
+        assert_eq!(counts.retained_view_attachments, 1);
+        assert_eq!(counts.live_views, 1, "the attachment is the second owner");
+        assert_eq!(counts.live_buffers, 1, "and it keeps the buffer too");
+
+        assert!(host.release_view_attachment(view_id));
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(
+            host.counts(),
+            TextResourceCounts::default(),
+            "the final release returns everything to baseline"
+        );
+    }
+
+    /// The second half of the OR: detaching does not kill a view the guest
+    /// still holds.
+    #[test]
+    fn detaching_a_view_the_guest_still_holds_keeps_it_alive() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view_id = host.resolve_view_lease(G17, view).expect("leased");
+        assert!(host.retain_view_attachment(view_id));
+
+        assert!(host.release_view_attachment(view_id));
+
+        let counts = host.counts();
+        assert_eq!(
+            counts.retained_view_attachments, 0,
+            "the attachment is gone"
+        );
+        assert_eq!(counts.guest_view_leases, 1, "the lease is not");
+        assert_eq!(counts.live_views, 1);
+
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(host.counts(), TextResourceCounts::default());
+    }
+
+    /// Teardown kills a dead generation's leases, never an attached view.
+    #[test]
+    fn a_dead_generation_keeps_retained_views() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view_id = host.resolve_view_lease(G17, view).expect("leased");
+        assert!(host.retain_view_attachment(view_id));
+
+        host.release_generation(G17);
+
+        let counts = host.counts();
+        assert_eq!(counts.guest_view_leases, 0);
+        assert_eq!(counts.retained_view_attachments, 1);
+        assert_eq!(counts.live_views, 1);
+        assert_eq!(counts.live_buffers, 1);
+
+        assert!(host.release_view_attachment(view_id));
+        assert_eq!(host.counts(), TextResourceCounts::default());
+    }
+
+    /// Replacement acquires the new attachment before releasing the old one:
+    /// the old view is destroyed only when nothing owns it any more, and the
+    /// retained count never leaves exactly one.
+    #[test]
+    fn replacement_collects_the_old_view_and_keeps_exactly_one_attachment() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let first = create_view(&mut host, G17, buffer);
+        let second = create_view(&mut host, G17, buffer);
+        let first_id = host.resolve_view_lease(G17, first).expect("leased");
+        let second_id = host.resolve_view_lease(G17, second).expect("leased");
+        assert!(host.retain_view_attachment(first_id));
+
+        // Drop first's guest lease while it is still attached. The attachment
+        // is the second owner, so the view survives until it is replaced.
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseView { key: first }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(host.counts().live_views, 2);
+
+        assert!(host.replace_view_attachment(Some(first_id), Some(second_id)));
+
+        let counts = host.counts();
+        assert_eq!(counts.retained_view_attachments, 1);
+        assert_eq!(counts.live_views, 1);
+        assert!(host.system().view(second_id).is_ok(), "the new view lives");
+        assert!(
+            host.system().view(first_id).is_err(),
+            "the old view had no owner left, so collection took it"
+        );
+
+        // A same-view replacement is a no-op, not a remove-and-re-add.
+        assert!(host.replace_view_attachment(Some(second_id), Some(second_id)));
+        assert_eq!(host.counts().retained_view_attachments, 1);
+    }
+
+    #[test]
+    fn a_stale_or_unretained_view_is_not_touched() {
+        let mut host = TextHost::new();
+        let ghost = TextViewId {
+            id: 900,
+            generation: 0,
+        };
+
+        assert!(
+            !host.retain_view_attachment(ghost),
+            "a ghost cannot be an owner"
+        );
+        assert_eq!(host.counts().retained_view_attachments, 0);
+        assert!(
+            !host.release_view_attachment(ghost),
+            "releasing what was never retained is a no-op"
+        );
+        assert!(
+            !host.replace_view_attachment(None, Some(ghost)),
+            "replacing onto a ghost changes nothing"
+        );
+        assert_eq!(host.counts(), TextResourceCounts::default());
+    }
+
+    /// Two retained nodes can attach the same view; each needs its own
+    /// release, and the count reports the sum, not the number of distinct
+    /// views.
+    #[test]
+    fn duplicate_retains_are_counted_and_released_individually() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view_id = host.resolve_view_lease(G17, view).expect("leased");
+
+        assert!(host.retain_view_attachment(view_id));
+        assert!(host.retain_view_attachment(view_id));
+        assert_eq!(host.retained_view_attachments(), 2);
+
+        assert!(host.release_view_attachment(view_id));
+        assert_eq!(
+            host.retained_view_attachments(),
+            1,
+            "one of two attachments is gone, the view stays"
+        );
+        assert_eq!(host.counts().live_views, 1);
+
+        assert!(host.release_view_attachment(view_id));
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(
+            serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
+            Ok(TextAnswer::Released)
+        );
+        assert_eq!(
+            host.counts(),
+            TextResourceCounts::default(),
+            "the final of two releases returns everything to baseline"
+        );
+        assert!(
+            !host.release_view_attachment(view_id),
+            "a release without a matching retain cannot underflow"
+        );
     }
 }

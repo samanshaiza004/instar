@@ -448,7 +448,7 @@ pub fn compute(
     // Translate to absolute coordinates. Taffy reports each node's position
     // relative to its parent, and every consumer here wants absolute.
     let mut rects = HashMap::with_capacity(keys.len());
-    accumulate(&taffy, root, 0.0, 0.0, &keys, &mut rects);
+    accumulate(&taffy, root, 0.0, 0.0, &key_by_id, &mut rects);
     let mut shaped = HashMap::new();
     finalize_text(text, tree, &taffy, &id_by_key, &mut shaped);
     LayoutSnapshot {
@@ -595,7 +595,7 @@ fn accumulate(
     id: taffy::NodeId,
     parent_x: f32,
     parent_y: f32,
-    keys: &[(taffy::NodeId, NodeKey)],
+    key_by_id: &HashMap<taffy::NodeId, NodeKey>,
     out: &mut HashMap<NodeKey, Rect>,
 ) {
     let Ok(layout) = taffy.layout(id) else {
@@ -604,7 +604,7 @@ fn accumulate(
     let x = parent_x + layout.location.x;
     let y = parent_y + layout.location.y;
 
-    if let Some((_, key)) = keys.iter().find(|(candidate, _)| *candidate == id) {
+    if let Some(key) = key_by_id.get(&id) {
         out.insert(
             *key,
             Rect::new(
@@ -617,7 +617,7 @@ fn accumulate(
     }
 
     for child in taffy.children(id).unwrap_or_default() {
-        accumulate(taffy, child, x, y, keys, out);
+        accumulate(taffy, child, x, y, key_by_id, out);
     }
 }
 
