@@ -396,16 +396,6 @@ pub enum TreeError {
     /// than putting the toolbar inside the editor.
     #[error("{key} is a text view with {children} children; a text view is a leaf")]
     TextViewArity { key: NodeKey, children: usize },
-    /// A text view arrived through an entry point that carries no side table.
-    ///
-    /// A slot only means something against the capabilities supplied with the
-    /// same commit, so a batch containing a text view cannot be admitted by a
-    /// path that has no table to resolve it against. The refusal is explicit
-    /// because the alternative — dropping the attachment and keeping the node
-    /// — would retain a text surface showing nothing, with no record that the
-    /// guest had named a document at all.
-    #[error("{key} names attachment slot {slot}, but this commit carries no side table")]
-    AttachmentWithoutTable { key: NodeKey, slot: u16 },
     /// A node stated a flex basis where it is not a flex item.
     ///
     /// `basis` describes how a node participates in **its parent's** layout,

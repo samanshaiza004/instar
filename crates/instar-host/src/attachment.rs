@@ -34,8 +34,23 @@
 
 use std::collections::BTreeMap;
 
+use instar_kernel::text_bridge::AttachmentRefusal;
 use instar_text::TextViewId;
-use instar_ui::{ChangeSet, NodeKey, TextAttachmentRef, Tree};
+use instar_ui::{ChangeSet, NodeKey, TextAttachmentRef, Tree, TreeError};
+
+/// Why an entire UI commit was refused.
+///
+/// One refusal family for the two admission vocabularies a commit crosses:
+/// tree problems (the batch, the diff, the ledger) and attachment problems
+/// (the side table, resolution, uniqueness). The bridge maps each family to
+/// its own guest-visible rejection; the host keeps them separate so a caller
+/// can tell whether a refused commit tripped the tree half or the attachment
+/// half without flattening both taxonomies into one error enum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiCommitRefusal {
+    Tree(TreeError),
+    Attachment(AttachmentRefusal),
+}
 
 /// Bytes are structurally valid; the semantic tree is valid.
 ///

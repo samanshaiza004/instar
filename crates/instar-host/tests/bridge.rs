@@ -43,6 +43,7 @@
 //! will stay that way until there are numbers from a real windowed host to
 //! calibrate against. See its docs for why.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -53,6 +54,7 @@ use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
 use instar_kernel::text_bridge::{TextOperation, TextRefusal, text_request};
+use instar_text::TextViewId;
 use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
 use instar_ui::{NodeKey, NodeKind};
 use instar_window::{
@@ -1184,6 +1186,146 @@ fn a_real_guest_acquires_and_releases_text_capabilities() {
         bridge.host().text_resources().counts().guest_view_leases,
         1,
         "and only one"
+    );
+}
+
+/// The node keys for the two commits that carry capabilities.
+const TEXT_COMMIT: NodeKey = NodeKey::first(18);
+const TEXT_REVERSE: NodeKey = NodeKey::first(19);
+/// The two text-view surfaces `guests/hostile` attaches.
+const TEXT_NODE_A: NodeKey = NodeKey::first(30);
+const TEXT_NODE_B: NodeKey = NodeKey::first(31);
+
+/// The window's retained `NodeKey -> TextViewId` map.
+fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
+    bridge
+        .host()
+        .window(WINDOW)
+        .map(|window| window.text_attachments().clone())
+        .unwrap_or_default()
+}
+
+/// Waits until the retained attachment map satisfies `done`, or gives up.
+fn await_attachments(
+    bridge: &mut HostBridge,
+    done: impl Fn(&BTreeMap<NodeKey, TextViewId>) -> bool,
+) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        if done(&attachments(bridge)) {
+            return true;
+        }
+        bridge.wait(Duration::from_millis(25));
+    }
+    false
+}
+
+/// Waits until another commit has been *accepted*, or gives up.
+///
+/// The signal has to be the commit itself. Waiting on something that was
+/// already true — the view count, say — reads the retained state before the
+/// commit under test has been applied, and then every assertion about "did
+/// this change anything?" is answered by the previous commit.
+fn await_commit_after(bridge: &mut HostBridge, applied: u64) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        if bridge.stats().applied_commits > applied {
+            return true;
+        }
+        bridge.wait(Duration::from_millis(25));
+    }
+    false
+}
+
+/// The whole of B2e-3, through a real guest.
+///
+/// This is the closure gate the phase rule demands: every new cross-thread or
+/// cross-crate authority check needs one test at the final joined seam, even
+/// when both halves have exhaustive unit tests. Twice in this phase a
+/// unit-level proof stood in for an integration-level one and the fault
+/// injection found it.
+///
+/// The path, end to end:
+///
+/// ```text
+/// guest holds two borrowed text-view handles
+///   -> kernel-ui.commit(batch, text-views)
+///   -> the bound check and the two gates
+///   -> Resource<GuestTextView> -> OpaqueResourceKey, borrows dropped
+///   -> the bounded queue and the generation screen
+///   -> TextHost lease resolution
+///   -> slot resolution and uniqueness
+///   -> atomic promotion
+/// ```
+///
+/// Two views rather than one, because that is what lets the *second* commit
+/// say something: it moves every slot number and every table position while
+/// keeping each node on the same view, so anything comparing positions rather
+/// than resolved identity produces a change where there is none.
+///
+/// The cross-generation authority fault is deliberately **not** injected here.
+/// A new generation gets a fresh `Store` and `ResourceTable` and cannot hold
+/// its predecessor's `Resource<GuestTextView>`, and the old generation's own
+/// commit dies at `StaleGeneration` long before the resolver is reached — so
+/// no real guest can express it without test-only machinery for smuggling a
+/// foreign key into a new Store. That check is covered one seam lower, where
+/// an `OpaqueResourceKey` can be constructed legitimately, by
+/// `bridge::tests::a_live_view_another_generation_owns_is_refused`.
+#[test]
+fn a_real_guest_commits_two_borrowed_views_and_the_table_order_does_not_matter() {
+    let (mut bridge, _wakes) = ready();
+
+    click(&mut bridge, TEXT_ACQUIRE);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 2),
+        "the guest acquired both views: {:?}",
+        bridge.host().text_resources().counts()
+    );
+    assert!(
+        attachments(&bridge).is_empty(),
+        "holding a capability is not attaching it"
+    );
+
+    // node A -> slot 1, node B -> slot 0, table [V8, V7].
+    click(&mut bridge, TEXT_COMMIT);
+    assert!(
+        await_attachments(&mut bridge, |map| map.len() == 2),
+        "both text views reached the retained map: {:?}",
+        attachments(&bridge)
+    );
+
+    let first = attachments(&bridge);
+    let node_a = *first.get(&TEXT_NODE_A).expect("node A is attached");
+    let node_b = *first.get(&TEXT_NODE_B).expect("node B is attached");
+    assert_ne!(
+        node_a, node_b,
+        "two nodes, two distinct views -- one view attached twice would be one \
+         caret and one selection in two places"
+    );
+
+    let revision = bridge.host().window(WINDOW).unwrap().tree_revision();
+    let applied = bridge.stats().applied_commits;
+
+    // The same tree and the same two views, with every slot number and every
+    // table position moved: node A -> slot 0, node B -> slot 1, table [V7, V8].
+    click(&mut bridge, TEXT_REVERSE);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the permuted commit was accepted -- without waiting for the commit \
+         itself, every assertion below would be answered by the previous one"
+    );
+
+    assert_eq!(
+        attachments(&bridge),
+        first,
+        "the whole side table was permuted and the retained map did not move; \
+         anything comparing slot numbers or table positions fails here"
+    );
+    assert_eq!(
+        bridge.host().window(WINDOW).unwrap().tree_revision(),
+        revision,
+        "and a commit that changed neither the tree nor the attachments is a \
+         no-op for the retained state, not a new revision"
     );
 }
 

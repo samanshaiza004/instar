@@ -83,6 +83,7 @@ use instar_ui::DecodedUiSnapshot;
 use instar_window::{WindowId, WindowOutput};
 use tokio::sync::mpsc;
 
+use crate::attachment::UiCommitRefusal;
 use crate::{Host, HostEffect};
 
 /// How many messages may be in flight in either direction.
@@ -1121,63 +1122,37 @@ impl HostBridge {
             }
         };
 
-        // 4. Slot resolution, then 5. uniqueness. The slot check happens on
-        //    the decoded refs — the tree is what says a text view exists —
-        //    but against the side table, which is where the slot indexes.
-        let attachments = match Host::resolve_attachments(&snapshot.text_attachments, &resolved) {
-            Ok(attachments) => attachments,
-            Err(refusal) => {
+        // Steps 4-8 move into the one authoritative admission path so the
+        // production host and every test exercise the same sequence: slot
+        // resolution and uniqueness, tree diff, ledger validation, attachment
+        // diff, then the infallible promotion. Only the refusal family and
+        // the guest-visible rejection differ from a direct caller.
+        match self.host.apply_ui_commit(self.window, snapshot, &resolved) {
+            Ok(effects) => {
+                // Every accepted commit is a new sequence number for the
+                // guest, even when the snapshot was a no-op for the host; the
+                // tree revision is the host's answer to "did anything
+                // actually change".
+                self.commit_sequence += 1;
+                self.stats.applied_commits += 1;
+
+                // 9. Reply last. The guest resumes knowing the interface it
+                //    described is the one the host is now showing.
+                screened.accept(self.commit_sequence);
+                effects
+            }
+            Err(UiCommitRefusal::Attachment(refusal)) => {
                 self.stats.attachment_refusals += 1;
                 screened.reject(CommitRejection::Attachment(refusal));
-                return Vec::new();
+                Vec::new()
             }
-        };
-
-        // 6. Tree diff, 7. ledger.validate, 8. attachment diff. The diff can
-        //    refuse — a key that named one kind of node and now names another
-        //    — and so can the ledger; the attachment diff is the last thing
-        //    computed and cannot. All three happen before a single byte of
-        //    state is touched.
-        let attachment_refs = snapshot.text_attachments;
-        let validated =
-            match self
-                .host
-                .validate_ui_commit(self.window, snapshot.tree, attachment_refs)
-            {
-                Ok(validated) => validated,
-                Err(error) => {
-                    self.stats.rejected_commits += 1;
-                    screened.reject(CommitRejection::Invalid(error.to_string()));
-                    return Vec::new();
-                }
-            };
-        let staged = match self
-            .host
-            .stage_ui_commit(self.window, validated, attachments)
-        {
-            Ok(staged) => staged,
-            Err(error) => {
+            Err(UiCommitRefusal::Tree(error)) => {
                 self.stats.rejected_commits += 1;
+                // Nothing was mutated, so the previous interface still stands.
                 screened.reject(CommitRejection::Invalid(error.to_string()));
-                return Vec::new();
+                Vec::new()
             }
-        };
-
-        // A StagedUiCommit exists, so nothing from here on can refuse: apply
-        // atomically, lay out, lower, ask for a frame — the same infallible
-        // tail `apply_tree` uses.
-        let effects = self.host.apply_staged_commit(self.window, staged);
-
-        // Every accepted commit is a new sequence number for the guest, even
-        // when the snapshot was a no-op for the host; the tree revision is the
-        // host's answer to "did anything actually change".
-        self.commit_sequence += 1;
-        self.stats.applied_commits += 1;
-
-        // 9. Reply last. The guest resumes knowing the interface it described
-        //    is the one the host is now showing.
-        screened.accept(self.commit_sequence);
-        effects
+        }
     }
 
     /// Stops the guest and joins its thread.
@@ -1207,7 +1182,7 @@ mod tests {
     use instar_text::TextViewId;
     use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
     use instar_ui::{NodeKey, NodeKind};
-    use instar_window::{LogicalSize, PhysicalSize, WindowMetricsChanged};
+    use instar_window::{Key, LogicalSize, PhysicalSize, RawKeyEvent, WindowMetricsChanged};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
     const GEN: GenerationId = GenerationId(1);
@@ -1711,5 +1686,120 @@ mod tests {
                 generation: 0
             }
         );
+    }
+
+    /// The atomicity invariant of the whole commit package: every operation
+    /// capable of refusing runs before the first mutation, so a refused
+    /// commit leaves ALL retained and transient state exactly as it was —
+    /// not just the tree.
+    ///
+    /// The refusal is deliberately an attachment-class one
+    /// (`TextViewAlreadyAttached`). A test that only checked the retained
+    /// tree would pass even if the attachment map or focus were touched
+    /// first; this test asserts tree, attachment map, and focus together,
+    /// because the failure it exists to prevent is a partial promotion that
+    /// leaves the tree looking fine while something else already moved.
+    #[test]
+    fn a_refused_commit_never_mutates_tree_attachments_or_focus() {
+        let (mut bridge, _tx, _wake) = test_bridge();
+        bridge.on_window_event(WindowOutput::MetricsChanged(metrics()));
+        let v7 = create_view(&mut bridge);
+
+        // A good commit: one text view plus a button the test can focus.
+        let mut encoder = BatchEncoder::new();
+        encoder
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                1,
+            )
+            .node(
+                opcode::NODE_COLUMN,
+                NodeKey::first(1),
+                0,
+                None,
+                WireLayout::default(),
+                2,
+            )
+            .text_view(NodeKey::first(50), flags::ENABLED, 0, WireLayout::default())
+            .node(
+                opcode::NODE_BUTTON,
+                NodeKey::first(51),
+                flags::ENABLED,
+                Some("Focused"),
+                WireLayout::default(),
+                0,
+            );
+        assert!(deliver_commit(&mut bridge, encoder.finish(), vec![v7]).is_ok());
+
+        // Focus the button through the host-local keyboard path, so the focus
+        // assertion is about transient state and not about the refused commit.
+        bridge.on_window_event(WindowOutput::Key(RawKeyEvent {
+            window_id: WINDOW,
+            key: Key::Tab,
+            pressed: true,
+            shift: false,
+            repeat: false,
+        }));
+        let window = bridge.host().window(WINDOW).unwrap();
+        assert_eq!(window.focus().focused(), Some(NodeKey::first(51)));
+
+        let tree_before = window.tree().cloned();
+        let attachments_before = window.text_attachments().clone();
+        let focus_before = *window.focus();
+
+        // Two live NodeKeys resolving to one TextViewId: an attachment-class
+        // refusal, after which the map and focus must be exactly what they
+        // were, not merely the tree.
+        let mut refused = BatchEncoder::new();
+        refused
+            .node(
+                opcode::NODE_ROOT,
+                NodeKey::first(0),
+                0,
+                None,
+                WireLayout::default(),
+                1,
+            )
+            .node(
+                opcode::NODE_COLUMN,
+                NodeKey::first(1),
+                0,
+                None,
+                WireLayout::default(),
+                2,
+            )
+            .text_view(NodeKey::first(60), flags::ENABLED, 0, WireLayout::default())
+            .text_view(NodeKey::first(61), flags::ENABLED, 0, WireLayout::default());
+        assert_eq!(
+            deliver_commit(&mut bridge, refused.finish(), vec![v7]),
+            Err(CommitRejection::Attachment(
+                AttachmentRefusal::TextViewAlreadyAttached
+            ))
+        );
+
+        let window = bridge.host().window(WINDOW).unwrap();
+        assert_eq!(
+            window.tree().cloned(),
+            tree_before,
+            "a refused commit must leave the retained tree exactly as it was"
+        );
+        assert_eq!(
+            window.text_attachments(),
+            &attachments_before,
+            "and the retained attachment map with it -- checking only the tree \
+             would miss a map that was mutated before the refusal"
+        );
+        assert_eq!(
+            *window.focus(),
+            focus_before,
+            "and transient state with it: every operation capable of refusing \
+             runs before the first mutation"
+        );
+        assert_eq!(bridge.stats().attachment_refusals, 1);
+        assert_eq!(bridge.stats().rejected_commits, 0);
     }
 }
