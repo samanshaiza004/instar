@@ -10,5 +10,5 @@ description = "Instar's text resource subsystem: buffers, views, revisions and e
 # revision protocol carries; the alternative ropes index by char. Confined
 # entirely to src/storage.rs -- no `crop` type appears in this crate's public
 # API, so a later measurement can replace it without touching TextBuffer.
-crop = "0.4.3"
+crop = { version = "0.4.3", features = ["graphemes"] }
 thiserror = "2"

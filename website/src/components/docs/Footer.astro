@@ -1,0 +1,57 @@
+---
+/**
+ * Starlight's own footer (pagination, edit link) followed by the portal's
+ * link strip, so the documentation ends the way the front page does.
+ */
+import Default from '@astrojs/starlight/components/Footer.astro';
+import { footerLinks } from '../../data/site';
+
+const year = new Date().getFullYear();
+---
+
+<Default {...Astro.props}><slot /></Default>
+
+<div class="portal-strip">
+  <nav aria-label="Site">
+    {footerLinks.map((link) => <a href={link.href}>{link.label}</a>)}
+  </nav>
+  <p>
+    © {year} Instar contributors. Experimental software, no stability promise. The repository is the
+    normative source; this guide is the readable one.
+  </p>
+</div>
+
+<style>
+  .portal-strip {
+    margin-top: 1.5rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--sl-color-hairline);
+    font: 10px/1.5 Verdana, Geneva, Arial, sans-serif;
+  }
+
+  .portal-strip nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+
+  .portal-strip nav a {
+    color: var(--sl-color-text-accent);
+    text-decoration: none;
+  }
+
+  .portal-strip nav a::before {
+    content: "▸\00A0";
+    color: #ff5a00;
+  }
+
+  .portal-strip nav a:hover {
+    text-decoration: underline;
+  }
+
+  .portal-strip p {
+    margin: 0;
+    color: var(--sl-color-gray-3);
+  }
+</style>

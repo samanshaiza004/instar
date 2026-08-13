@@ -150,6 +150,52 @@ impl From<Alignment> for parley::Alignment {
     }
 }
 
+/// How tall one line box is.
+///
+/// Instar's own enum rather than Parley's, for the same reason `TextLayout`
+/// exists: the shaping layer should be able to change what Parley exposes
+/// without every editor-facing crate knowing about it. The default follows
+/// Parley: the font's own preferred line height.
+///
+/// Line height affects shaping and line breaking, so unlike alignment it is
+/// part of a shape, not a post-break repositioning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// A multiple of the face's metric line height (ascender + descender +
+    /// leading). This is Parley's default at `1.0`.
+    MetricsRelative(f32),
+    /// A multiple of the font size, CSS `line-height` unitless-number style.
+    FontSizeRelative(f32),
+    /// A fixed logical-pixel line box.
+    Absolute(f32),
+}
+
+impl Default for LineHeight {
+    fn default() -> Self {
+        Self::MetricsRelative(1.0)
+    }
+}
+
+impl From<LineHeight> for parley::LineHeight {
+    fn from(line_height: LineHeight) -> Self {
+        match line_height {
+            LineHeight::MetricsRelative(value) => Self::MetricsRelative(value),
+            LineHeight::FontSizeRelative(value) => Self::FontSizeRelative(value),
+            LineHeight::Absolute(value) => Self::Absolute(value),
+        }
+    }
+}
+
+impl From<parley::LineHeight> for LineHeight {
+    fn from(line_height: parley::LineHeight) -> Self {
+        match line_height {
+            parley::LineHeight::MetricsRelative(value) => Self::MetricsRelative(value),
+            parley::LineHeight::FontSizeRelative(value) => Self::FontSizeRelative(value),
+            parley::LineHeight::Absolute(value) => Self::Absolute(value),
+        }
+    }
+}
+
 /// glyphs cannot differ.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapingStyle {
@@ -339,6 +385,44 @@ pub struct TextCursor {
     pub affinity: Affinity,
 }
 
+/// A range within one layout, as the navigation operations see it.
+///
+/// Anchor and focus, not an ordered range: a drag backwards is a different
+/// gesture from a drag forwards even when the selected bytes are identical.
+/// This is the layout-local projection of a document selection, and like
+/// [`TextCursor`] it is deliberately Parley-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: TextCursor,
+    pub focus: TextCursor,
+}
+
+impl TextSelection {
+    pub fn new(anchor: TextCursor, focus: TextCursor) -> Self {
+        Self { anchor, focus }
+    }
+
+    pub fn at(cursor: TextCursor) -> Self {
+        Self {
+            anchor: cursor,
+            focus: cursor,
+        }
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        self.anchor.index == self.focus.index
+    }
+
+    /// The selection as an ordered byte range.
+    pub fn text_range(&self) -> std::ops::Range<usize> {
+        if self.anchor.index <= self.focus.index {
+            self.anchor.index..self.focus.index
+        } else {
+            self.focus.index..self.anchor.index
+        }
+    }
+}
+
 /// Where a caret should be drawn, in the layout's own logical coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaretGeometry {
@@ -415,6 +499,164 @@ impl TextLayout {
                 height: (box_.y1 - box_.y0) as f32,
             });
         });
+    }
+
+    /// The cursor one visual cluster to the left.
+    ///
+    /// Parley resolves bidi, soft line breaks, and RTL cluster directions;
+    /// Instar does not reimplement any of it. At the start of the layout the
+    /// cursor is returned unchanged, matching Parley's own clamping.
+    pub fn cursor_previous_visual(&self, cursor: TextCursor) -> TextCursor {
+        self.text_cursor(self.parley_cursor(cursor).previous_visual(&self.layout))
+    }
+
+    /// The cursor one visual cluster to the right.
+    pub fn cursor_next_visual(&self, cursor: TextCursor) -> TextCursor {
+        self.text_cursor(self.parley_cursor(cursor).next_visual(&self.layout))
+    }
+
+    /// The cursor to the previous word boundary in visual order.
+    pub fn cursor_previous_visual_word(&self, cursor: TextCursor) -> TextCursor {
+        self.text_cursor(
+            self.parley_cursor(cursor)
+                .previous_visual_word(&self.layout),
+        )
+    }
+
+    /// The cursor to the next word boundary in visual order.
+    pub fn cursor_next_visual_word(&self, cursor: TextCursor) -> TextCursor {
+        self.text_cursor(self.parley_cursor(cursor).next_visual_word(&self.layout))
+    }
+
+    /// The cursor at the start of the visual line `cursor` is on.
+    pub fn cursor_line_start(&self, cursor: TextCursor) -> TextCursor {
+        self.selection_line_start(TextSelection::at(cursor), false)
+            .focus
+    }
+
+    /// The cursor at the end of the visual line `cursor` is on.
+    pub fn cursor_line_end(&self, cursor: TextCursor) -> TextCursor {
+        self.selection_line_end(TextSelection::at(cursor), false)
+            .focus
+    }
+
+    /// The cursor at the start of the paragraph `cursor` is on.
+    pub fn cursor_hard_line_start(&self, cursor: TextCursor) -> TextCursor {
+        self.selection_hard_line_start(TextSelection::at(cursor), false)
+            .focus
+    }
+
+    /// The cursor at the end of the paragraph `cursor` is on.
+    pub fn cursor_hard_line_end(&self, cursor: TextCursor) -> TextCursor {
+        self.selection_hard_line_end(TextSelection::at(cursor), false)
+            .focus
+    }
+
+    /// Moves a selection's focus one visual cluster, keeping the anchor when
+    /// `extend` is set.
+    pub fn selection_previous_visual(
+        &self,
+        selection: TextSelection,
+        extend: bool,
+    ) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .previous_visual(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus one visual cluster, keeping the anchor when
+    /// `extend` is set.
+    pub fn selection_next_visual(&self, selection: TextSelection, extend: bool) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .next_visual(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the previous word boundary.
+    pub fn selection_previous_visual_word(
+        &self,
+        selection: TextSelection,
+        extend: bool,
+    ) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .previous_visual_word(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the next word boundary.
+    pub fn selection_next_visual_word(
+        &self,
+        selection: TextSelection,
+        extend: bool,
+    ) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .next_visual_word(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the start of its visual line.
+    pub fn selection_line_start(&self, selection: TextSelection, extend: bool) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .line_start(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the end of its visual line.
+    pub fn selection_line_end(&self, selection: TextSelection, extend: bool) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .line_end(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the start of its paragraph.
+    pub fn selection_hard_line_start(
+        &self,
+        selection: TextSelection,
+        extend: bool,
+    ) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .hard_line_start(&self.layout, extend),
+        )
+    }
+
+    /// Moves a selection's focus to the end of its paragraph.
+    pub fn selection_hard_line_end(&self, selection: TextSelection, extend: bool) -> TextSelection {
+        self.text_selection(
+            self.parley_selection(selection)
+                .hard_line_end(&self.layout, extend),
+        )
+    }
+
+    fn parley_cursor(&self, cursor: TextCursor) -> parley::Cursor {
+        parley::Cursor::from_byte_index(&self.layout, cursor.index, cursor.affinity.into())
+    }
+
+    fn text_cursor(&self, cursor: parley::Cursor) -> TextCursor {
+        TextCursor {
+            index: cursor.index(),
+            affinity: cursor.affinity().into(),
+        }
+    }
+
+    fn parley_selection(&self, selection: TextSelection) -> parley::editing::Selection {
+        parley::editing::Selection::new(
+            self.parley_cursor(selection.anchor),
+            self.parley_cursor(selection.focus),
+        )
+    }
+
+    fn text_selection(&self, selection: parley::editing::Selection) -> TextSelection {
+        TextSelection {
+            anchor: self.text_cursor(selection.anchor()),
+            focus: self.text_cursor(selection.focus()),
+        }
     }
 
     /// Breaks the text into lines at `width`, or unbroken when `None`.
@@ -644,6 +886,13 @@ thread_local! {
 }
 
 impl TextContext {
+    pub fn resolve_line_height(style: ShapingStyle, line_height: LineHeight) -> f32 {
+        match line_height {
+            LineHeight::MetricsRelative(value) => style.size * value,
+            LineHeight::FontSizeRelative(value) => style.size * value,
+            LineHeight::Absolute(value) => value,
+        }
+    }
     /// Builds the long-lived Parley resources.
     ///
     /// Both contexts are expensive to construct and reusable across every
@@ -883,14 +1132,40 @@ impl TextContext {
     /// This is the whole of `instar-ui`'s knowledge of editors: it shapes a
     /// string. It does not know a `TextBuffer` exists.
     pub fn shape_keyless(&mut self, text: &str, style: ShapingStyle) -> TextLayout {
+        self.shape_keyless_with_line_height(text, style, LineHeight::default())
+    }
+
+    /// [`Self::shape_keyless`] with an explicit line-height policy.
+    ///
+    /// Kept out of `ShapingStyle` for now: that struct is hashed as the
+    /// semantic tree's text-cache identity, and adding line height to it
+    /// would force every `ShapingStyle` literal and the wire mapping to move
+    /// in the same package. A `TextView` asks for a keyless shape anyway, so
+    /// this is the seam the editor's row policy can use without touching the
+    /// shared text-node path.
+    pub fn shape_keyless_with_line_height(
+        &mut self,
+        text: &str,
+        style: ShapingStyle,
+        line_height: LineHeight,
+    ) -> TextLayout {
         TextLayout {
-            layout: self.shape(text, &style),
+            layout: self.shape_with_line_height(text, &style, line_height),
             shaped: ShapedText::default(),
             shaped_valid: false,
         }
     }
 
     fn shape(&mut self, text: &str, style: &ShapingStyle) -> parley::Layout<[u8; 4]> {
+        self.shape_with_line_height(text, style, LineHeight::default())
+    }
+
+    fn shape_with_line_height(
+        &mut self,
+        text: &str,
+        style: &ShapingStyle,
+        line_height: LineHeight,
+    ) -> parley::Layout<[u8; 4]> {
         let family = match style.role {
             FontRole::SystemUi => parley::FontFamily::from(parley::GenericFamily::SystemUi),
             FontRole::Monospace => parley::FontFamily::from(parley::GenericFamily::Monospace),
@@ -903,6 +1178,7 @@ impl TextContext {
         builder.push_default(parley::StyleProperty::FontWeight(parley::FontWeight::new(
             f32::from(style.weight),
         )));
+        builder.push_default(parley::StyleProperty::LineHeight(line_height.into()));
         if !style.wrap {
             builder.push_default(parley::StyleProperty::TextWrapMode(
                 parley::TextWrapMode::NoWrap,
@@ -1338,5 +1614,144 @@ mod tests {
             "the derived Debug printed every byte as a decimal integer, which \
              turned one failed layout comparison into a 182 MB dump: {rendered}"
         );
+    }
+
+    #[test]
+    fn line_height_maps_both_directions() {
+        for instar in [
+            LineHeight::MetricsRelative(1.0),
+            LineHeight::FontSizeRelative(1.5),
+            LineHeight::Absolute(32.0),
+        ] {
+            let parley: parley::LineHeight = instar.into();
+            assert_eq!(LineHeight::from(parley), instar);
+        }
+    }
+
+    /// Line height is a shape property, not a post-break alignment: Parley
+    /// bakes it into the line boxes it produces.
+    #[test]
+    fn line_height_changes_the_layout_height() {
+        let mut text = TextContext::new();
+        let mut default = text.shape_keyless_with_line_height(
+            "one\ntwo",
+            style(),
+            LineHeight::MetricsRelative(1.0),
+        );
+        default.break_lines(None);
+        let mut relative = text.shape_keyless_with_line_height(
+            "one\ntwo",
+            style(),
+            LineHeight::FontSizeRelative(2.0),
+        );
+        relative.break_lines(None);
+        let mut absolute =
+            text.shape_keyless_with_line_height("one\ntwo", style(), LineHeight::Absolute(40.0));
+        absolute.break_lines(None);
+
+        assert!(relative.height() > default.height());
+        assert!(absolute.height() >= 78.0, "two 40-pixel lines");
+        assert!(absolute.height() > relative.height());
+    }
+
+    #[test]
+    fn visual_cursor_wrappers_walk_ascii_clusters_and_words() {
+        let mut text = TextContext::new();
+        let mut layout = text.shape_keyless("hello world", style());
+        layout.break_lines(None);
+
+        let start = layout.cursor_from_byte_index(0, Affinity::Downstream);
+        assert_eq!(layout.cursor_next_visual(start).index, 1);
+        assert_eq!(layout.cursor_previous_visual(start).index, 0);
+
+        let end = layout.cursor_from_byte_index(11, Affinity::Upstream);
+        assert_eq!(layout.cursor_previous_visual(end).index, 10);
+        assert_eq!(layout.cursor_next_visual(end).index, 11, "end clamps");
+
+        assert!(
+            layout.cursor_next_visual_word(start).index > start.index,
+            "word movement progresses"
+        );
+        assert!(
+            layout.cursor_previous_visual_word(end).index < end.index,
+            "and regresses from the end"
+        );
+
+        // Moving forward then back returns to the same boundary.
+        let forward = layout.cursor_next_visual(start);
+        assert_eq!(layout.cursor_previous_visual(forward), start);
+    }
+
+    #[test]
+    fn visual_cursor_wrappers_survive_bidi() {
+        let mut text = TextContext::new();
+        let mut layout = text.shape_keyless("a\u{05d0}b\u{05e9}c", style());
+        layout.break_lines(None);
+
+        let mut cursor = layout.cursor_from_byte_index(0, Affinity::Downstream);
+        for _ in 0..20 {
+            let next = layout.cursor_next_visual(cursor);
+            assert!(next.index <= 7, "never leaves the layout");
+            if next == cursor {
+                break;
+            }
+            cursor = next;
+        }
+    }
+
+    #[test]
+    fn selection_wrappers_move_focus_and_keep_anchor_on_extend() {
+        let mut text = TextContext::new();
+        let mut layout = text.shape_keyless("hello world", style());
+        layout.break_lines(None);
+
+        let start = TextSelection::at(layout.cursor_from_byte_index(0, Affinity::Downstream));
+        let extended = layout.selection_next_visual(start, true);
+        assert_eq!(extended.anchor, start.anchor);
+        assert_eq!(extended.focus.index, 1);
+        assert!(!extended.is_collapsed());
+
+        let collapsed = layout.selection_next_visual(start, false);
+        assert!(collapsed.is_collapsed());
+        assert_eq!(collapsed.focus.index, 1);
+        assert_eq!(collapsed.anchor.index, 1);
+    }
+
+    #[test]
+    fn line_edge_wrappers_reach_the_edges_parley_knows() {
+        let mut text = TextContext::new();
+        let mut layout = text.shape_keyless("one\ntwo", style());
+        layout.break_lines(None);
+
+        let first = layout.cursor_from_byte_index(1, Affinity::Downstream);
+        let second = layout.cursor_from_byte_index(4, Affinity::Downstream);
+
+        assert_eq!(layout.cursor_line_start(first).index, 0);
+        assert_eq!(layout.cursor_hard_line_start(first).index, 0);
+        assert_eq!(
+            layout.cursor_hard_line_end(first).index,
+            3,
+            "before the newline"
+        );
+        assert_eq!(layout.cursor_line_start(second).index, 4);
+        assert_eq!(layout.cursor_hard_line_start(second).index, 4);
+        assert_eq!(
+            layout.cursor_hard_line_end(second).index,
+            7,
+            "paragraph end"
+        );
+    }
+
+    #[test]
+    fn line_edge_selection_extends_instead_of_collapsing() {
+        let mut text = TextContext::new();
+        let mut layout = text.shape_keyless("one\ntwo", style());
+        layout.break_lines(None);
+
+        let start = TextSelection::at(layout.cursor_from_byte_index(1, Affinity::Downstream));
+        let extended = layout.selection_hard_line_end(start, true);
+        assert_eq!(extended.anchor, start.anchor);
+        assert_eq!(extended.focus.index, 3);
+        assert_eq!(extended.text_range(), 1..3);
     }
 }

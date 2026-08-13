@@ -321,6 +321,21 @@ impl Shell {
                         native.window.request_redraw();
                     }
                 }
+                HostEffect::ConfigureIme {
+                    enabled,
+                    cursor_area,
+                    ..
+                } => {
+                    if let Some(native) = self.native.as_ref() {
+                        native.window.set_ime_allowed(enabled);
+                        if let Some(area) = cursor_area {
+                            native.window.set_ime_cursor_area(
+                                winit::dpi::LogicalPosition::new(area.x as f64, area.y as f64),
+                                winit::dpi::LogicalSize::new(area.width as f64, area.height as f64),
+                            );
+                        }
+                    }
+                }
                 HostEffect::GuestGone { generation, error } => match error {
                     // Not fatal to the shell: the host owns the window now and
                     // is showing the crash surface. Exiting here would replace

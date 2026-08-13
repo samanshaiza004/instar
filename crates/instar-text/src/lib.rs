@@ -147,6 +147,8 @@ pub enum TextError {
     },
     #[error("byte {byte} is not a UTF-8 character boundary")]
     NotACharBoundary { byte: usize },
+    #[error("byte {byte} is not a grapheme cluster boundary")]
+    NotAGraphemeBoundary { byte: usize },
     #[error("line {line} is out of bounds for a {lines}-line buffer")]
     LineOutOfBounds { line: usize, lines: usize },
     /// A handle that named a buffer this system does not have, or names one it

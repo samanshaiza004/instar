@@ -1,0 +1,41 @@
+---
+/**
+ * Starlight's search, plus support for arriving with a query already typed.
+ *
+ * The portal masthead has a period-correct SEARCH box that submits to
+ * `/docs/?q=…`. Pagefind has no deep-link handling of its own, so this override
+ * opens the dialog and feeds the term into the Pagefind input once it exists.
+ */
+import Default from '@astrojs/starlight/components/Search.astro';
+---
+
+<Default {...Astro.props}><slot /></Default>
+
+<script is:inline>
+  (() => {
+    const query = new URLSearchParams(window.location.search).get('q');
+    if (!query) return;
+
+    const fill = (attemptsLeft) => {
+      const input = document.querySelector('#starlight__search input');
+      if (input) {
+        input.value = query;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      if (attemptsLeft > 0) window.setTimeout(() => fill(attemptsLeft - 1), 150);
+    };
+
+    const open = (attemptsLeft) => {
+      const button = document.querySelector('button[data-open-modal]');
+      if (button && !button.disabled) {
+        button.click();
+        fill(40);
+        return;
+      }
+      if (attemptsLeft > 0) window.setTimeout(() => open(attemptsLeft - 1), 150);
+    };
+
+    window.addEventListener('load', () => open(40));
+  })();
+</script>

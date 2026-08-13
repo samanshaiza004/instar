@@ -10,7 +10,7 @@
 //! event loop needs a display server. That is the reason for the split: the
 //! part that cannot be tested in CI is the part with no logic in it.
 
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key as WinitKey, NamedKey};
 
 use crate::{
@@ -182,6 +182,24 @@ pub fn translate(
             event.repeat,
         ))),
 
+        // IME input crosses the seam as text, not as keys: winit delivers the
+        // full preedit string, the byte-wise caret range inside it, and the
+        // whole committed string. The host owns the payload, so it is cloned
+        // out of the event before this event is dropped.
+        WindowEvent::Ime(ime) => match ime {
+            Ime::Enabled => Some(WindowOutput::ImeEnabled { window_id }),
+            Ime::Preedit(text, cursor_range) => Some(WindowOutput::ImePreedit {
+                window_id,
+                text: text.clone(),
+                cursor_range: *cursor_range,
+            }),
+            Ime::Commit(text) => Some(WindowOutput::ImeCommit {
+                window_id,
+                text: text.clone(),
+            }),
+            Ime::Disabled => Some(WindowOutput::ImeDisabled { window_id }),
+        },
+
         _ => None,
     }
 }
@@ -205,6 +223,12 @@ pub fn instar_key(logical: &WinitKey) -> Key {
         WinitKey::Named(NamedKey::Enter) => Key::Enter,
         WinitKey::Named(NamedKey::Space) => Key::Space,
         WinitKey::Named(NamedKey::Escape) => Key::Escape,
+        WinitKey::Named(NamedKey::ArrowLeft) => Key::ArrowLeft,
+        WinitKey::Named(NamedKey::ArrowRight) => Key::ArrowRight,
+        WinitKey::Named(NamedKey::Home) => Key::Home,
+        WinitKey::Named(NamedKey::End) => Key::End,
+        WinitKey::Named(NamedKey::Backspace) => Key::Backspace,
+        WinitKey::Named(NamedKey::Delete) => Key::Delete,
         // Carried rather than dropped: the host is entitled to know a key
         // happened without this crate growing an opinion about which one.
         _ => Key::Other,
@@ -282,6 +306,10 @@ mod tests {
 
     fn focused(focused: bool) -> WindowEvent {
         WindowEvent::Focused(focused)
+    }
+
+    fn ime(ime: Ime) -> WindowEvent {
+        WindowEvent::Ime(ime)
     }
 
     /// A move is an event, and it carries where it happened.
@@ -449,6 +477,12 @@ mod tests {
             (NamedKey::Enter, Key::Enter),
             (NamedKey::Space, Key::Space),
             (NamedKey::Escape, Key::Escape),
+            (NamedKey::ArrowLeft, Key::ArrowLeft),
+            (NamedKey::ArrowRight, Key::ArrowRight),
+            (NamedKey::Home, Key::Home),
+            (NamedKey::End, Key::End),
+            (NamedKey::Backspace, Key::Backspace),
+            (NamedKey::Delete, Key::Delete),
         ] {
             assert_eq!(
                 instar_key(&WinitKey::Named(named)),
@@ -468,6 +502,58 @@ mod tests {
             Key::Other,
             "and character input is Phase 3's, not a fifth named key"
         );
+    }
+
+    /// IME text is a payload, not a key name: the whole string and the
+    /// byte-wise caret range cross the seam, and the preedit and commit arms
+    /// own the strings rather than borrowing the winit event.
+    #[test]
+    fn ime_preedit_carries_the_full_string_and_cursor_range() {
+        let mut state = state(1.0);
+        match translate(
+            &mut state,
+            WINDOW,
+            &ime(Ime::Preedit("あb".into(), Some((1, 1)))),
+        ) {
+            Some(WindowOutput::ImePreedit {
+                window_id,
+                text,
+                cursor_range,
+            }) => {
+                assert_eq!(window_id, WINDOW);
+                assert_eq!(text, "あb");
+                assert_eq!(cursor_range, Some((1, 1)));
+            }
+            other => panic!("an IME preedit must be delivered, got {other:?}"),
+        }
+    }
+
+    /// Committed text arrives whole; the host decides where and how it edits.
+    #[test]
+    fn ime_commit_carries_the_full_string() {
+        let mut state = state(1.0);
+        match translate(&mut state, WINDOW, &ime(Ime::Commit("あ不".into()))) {
+            Some(WindowOutput::ImeCommit { window_id, text }) => {
+                assert_eq!(window_id, WINDOW);
+                assert_eq!(text, "あ不");
+            }
+            other => panic!("an IME commit must be delivered, got {other:?}"),
+        }
+    }
+
+    /// The session lifecycle is reported so the host can flip composition
+    /// state on and off instead of guessing from empty preedits.
+    #[test]
+    fn ime_session_lifecycle_is_delivered() {
+        let mut state = state(1.0);
+        match translate(&mut state, WINDOW, &ime(Ime::Enabled)) {
+            Some(WindowOutput::ImeEnabled { window_id }) => assert_eq!(window_id, WINDOW),
+            other => panic!("Ime::Enabled must emit ImeEnabled, got {other:?}"),
+        }
+        match translate(&mut state, WINDOW, &ime(Ime::Disabled)) {
+            Some(WindowOutput::ImeDisabled { window_id }) => assert_eq!(window_id, WINDOW),
+            other => panic!("Ime::Disabled must emit ImeDisabled, got {other:?}"),
+        }
     }
 
     /// Shift arrives on its own event, and has to still be attached to the key

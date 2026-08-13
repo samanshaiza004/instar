@@ -1123,6 +1123,155 @@ B2e-4   lifetime, and behaviour
 
 Keeping them apart is what makes each provable.
 
+#### B2e-3, as built: where the freeze was wrong
+
+Recorded because the freeze was written before the code and four of its
+statements did not survive contact with it.
+
+**The order above starts too late.** It began at the generation screen and said
+nothing about the single-flight gate or about where borrow extraction sits
+relative to either. Extracting up to `MAX_TEXT_ATTACHMENTS` handles before
+those gates would let a superseded or overlapping guest buy that work — the
+containment invariant, broken by the feature meant to sit behind it. The real
+order is:
+
+```text
+canonical ABI lift                       unavoidable
+generation preflight                     -> stale-generation
+single-flight acquisition                -> commit-in-progress
+attachment-count bound                   -> too-many-attachments
+handle -> opaque key                     O(n), gated by everything above
+generation recheck                       the race after preflight
+cross-thread submit
+main-thread generation screen            checked again, deliberately
+capability resolution                    -> unavailable-text-view
+decode + semantic validation             -> invalid-batch
+```
+
+`CommitPermit` exists to hold that: `commit_batch` cannot be called without
+one, so a later edit cannot reintroduce the old shape by writing a fresh call
+that skips the gates.
+
+**`ledger.validate` belongs inside staging.** The freeze's order omitted it,
+which made `StagedUiCommit` a weaker statement than its name: it was the second
+fallible pre-mutation check, sitting beside the tree diff, and a staged commit
+that could still fail it would not be staged. `ledger.apply` stays
+mutation-side.
+
+**The no-op gate had to widen.** It returned early on an empty *tree* diff, so
+the frozen `V7 -> V12` case — same node, same bytes, different document — was
+accepted and never promoted. The host reporting success for a change it
+discarded is worse than refusing it. The gate now consults both diffs.
+
+**The bound is a policy, not a theorem.** `MAX_TEXT_ATTACHMENTS = MAX_NODES`
+was justified as the structural maximum implied by a valid snapshot. It is not:
+unreferenced side-table entries are legal, so a one-node tree supplying 4097
+entries is meaningful under Instar's own semantics and is refused by this rule
+alone. The value stands; it is the maximum *useful* cardinality, and the
+reasoning is now written that way.
+
+**One joined-seam fault was unreachable.** B2e-3's proof was to be a real guest
+committing a capability it did not own. No real guest can express that: a new
+generation gets a fresh `Store` and `ResourceTable` and cannot hold its
+predecessor's handle, and the old generation's own commit dies at
+`stale-generation` long before the resolver. Manufacturing it would have meant
+test-only machinery for smuggling a foreign key into a new Store, which proves
+the machinery. The authority check is tested one seam lower, where an
+`OpaqueResourceKey` can be constructed legitimately; the real guest proves
+transport, permutation and promotion.
+
+#### The rule B2e-3 earned: the mutant comes first
+
+> **Every new lifetime or authority invariant gets its mutant written first.
+> The test is accepted only after the mutant has been observed failing.**
+
+Not adopted ceremonially. B2e-3 shipped four tests that could not fail, and
+every one of them was green and confident:
+
+```text
+the permutation regression   rebuilt the slot -> view map inside its own
+                             helper, so the one test written to catch "code
+                             comparing slot numbers" never called that code
+a diff-ignores-the-table     had no table in it: two hand-built maps, an
+  test                       assertion true of any implementation
+the unowned-key test         named a resource that never existed, so identity
+                             refused it and authority was never consulted
+the joined-seam test         waited on a condition that was already true, and
+                             so read the retained map before the commit under
+                             test had been applied
+```
+
+The last two were written while explicitly trying not to make this mistake.
+That is the argument for the rule: green is not evidence, and intent is not a
+substitute for the mutant.
+
+The stronger form, which is what the rule is actually for:
+
+> A passing test is evidence only after it has been shown to turn red under
+> the specific wrong implementation it claims to exclude.
+
+##### B2e-4's mutants, which its frozen law already names
+
+The lifetime law is two `OR`s, stated in
+`instar-host/src/text_host.rs::collect_unowned_resources`:
+
+```text
+a TextView   lives while a guest lease names it OR a retained attachment does
+a TextBuffer lives while a guest lease names it OR a live TextView does
+```
+
+Both halves of both `OR`s are a mutant, and each has one obligation:
+
+```text
+view lifetime -> guest lease only      dropping the guest handle kills an
+                                       attached view
+view lifetime -> attachment only       detaching kills a view the guest still
+                                       holds
+detach forgets to decrement            the live-view counter never returns to
+                                       baseline
+replacement releases before acquiring  an observable intermediate destruction
+                                       between V7 leaving and V12 arriving
+teardown kills an attached view        a generation's death destroys a document
+  because its lease went               -- the thing B2e exists to disprove
+buffer rule broken                     the last guest buffer lease destroys a
+                                       buffer a live view still references
+final release leaks                    the view goes, the buffer does not
+```
+
+The counters already exist for this: `TextResourceCounts` asserts a return to
+baseline rather than that some `drop` ran, which is what makes the third and
+seventh expressible at all.
+
+Then the behavioural mutants, which are about the B2d seam rather than lifetime:
+
+```text
+NodeKey -> TextViewId lookup skipped
+attachment replacement treated as a kind change
+detachment leaves text capture or the focus route alive
+a pointer event routes through a stale previous TextViewId
+```
+
+The second is already half-frozen: `NodeKey` remains the focus identity and the
+attachment is only how the host reaches the view, so `V7 -> V12` must not
+recreate the semantic node. B2e-3 locked the control that it is not a kind
+change; B2e-4 owes the mutant that proves nothing downstream treats it as one.
+
+##### `cargo-mutants` as a supplement, and only that
+
+Worth adding, scoped to the changed B2e modules rather than the workspace —
+mutation runs get expensive fast, and ~660 tests is already a slow full pass.
+(Not installed here yet; it is a `cargo install cargo-mutants` away.)
+
+What it is good for is the boring holes: an unmutated branch, a comparison that
+could be inverted with nobody noticing. What it will not invent is
+"resolve authority *after* decode", or "retain slot identity instead of
+resource identity", or "wait on a condition that was already true" — none of
+which are local code mutations. Those are the architectural invariants, they
+are where this package's real defects were, and they stay hand-written.
+
+The tool finds the holes around the deliberate faults. It does not replace
+them, and a green `cargo-mutants` run is not the rule above being satisfied.
+
 #### Order
 
 ```text
@@ -1378,3 +1527,28 @@ pending batches, session epoch, conflict handling, recovery, and the 500 ms
 stalled guest — and it gets them against a text stack whose presentation and
 input are already known to work, so a bad typing experience there is a
 synchronization defect rather than an ambiguous one.
+
+### Package B completion (B2e-4 through B4)
+
+Package B is host-local and deliberately does not add a guest edit protocol or
+an application/package format. TextView presentation is strictly unwrapped:
+one hard document line is one row, with the shared Parley-derived
+`FontSizeRelative(1.4)` row height used for shaping, viewport arithmetic,
+scrolling, and candidate geometry. Crop owns grapheme and CRLF storage facts;
+Parley remains behind `instar-ui::TextLayout` for visual cursor semantics.
+
+Retained attachments are counted owners. Admission enforces global
+`TextViewId` uniqueness across windows, replacement retains the new view before
+releasing the old one, and generation teardown removes only guest leases.
+Pointer, focus, wheel chaining, and command editing are host-local and never
+send guest events. IME state separates transient preedit from its saved target;
+the empty-preedit-before-commit sequence is preserved, invalid cursor metadata
+only hides the composition cursor, and commit without a preedit replaces the
+current selection. Native configuration is deduplicated and disabled across
+the metrics barrier.
+
+Completion evidence: `cargo test -p instar-text`, `cargo test -p instar-ui`,
+`cargo test -p instar-window`, `cargo test -p instar-host --lib`, and
+`cargo check -p instar-shell` pass in the workspace. The production harness
+observes retained attachments, resource counts, selection/revision, and scene
+state without adding a routing or promotion test path.

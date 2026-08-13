@@ -6,7 +6,7 @@ typed WIT contract; the host owns rendering, input, and the boundary around
 every guest turn.
 
 [Website](https://instar.samanshaiza.com/) ·
-[Install guide](https://instar.samanshaiza.com/docs/getting-started/install.html) ·
+[Install guide](https://instar.samanshaiza.com/docs/getting-started/install) ·
 [Documentation](https://instar.samanshaiza.com/docs/)
 
 > **Status: early. Phase 1 complete; not stable.**

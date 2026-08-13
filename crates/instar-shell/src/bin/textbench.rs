@@ -646,7 +646,6 @@ fn shaping_table() {
             wrap: false,
         },
         row_height: 20.0,
-        wrap_width: None,
     };
     // One font stack for the whole benchmark, as Parley intends and as
     // instar-host does.
