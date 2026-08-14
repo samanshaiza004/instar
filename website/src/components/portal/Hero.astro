@@ -1,46 +1,45 @@
 ---
-/**
- * The portal hero.
- *
- * Three real grid columns — photo air, headline, news rail — inside a box whose
- * bottom padding is reserved for the module deck that rides up over it. The
- * only absolutely positioned things in here are the photograph and the dot
- * field, neither of which carries text.
- */
 ---
 
 <section class="hero" aria-labelledby="hero-title">
-  <img
-    class="hero-photo"
-    src="/assets/shore-hero.jpg"
-    alt=""
-    width="736"
-    height="520"
-    style="object-position: 30% 72%;"
-    fetchpriority="high"
-    decoding="async"
-  />
-  <div class="hero-dots" aria-hidden="true"></div>
-
-  <div class="hero-inner">
-    <p class="hero-stamp">DEVELOPER PREVIEW ✦ 0.0.2</p>
-
+  <div class="hero-main">
+    <img
+      class="hero-photo"
+      src="/assets/instar-model.webp"
+      alt=""
+      width="1200"
+      height="800"
+      fetchpriority="high"
+      decoding="async"
+    />
+    <div class="hero-grid" aria-hidden="true"></div>
+    <p class="hero-stamp">DEVELOPER PREVIEW / 0.0.2</p>
     <div class="hero-copy">
       <p class="eyebrow">NATIVE HOST / WASM COMPONENTS</p>
       <h1 id="hero-title">
-        <span class="line-a">run the guest.</span>
+        <span>run the guest.</span>
         own the machine.
       </h1>
       <p class="standfirst">
-        A WebAssembly component describes a semantic interface. The native host keeps authority over
-        layout, input, accessibility, rendering, and failure.
+        The guest describes meaning. Instar owns the native window, layout, input, accessibility,
+        and pixels.
+      </p>
+      <p class="hero-actions">
+        <a href="/docs/getting-started/install">START HERE</a>
+        <a href="/docs/concepts/host-owned-ui">HOW IT WORKS</a>
       </p>
     </div>
-
-    <aside class="hero-news" aria-label="What is active">
-      <h2>pre-0.3</h2>
-      <p><b>Phase 3:</b> the host-owned text boundary is taking shape.</p>
-      <a href="/blog/phase-3-pre-0-3">Read the release note ▸</a>
-    </aside>
   </div>
+
+  <aside class="hero-news" aria-labelledby="news-title">
+    <h2 id="news-title">what's new <span aria-hidden="true">»</span></h2>
+    <div class="hero-news-body">
+      <p class="news-date">AUG 13, 2026 / PRE-0.3</p>
+      <h3>Host-owned text is taking shape.</h3>
+      <p>Phase 3 is extending the same ownership boundary to text buffers and views.</p>
+      <p class="news-fact"><b>TEXT</b> Buffers + views</p>
+      <p class="news-fact"><b>RELEASES</b> No tagged binary yet</p>
+      <a href="/blog/phase-3-pre-0-3">READ THE RELEASE NOTE »</a>
+    </div>
+  </aside>
 </section>

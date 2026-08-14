@@ -10,9 +10,8 @@ const { current } = Astro.props;
 
 <nav class="channel-nav" aria-label="Primary">
   {
-    channels.map((channel, index) => (
+    channels.map((channel) => (
       <>
-        {index === 1 && <span class="explore">EXPLORE:</span>}
         <a href={channel.href} aria-current={current === channel.label ? 'page' : undefined}>
           {channel.label}
         </a>

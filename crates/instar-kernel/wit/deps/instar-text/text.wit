@@ -92,6 +92,16 @@ interface text-types {
         /// nothing in the batch was applied.
         conflict(u64),
     }
+
+    /// The exact bytes of a byte range, and the revision they were read at.
+    ///
+    /// `contents` is guaranteed complete, valid UTF-8: the same boundary
+    /// check `apply-edits` uses refuses a range that lands mid-character, so
+    /// a successful read never has to describe a partial code point.
+    record range-contents {
+        contents: string,
+        revision: u64,
+    }
 }
 
 /// Host-owned text resources, leased to a guest as capabilities.
@@ -120,7 +130,7 @@ interface text-types {
 /// and a UI event at the same time -- is worse than the overlapping-subtask
 /// machinery this package otherwise avoids. See its own doc comment for why.
 interface text {
-    use text-types.{text-error, edit-notification, text-edit, apply-edits-result};
+    use text-types.{text-error, edit-notification, text-edit, apply-edits-result, range-contents};
 
     resource text-buffer;
     resource text-view;
@@ -199,4 +209,32 @@ interface text {
         expected-revision: u64,
         edits: list<text-edit>,
     ) -> result<apply-edits-result, text-error>;
+
+    /// Reads an exact byte range, and the revision it was read at.
+    ///
+    /// **Strictly observational.** This call never advances or re-arms this
+    /// generation's synchronization state for `buffer` -- it is not the
+    /// recovery mechanism, and treating it as one is the double-application
+    /// hazard C4's design explicitly refuses to ship:
+    ///
+    /// ```text
+    /// guest apply-edits(expected=5) -> conflict(7)
+    /// guest read-range(...)         -> bytes at revision 7
+    /// queue still holds the two edits between 5 and 7
+    /// ```
+    ///
+    /// A guest that adopted revision 7 from that read and then drained
+    /// `next-edit` would apply both edits a second time. After a conflict, a
+    /// guest either drains `next-edit` until caught up, or calls
+    /// `resynchronize` -- the one call that atomically snapshots *and*
+    /// re-arms, in that order, as one owner-thread transition.
+    ///
+    /// A malformed range -- inverted, out of bounds, or off a character
+    /// boundary -- is `invalid-edit`, the same coarse refusal `apply-edits`
+    /// uses for the same underlying check.
+    read-range: func(
+        buffer: borrow<text-buffer>,
+        start: u64,
+        end: u64,
+    ) -> result<range-contents, text-error>;
 }

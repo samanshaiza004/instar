@@ -21,11 +21,10 @@ export const site = {
 
 /** The orange-arrow channel strip under the masthead. */
 export const channels = [
-  { label: 'START', href: '/docs/getting-started/install' },
+  { label: 'GET STARTED', href: '/docs/getting-started/install' },
   { label: 'FIRST RUN', href: '/docs/getting-started/first-run' },
   { label: 'BUILD A GUEST', href: '/docs/getting-started/build-a-guest' },
   { label: 'RUNTIME', href: '/docs/concepts/runtime-model' },
-  { label: 'CLI', href: '/docs/reference/cli' },
   { label: 'DOWNLOADS', href: '/downloads' },
   { label: 'BLOG', href: '/blog' },
 ];
@@ -44,36 +43,7 @@ export const facts = [
 export const footerLinks = [
   { label: 'Documentation', href: '/docs' },
   { label: 'Downloads', href: '/downloads' },
-  { label: 'Blog', href: '/blog' },
   { label: 'Project status', href: '/docs/project/status' },
   { label: 'Source', href: repository },
-  { label: 'Issues', href: `${repository}/issues` },
   { label: 'License', href: `${repository}/blob/master/LICENSE-MIT` },
-];
-
-/** The footer "jump to" menu — a period-correct navigation dropdown. */
-export const jumpTargets = [
-  { label: 'Requirements', href: '/docs/getting-started/requirements' },
-  { label: 'Install Instar', href: '/docs/getting-started/install' },
-  { label: 'Your first run', href: '/docs/getting-started/first-run' },
-  { label: 'Build a guest', href: '/docs/getting-started/build-a-guest' },
-  { label: 'Verify a download', href: '/docs/getting-started/verify' },
-  { label: 'Runtime model', href: '/docs/concepts/runtime-model' },
-  { label: 'Host-owned UI', href: '/docs/concepts/host-owned-ui' },
-  { label: 'Architecture', href: '/docs/concepts/architecture' },
-  { label: 'Failure and recovery', href: '/docs/concepts/failure-and-recovery' },
-  { label: 'Command line', href: '/docs/reference/cli' },
-  { label: 'UI vocabulary', href: '/docs/reference/ui-vocabulary' },
-  { label: 'Wire protocol', href: '/docs/reference/protocol' },
-  { label: 'Error taxonomy', href: '/docs/reference/errors' },
-  { label: 'WIT contract', href: '/docs/reference/wit' },
-  { label: 'Distribution', href: '/docs/reference/distribution' },
-  { label: 'Troubleshooting', href: '/docs/reference/troubleshooting' },
-  { label: 'Glossary', href: '/docs/reference/glossary' },
-  { label: 'Build from source', href: '/docs/development/build-from-source' },
-  { label: 'Tests and gates', href: '/docs/development/testing' },
-  { label: 'Repository map', href: '/docs/development/repository-map' },
-  { label: 'Contributing', href: '/docs/development/contributing' },
-  { label: 'Project status', href: '/docs/project/status' },
-  { label: 'Questions', href: '/docs/project/faq' },
 ];

@@ -30,6 +30,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? 'https://instar.sama
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical.href} />
+    <meta property="og:image" content={new URL('/assets/instar-model.webp', canonical).href} />
     <meta name="twitter:card" content="summary_large_image" />
   </head>
   <body>
@@ -59,14 +60,6 @@ const canonical = new URL(Astro.url.pathname, Astro.site ?? 'https://instar.sama
         window.setTimeout(() => {
           button.textContent = original;
         }, 1400);
-      });
-
-      // The footer "jump to" menu navigates on change, the way a portal
-      // dropdown did before anyone had a router.
-      document.querySelectorAll<HTMLSelectElement>('[data-jump]').forEach((select) => {
-        select.addEventListener('change', () => {
-          if (select.value) window.location.href = select.value;
-        });
       });
     </script>
   </body>

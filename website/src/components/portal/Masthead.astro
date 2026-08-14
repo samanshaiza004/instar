@@ -3,7 +3,11 @@ import { site } from '../../data/site';
 ---
 
 <header class="masthead">
-  <a class="wordmark" href="/" aria-label="Instar home">INSTAR<span class="spark" aria-hidden="true">✦</span></a>
+  <a class="wordmark" href="/" aria-label="Instar home">
+    <span class="wordmark-name"><span>IN</span>STAR</span>
+    <img src="/assets/instar-mark.svg" alt="" width="38" height="38" />
+    <small>native host.<br />wasm guest.</small>
+  </a>
 
   <form class="site-search" action="/docs/" method="get">
     <label for="site-q">SEARCH:</label>
@@ -12,9 +16,8 @@ import { site } from '../../data/site';
   </form>
 
   <div class="utility-links">
-    <a href={site.repository}>⌁ SOURCE</a>
-    <a href="/docs/project/status">STATUS</a>
-    <a href="/blog">BLOG</a>
+    <a href={site.repository}>SOURCE</a>
+    <a href="/docs/">DOCS</a>
     <strong class="protocol-stamp">PROTOCOL {site.protocolVersion}</strong>
   </div>
 </header>
