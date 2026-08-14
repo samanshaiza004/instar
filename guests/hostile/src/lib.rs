@@ -35,6 +35,8 @@
 //! | Bootstrap max legal | Calls `create-buffer` with a payload exactly at the size ceiling | a maximum legal transfer succeeds end to end (C4a) |
 //! | Bootstrap oversized | Calls `create-buffer` with a payload over the ceiling but still liftable | Instar's own refusal, not Wasmtime's, catches a liftable-but-too-large payload |
 //! | Bootstrap absurd | Calls `create-buffer` with a payload past the hostcall-fuel budget | Wasmtime stops an absurd payload before `TextHost` ever sees it |
+//! | Acquire non-empty text | Bootstraps a non-empty buffer and its two views | real content and a real revision history, for C4d's convergence claim |
+//! | Resynchronize | Calls `resynchronize` and reports the resulting length and revision | a real guest converges with the host after an overflow-forced desync (C4d) |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -118,6 +120,13 @@ const BOOTSTRAP_MAX_LEGAL: NodeKey = NodeKey::first(24);
 const BOOTSTRAP_OVERSIZED_LIFTABLE: NodeKey = NodeKey::first(25);
 /// Calls `create-buffer` with a payload past the hostcall-fuel budget.
 const BOOTSTRAP_ABSURD: NodeKey = NodeKey::first(26);
+/// Bootstraps a non-empty buffer and its two views, in place of the empty
+/// one `TEXT_ACQUIRE` holds -- C4d needs real content and a real revision
+/// history to converge, not an empty document.
+const TEXT_ACQUIRE_NONEMPTY: NodeKey = NodeKey::first(27);
+/// Calls `resynchronize` on the first held buffer and reports its length and
+/// revision, for C4d's convergence claim.
+const RESYNCHRONIZE: NodeKey = NodeKey::first(28);
 /// The first text-view surface the commit buttons attach.
 const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 /// The second text-view surface the commit buttons attach.
@@ -137,6 +146,10 @@ const BOOTSTRAP_OVERSIZED_LIFTABLE_BYTES: usize = 36 * 1024 * 1024;
 /// before any host text code runs, small enough that allocating it here
 /// doesn't trip a different limit first.
 const BOOTSTRAP_ABSURD_BYTES: usize = 56 * 1024 * 1024;
+
+/// C4d's seed content: known, short, and distinct from anything a host-local
+/// edit inserts, so a mismatch in the converged document is easy to place.
+const NONEMPTY_SEED: &str = "seed";
 
 /// Comfortably over the host's 32 KiB crash-surface cap, so the clamp is
 /// exercised by a real trap rather than only by a unit test.
@@ -270,7 +283,7 @@ impl Hostile {
                 0,
                 None,
                 container(0, 4),
-                (25 + extra_views) as u16,
+                (27 + extra_views) as u16,
             )
             .node(
                 opcode::NODE_TEXT,
@@ -473,6 +486,22 @@ impl Hostile {
                 BOOTSTRAP_ABSURD,
                 flags::ENABLED,
                 Some("Bootstrap absurd"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                TEXT_ACQUIRE_NONEMPTY,
+                flags::ENABLED,
+                Some("Acquire non-empty text"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                RESYNCHRONIZE,
+                flags::ENABLED,
+                Some("Resynchronize"),
                 WireLayout::default(),
                 0,
             );
@@ -815,6 +844,35 @@ impl Hostile {
                 let _ = text::create_buffer(&contents);
                 self.label_override = Some("bootstrap: absurd call returned".to_string());
             }
+            // C4d: a non-empty buffer with real content and two views, in
+            // place of `TEXT_ACQUIRE`'s empty one -- reused for everything
+            // downstream (`TEXT_COMMIT`'s attachment, real host-local edits,
+            // `RESYNCHRONIZE`) exactly as `TEXT_ACQUIRE`'s empty buffer
+            // already is, so convergence is proven through the same real
+            // machinery every other joined-seam test uses rather than a
+            // parallel path built just for this claim.
+            WireEvent::Click { node } if node == TEXT_ACQUIRE_NONEMPTY => {
+                match text::create_buffer(NONEMPTY_SEED) {
+                    Ok(buffer) => {
+                        for _ in 0..2 {
+                            match text::create_view(&buffer) {
+                                Ok(view) => self.views.push(view),
+                                Err(error) => {
+                                    self.label_override = Some(format!("view failed: {error:?}"));
+                                }
+                            }
+                        }
+                        self.label_override = Some(format!("held {} view(s)", self.views.len()));
+                        self.buffers.push(buffer);
+                    }
+                    Err(error) => {
+                        self.label_override = Some(format!("buffer failed: {error:?}"));
+                    }
+                }
+            }
+            WireEvent::Click { node } if node == RESYNCHRONIZE => {
+                self.label_override = Some(self.resynchronize_report());
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
@@ -888,6 +946,25 @@ impl Hostile {
                 format!("bootstrap: ok {size} bytes")
             }
             Err(error) => format!("bootstrap: refused {error:?}"),
+        }
+    }
+
+    /// Calls `resynchronize` on the first held buffer and reports its length
+    /// and revision -- not the full contents, which can be arbitrarily large
+    /// after a desync-triggering edit and would make a poor UI label. Length
+    /// and revision are exactly what C4d's test needs to compare against the
+    /// host's own buffer state for its convergence claim.
+    fn resynchronize_report(&self) -> String {
+        let Some(buffer) = self.buffers.first() else {
+            return "no buffer to resynchronize".to_string();
+        };
+        match text::resynchronize(buffer) {
+            Ok(snapshot) => format!(
+                "resync: len={} revision={}",
+                snapshot.contents.len(),
+                snapshot.revision
+            ),
+            Err(error) => format!("resync: refused {error:?}"),
         }
     }
 }

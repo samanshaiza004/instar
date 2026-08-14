@@ -1910,6 +1910,39 @@ second allocation before ever reaching the call under test — the memory
 never shrinks between allocations, so the two peaks add. Each of C4a's
 three size-tier tests therefore runs its own fresh generation.
 
+#### C4d close-out: the convergence claim, proven rather than assumed
+
+Every earlier joined-seam test in Package C proved one seam in isolation.
+None of them puts a real guest through the property the whole package exists
+for: that host and guest *converge*. `a_real_guest_converges_with_the_host_after_a_forced_desync`
+is that test —  a real guest bootstraps a non-empty document, an ordinary
+real host-local edit lands, a second real host-local edit deliberately
+exceeds `MAX_PENDING_EDIT_BYTES` in one push to force `Desynchronized`
+cheaply and deterministically (no need for thousands of real round trips to
+exhaust the count bound instead), the guest calls `resynchronize`, and its
+reported length and revision are checked against the host's own buffer
+state — not trusted.
+
+Two findings from actually running it, kept here so they don't have to be
+rediscovered:
+
+- **Clicking a button steals focus from the text view.** The same lesson
+  C2c's own test already learned for its "Await edit" button applies to
+  "Resynchronize": IME has to be refocused onto `TEXT_NODE_A` before the
+  edit that verifies recovery held has anywhere host-local to route, or it
+  silently no-ops and the assertion fails for the wrong reason.
+- **Document length and revision converging is not the same claim as the
+  relationship's own baseline converging.** The first version of this test
+  checked the guest's reported `(len, revision)` against
+  `TextBuffer::len_bytes`/`revision` — both untouched by the C4c priority
+  mutant, since that mutant only corrupts `SyncState::latest_revision`, a
+  separate value. The test passed under the mutant. Adding an explicit
+  `sync_state(...).latest_revision()` assertion — independent of what the
+  guest was told — closed the gap; re-running the same mutant against the
+  fixed test now fails it, confirming the closure test exercises the
+  priority mutant's exact claim, not just a claim that happens to look
+  similar.
+
 ### Generation teardown, and what C does not answer
 
 A new generation cannot inherit handles: leases die with the generation, and

@@ -1210,6 +1210,10 @@ const BOOTSTRAP_MAX_LEGAL: NodeKey = NodeKey::first(24);
 const BOOTSTRAP_OVERSIZED_LIFTABLE: NodeKey = NodeKey::first(25);
 /// Calls `create-buffer` with a payload past the hostcall-fuel budget.
 const BOOTSTRAP_ABSURD: NodeKey = NodeKey::first(26);
+/// Bootstraps a non-empty buffer and its two views.
+const TEXT_ACQUIRE_NONEMPTY: NodeKey = NodeKey::first(27);
+/// Calls `resynchronize` and reports the resulting length and revision.
+const RESYNCHRONIZE: NodeKey = NodeKey::first(28);
 
 /// The window's retained `NodeKey -> TextViewId` map.
 fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
@@ -1765,6 +1769,205 @@ fn a_real_guest_bootstrap_past_the_fuel_budget_is_stopped_before_texthost_sees_i
         0,
         "TextHost never saw this call at all -- there is nothing for it to \
          have created"
+    );
+}
+
+/// C4d: the closure gate for the whole convergence claim, through a real
+/// guest.
+///
+/// Every earlier C-series test proved one seam: C2c a host-local edit
+/// reaching a suspended guest, C3c a guest's own `apply-edits` round-
+/// tripping, C4a/C4b/C4c their own calls in isolation. None of them proves
+/// the property Package C actually exists for -- that host and guest
+/// *converge* -- because none puts a real guest through the one path that
+/// can disagree about it: a desync forced by real host-local edits, closed
+/// by a real `resynchronize` call, with the guest's own report checked
+/// against the host's own buffer state rather than trusted.
+///
+/// ```text
+/// a real guest bootstraps a non-empty buffer, attaches a view
+///   -> a real host-local edit                 ordinary editing still works
+///   -> a real host-local edit past the byte bound  forces Desynchronized
+///   -> the real guest calls resynchronize
+///   -> the guest's reported (len, revision) == the host's own buffer state
+///   -> the relationship is Synchronized again, with nothing queued
+///   -> one more host-local edit queues normally, proving the recovery held
+/// ```
+#[test]
+fn a_real_guest_converges_with_the_host_after_a_forced_desync() {
+    let (mut bridge, _wakes) = ready();
+
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, TEXT_ACQUIRE_NONEMPTY);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 2),
+        "the guest acquired a non-empty buffer and its views"
+    );
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the acquire commit must land before the next baseline is captured"
+    );
+
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, TEXT_COMMIT);
+    assert!(
+        await_attachments(&mut bridge, |map| map.len() == 2),
+        "both text views reached the retained map"
+    );
+    assert!(await_commit_after(&mut bridge, applied));
+
+    let view = *attachments(&bridge)
+        .get(&TEXT_NODE_A)
+        .expect("node A is attached");
+    let buffer = bridge
+        .host()
+        .text_resources()
+        .system()
+        .view(view)
+        .expect("the view is live")
+        .buffer();
+    let generation = bridge.generation();
+
+    click(&mut bridge, TEXT_NODE_A);
+    assert_eq!(
+        bridge.host().window(WINDOW).unwrap().focus().focused(),
+        Some(TEXT_NODE_A),
+        "IME has nowhere else to route to"
+    );
+
+    // An ordinary host-local edit: revision advances normally, still
+    // synchronized. Applying through `on_window_event` is synchronous on
+    // this thread -- no guest round trip is needed to observe host state.
+    bridge.on_window_event(WindowOutput::ImeCommit {
+        window_id: WINDOW,
+        text: "hi".to_string(),
+    });
+    assert_eq!(
+        bridge
+            .host()
+            .text_resources()
+            .system()
+            .buffer(buffer)
+            .unwrap()
+            .revision(),
+        instar_text::Revision(1)
+    );
+    assert!(
+        bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .is_synchronized(),
+        "one ordinary edit does not desynchronize anything"
+    );
+
+    // Past the byte bound in one push: forces Desynchronized deterministically
+    // and cheaply, without thousands of real round trips.
+    bridge.on_window_event(WindowOutput::ImeCommit {
+        window_id: WINDOW,
+        text: "x".repeat(instar_host::text_sync::MAX_PENDING_EDIT_BYTES + 1),
+    });
+    assert!(
+        !bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .is_synchronized(),
+        "the oversized edit must desynchronize this relationship"
+    );
+
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, RESYNCHRONIZE);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the resynchronize report must commit"
+    );
+
+    let reported = label(&bridge);
+    let (guest_len, guest_revision) = {
+        let rest = reported
+            .strip_prefix("resync: len=")
+            .unwrap_or_else(|| panic!("unexpected resync label shape: {reported}"));
+        let (len, rest) = rest
+            .split_once(" revision=")
+            .unwrap_or_else(|| panic!("unexpected resync label shape: {reported}"));
+        (
+            len.parse::<usize>().expect("length is a number"),
+            rest.parse::<u64>().expect("revision is a number"),
+        )
+    };
+
+    let host_buffer = bridge.host().text_resources().system().buffer(buffer).unwrap();
+    assert_eq!(
+        guest_len,
+        host_buffer.len_bytes(),
+        "the guest's reported length must match the host's actual document, \
+         byte for byte"
+    );
+    assert_eq!(
+        guest_revision,
+        host_buffer.revision().0,
+        "the guest's reported revision must match the host's actual revision"
+    );
+    assert_eq!(
+        bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .latest_revision(),
+        instar_text::Revision(guest_revision),
+        "the relationship must be re-armed at exactly the revision the \
+         guest was told, not a different one -- the document's own \
+         revision and the relationship's idea of its own baseline are two \
+         separate values in the host, and a bug that let them diverge \
+         would still report a consistent-looking document length and \
+         revision to the guest above"
+    );
+
+    assert!(
+        bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .is_synchronized(),
+        "resynchronize must recover from Desynchronized"
+    );
+    assert_eq!(
+        bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .queued(),
+        0,
+        "the backlog through the resync point is discarded, not replayed"
+    );
+
+    // Clicking the Resynchronize button above moved focus onto it, exactly
+    // as C2c's own test found for its "Await edit" button -- IME has to be
+    // refocused onto the text view before this commit has anywhere
+    // host-local to route.
+    click(&mut bridge, TEXT_NODE_A);
+
+    // The recovery held: an edit after resync queues normally again, not as
+    // another desync.
+    bridge.on_window_event(WindowOutput::ImeCommit {
+        window_id: WINDOW,
+        text: "!".to_string(),
+    });
+    assert_eq!(
+        bridge
+            .host()
+            .text_resources()
+            .sync_state(generation, buffer)
+            .unwrap()
+            .queued(),
+        1,
+        "edits queue normally again after resynchronize"
     );
 }
 
