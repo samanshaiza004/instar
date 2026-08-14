@@ -1843,6 +1843,30 @@ canonical ABI fuel   containment against absurd pre-lift input
 Instar limits        precise API policy, and a typed refusal
 ```
 
+#### C4a close-out: the chosen fuel value, and what a real guest showed
+
+`TEXT_TRANSFER_HOSTCALL_FUEL = 40 MiB`, in `instar-kernel/src/resource.rs`,
+installed once per generation alongside the epoch deadline. Comfortably above
+`MAX_TEXT_BUFFER_BYTES` (32 MiB, with headroom asserted in
+`crates/instar-host/tests/text_transfer_bound.rs`) and well under Wasmtime's
+own 128 MiB default, so the window between the two ceilings is wide enough to
+exercise "liftable but too large for Instar" as its own observable outcome.
+
+Confirmed against a real guest, not assumed: exceeding the fuel budget traps
+the generation with Wasmtime's own message, `"fuel allocated for hostcalls
+has been exhausted"`, distinct from a memory-policy trap ("forcing trap when
+growing memory") and from an ordinary guest panic (a bare Wasmtime
+backtrace). The trap surfaces through the same `GuestTrapped` channel a
+guest panic does — there is no `text-error` for it, because the host
+implementation of `create-buffer` is never entered.
+
+One test-design finding worth keeping: Wasm linear memory only grows. A
+single guest generation that allocates a legal-sized payload and then an
+oversized one back to back can trip its *own* 64 MiB memory policy on the
+second allocation before ever reaching the call under test — the memory
+never shrinks between allocations, so the two peaks add. Each of C4a's
+three size-tier tests therefore runs its own fresh generation.
+
 ### Generation teardown, and what C does not answer
 
 A new generation cannot inherit handles: leases die with the generation, and

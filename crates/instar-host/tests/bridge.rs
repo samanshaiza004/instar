@@ -1204,6 +1204,12 @@ const APPLY_EDITS_MALFORMED: NodeKey = NodeKey::first(22);
 /// Calls `apply-edits` with a well-formed edit at a revision that cannot be
 /// current.
 const APPLY_EDITS_STALE: NodeKey = NodeKey::first(23);
+/// Calls `create-buffer` with a payload exactly at the size ceiling.
+const BOOTSTRAP_MAX_LEGAL: NodeKey = NodeKey::first(24);
+/// Calls `create-buffer` with a payload over the ceiling but still liftable.
+const BOOTSTRAP_OVERSIZED_LIFTABLE: NodeKey = NodeKey::first(25);
+/// Calls `create-buffer` with a payload past the hostcall-fuel budget.
+const BOOTSTRAP_ABSURD: NodeKey = NodeKey::first(26);
 
 /// The window's retained `NodeKey -> TextViewId` map.
 fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
@@ -1657,6 +1663,108 @@ fn a_real_guest_calls_apply_edits_and_the_result_round_trips_unchanged() {
         "the guest must genuinely suspend in next-edit on its own buffer -- \
          if its own batch had been echoed back to it, this would resolve \
          immediately instead of ever installing a waiter"
+    );
+}
+
+/// C4a: a payload exactly at `instar-text`'s own size ceiling must succeed
+/// through a real guest -- not merely "not trap", but reach a live host
+/// buffer with the guest's own bytes in it.
+///
+/// A fresh bridge, not shared with the oversized-liftable test below:
+/// Wasm linear memory only grows, and a real guest allocating a legal-then-
+/// oversized payload back to back inside one generation trips the *guest's
+/// own* 64 MiB memory policy on the second allocation, before the call this
+/// test is actually about is ever made -- discovered by running exactly that
+/// and watching the generation trap with "forcing trap when growing memory".
+/// One generation, one large allocation, is what each of these tests proves
+/// something about; the guest's own memory ceiling is not the tier under
+/// test.
+#[test]
+fn a_real_guest_bootstraps_at_the_max_legal_size() {
+    let (mut bridge, _wakes) = ready();
+
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, BOOTSTRAP_MAX_LEGAL);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "a maximum legal bootstrap must commit its report"
+    );
+    assert_eq!(
+        label(&bridge),
+        "bootstrap: ok 33554432 bytes",
+        "the maximum legal payload must succeed, not merely avoid crashing"
+    );
+    assert_eq!(
+        bridge.host().text_resources().counts().live_buffers,
+        1,
+        "the buffer this bootstrap created is live on the host"
+    );
+}
+
+/// A payload over `instar-text`'s ceiling but still inside Wasmtime's
+/// `hostcall_fuel` budget must be refused by Instar's own `buffer-too-large`
+/// -- proving that refusal is reachable through a real guest at all, not
+/// merely theoretical because nothing ever gets that far to exercise it.
+///
+/// Its own fresh bridge; see [`a_real_guest_bootstraps_at_the_max_legal_size`]
+/// for why.
+#[test]
+fn a_real_guest_bootstrap_over_the_ceiling_but_within_fuel_is_refused() {
+    let (mut bridge, _wakes) = ready();
+
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, BOOTSTRAP_OVERSIZED_LIFTABLE);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "an oversized-but-liftable bootstrap must commit its refusal report"
+    );
+    assert_eq!(
+        label(&bridge),
+        "bootstrap: refused TextError::BufferTooLarge",
+        "liftable, but still too large for instar-text's own ceiling"
+    );
+    assert_eq!(
+        bridge.host().text_resources().counts().live_buffers,
+        0,
+        "a refused bootstrap creates nothing"
+    );
+}
+
+/// A payload past Wasmtime's `hostcall_fuel` budget is stopped by Wasmtime
+/// itself, before `create-buffer`'s host implementation -- and so before
+/// `TextHost` -- ever runs.
+///
+/// There is no `Result` for this: `create-buffer` returns
+/// `result<text-buffer, text-error>` from a host implementation that never
+/// gets entered, so the guest's whole call -- and, because a component-model
+/// trap unwinds the calling Wasm stack, the generation making it -- ends
+/// instead. Confirmed empirically before writing this assertion, the same
+/// discipline every mutant in this project uses for the other direction: a
+/// diagnostic run against the real guest showed
+/// `HostEffect::GuestGone { error: Some(msg), .. }` with `msg` containing
+/// Wasmtime's own "fuel allocated for hostcalls has been exhausted" --
+/// distinct from a memory-limiter trap (which says "forcing trap when
+/// growing memory") or an ordinary guest panic (Wasmtime's backtrace, with
+/// no fuel wording at all) -- so this checks for that exact phrase rather
+/// than merely "the generation died".
+#[test]
+fn a_real_guest_bootstrap_past_the_fuel_budget_is_stopped_before_texthost_sees_it() {
+    let (mut bridge, _wakes) = ready();
+
+    click(&mut bridge, BOOTSTRAP_ABSURD);
+    let error = await_guest_gone(&mut bridge);
+
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("fuel allocated for hostcalls")),
+        "expected a hostcall-fuel exhaustion trap, got {error:?}"
+    );
+    assert_eq!(
+        bridge.host().text_resources().counts().live_buffers,
+        0,
+        "TextHost never saw this call at all -- there is nothing for it to \
+         have created"
     );
 }
 

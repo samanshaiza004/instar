@@ -127,12 +127,29 @@ interface text {
 
     /// Opens an empty document.
     ///
-    /// Empty, and only empty, in this package. Creating a buffer from guest
-    /// contents raises canonical transfer, copy limits, bootstrap revisions
-    /// and resynchronization all at once -- which is Package C, and pulling it
-    /// forward here would mean designing synchronization inside a resource
-    /// constructor.
+    /// Predates `create-buffer` below: Package B could not yet raise canonical
+    /// transfer, copy limits, and bootstrap revisions all at once, so this
+    /// stayed the only constructor until C4a. Kept now because "no contents to
+    /// transfer" is a real, common case that a `create-buffer("")` call would
+    /// only reach by more roundabout means.
     create-empty-buffer: func() -> result<text-buffer, text-error>;
+
+    /// Opens a document pre-populated with `contents`.
+    ///
+    /// Born `Synchronized` at revision 0, exactly as `create-empty-buffer`'s
+    /// document is. Bootstrap establishes a baseline, not an edit: the guest
+    /// supplied these bytes itself, so this generates no `edit-notification`
+    /// and no undo entry -- reporting them back would be the host telling the
+    /// guest its own text as news, and an undo entry would make this document's
+    /// first state undoable into an empty one it never had.
+    ///
+    /// `contents` past `instar-text`'s size ceiling is refused with
+    /// `buffer-too-large`. That refusal means the payload *reached* Instar and
+    /// was still too large -- Wasmtime's own hostcall-fuel budget is what
+    /// stops a payload too large to lift at all, before this function's host
+    /// implementation ever runs. See `resource::TEXT_TRANSFER_HOSTCALL_FUEL`
+    /// in `instar-kernel`.
+    create-buffer: func(contents: string) -> result<text-buffer, text-error>;
 
     /// Opens a view onto a buffer.
     ///

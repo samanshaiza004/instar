@@ -47,6 +47,33 @@ use wasmtime::{ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 /// touched by epochs (Wasmtime only checks epochs while Wasm is executing).
 pub const EPOCH_DEADLINE_TICKS: u64 = 1;
 
+/// Guest-to-host Canonical ABI lifting budget for one host call, installed
+/// via `Store::set_hostcall_fuel`.
+///
+/// Containment, not the API limit. Wasmtime resets this fuel at the start of
+/// every guest-to-host component call and spends it while lifting that
+/// call's arguments -- a `string` or `list<T>` the guest is handing over --
+/// so it bounds what Wasmtime itself will allocate before any Instar code
+/// runs. It says nothing about whether the payload is one `instar-text`
+/// wants: `instar_text::MAX_TEXT_BUFFER_BYTES` (32 MiB) is the precise
+/// policy check that runs *after* lifting succeeds, inside
+/// `TextSystem::open_buffer` and `apply_edits_to_buffer`. The two interlock
+/// and neither replaces the other -- see docs/PHASE-3.md, "Hostcall fuel is
+/// containment, not the API limit".
+///
+/// `instar-kernel` cannot name `instar_text::MAX_TEXT_BUFFER_BYTES` directly
+/// (no `instar-kernel -> instar-text` dependency; see this crate's
+/// `Cargo.toml` description), so this is a literal comfortably above it,
+/// with the relationship asserted in
+/// `crates/instar-host/tests/text_transfer_bound.rs` -- the same pattern
+/// `MAX_TEXT_ATTACHMENTS` already uses for `MAX_NODES`.
+///
+/// Deliberately far below Wasmtime's own 128 MiB default: a payload between
+/// `instar_text::MAX_TEXT_BUFFER_BYTES` and this value is liftable but gets
+/// Instar's own `BufferTooLarge` refusal; a payload past this value is
+/// stopped by Wasmtime before `TextHost` ever sees it.
+pub const TEXT_TRANSFER_HOSTCALL_FUEL: usize = 40 * 1024 * 1024;
+
 /// The resource limits every Instar generation runs under.
 ///
 /// Fields are deliberately named for the policy, not for Wasmtime: the policy

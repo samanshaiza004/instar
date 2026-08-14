@@ -68,8 +68,21 @@ impl TextSystem {
         Self::default()
     }
 
-    /// Opens a buffer, or refuses if [`MAX_TEXT_BUFFERS`] are already live.
+    /// Opens a buffer, or refuses if [`MAX_TEXT_BUFFERS`] are already live or
+    /// `text` would exceed [`crate::MAX_TEXT_BUFFER_BYTES`].
+    ///
+    /// The size check runs before any allocation -- `TextBuffer::from_text`
+    /// is not reached at all for an oversized payload -- the same
+    /// bound-before-allocation discipline [`TextStorage::replace`] uses for
+    /// every later mutation. Bootstrap has no rope yet to clone; checking
+    /// `text.len()` directly is that same rule with nothing to clone against.
     pub fn open_buffer(&mut self, text: &str) -> Result<TextBufferId, TextError> {
+        if text.len() > crate::MAX_TEXT_BUFFER_BYTES {
+            return Err(TextError::BufferTooLarge {
+                resulting: text.len(),
+                limit: crate::MAX_TEXT_BUFFER_BYTES,
+            });
+        }
         if self.buffers.len() >= MAX_TEXT_BUFFERS {
             return Err(TextError::TooManyBuffers {
                 limit: MAX_TEXT_BUFFERS,
@@ -667,5 +680,55 @@ mod limits {
             text.open_view(buffer),
             Err(TextError::TooManyViews { .. })
         ));
+    }
+
+    /// C4a: the size ceiling applies at bootstrap too, checked before any
+    /// allocation -- a payload that would exceed it never reaches
+    /// `TextBuffer::from_text` at all.
+    #[test]
+    fn a_bootstrap_landing_exactly_at_the_ceiling_succeeds() {
+        let mut text = TextSystem::new();
+        let content = "x".repeat(crate::MAX_TEXT_BUFFER_BYTES);
+        let buffer = text
+            .open_buffer(&content)
+            .expect("exactly at the ceiling is legal");
+        assert_eq!(
+            text.buffer(buffer).unwrap().len_bytes(),
+            crate::MAX_TEXT_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn one_byte_past_the_bootstrap_ceiling_is_refused_and_creates_nothing() {
+        let mut text = TextSystem::new();
+        let content = "x".repeat(crate::MAX_TEXT_BUFFER_BYTES + 1);
+        assert!(matches!(
+            text.open_buffer(&content),
+            Err(TextError::BufferTooLarge { resulting, limit })
+                if resulting == crate::MAX_TEXT_BUFFER_BYTES + 1
+                    && limit == crate::MAX_TEXT_BUFFER_BYTES
+        ));
+        assert_eq!(
+            text.live_buffers(),
+            0,
+            "a refused bootstrap allocates nothing -- not even a slot"
+        );
+    }
+
+    /// Bootstrap establishes a baseline, not an edit: the guest supplied
+    /// these bytes, so recording them as an undoable transaction would let
+    /// undo reach a document that never existed -- an empty one the guest
+    /// never had. Already true for an empty bootstrap; this is the same
+    /// claim for a non-empty one.
+    #[test]
+    fn a_non_empty_bootstrap_creates_no_undo_history() {
+        let mut text = TextSystem::new();
+        let buffer = text
+            .open_buffer("hello world")
+            .expect("well under every limit");
+        assert!(
+            !text.buffer(buffer).unwrap().journal().can_undo(),
+            "the guest's own bytes must not be one undo away from an empty document"
+        );
     }
 }

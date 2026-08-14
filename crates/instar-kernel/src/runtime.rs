@@ -31,7 +31,10 @@ use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bridge::{CommitRejection, CommitSink};
-use crate::resource::{EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy};
+use crate::resource::{
+    EPOCH_DEADLINE_TICKS, MeasuredLimiter, ResourceMetrics, ResourcePolicy,
+    TEXT_TRANSFER_HOSTCALL_FUEL,
+};
 use crate::text_bridge::{GuestTextBuffer, GuestTextView, MAX_TEXT_ATTACHMENTS, OpaqueResourceKey};
 
 wasmtime::component::bindgen!({
@@ -538,24 +541,21 @@ impl From<crate::text_bridge::AttachmentRefusal> for AttachmentError {
     }
 }
 
-/// The guest's text capabilities.
-///
-/// Every method here does the same three things: copy the tiny opaque lease
-/// out of the resource table, release every Store-backed borrow, and only then
-/// await the thread that owns the text subsystem. Nothing derived from the
-/// table survives the await — which is the invariant, stated in terms of what
-/// can actually go wrong rather than as "no Store access".
-impl instar::text::text::Host for GenerationState {
-    async fn create_empty_buffer(
+impl GenerationState {
+    /// The tail both buffer-creation calls share: turn a `TextAnswer` into a
+    /// pushed resource handle, or refuse.
+    ///
+    /// `label` names the WIT function only for the trap message on an
+    /// answer-shape mismatch, so that message still says which call was
+    /// actually made rather than a generic "buffer creation".
+    async fn finish_buffer_creation(
         &mut self,
+        answer: Result<crate::text_bridge::TextAnswer, crate::text_bridge::TextRefusal>,
+        label: &str,
     ) -> wasmtime::Result<Result<Resource<GuestTextBuffer>, instar::text::text_types::TextError>>
     {
         use crate::text_bridge::{TextAnswer, TextOperation};
 
-        let answer = self
-            .kernel
-            .submit_text(self.generation, TextOperation::CreateBuffer)
-            .await;
         let key = match answer {
             Ok(TextAnswer::Created(key)) => key,
             // The sink answered a creation with anything else. That is not a
@@ -566,7 +566,7 @@ impl instar::text::text::Host for GenerationState {
             // into a wrong `key`.
             Ok(other) => {
                 return Err(wasmtime::Error::msg(format!(
-                    "text sink answered create-empty-buffer with {other:?}"
+                    "text sink answered {label} with {other:?}"
                 )));
             }
             Err(refusal) => return Ok(Err(refusal.into())),
@@ -585,6 +585,53 @@ impl instar::text::text::Host for GenerationState {
                 Err(error.into())
             }
         }
+    }
+}
+
+/// The guest's text capabilities.
+///
+/// Every method here does the same three things: copy the tiny opaque lease
+/// out of the resource table, release every Store-backed borrow, and only then
+/// await the thread that owns the text subsystem. Nothing derived from the
+/// table survives the await — which is the invariant, stated in terms of what
+/// can actually go wrong rather than as "no Store access".
+impl instar::text::text::Host for GenerationState {
+    async fn create_empty_buffer(
+        &mut self,
+    ) -> wasmtime::Result<Result<Resource<GuestTextBuffer>, instar::text::text_types::TextError>>
+    {
+        use crate::text_bridge::TextOperation;
+
+        let answer = self
+            .kernel
+            .submit_text(self.generation, TextOperation::CreateBuffer)
+            .await;
+        self.finish_buffer_creation(answer, "create-empty-buffer").await
+    }
+
+    /// Opens a document pre-populated with `contents` (C4a).
+    ///
+    /// The host implementation checks nothing about `contents` beyond what
+    /// `TextSystem::open_buffer` already does -- the size ceiling that can
+    /// answer `buffer-too-large` here belongs to `instar-text`, not to this
+    /// glue. What Wasmtime's `hostcall_fuel` budget bounds is a call this
+    /// function's body never even begins: a payload too large to lift traps
+    /// before `create_buffer` is entered at all.
+    async fn create_buffer(
+        &mut self,
+        contents: String,
+    ) -> wasmtime::Result<Result<Resource<GuestTextBuffer>, instar::text::text_types::TextError>>
+    {
+        use crate::text_bridge::TextOperation;
+
+        let answer = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::CreateBufferWithContents { contents },
+            )
+            .await;
+        self.finish_buffer_creation(answer, "create-buffer").await
     }
 
     async fn create_view(
@@ -1250,6 +1297,10 @@ impl Runtime {
         // The shutdown path's single epoch increment is the deadline. See
         // `resource::EPOCH_DEADLINE_TICKS`.
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        // C4a: bounds Canonical ABI lifting for guest-to-host calls -- a
+        // `create-buffer` or `apply-edits` argument -- before any Instar code
+        // runs. See `resource::TEXT_TRANSFER_HOSTCALL_FUEL`.
+        store.set_hostcall_fuel(TEXT_TRANSFER_HOSTCALL_FUEL);
         let instance = self
             .linker
             .instantiate_async(&mut store, &self.component)

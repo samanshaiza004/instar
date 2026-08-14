@@ -32,6 +32,9 @@
 //! | Apply edits | Calls `apply-edits` with a well-formed batch | a real guest's batch round-trips through the WIT/bridge mapping unchanged (C3c) |
 //! | Apply malformed edit | Calls `apply-edits` with an inverted range | a real guest sees `invalid-edit`, not the storage layer's own taxonomy |
 //! | Apply stale revision | Calls `apply-edits` with a revision that cannot be current | a real guest sees `conflict`, and nothing it sent lands |
+//! | Bootstrap max legal | Calls `create-buffer` with a payload exactly at the size ceiling | a maximum legal transfer succeeds end to end (C4a) |
+//! | Bootstrap oversized | Calls `create-buffer` with a payload over the ceiling but still liftable | Instar's own refusal, not Wasmtime's, catches a liftable-but-too-large payload |
+//! | Bootstrap absurd | Calls `create-buffer` with a payload past the hostcall-fuel budget | Wasmtime stops an absurd payload before `TextHost` ever sees it |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -108,6 +111,13 @@ const APPLY_EDITS_MALFORMED: NodeKey = NodeKey::first(22);
 /// Calls `apply-edits` with a well-formed edit but a revision that cannot be
 /// current.
 const APPLY_EDITS_STALE: NodeKey = NodeKey::first(23);
+/// Calls `create-buffer` with a payload exactly at the size ceiling.
+const BOOTSTRAP_MAX_LEGAL: NodeKey = NodeKey::first(24);
+/// Calls `create-buffer` with a payload over the ceiling but still liftable
+/// within the hostcall-fuel budget.
+const BOOTSTRAP_OVERSIZED_LIFTABLE: NodeKey = NodeKey::first(25);
+/// Calls `create-buffer` with a payload past the hostcall-fuel budget.
+const BOOTSTRAP_ABSURD: NodeKey = NodeKey::first(26);
 /// The first text-view surface the commit buttons attach.
 const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 /// The second text-view surface the commit buttons attach.
@@ -116,6 +126,17 @@ const TEXT_NODE_B: NodeKey = NodeKey::first(31);
 /// How long the bulk operation runs. Long enough that it is unambiguously
 /// still in flight while the gate measures a click round-trip against it.
 const BULK_MILLIS: &str = "3000";
+
+/// C4a: exactly at `instar-text`'s own size ceiling. Legal, and must succeed.
+const BOOTSTRAP_MAX_LEGAL_BYTES: usize = 32 * 1024 * 1024;
+/// Over the ceiling but comfortably under the hostcall-fuel budget: liftable,
+/// but `instar-text` must still refuse it.
+const BOOTSTRAP_OVERSIZED_LIFTABLE_BYTES: usize = 36 * 1024 * 1024;
+/// Past the hostcall-fuel budget, and still comfortably under the guest's own
+/// 64 MiB memory policy ceiling -- large enough that Wasmtime stops the lift
+/// before any host text code runs, small enough that allocating it here
+/// doesn't trip a different limit first.
+const BOOTSTRAP_ABSURD_BYTES: usize = 56 * 1024 * 1024;
 
 /// Comfortably over the host's 32 KiB crash-surface cap, so the clamp is
 /// exercised by a real trap rather than only by a unit test.
@@ -249,7 +270,7 @@ impl Hostile {
                 0,
                 None,
                 container(0, 4),
-                (22 + extra_views) as u16,
+                (25 + extra_views) as u16,
             )
             .node(
                 opcode::NODE_TEXT,
@@ -428,6 +449,30 @@ impl Hostile {
                 APPLY_EDITS_STALE,
                 flags::ENABLED,
                 Some("Apply stale revision"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                BOOTSTRAP_MAX_LEGAL,
+                flags::ENABLED,
+                Some("Bootstrap max legal"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                BOOTSTRAP_OVERSIZED_LIFTABLE,
+                flags::ENABLED,
+                Some("Bootstrap oversized"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                BOOTSTRAP_ABSURD,
+                flags::ENABLED,
+                Some("Bootstrap absurd"),
                 WireLayout::default(),
                 0,
             );
@@ -747,6 +792,29 @@ impl Hostile {
                 }];
                 self.label_override = Some(self.apply_edits_report(42, edits));
             }
+            // C4a: `create-buffer` at three size tiers relative to the two
+            // budgets that gate it -- `instar-text`'s own ceiling, and
+            // Wasmtime's hostcall-fuel budget above that.
+            WireEvent::Click { node } if node == BOOTSTRAP_MAX_LEGAL => {
+                self.label_override = Some(self.bootstrap_report(BOOTSTRAP_MAX_LEGAL_BYTES));
+            }
+            WireEvent::Click { node } if node == BOOTSTRAP_OVERSIZED_LIFTABLE => {
+                self.label_override =
+                    Some(self.bootstrap_report(BOOTSTRAP_OVERSIZED_LIFTABLE_BYTES));
+            }
+            WireEvent::Click { node } if node == BOOTSTRAP_ABSURD => {
+                // Deliberately no result handling: a payload this size is
+                // expected to exceed Wasmtime's hostcall-fuel budget and trap
+                // this generation while lifting the argument, before
+                // `create-buffer`'s host implementation ever runs. There is
+                // no outcome to report because the call itself is not
+                // expected to return one -- the label below is a canary: if
+                // it is ever observed, the trap did not happen and the fuel
+                // assumption this button exists to prove needs revisiting.
+                let contents = "x".repeat(BOOTSTRAP_ABSURD_BYTES);
+                let _ = text::create_buffer(&contents);
+                self.label_override = Some("bootstrap: absurd call returned".to_string());
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
@@ -805,6 +873,21 @@ impl Hostile {
                 format!("apply: conflict({revision})")
             }
             Err(error) => format!("apply: refused {error:?}"),
+        }
+    }
+
+    /// Calls `create-buffer` with `size` bytes of content and formats the
+    /// outcome. On success the handle is retained, the same way `TEXT_ACQUIRE`
+    /// keeps what it creates, so the host-side buffer stays live for the test
+    /// to inspect.
+    fn bootstrap_report(&mut self, size: usize) -> String {
+        let contents = "x".repeat(size);
+        match text::create_buffer(&contents) {
+            Ok(buffer) => {
+                self.buffers.push(buffer);
+                format!("bootstrap: ok {size} bytes")
+            }
+            Err(error) => format!("bootstrap: refused {error:?}"),
         }
     }
 }

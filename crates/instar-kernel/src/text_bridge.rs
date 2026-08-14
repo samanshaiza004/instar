@@ -122,6 +122,17 @@ pub struct BridgeTextEdit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextOperation {
     CreateBuffer,
+    /// Opens a buffer pre-populated with `contents`, refusing a payload that
+    /// would exceed the size ceiling.
+    ///
+    /// Kept separate from [`TextOperation::CreateBuffer`] (which serves
+    /// `create-empty-buffer` and cannot fail this way) rather than adding an
+    /// optional field to it: their refusal surfaces genuinely differ, and a
+    /// unit variant that suddenly grows an error case it cannot produce is a
+    /// worse shape than two variants each shaped like what they actually do.
+    CreateBufferWithContents {
+        contents: String,
+    },
     CreateView {
         buffer: OpaqueResourceKey,
     },

@@ -198,6 +198,22 @@ impl TextHost {
         WaiterId(self.next_waiter_id)
     }
 
+    /// Registers a freshly opened buffer's lease and its synchronized-at-
+    /// baseline relationship.
+    ///
+    /// Shared by both bootstrap paths (`CreateBuffer` and
+    /// `CreateBufferWithContents`): a document is born `Synchronized` at
+    /// whatever revision `TextSystem::open_buffer` just gave it, with an
+    /// empty queue -- the guest supplied its own bytes, if any, so there is
+    /// nothing to report back as an edit. Empty and non-empty bootstrap get
+    /// identical treatment here on purpose.
+    fn register_new_buffer(&mut self, generation: GenerationId, id: TextBufferId) {
+        self.leases.entry(generation).or_default().buffers.insert(id);
+        let baseline = self.system.revision(id).unwrap_or_default();
+        self.sync
+            .insert((generation, id), BufferSync::synchronized(baseline));
+    }
+
     pub fn system(&self) -> &TextSystem {
         &self.system
     }
@@ -469,21 +485,31 @@ impl TextHost {
         match request.operation() {
             TextOperation::CreateBuffer => match self.system.open_buffer("") {
                 Ok(id) => {
-                    self.leases
-                        .entry(generation)
-                        .or_default()
-                        .buffers
-                        .insert(id);
-                    // Born synchronized at the baseline: the guest knows an
-                    // empty document is empty. Bootstrap establishes a
-                    // revision, never an edit.
-                    let baseline = self.system.revision(id).unwrap_or_default();
-                    self.sync
-                        .insert((generation, id), BufferSync::synchronized(baseline));
+                    self.register_new_buffer(generation, id);
                     request.answer(TextAnswer::Created(buffer_key(id)));
                 }
                 Err(_) => request.refuse(TextRefusal::TooManyBuffers(MAX_TEXT_BUFFERS as u32)),
             },
+            // C4a: the same bootstrap, pre-populated. `open_buffer` enforces
+            // the size ceiling itself, before allocating anything -- this arm
+            // only has to translate its one distinguishable refusal.
+            // Anything else `open_buffer` could return here is in practice
+            // always `TooManyBuffers`, the same assumption the empty-buffer
+            // arm above already makes.
+            TextOperation::CreateBufferWithContents { contents } => {
+                match self.system.open_buffer(&contents) {
+                    Ok(id) => {
+                        self.register_new_buffer(generation, id);
+                        request.answer(TextAnswer::Created(buffer_key(id)));
+                    }
+                    Err(TextError::BufferTooLarge { .. }) => {
+                        request.refuse(TextRefusal::BufferTooLarge)
+                    }
+                    Err(_) => {
+                        request.refuse(TextRefusal::TooManyBuffers(MAX_TEXT_BUFFERS as u32))
+                    }
+                }
+            }
             TextOperation::CreateView { buffer } => {
                 let buffer = match self.resolve_buffer_lease(generation, buffer) {
                     Ok(id) => id,
@@ -706,6 +732,67 @@ mod tests {
             Ok(TextAnswer::Created(key)) => key,
             other => panic!("expected a view, got {other:?}"),
         }
+    }
+
+    /// C4a: a non-empty bootstrap gets exactly the same synchronization
+    /// treatment as an empty one -- born `Synchronized` at whatever revision
+    /// the fresh buffer holds, with nothing queued.
+    #[test]
+    fn a_non_empty_bootstrap_is_synchronized_at_baseline_with_an_empty_queue() {
+        let mut host = TextHost::new();
+        let buffer = match serve(
+            &mut host,
+            G17,
+            TextOperation::CreateBufferWithContents {
+                contents: "hello world".to_string(),
+            },
+        ) {
+            Ok(TextAnswer::Created(key)) => key,
+            other => panic!("expected a buffer, got {other:?}"),
+        };
+        let id = buffer_id(buffer);
+
+        assert_eq!(
+            host.system().buffer(id).unwrap().len_bytes(),
+            "hello world".len(),
+            "the guest's own bytes reached the document"
+        );
+        let state = host.sync_state(G17, id).expect("born with the buffer");
+        assert_eq!(
+            state.queued(),
+            0,
+            "the guest supplied these bytes itself; there is nothing to \
+             report back as an edit"
+        );
+        assert!(state.is_synchronized());
+    }
+
+    /// A bootstrap payload past the ceiling is refused and leaves nothing
+    /// behind -- no lease, no buffer, no sync relationship. Reuses the
+    /// coarse-refusal-mapping discipline `apply_guest_edits` established:
+    /// `open_buffer` can only fail two ways, and only one of them is
+    /// distinguished here.
+    #[test]
+    fn a_bootstrap_past_the_ceiling_is_refused_and_creates_nothing() {
+        let mut host = TextHost::new();
+        let oversized = "x".repeat(instar_text::MAX_TEXT_BUFFER_BYTES + 1);
+
+        let refusal = match serve(
+            &mut host,
+            G17,
+            TextOperation::CreateBufferWithContents { contents: oversized },
+        ) {
+            Err(refusal) => refusal,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(refusal, TextRefusal::BufferTooLarge);
+        assert_eq!(
+            host.counts(),
+            TextResourceCounts::default(),
+            "a refused bootstrap leaves no lease, no buffer, and no \
+             relationship behind"
+        );
+        assert_eq!(host.sync_relationships(), 0);
     }
 
     /// Every host-local edit reaches the generation that owes the buffer.
