@@ -182,6 +182,86 @@ impl TextSystem {
         Ok(applied)
     }
 
+    /// Applies an edit directly to a buffer, transforming every view of it.
+    ///
+    /// The counterpart to [`Self::apply_edit`] for edits that did not
+    /// originate from any particular view. A guest's own `apply-edits`
+    /// reports canonical changes to a *document* -- it has no caret, no
+    /// selection, no notion of "the view that made this edit" at all, since
+    /// views are a host-side presentation concept the guest's document model
+    /// never sees. So there is no view to exclude from transformation the way
+    /// a host-local edit excludes the one that produced it: every view of the
+    /// buffer moves by exactly the same rule.
+    pub fn apply_edit_to_buffer(
+        &mut self,
+        buffer_id: TextBufferId,
+        edit: TextEdit,
+    ) -> Result<AppliedEdit, TextError> {
+        let buffer = self
+            .buffers
+            .get_mut(&buffer_id)
+            .ok_or(TextError::NoSuchBuffer(buffer_id))?;
+
+        let applied = buffer.apply(&edit)?;
+        self.transform_views(buffer_id, &applied.edit, None);
+        Ok(applied)
+    }
+
+    /// Applies a whole batch of edits to a buffer, sequentially, or none of
+    /// them.
+    ///
+    /// This is `apply-edits`' atomicity claim (Package C), and the mechanism
+    /// is a clone rather than a rollback. Undo was tempting and wrong: undoing
+    /// N edits by reversing them is N *more* edits as far as `TextBuffer` is
+    /// concerned, so the revision after "rolling back" is not the revision
+    /// before the batch, it is `before + 2N` -- observably mutated, and every
+    /// one of those 2N steps would otherwise get reported to every other
+    /// generation watching the buffer through `next-edit`, which is a
+    /// document that was never supposed to have changed at all.
+    ///
+    /// A clone sidesteps the question entirely:
+    ///
+    /// ```text
+    /// clone the buffer                    crop::Rope is O(1), see C0
+    /// apply every edit to the clone        the real buffer is untouched so far
+    /// any edit fails -> stop, discard the clone, return the error
+    /// all edits succeed -> swap the clone in, one assignment
+    /// ```
+    ///
+    /// `TextBuffer::apply`'s own contract already guarantees a single refused
+    /// edit is never partial (the removed text is read before the storage is
+    /// mutated); this extends the same guarantee across the whole sequence by
+    /// construction, because nothing about a discarded clone can be observed.
+    pub fn apply_edits_to_buffer(
+        &mut self,
+        buffer_id: TextBufferId,
+        edits: &[TextEdit],
+    ) -> Result<Vec<AppliedEdit>, TextError> {
+        let original = self
+            .buffers
+            .get(&buffer_id)
+            .ok_or(TextError::NoSuchBuffer(buffer_id))?;
+        let mut scratch = original.clone();
+
+        let mut applied = Vec::with_capacity(edits.len());
+        for edit in edits {
+            applied.push(scratch.apply(edit)?);
+        }
+
+        // Every edit in the batch validated against the exact sequence it
+        // actually produced. Commit: swap the proven buffer in, then move
+        // every view through the same sequence, in order -- the same
+        // transform a real one-at-a-time application would have produced.
+        *self
+            .buffers
+            .get_mut(&buffer_id)
+            .expect("resolved above; nothing between there and here can remove it") = scratch;
+        for applied_edit in &applied {
+            self.transform_views(buffer_id, &applied_edit.edit, None);
+        }
+        Ok(applied)
+    }
+
     /// Undoes the last edit to a buffer, moving every view of it.
     ///
     /// Routed through the same transform as an ordinary edit rather than
@@ -314,6 +394,42 @@ mod tests {
         assert_eq!(text.view(b).unwrap().caret(), 10, "the observer does not");
     }
 
+    /// The contrast the test above draws: with no originating view at all,
+    /// nothing is privileged as the typist. `transform_position`'s policy for
+    /// a pure insertion exactly at a caret is "follow it" for the originating
+    /// view and "hold position" for every other -- and with `origin: None`,
+    /// every view gets the second treatment, including the one whose caret
+    /// would have followed had this gone through `apply_edit` instead. A
+    /// guest's own `apply-edits` has no caret to privilege in the first
+    /// place: it reports a document change, not an interaction.
+    #[test]
+    fn apply_edit_to_buffer_exempts_no_view() {
+        let mut text = TextSystem::new();
+        let buffer = open(&mut text, "0123456789abcdef");
+        let a = text.open_view(buffer).unwrap();
+        let b = text.open_view(buffer).unwrap();
+
+        text.view_mut(a).unwrap().set_caret(10);
+        text.view_mut(b).unwrap().set_caret(10);
+        text.apply_edit_to_buffer(buffer, TextEdit::insert(10, "XYZ"))
+            .expect("valid");
+
+        assert_eq!(
+            text.view(a).unwrap().caret(),
+            10,
+            "A held its position exactly as B did -- the same treatment \
+             apply_edit gives only to the non-originating view, and here \
+             there is no originating view at all"
+        );
+        assert_eq!(
+            text.view(b).unwrap().caret(),
+            10,
+            "and B is identical to A: neither view is distinguished from \
+             the other"
+        );
+        assert_eq!(text.revision(buffer).unwrap(), Revision(1));
+    }
+
     #[test]
     fn a_refused_edit_moves_no_view_at_all() {
         let mut text = TextSystem::new();
@@ -327,6 +443,89 @@ mod tests {
 
         assert_eq!(text.view(b).unwrap().caret(), 5);
         assert_eq!(text.revision(buffer).unwrap(), Revision(0));
+    }
+
+    #[test]
+    fn a_batch_applies_sequentially_with_each_edit_against_the_last() {
+        let mut text = TextSystem::new();
+        let buffer = open(&mut text, "hello");
+
+        let applied = text
+            .apply_edits_to_buffer(
+                buffer,
+                &[
+                    TextEdit::insert(5, " world"),
+                    // This range only exists because the first edit already
+                    // ran: "hello world" -> delete "world" at 6..11.
+                    TextEdit::delete(6..11),
+                ],
+            )
+            .expect("both edits are valid against the sequence they produce");
+
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].base_revision, Revision(0));
+        assert_eq!(applied[0].resulting_revision, Revision(1));
+        assert_eq!(
+            applied[1].base_revision,
+            Revision(1),
+            "the second edit's base is the first edit's result, not the \
+             batch's starting revision"
+        );
+        assert_eq!(applied[1].resulting_revision, Revision(2));
+        assert_eq!(text.revision(buffer).unwrap(), Revision(2));
+        assert_eq!(
+            text.buffer(buffer)
+                .unwrap()
+                .slice(0..6)
+                .unwrap()
+                .materialize(),
+            "hello "
+        );
+    }
+
+    /// The atomicity claim itself: a batch whose second edit is invalid
+    /// leaves the buffer exactly as it was, not one edit into the sequence.
+    /// This is the mutant the frozen order names directly -- "conflict
+    /// applies a prefix" -- proven here one level below the conflict check,
+    /// against a batch that passed the revision gate and failed partway
+    /// through anyway.
+    #[test]
+    fn a_batch_that_fails_partway_leaves_the_buffer_completely_unchanged() {
+        let mut text = TextSystem::new();
+        let buffer = open(&mut text, "hello");
+        let view = text.open_view(buffer).unwrap();
+        text.view_mut(view).unwrap().set_caret(3);
+
+        let result = text.apply_edits_to_buffer(
+            buffer,
+            &[
+                TextEdit::insert(5, " world"), // valid
+                TextEdit::delete(100..200),    // out of range once applied
+            ],
+        );
+
+        assert!(result.is_err(), "the batch as a whole must be refused");
+        assert_eq!(
+            text.revision(buffer).unwrap(),
+            Revision(0),
+            "not even the first, individually-valid edit may survive"
+        );
+        assert_eq!(
+            text.buffer(buffer)
+                .unwrap()
+                .slice(0..5)
+                .unwrap()
+                .materialize(),
+            "hello",
+            "the content is byte-for-byte what it was before the batch"
+        );
+        assert_eq!(
+            text.view(view).unwrap().caret(),
+            3,
+            "and no view moved -- the first edit's transform never happened, \
+             because the first edit was never actually applied to the real \
+             buffer, only to a clone that was discarded"
+        );
     }
 
     #[test]
