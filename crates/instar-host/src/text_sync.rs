@@ -121,6 +121,20 @@ pub enum EditNotification {
     Desynchronized(Revision),
 }
 
+/// The outcome of one atomic admission: work now, or a sleep.
+///
+/// **The waiter carries a signal and never the edits.** Putting the batch in
+/// the channel would make cancellation part of synchronization correctness —
+/// a send can succeed and the receiver vanish immediately after, and the edits
+/// would go with it. Keeping them in the bounded queue means a woken reader
+/// that dies before consuming leaves the work still owed, and the queue stays
+/// the single source of truth for what a generation has not been told.
+#[derive(Debug)]
+pub enum NextEditAdmission {
+    Ready(EditNotification),
+    Wait(oneshot::Receiver<()>),
+}
+
 /// How many pending edits one generation may owe on one buffer.
 ///
 /// Sized for a stall, not for a document: at ordinary typing speed this is
@@ -366,6 +380,41 @@ impl BufferSync {
         self.sync
             .take_batch(max_entries)
             .map(EditNotification::Edits)
+    }
+
+    /// Inspects and registers as **one** operation.
+    ///
+    /// This is the whole of C2b-1's hazard, closed by construction. The
+    /// tempting shape is two round trips —
+    ///
+    /// ```text
+    /// ask the host whether anything is queued   ->  "no"
+    /// ask the host to install a waiter
+    /// ```
+    ///
+    /// — and an edit landing in that gap is queued *before* the waiter exists,
+    /// so nothing wakes anyone and the guest sleeps on work it has already
+    /// been owed. Silent, and indistinguishable from an idle document.
+    ///
+    /// Taking `&mut self` on the thread that owns the text subsystem makes the
+    /// gap unrepresentable: there is no point between the check and the
+    /// install at which an edit can be recorded, because recording one needs
+    /// the same borrow.
+    ///
+    /// Order matters within it too. The queue is consulted *first*: installing
+    /// a waiter before looking would park a reader on work already sitting in
+    /// front of it.
+    pub fn admit(
+        &mut self,
+        max_entries: usize,
+        id: WaiterId,
+    ) -> Result<NextEditAdmission, WaitRefusal> {
+        if let Some(notification) = self.poll(max_entries) {
+            return Ok(NextEditAdmission::Ready(notification));
+        }
+        let (wake, rx) = oneshot::channel();
+        self.install_waiter(NextEditWaiter::new(id, wake))?;
+        Ok(NextEditAdmission::Wait(rx))
     }
 
     /// Registers a sleeper, or refuses because a live one already exists.
@@ -792,6 +841,131 @@ mod tests {
                 Some(EditNotification::Desynchronized(_))
             ));
         }
+    }
+
+    // --------------------------------------- C2b-1: atomic admission
+
+    /// Queued work is returned rather than slept on.
+    #[test]
+    fn admission_returns_pending_work_without_installing_a_waiter() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        sync.record(&edit_of(0, 3));
+
+        match sync.admit(16, WaiterId(1)) {
+            Ok(NextEditAdmission::Ready(EditNotification::Edits(edits))) => {
+                assert_eq!(edits.len(), 1)
+            }
+            other => panic!("expected the queued edit, got {other:?}"),
+        }
+        assert!(
+            !sync.has_waiter(),
+            "checking the queue first is what stops a reader parking on work \
+             already sitting in front of it"
+        );
+    }
+
+    #[test]
+    fn admission_reports_desynchronization_without_installing_a_waiter() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        record_n(sync.state_mut_for_test(), MAX_PENDING_EDITS + 1, 1);
+
+        assert!(matches!(
+            sync.admit(16, WaiterId(1)),
+            Ok(NextEditAdmission::Ready(EditNotification::Desynchronized(
+                _
+            )))
+        ));
+        assert!(!sync.has_waiter());
+    }
+
+    #[test]
+    fn admission_installs_a_waiter_only_when_there_is_nothing_to_say() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+
+        let admission = sync.admit(16, WaiterId(1)).expect("free");
+        assert!(matches!(admission, NextEditAdmission::Wait(_)));
+        assert!(sync.has_waiter());
+    }
+
+    #[test]
+    fn a_second_admission_while_one_sleeps_is_refused() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let _first = sync.admit(16, WaiterId(1)).expect("free");
+
+        assert_eq!(
+            sync.admit(16, WaiterId(2)).err(),
+            Some(WaitRefusal::AlreadyWaiting)
+        );
+    }
+
+    /// **The race the single operation exists to close.**
+    ///
+    /// An edit recorded after the queue was found empty must still reach the
+    /// reader. Because admission takes `&mut self`, there is no instant at
+    /// which the check has happened and the waiter does not yet exist — so the
+    /// edit either arrives before the check (and is returned immediately) or
+    /// after the install (and wakes the sleeper). A two-round-trip
+    /// implementation has a third possibility, and it loses the edit.
+    #[test]
+    fn an_edit_arriving_right_after_an_empty_check_still_reaches_the_reader() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+
+        let NextEditAdmission::Wait(mut rx) = sync.admit(16, WaiterId(1)).expect("free") else {
+            panic!("an empty synchronized buffer has nothing to report");
+        };
+
+        sync.record(&edit_of(0, 5));
+
+        assert!(rx.try_recv().is_ok(), "the sleeper was woken, not stranded");
+        match sync.admit(16, WaiterId(2)) {
+            Ok(NextEditAdmission::Ready(EditNotification::Edits(edits))) => {
+                assert_eq!(edits.len(), 1, "and the edit is still there to take")
+            }
+            other => panic!("expected the edit on re-entry, got {other:?}"),
+        }
+    }
+
+    /// A woken reader that dies before consuming leaves the work owed.
+    ///
+    /// This is why the waiter carries a signal and never the batch: a `send`
+    /// can succeed and the receiver vanish an instant later, and edits routed
+    /// through the channel would vanish with it. In the queue they survive.
+    #[test]
+    fn a_reader_that_dies_after_waking_leaves_the_edit_owed() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let NextEditAdmission::Wait(rx) = sync.admit(16, WaiterId(1)).expect("free") else {
+            panic!("nothing to report yet");
+        };
+
+        sync.record(&edit_of(0, 5));
+        drop(rx); // woken, then the guest went away without draining
+
+        match sync.admit(16, WaiterId(2)) {
+            Ok(NextEditAdmission::Ready(EditNotification::Edits(edits))) => {
+                assert_eq!(
+                    edits.len(),
+                    1,
+                    "the edit is still owed to whoever asks next"
+                )
+            }
+            other => panic!("the edit must survive its reader, got {other:?}"),
+        }
+    }
+
+    /// A wake with nothing behind it is harmless: the reader loops, finds
+    /// nothing, and sleeps again rather than reporting an empty batch.
+    #[test]
+    fn a_spurious_wake_is_harmless_because_the_queue_is_the_truth() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let NextEditAdmission::Wait(_rx) = sync.admit(16, WaiterId(1)).expect("free") else {
+            panic!("nothing to report yet");
+        };
+        sync.remove_waiter_if(WaiterId(1));
+
+        assert!(matches!(
+            sync.admit(16, WaiterId(2)),
+            Ok(NextEditAdmission::Wait(_))
+        ));
     }
 
     #[test]
