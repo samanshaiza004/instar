@@ -45,6 +45,81 @@
 use std::collections::VecDeque;
 
 use instar_text::{AppliedEdit, Revision};
+use tokio::sync::oneshot;
+
+/// Identifies one registration of one sleeper.
+///
+/// Monotonic and never reused, so "remove the waiter" can always be stated as
+/// "remove *this* waiter" — see [`BufferSync::remove_waiter_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WaiterId(pub u64);
+
+/// One suspended consumer of one buffer's queue.
+///
+/// Deliberately **not** a semaphore permit, and deliberately not the same type
+/// as `CommitPermit`. The two look alike — both say "only one" — and are
+/// different protocols:
+///
+/// ```text
+/// CommitPermit      scope GenerationId          admission and exclusion
+///                   a second commit is refused because the first is working
+/// NextEditWaiter    scope (generation, buffer)  notification and cancellation
+///                   a second reader is refused because there is nothing to
+///                   read and someone else is already asleep on it
+/// ```
+///
+/// A semaphore is the wrong shape for the second: acquiring one *queues*, and
+/// a second `next-edit` must fail immediately rather than line up behind a
+/// sleeper it would then race to serve. `Notify` is wrong for a different
+/// reason — its cancellation and fairness caveats buy generality that a single
+/// explicitly-owned waiter does not need.
+#[derive(Debug)]
+pub struct NextEditWaiter {
+    id: WaiterId,
+    wake: oneshot::Sender<()>,
+}
+
+impl NextEditWaiter {
+    pub fn new(id: WaiterId, wake: oneshot::Sender<()>) -> Self {
+        Self { id, wake }
+    }
+
+    pub fn id(&self) -> WaiterId {
+        self.id
+    }
+
+    /// Whether the sleeper has gone away.
+    ///
+    /// The only way cancellation is observed. A guest dropping its `next-edit`
+    /// future drops the receiver, and nothing tells the host — the alternative
+    /// would be cross-thread work in a `Drop`, which is exactly the lifecycle
+    /// coupling this project spent two phases removing. So the slot is checked
+    /// rather than notified, at the two moments it matters: installing a new
+    /// waiter, and waking an existing one.
+    pub fn is_abandoned(&self) -> bool {
+        self.wake.is_closed()
+    }
+
+    fn wake(self) {
+        // A closed channel means the sleeper left. Nothing to do, and nothing
+        // wrong with it.
+        let _ = self.wake.send(());
+    }
+}
+
+/// Why a `next-edit` could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitRefusal {
+    /// Another live caller is already asleep on this buffer's queue.
+    AlreadyWaiting,
+}
+
+/// What a `next-edit` call resolves to without suspending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditNotification {
+    Edits(Vec<AppliedEdit>),
+    Desynchronized(Revision),
+}
 
 /// How many pending edits one generation may owe on one buffer.
 ///
@@ -222,6 +297,128 @@ impl SyncState {
             queue: VecDeque::new(),
             bytes: 0,
         };
+    }
+}
+
+/// One buffer's synchronization relationship with one generation: what it is
+/// owed, and who is asleep waiting to be told.
+///
+/// The waiter lives beside the state rather than in a registry of its own,
+/// because "is there anything to report" and "is anyone listening" are
+/// answered together on every path that touches either — an edit arriving, a
+/// collapse, a drain, a teardown. Splitting them would mean two lookups that
+/// must agree.
+#[derive(Debug)]
+pub struct BufferSync {
+    sync: SyncState,
+    waiter: Option<NextEditWaiter>,
+}
+
+impl BufferSync {
+    pub fn synchronized(baseline: Revision) -> Self {
+        Self {
+            sync: SyncState::synchronized(baseline),
+            waiter: None,
+        }
+    }
+
+    pub fn state(&self) -> &SyncState {
+        &self.sync
+    }
+
+    /// Reaches the state machine directly, so a test can drive it to a
+    /// specific shape without going through the wake path it is about to
+    /// assert on.
+    #[cfg(test)]
+    fn state_mut_for_test(&mut self) -> &mut SyncState {
+        &mut self.sync
+    }
+
+    pub fn has_waiter(&self) -> bool {
+        self.waiter.is_some()
+    }
+
+    /// Records an edit, and wakes a sleeper if this gave it something to say.
+    ///
+    /// Both transitions wake: a queued edit and a collapse into
+    /// [`Pending::Desynchronized`] are equally things the guest is owed. A
+    /// collapse that did not wake would leave a sleeper parked until the
+    /// *next* edit, and a guest that never hears it has fallen behind is worse
+    /// off than one told immediately.
+    pub fn record(&mut self, applied: &AppliedEdit) {
+        self.sync.record(applied);
+        self.wake_if_ready();
+    }
+
+    /// Takes what a `next-edit` should return right now, if anything.
+    ///
+    /// `None` means "nothing to say, suspend" — which is the only case in
+    /// which a waiter is installed.
+    pub fn poll(&mut self, max_entries: usize) -> Option<EditNotification> {
+        if !self.sync.is_synchronized() {
+            // Sticky by design: reporting the marker does not clear it. Only
+            // an authoritative read re-arms, so a guest that hears it is
+            // behind and then reads cannot lose an edit in between.
+            return Some(EditNotification::Desynchronized(
+                self.sync.latest_revision(),
+            ));
+        }
+        self.sync
+            .take_batch(max_entries)
+            .map(EditNotification::Edits)
+    }
+
+    /// Registers a sleeper, or refuses because a live one already exists.
+    ///
+    /// An abandoned waiter is evicted rather than counted: a guest that
+    /// dropped its future left a slot behind, and treating that as "already
+    /// waiting" would lock the buffer out of ever being read again.
+    pub fn install_waiter(&mut self, waiter: NextEditWaiter) -> Result<(), WaitRefusal> {
+        if self.waiter.as_ref().is_some_and(|w| !w.is_abandoned()) {
+            return Err(WaitRefusal::AlreadyWaiting);
+        }
+        self.waiter = Some(waiter);
+        Ok(())
+    }
+
+    /// Removes the waiter **only if it is still the one named**.
+    ///
+    /// Stated as an identity comparison rather than `waiter = None` so that a
+    /// late cleanup for a waiter that has already been replaced cannot
+    /// unregister its successor.
+    pub fn remove_waiter_if(&mut self, id: WaiterId) {
+        if self.waiter.as_ref().is_some_and(|w| w.id() == id) {
+            self.waiter = None;
+        }
+    }
+
+    /// Re-arms at an authoritatively read revision, waking any sleeper.
+    pub fn resynchronize(&mut self, revision: Revision) {
+        self.sync.resynchronize(revision);
+        self.wake_if_ready();
+    }
+
+    fn wake_if_ready(&mut self) {
+        let has_news = !self.sync.is_synchronized() || self.sync.queued() > 0;
+        if !has_news {
+            return;
+        }
+        if let Some(waiter) = self.waiter.take() {
+            waiter.wake();
+        }
+    }
+}
+
+impl Drop for BufferSync {
+    /// Teardown wakes the sleeper rather than stranding it.
+    ///
+    /// Dropping the sender closes the channel, so the suspended `next-edit`
+    /// resolves with a cancellation instead of parking on a reply that is
+    /// never coming — the same guarantee `CommitRequest`'s reply guard makes,
+    /// reached the same way: by the type, not by every teardown path
+    /// remembering.
+    fn drop(&mut self) {
+        drop(self.waiter.take());
     }
 }
 
@@ -419,6 +616,182 @@ mod tests {
             MAX_PENDING_EDIT_BYTES,
             "the refused edit was never cloned into the queue"
         );
+    }
+
+    // ------------------------------------------------ C2: the waiter
+
+    fn waiter(id: u64) -> (NextEditWaiter, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (NextEditWaiter::new(WaiterId(id), tx), rx)
+    }
+
+    #[test]
+    fn a_synchronized_empty_buffer_has_nothing_to_say() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        assert!(sync.poll(16).is_none(), "and the caller therefore suspends");
+    }
+
+    #[test]
+    fn an_edit_wakes_the_sleeper() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (w, mut rx) = waiter(1);
+        sync.install_waiter(w).expect("nobody is waiting yet");
+        assert!(rx.try_recv().is_err(), "nothing has happened yet");
+
+        sync.record(&edit_of(0, 4));
+
+        assert!(rx.try_recv().is_ok(), "the sleeper was woken");
+        assert!(!sync.has_waiter(), "and the slot released");
+    }
+
+    /// A collapse is news too. A sleeper that only woke for queued edits would
+    /// stay parked through the one event it most needs to hear.
+    #[test]
+    fn a_collapse_wakes_the_sleeper() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        record_n(sync.state_mut_for_test(), MAX_PENDING_EDITS, 1);
+        let (w, mut rx) = waiter(1);
+        sync.install_waiter(w).expect("nobody is waiting yet");
+
+        sync.record(&edit_of(MAX_PENDING_EDITS as u64, 1));
+
+        assert!(!sync.state().is_synchronized());
+        assert!(rx.try_recv().is_ok(), "desynchronization woke the sleeper");
+    }
+
+    #[test]
+    fn resynchronizing_wakes_a_sleeper_only_when_there_is_news() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        record_n(sync.state_mut_for_test(), MAX_PENDING_EDITS + 1, 1);
+        let (w, mut rx) = waiter(1);
+        sync.install_waiter(w).expect("free");
+
+        sync.resynchronize(Revision(50));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "re-arming leaves an empty queue, so there is nothing to report \
+             and the sleeper stays asleep"
+        );
+        assert!(sync.has_waiter());
+    }
+
+    #[test]
+    fn a_second_live_waiter_is_refused() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (first, _keep) = waiter(1);
+        sync.install_waiter(first).expect("free");
+
+        let (second, _rx) = waiter(2);
+        assert_eq!(
+            sync.install_waiter(second),
+            Err(WaitRefusal::AlreadyWaiting),
+            "a second reader must fail immediately rather than queue behind \
+             the first and race it to serve the same edits"
+        );
+    }
+
+    /// An abandoned slot must not lock the buffer out forever.
+    #[test]
+    fn an_abandoned_waiter_is_replaced_rather_than_counted() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (first, rx) = waiter(1);
+        sync.install_waiter(first).expect("free");
+
+        drop(rx); // the guest dropped its next-edit future
+
+        let (second, mut rx2) = waiter(2);
+        sync.install_waiter(second)
+            .expect("the abandoned slot is evicted, not honoured");
+
+        sync.record(&edit_of(0, 1));
+        assert!(
+            rx2.try_recv().is_ok(),
+            "and the live waiter is the one woken"
+        );
+    }
+
+    /// Late cleanup for a replaced waiter must not unregister its successor.
+    #[test]
+    fn removing_an_old_waiter_leaves_its_replacement_alone() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (first, rx) = waiter(1);
+        sync.install_waiter(first).expect("free");
+        drop(rx);
+        let (second, mut rx2) = waiter(2);
+        sync.install_waiter(second)
+            .expect("evicts the abandoned one");
+
+        // The first waiter's cleanup arrives late, naming an id that is no
+        // longer installed.
+        sync.remove_waiter_if(WaiterId(1));
+
+        assert!(sync.has_waiter(), "the replacement survived");
+        sync.record(&edit_of(0, 1));
+        assert!(rx2.try_recv().is_ok());
+    }
+
+    #[test]
+    fn removing_the_current_waiter_frees_the_slot() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (w, _rx) = waiter(7);
+        sync.install_waiter(w).expect("free");
+
+        sync.remove_waiter_if(WaiterId(7));
+
+        assert!(!sync.has_waiter());
+    }
+
+    /// Dropping the relationship wakes rather than strands.
+    #[test]
+    fn teardown_resolves_a_suspended_reader() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (w, mut rx) = waiter(1);
+        sync.install_waiter(w).expect("free");
+
+        drop(sync);
+
+        // `try_recv`, never `blocking_recv`. The condition under test is
+        // exactly "does this channel close?", so a test that *blocks* on it
+        // hangs forever under the mutant it exists to catch — and a suite that
+        // hangs is worse than one that fails, because it takes every other
+        // test with it and reports nothing. A closed channel answers
+        // immediately.
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+            "the channel closed, so the suspended call resolves with a \
+             cancellation instead of parking on a reply never coming"
+        );
+    }
+
+    /// Waking hands over no state: the woken caller re-enters and drains.
+    #[test]
+    fn a_woken_reader_still_has_to_drain() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        let (w, mut rx) = waiter(1);
+        sync.install_waiter(w).expect("free");
+        sync.record(&edit_of(0, 3));
+        assert!(rx.try_recv().is_ok());
+
+        let notification = sync.poll(16).expect("the edit is still queued");
+        match notification {
+            EditNotification::Edits(edits) => assert_eq!(edits.len(), 1),
+            other => panic!("expected the queued edit, got {other:?}"),
+        }
+        assert!(sync.poll(16).is_none(), "and only once");
+    }
+
+    #[test]
+    fn a_desynchronized_buffer_reports_the_marker_every_time() {
+        let mut sync = BufferSync::synchronized(Revision(0));
+        record_n(sync.state_mut_for_test(), MAX_PENDING_EDITS + 1, 1);
+
+        for _ in 0..3 {
+            assert!(matches!(
+                sync.poll(16),
+                Some(EditNotification::Desynchronized(_))
+            ));
+        }
     }
 
     #[test]
