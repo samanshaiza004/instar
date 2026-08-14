@@ -66,6 +66,31 @@ interface text-types {
         /// than queued behind the first, because there is nothing left for it
         /// to read and two sleepers would race to serve the same edits.
         already-waiting,
+        /// An `apply-edits` batch exceeded the inbound count or byte bound,
+        /// checked before any edit in it is attempted.
+        edit-batch-too-large,
+        /// One coarse refusal for every way a submitted byte range is
+        /// unusable: inverted, out of bounds, or off a character boundary.
+        /// Deliberately not three cases -- the storage-layer distinction is
+        /// `instar-text`'s to know, not this interface's to expose.
+        invalid-edit,
+        /// The document that would result from an otherwise-valid batch
+        /// exceeds the host's size ceiling.
+        buffer-too-large,
+    }
+
+    /// What `apply-edits` resolved to, once the request cleared every
+    /// `text-error`.
+    ///
+    /// Not folded into `text-error`: a guest that lost an optimistic race
+    /// submitted a well-formed request against text that moved underneath
+    /// it. That is an ordinary outcome to handle, not a malformed one.
+    variant apply-edits-result {
+        /// The batch applied. The buffer's new revision.
+        applied(u64),
+        /// `expected-revision` did not match. The buffer's current revision;
+        /// nothing in the batch was applied.
+        conflict(u64),
     }
 }
 
@@ -95,7 +120,7 @@ interface text-types {
 /// and a UI event at the same time -- is worse than the overlapping-subtask
 /// machinery this package otherwise avoids. See its own doc comment for why.
 interface text {
-    use text-types.{text-error, edit-notification};
+    use text-types.{text-error, edit-notification, text-edit, apply-edits-result};
 
     resource text-buffer;
     resource text-view;
@@ -134,4 +159,27 @@ interface text {
     /// and two sleepers would race to serve the same edits.
     next-edit: async func(buffer: borrow<text-buffer>)
         -> result<edit-notification, text-error>;
+
+    /// Applies a batch of edits optimistically against the revision this
+    /// guest last saw.
+    ///
+    /// Plain `func`, not `async`: unlike `next-edit`, this call is bounded by
+    /// how long the thread that owns the text subsystem takes to answer, the
+    /// same shape `create-view` already has.
+    ///
+    /// `expected-revision` is checked against the buffer's current revision
+    /// before any edit in `edits` is even looked at -- a stale revision is a
+    /// `conflict`, not a reason to validate a batch authored against text
+    /// that has already moved. The batch itself is atomic: on any refusal,
+    /// nothing in it is applied, exactly as a refused UI commit promotes
+    /// nothing.
+    ///
+    /// A batch this generation submits is never echoed back to it through
+    /// its own `next-edit` -- it already knows what it applied. Every other
+    /// generation watching this buffer hears about it normally.
+    apply-edits: func(
+        buffer: borrow<text-buffer>,
+        expected-revision: u64,
+        edits: list<text-edit>,
+    ) -> result<apply-edits-result, text-error>;
 }

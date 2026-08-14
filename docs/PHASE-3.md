@@ -1589,7 +1589,7 @@ next-edit: async func(buffer: borrow<text-buffer>)
 create-buffer:  func(contents: string)            -> result<text-buffer, text-error>;
 apply-edits:    func(buffer: borrow<text-buffer>,
                      expected-revision: u64,
-                     edits: list<text-edit>)      -> result<apply-outcome, text-error>;
+                     edits: list<text-edit>)      -> result<apply-edits-result, text-error>;
 read-range:     func(buffer: borrow<text-buffer>,
                      start: u64, end: u64)        -> result<range-contents, text-error>;
 resynchronize:  func(buffer: borrow<text-buffer>) -> result<snapshot, text-error>;
@@ -1599,7 +1599,7 @@ variant edit-notification {
     desynchronized(u64),        // latest revision
 }
 
-variant apply-outcome {
+variant apply-edits-result {
     applied(u64),               // new revision
     conflict(u64),              // current revision
 }
@@ -1607,6 +1607,49 @@ variant apply-outcome {
 
 `conflict` is an outcome, not a `text-error`. A guest that loses a race is
 told, and being told is ordinary.
+
+### `invalid-edit` is one refusal, not three
+
+`instar-text`'s own `TextError` distinguishes `InvertedRange`,
+`RangeOutOfBounds`, `NotACharBoundary`, `NotAGraphemeBoundary`, and
+`LineOutOfBounds` — the storage layer's own taxonomy for a byte range it
+cannot use. None of that crosses into `text-error`. Adding a WIT variant case
+is itself a breaking interface change, so the public shape stops at what a
+guest can act on — "this batch was malformed" — not at which storage-layer
+check caught it:
+
+```wit
+variant text-error {
+    too-many-buffers(u32),
+    too-many-views(u32),
+    no-such-resource,
+    unavailable,
+    already-waiting,
+    edit-batch-too-large,
+    invalid-edit,
+    buffer-too-large,
+}
+```
+
+`apply-edits` enforces these, and everything else `apply-edits` can refuse, in
+one fixed order — frozen so fault attribution stays unambiguous the same way
+every other "one refusal per class of bad input" rule in this document does:
+
+```text
+1  generation screen           stale-generation
+2  capability/lease resolve    no-such-resource
+3  inbound count/byte bounds   edit-batch-too-large, before anything clones
+4  expected-revision           conflict(current), before any edit is attempted
+5  sequential clone validation invalid-edit
+6  resulting document ceiling  buffer-too-large
+7  swap the clone in
+8  publish to every relationship but the source
+```
+
+Step 4 before step 5 is load-bearing, not incidental: judging a byte range
+against the buffer's current state when the batch was authored against a
+revision that no longer exists is meaningless, so a stale revision paired with
+a malformed range is `conflict`, never `invalid-edit`.
 
 ### The sync state machine
 
@@ -1857,7 +1900,12 @@ C2  next-edit declared plain func            no guest can await UI and edits at 
 
 C3  conflict applies a prefix                a refused batch mutated the document
     expected_revision unchecked              applied to text that moved underneath
+    revision checked after validation        a stale+malformed batch reports invalid-edit,
+                                              not conflict — coordinates judged against a
+                                              revision the guest never authored against
     guest edits echoed to their origin       every guest double-applies its own
+    origin filter reaches everyone           the source relearns what it already applied
+    origin filter reaches no one             another relationship never hears about it
     inbound batch unbounded                  a million empty edits, or one huge one
 
 C4  resynchronize re-arms non-atomically     edits between read and re-arm are lost

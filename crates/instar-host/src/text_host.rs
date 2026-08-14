@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{
-    BridgeAppliedEdit, NextEditOutcome, OpaqueResourceKey, ScreenedTextRequest, TextAnswer,
-    TextOperation, TextRefusal,
+    ApplyEditsOutcome, BridgeAppliedEdit, BridgeTextEdit, NextEditOutcome, OpaqueResourceKey,
+    ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
 };
 use instar_text::{
     AppliedEdit, MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextEdit, TextError, TextSystem,
@@ -45,8 +45,8 @@ use instar_text::{
 };
 
 use crate::text_sync::{
-    BufferSync, EditNotification, MAX_PENDING_EDITS, NextEditAdmission, SyncState, WaitRefusal,
-    WaiterId,
+    BufferSync, EditNotification, MAX_PENDING_EDIT_BYTES, MAX_PENDING_EDITS, NextEditAdmission,
+    SyncState, WaitRefusal, WaiterId,
 };
 
 /// What one guest generation currently holds.
@@ -139,6 +139,24 @@ fn view_id(key: OpaqueResourceKey) -> TextViewId {
     TextViewId {
         id: key.slot,
         generation: key.incarnation,
+    }
+}
+
+/// Translates one inbound guest edit into `instar-text` vocabulary.
+///
+/// `u64 -> usize` is narrowing here, unlike every other conversion in this
+/// file: these offsets came from a guest, not from a revision this host
+/// minted. A value that does not fit becomes `usize::MAX` rather than
+/// wrapping -- `as usize` would truncate a hostile 64-bit offset down to
+/// whatever its low bits happen to be, which on a 32-bit host could turn an
+/// out-of-range offset into one that looks valid. `usize::MAX` instead
+/// guarantees `TextStorage::check` refuses it as out of bounds, the same
+/// refusal a genuinely oversized in-range offset gets.
+fn edit_from_bridge(edit: BridgeTextEdit) -> TextEdit {
+    TextEdit {
+        range: usize::try_from(edit.start).unwrap_or(usize::MAX)
+            ..usize::try_from(edit.end).unwrap_or(usize::MAX),
+        replacement: edit.replacement,
     }
 }
 
@@ -297,6 +315,79 @@ impl TextHost {
         Ok(applied)
     }
 
+    /// Applies a guest's batch of edits, in the order frozen for C3b:
+    ///
+    /// ```text
+    /// 1  generation screen           already done: ScreenedTextRequest
+    /// 2  capability/lease resolve -> NoSuchResource
+    /// 3  inbound count/byte bounds-> EditBatchTooLarge, before anything clones
+    /// 4  expected revision        -> Conflict(current), before any edit runs
+    /// 5  sequential validation    -> InvalidEdit
+    /// 6  resulting document size  -> BufferTooLarge
+    /// 7  swap the clone in
+    /// 8  publish to every relationship but the source
+    /// ```
+    ///
+    /// Steps 5-7 are exactly [`TextSystem::apply_edits_to_buffer`]'s
+    /// clone-and-swap; this method's own job is only what surrounds it: the
+    /// two refusals that must be decided *before* that call is worth making,
+    /// and the fan-out after it succeeds.
+    ///
+    /// `expected_revision` is checked against the buffer's revision as it
+    /// stood before this call touches anything -- a stale revision paired
+    /// with an otherwise-malformed batch is `Conflict`, not `InvalidEdit`:
+    /// judging byte offsets against a document state the caller never saw is
+    /// meaningless, so there is no reason to look at them at all.
+    ///
+    /// Never echoed to `generation`: it already knows what it submitted. Every
+    /// other relationship watching this buffer is recorded normally.
+    pub fn apply_guest_edits(
+        &mut self,
+        generation: GenerationId,
+        buffer: OpaqueResourceKey,
+        expected_revision: u64,
+        edits: Vec<TextEdit>,
+    ) -> Result<ApplyEditsOutcome, TextRefusal> {
+        let id = self.resolve_buffer_lease(generation, buffer)?;
+
+        let prospective_bytes = edits
+            .iter()
+            .try_fold(0usize, |total, edit| total.checked_add(edit.replacement.len()));
+        let fits = edits.len() <= MAX_PENDING_EDITS
+            && prospective_bytes.is_some_and(|total| total <= MAX_PENDING_EDIT_BYTES);
+        if !fits {
+            return Err(TextRefusal::EditBatchTooLarge);
+        }
+
+        let current = self.system.revision(id).unwrap_or_default();
+        if current.0 != expected_revision {
+            return Ok(ApplyEditsOutcome::Conflict(current.0));
+        }
+
+        let applied = self
+            .system
+            .apply_edits_to_buffer(id, &edits)
+            .map_err(|error| match error {
+                TextError::BufferTooLarge { .. } => TextRefusal::BufferTooLarge,
+                _ => TextRefusal::InvalidEdit,
+            })?;
+
+        let resulting = applied
+            .last()
+            .map(|edit| edit.resulting_revision.0)
+            .unwrap_or(current.0);
+
+        for ((owner, owed), state) in self.sync.iter_mut() {
+            if *owed == id && *owner != generation {
+                for applied_edit in &applied {
+                    state.record(applied_edit);
+                }
+            }
+        }
+
+        Ok(ApplyEditsOutcome::Applied(resulting))
+    }
+
     /// What one generation still owes on one buffer. Read-only: the state is
     /// advanced by [`TextHost::apply_edit`] and by nothing else.
     pub fn sync_state(&self, generation: GenerationId, buffer: TextBufferId) -> Option<&SyncState> {
@@ -448,6 +539,17 @@ impl TextHost {
                     Err(WaitRefusal::AlreadyWaiting) => {
                         request.refuse(TextRefusal::AlreadyWaiting);
                     }
+                }
+            }
+            TextOperation::ApplyEdits {
+                buffer,
+                expected_revision,
+                edits,
+            } => {
+                let edits: Vec<TextEdit> = edits.into_iter().map(edit_from_bridge).collect();
+                match self.apply_guest_edits(generation, buffer, expected_revision, edits) {
+                    Ok(outcome) => request.answer(TextAnswer::AppliedEdits(outcome)),
+                    Err(refusal) => request.refuse(refusal),
                 }
             }
         }
@@ -673,6 +775,87 @@ mod tests {
             "a surviving document owes a dead guest nothing"
         );
         assert_eq!(host.counts(), TextResourceCounts::default());
+    }
+
+    /// A stale `expected_revision` takes precedence over a malformed range.
+    ///
+    /// Judging byte offsets against a document state the caller never saw is
+    /// meaningless, so revision is checked before the batch is inspected at
+    /// all -- a request that is wrong in both ways at once is `Conflict`,
+    /// never `InvalidEdit`.
+    #[test]
+    fn a_stale_revision_reports_conflict_even_with_a_malformed_range() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        // Advances the revision out from under the batch below, exactly as
+        // a slower guest's own edit would.
+        host.apply_edit(view, TextEdit::insert(0, "hi"))
+            .expect("moves the revision to 1");
+        let current = host.system().revision(id).expect("live buffer");
+        assert_eq!(current.0, 1);
+
+        // Stale relative to `current`, and separately inverted -- a range no
+        // validator could accept regardless of revision.
+        let stale_revision = 0;
+        let malformed = vec![TextEdit {
+            range: 9..3,
+            replacement: "nope".to_string(),
+        }];
+
+        let outcome = host
+            .apply_guest_edits(G17, buffer, stale_revision, malformed)
+            .expect("a stale revision is an outcome, not a refusal");
+
+        assert_eq!(
+            outcome,
+            ApplyEditsOutcome::Conflict(1),
+            "revision is judged before the batch is ever inspected"
+        );
+    }
+
+    /// A guest's own batch is never echoed back to it, but another
+    /// generation watching the same buffer hears about it normally.
+    ///
+    /// No guest-facing API today lets a second generation acquire a lease
+    /// on a buffer another generation created -- `CreateView` requires the
+    /// caller to already hold the buffer lease -- so this installs a second
+    /// relationship directly, the same way C1's tests exercised the sync
+    /// state machine without going through lease acquisition at all. The
+    /// fan-out this test is about is a property of the sync map, not of how
+    /// a relationship came to exist. The origin filter is the only thing
+    /// standing between "everyone receives" and "no one receives" -- both
+    /// would make this test pass for the wrong reason, which is why it
+    /// checks the source and the watcher separately rather than only one.
+    #[test]
+    fn a_guest_batch_reaches_every_other_relationship_but_not_its_source() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let id = buffer_id(buffer);
+
+        let baseline = host.system().revision(id).unwrap_or_default();
+        host.sync.insert((G18, id), BufferSync::synchronized(baseline));
+
+        let outcome = host
+            .apply_guest_edits(G17, buffer, baseline.0, vec![TextEdit::insert(0, "hi")])
+            .expect("a fresh, well-formed batch applies");
+        assert!(matches!(outcome, ApplyEditsOutcome::Applied(_)));
+
+        assert_eq!(
+            host.sync_state(G17, id).expect("source relationship").queued(),
+            0,
+            "the source generation already knows what it applied"
+        );
+        assert_eq!(
+            host.sync_state(G18, id)
+                .expect("watching relationship")
+                .queued(),
+            1,
+            "another generation watching the same buffer must hear about it"
+        );
     }
 
     /// One generation's edits are not owed to another's relationship.

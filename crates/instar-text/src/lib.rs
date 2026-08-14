@@ -71,7 +71,7 @@ mod viewport;
 
 pub use buffer::TextBuffer;
 pub use edit::{AppliedEdit, EditJournal, TextEdit};
-pub use storage::{TextSlice, TextStorage};
+pub use storage::{MAX_TEXT_BUFFER_BYTES, TextSlice, TextStorage};
 pub use system::{MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextSystem};
 pub use view::{Selection, TextAffinity, TextPosition, TextView};
 pub use viewport::{MAX_SHAPED_PARAGRAPH_BYTES, ParagraphWindow, ShapingWindow, TextViewport};
@@ -168,4 +168,10 @@ pub enum TextError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
+    /// The document would exceed [`storage::MAX_TEXT_BUFFER_BYTES`] after this
+    /// edit. Checked against the *resulting* size, not the edit's own size, so
+    /// a small edit to an already-large document is refused exactly as an
+    /// edit that would singlehandedly cross the line is.
+    #[error("a {resulting}-byte document exceeds the {limit}-byte ceiling")]
+    BufferTooLarge { resulting: usize, limit: usize },
 }

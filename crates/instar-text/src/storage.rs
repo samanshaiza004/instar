@@ -33,6 +33,27 @@ use std::ops::Range;
 
 use crate::TextError;
 
+/// The largest a document may grow to, in bytes.
+///
+/// Frozen alongside Package C's synchronization contract rather than derived
+/// from it: `docs/PHASE-3.md` requires
+/// `MAX_TEXT_BUFFER_BYTES <= MAX_TEXT_TRANSFER_BYTES`, because a document a
+/// bounded single-shot `resynchronize` cannot return is a desynchronized
+/// buffer with no way back. `MAX_TEXT_TRANSFER_BYTES` is Package C4's number
+/// and does not exist yet, so this is not derived from it -- it is the value
+/// C4's own freeze already named as ample against the 1-10 MiB target
+/// `textbench` exercises, chosen now because the ceiling has to hold on every
+/// mutation from here on, not only once transfer exists to justify it
+/// formally. If C4 ever needs a smaller number, this is a policy change, not
+/// a bug fix.
+///
+/// Enforced here rather than in `TextBuffer` or `TextSystem`: every mutation
+/// path -- a host-local edit, a guest's own `apply-edits`, and the clone this
+/// crate validates a whole batch against -- funnels through
+/// [`TextStorage::replace`], so the ceiling applies uniformly with nothing
+/// above this layer having to remember to check it.
+pub const MAX_TEXT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 /// Instar's text storage: a rope, behind an API that cannot panic.
 #[derive(Debug, Clone, Default)]
 pub struct TextStorage {
@@ -129,9 +150,23 @@ impl TextStorage {
     ///
     /// The whole of the validation this crate needs is here: a range that is
     /// out of bounds, inverted, or lands mid-character is refused and the
-    /// storage is untouched. `crop` would panic on all three.
+    /// storage is untouched, `crop` would panic on all three, and a result
+    /// that would exceed [`MAX_TEXT_BUFFER_BYTES`] is refused too, checked
+    /// only once the range itself is known good -- a malformed edit is
+    /// reported as malformed, not as "too large", even when it also happens
+    /// to be both.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> Result<(), TextError> {
         self.check(range.clone())?;
+
+        let removed = range.end - range.start;
+        let resulting = self.len_bytes().saturating_sub(removed).saturating_add(text.len());
+        if resulting > MAX_TEXT_BUFFER_BYTES {
+            return Err(TextError::BufferTooLarge {
+                resulting,
+                limit: MAX_TEXT_BUFFER_BYTES,
+            });
+        }
+
         self.rope.replace(range, text);
         Ok(())
     }
@@ -317,6 +352,62 @@ mod tests {
             before,
             "a refused edit leaves the storage exactly as it was"
         );
+    }
+
+    /// The ceiling is on the *resulting* size, not the edit's own size: a
+    /// one-byte insertion that tips an already-large document over the line
+    /// is refused exactly as an edit that is large all by itself would be.
+    #[test]
+    fn an_edit_landing_exactly_at_the_ceiling_succeeds() {
+        let mut storage = TextStorage::from_text(&"x".repeat(MAX_TEXT_BUFFER_BYTES - 1));
+        storage.replace(0..0, "y").expect("lands exactly at the ceiling");
+        assert_eq!(storage.len_bytes(), MAX_TEXT_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn one_byte_past_the_ceiling_is_refused_and_the_document_is_untouched() {
+        let mut storage = TextStorage::from_text(&"x".repeat(MAX_TEXT_BUFFER_BYTES));
+        let before = storage.len_bytes();
+
+        assert!(matches!(
+            storage.replace(0..0, "y"),
+            Err(TextError::BufferTooLarge {
+                resulting,
+                limit
+            }) if resulting == MAX_TEXT_BUFFER_BYTES + 1 && limit == MAX_TEXT_BUFFER_BYTES
+        ));
+        assert_eq!(
+            storage.len_bytes(),
+            before,
+            "the ceiling refused the edit; nothing about the document moved"
+        );
+    }
+
+    /// Precedence: a malformed edit is reported as malformed, even when it
+    /// would also have been too large. The size check runs only once the
+    /// range itself is known good, so a hostile out-of-bounds edit still gets
+    /// `RangeOutOfBounds`, not `BufferTooLarge` -- one refusal per class of
+    /// bad input, the same rule Package C's other bounds hold.
+    ///
+    /// The buffer here is small and the replacement is what pushes the
+    /// naive size arithmetic over the ceiling: on a 5-byte document, an
+    /// out-of-bounds `removed` length saturates toward zero, so a version of
+    /// `replace` that computed size first would see the huge replacement
+    /// alone as oversized and answer `BufferTooLarge` -- before `check` ever
+    /// got a chance to say the range itself made no sense. A version that
+    /// mirrors this test's oversized-document setup instead (range and
+    /// document both already near the ceiling) cannot tell the two orderings
+    /// apart, because the saturating subtraction erases the malformed
+    /// range's contribution either way.
+    #[test]
+    fn a_malformed_edit_reports_the_malformation_even_against_an_oversized_replacement() {
+        let mut storage = TextStorage::from_text("hello");
+        let oversized_replacement = "y".repeat(MAX_TEXT_BUFFER_BYTES + 1);
+
+        assert!(matches!(
+            storage.replace(0..99, &oversized_replacement),
+            Err(TextError::RangeOutOfBounds { .. })
+        ));
     }
 
     /// Which line-counting convention `crop` uses, pinned.

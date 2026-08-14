@@ -101,8 +101,25 @@ pub struct GuestTextView {
     pub key: OpaqueResourceKey,
 }
 
+/// One inbound edit, as fixed-width scalars and an owned replacement.
+///
+/// The request-side counterpart to [`BridgeAppliedEdit`]: this crate cannot
+/// import `instar_text::TextEdit` for the same reason it cannot import
+/// `AppliedEdit`, and the byte range travels as two `u64`s rather than a
+/// `Range<usize>` for the same widening reason documented there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeTextEdit {
+    pub start: u64,
+    pub end: u64,
+    pub replacement: String,
+}
+
 /// What a guest asked the text subsystem to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: [`TextOperation::ApplyEdits`] carries a batch of owned
+/// replacement text, not just keys. `Eq` still holds because every field
+/// down to `BridgeTextEdit` compares structurally.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextOperation {
     CreateBuffer,
     CreateView {
@@ -116,11 +133,23 @@ pub enum TextOperation {
     },
     /// Asks whoever owns the text subsystem what it owes this buffer.
     ///
-    /// Still `Copy + Eq`: the operation itself carries only the key, never the
-    /// answer. What can suspend is the *reply* — see [`NextEditOutcome`] and
-    /// [`TextAnswer`], which is why the loss of those derives stops here.
+    /// What can suspend is the *reply* — see [`NextEditOutcome`] and
+    /// [`TextAnswer`], not this operation.
     NextEdit {
         buffer: OpaqueResourceKey,
+    },
+    /// A guest's own edits, applied optimistically against the revision it
+    /// last saw.
+    ///
+    /// `expected_revision` is compared against the buffer's *current*
+    /// revision before any edit in `edits` is attempted — a stale revision
+    /// is a [`ApplyEditsOutcome::Conflict`], not a reason to inspect the
+    /// batch at all. See `instar-host`'s `TextHost::apply_guest_edits`,
+    /// which is the authority on the full refusal order.
+    ApplyEdits {
+        buffer: OpaqueResourceKey,
+        expected_revision: u64,
+        edits: Vec<BridgeTextEdit>,
     },
 }
 
@@ -148,6 +177,47 @@ pub enum TextRefusal {
     /// same edits. See `instar-host`'s `BufferSync::admit`, which is the
     /// authority this refusal reports.
     AlreadyWaiting,
+    /// An `apply-edits` batch exceeded the inbound count or byte bound,
+    /// checked before any edit in it is cloned or attempted.
+    EditBatchTooLarge,
+    /// One coarse refusal standing in for every way `instar-text` can find a
+    /// byte range unusable: inverted, out of bounds, or off a character
+    /// boundary.
+    ///
+    /// Deliberately not three cases mirroring `instar_text::TextError`.
+    /// Adding a WIT variant case is itself a breaking interface change, so
+    /// the public taxonomy stops at what an application can meaningfully
+    /// distinguish and act on — "this edit was malformed" — rather than
+    /// exposing which storage-layer check caught it. `instar-text` knows
+    /// why; `instar-kernel` only needs to know the guest submitted something
+    /// it cannot apply.
+    InvalidEdit,
+    /// The document that would result from an otherwise-valid batch exceeds
+    /// `instar_text::MAX_TEXT_BUFFER_BYTES`.
+    ///
+    /// Checked only after every edit in the batch has passed range
+    /// validation — a malformed edit against an oversized document is still
+    /// reported as [`TextRefusal::InvalidEdit`], not this.
+    BufferTooLarge,
+}
+
+/// What `apply-edits` resolved to, once the request cleared every
+/// [`TextRefusal`].
+///
+/// Deliberately not a `TextRefusal` case: a guest that lost an optimistic
+/// race submitted a perfectly well-formed request against text that moved
+/// underneath it. That is an ordinary outcome to handle, not a malformed
+/// one — the same reason a refused UI commit and an unreadable one are kept
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyEditsOutcome {
+    /// The batch applied. The buffer's new revision.
+    Applied(u64),
+    /// `expected_revision` did not match the buffer's current revision. The
+    /// current revision, so the guest can decide whether to drain
+    /// `next-edit` or call `resynchronize`. Nothing in the batch was
+    /// applied.
+    Conflict(u64),
 }
 
 /// Why a commit's text-view attachments were refused.
@@ -211,6 +281,7 @@ pub enum TextAnswer {
     Created(OpaqueResourceKey),
     Released,
     NextEdit(NextEditOutcome),
+    AppliedEdits(ApplyEditsOutcome),
 }
 
 /// Answers exactly once, including on the paths that forget to.
@@ -290,7 +361,7 @@ impl ScreenedTextRequest {
     }
 
     pub fn operation(&self) -> TextOperation {
-        self.operation
+        self.operation.clone()
     }
 
     pub fn answer(self, answer: TextAnswer) {

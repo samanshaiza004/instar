@@ -519,6 +519,9 @@ impl From<crate::text_bridge::TextRefusal> for instar::text::text_types::TextErr
             // told the host could not serve it, not that its handle was bad.
             TextRefusal::StaleGeneration | TextRefusal::HostUnavailable => Self::Unavailable,
             TextRefusal::AlreadyWaiting => Self::AlreadyWaiting,
+            TextRefusal::EditBatchTooLarge => Self::EditBatchTooLarge,
+            TextRefusal::InvalidEdit => Self::InvalidEdit,
+            TextRefusal::BufferTooLarge => Self::BufferTooLarge,
         }
     }
 }
@@ -623,6 +626,63 @@ impl instar::text::text::Host for GenerationState {
                     .await;
                 Err(error.into())
             }
+        }
+    }
+
+    /// Bounded by the text subsystem's response time, the same shape
+    /// `create-view` has -- not `async func` in the WIT, so this stays on
+    /// `Host` rather than `HostWithStore`. See that trait's own doc comment
+    /// for why `next-edit` is the one function that cannot.
+    async fn apply_edits(
+        &mut self,
+        buffer: Resource<GuestTextBuffer>,
+        expected_revision: u64,
+        edits: Vec<instar::text::text_types::TextEdit>,
+    ) -> wasmtime::Result<
+        Result<instar::text::text_types::ApplyEditsResult, instar::text::text_types::TextError>,
+    > {
+        use crate::text_bridge::{BridgeTextEdit, TextAnswer, TextOperation};
+
+        let buffer_key = self.table.get(&buffer)?.key;
+
+        let bridge_edits = edits
+            .into_iter()
+            .map(|edit| BridgeTextEdit {
+                start: edit.range_start,
+                end: edit.range_end,
+                replacement: edit.replacement,
+            })
+            .collect();
+
+        let answer = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::ApplyEdits {
+                    buffer: buffer_key,
+                    expected_revision,
+                    edits: bridge_edits,
+                },
+            )
+            .await;
+
+        match answer {
+            Ok(TextAnswer::AppliedEdits(outcome)) => Ok(Ok(outcome.into())),
+            // See `create_empty_buffer`: matched by exclusion so a future
+            // answer variant traps here by default.
+            Ok(other) => Err(wasmtime::Error::msg(format!(
+                "text sink answered apply-edits with {other:?}"
+            ))),
+            Err(refusal) => Ok(Err(refusal.into())),
+        }
+    }
+}
+
+impl From<crate::text_bridge::ApplyEditsOutcome> for instar::text::text_types::ApplyEditsResult {
+    fn from(outcome: crate::text_bridge::ApplyEditsOutcome) -> Self {
+        match outcome {
+            crate::text_bridge::ApplyEditsOutcome::Applied(revision) => Self::Applied(revision),
+            crate::text_bridge::ApplyEditsOutcome::Conflict(revision) => Self::Conflict(revision),
         }
     }
 }
