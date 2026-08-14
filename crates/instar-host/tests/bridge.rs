@@ -1195,6 +1195,8 @@ const TEXT_REVERSE: NodeKey = NodeKey::first(19);
 /// The two text-view surfaces `guests/hostile` attaches.
 const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 const TEXT_NODE_B: NodeKey = NodeKey::first(31);
+/// Suspends the guest in `next-edit` and reports exactly what it receives.
+const AWAIT_EDIT: NodeKey = NodeKey::first(20);
 
 /// The window's retained `NodeKey -> TextViewId` map.
 fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
@@ -1213,6 +1215,36 @@ fn await_attachments(
     let started = Instant::now();
     while started.elapsed() < PATIENCE {
         if done(&attachments(bridge)) {
+            return true;
+        }
+        bridge.wait(Duration::from_millis(25));
+    }
+    false
+}
+
+/// Waits until the guest is genuinely asleep in `next-edit` on `buffer`, or
+/// gives up.
+///
+/// Without this, firing a host-local edit immediately after the "awaiting
+/// edit..." commit is a race: the edit applies synchronously on this thread,
+/// while the guest's own `next-edit` request has to cross to the runtime
+/// thread and back before a waiter is even installed. In practice the edit
+/// almost always wins that race, and `admit` answers `Ready` on the very
+/// first call -- which proves the queue works and proves nothing about the
+/// wake, because the wake path was never entered. This is the wait that
+/// makes suspension a confirmed precondition instead of a hoped-for outcome.
+fn await_waiter(
+    bridge: &mut HostBridge,
+    generation: GenerationId,
+    buffer: instar_text::TextBufferId,
+) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        if bridge
+            .host()
+            .text_resources()
+            .has_waiter(generation, buffer)
+        {
             return true;
         }
         bridge.wait(Duration::from_millis(25));
@@ -1327,6 +1359,142 @@ fn a_real_guest_commits_two_borrowed_views_and_the_table_order_does_not_matter()
         "and a commit that changed neither the tree nor the attachments is a \
          no-op for the retained state, not a new revision"
     );
+}
+
+/// C2c: the closure gate for `next-edit` delivery, and the reason it exists.
+///
+/// Every layer up to here has its own proof -- C1's state machine is
+/// exhaustively mutant-tested, C2b-1a's waiter wakes on exactly the right
+/// transitions, C2b-1b's retry loop is driven through a real
+/// `HostWithStore::next_edit` against a held fake sink -- but nothing yet
+/// proves the whole chain fires from a genuinely host-local trigger through
+/// to a genuinely suspended guest. This is that test:
+///
+/// ```text
+/// a real IME commit
+///   -> Host::on_ime_commit           finds the focused node's attached view
+///   -> TextHost::apply_edit          the one edit path (C1)
+///   -> BufferSync::record            queues, wakes the sleeper (C2b-1a)
+///   -> the kernel's retry loop       resubmits NextEdit, receives it (C2b-1b)
+///   -> a real guest                  reports the exact fields back
+/// ```
+///
+/// The guest is focused the same way a pointer really would: a click that
+/// hit-tests into the text-view surface via `on_text_pointer`, which is the
+/// only route `focus_by_pointer` has for a `TextView` node (B2e-4 -- a
+/// `TextView` is not `is_interactive()`, so Tab traversal can never reach
+/// one). The edit itself is a real `WindowOutput::ImeCommit`, not a direct
+/// call to `apply_edit`: that is the difference between proving this seam
+/// and proving C1 a second time.
+#[test]
+fn a_real_host_local_edit_reaches_a_suspended_guest_unchanged() {
+    let (mut bridge, _wakes) = ready();
+
+    click(&mut bridge, TEXT_ACQUIRE);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 2),
+        "the guest acquired both views"
+    );
+
+    click(&mut bridge, TEXT_COMMIT);
+    assert!(
+        await_attachments(&mut bridge, |map| map.len() == 2),
+        "both text views reached the retained map"
+    );
+    let view = *attachments(&bridge)
+        .get(&TEXT_NODE_A)
+        .expect("node A is attached");
+    let buffer = bridge
+        .host()
+        .text_resources()
+        .system()
+        .view(view)
+        .expect("the view is live")
+        .buffer();
+    let generation = bridge.generation();
+
+    click(&mut bridge, TEXT_NODE_A);
+    assert_eq!(
+        bridge.host().window(WINDOW).unwrap().focus().focused(),
+        Some(TEXT_NODE_A),
+        "a press on the text-view surface must focus it through \
+         on_text_pointer -- IME has nowhere else to route to"
+    );
+
+    // The guest suspends inside next-edit on an idle, synchronized buffer.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, AWAIT_EDIT);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the guest's 'awaiting edit...' commit must land before it suspends, \
+         or the click never actually reached the guest"
+    );
+    assert_eq!(label(&bridge), "awaiting edit...");
+
+    // Confirmed, not assumed: the guest has genuinely reached the suspension
+    // point inside next-edit, with a waiter installed on this exact buffer.
+    assert!(
+        await_waiter(&mut bridge, generation, buffer),
+        "the guest must actually be asleep in next-edit before the edit \
+         below fires, or the wake path is never exercised"
+    );
+
+    // Clicking the Button above moved focus onto it -- an ordinary button
+    // click focuses the button, exactly as it should -- so the text view has
+    // to be refocused before the IME commit has anywhere host-local to route.
+    // This is unrelated to the suspended `next-edit` call: text-view pointer
+    // handling never sends the guest anything, so re-focusing while the guest
+    // sleeps changes nothing about what it is waiting on.
+    click(&mut bridge, TEXT_NODE_A);
+    assert_eq!(
+        bridge.host().window(WINDOW).unwrap().focus().focused(),
+        Some(TEXT_NODE_A),
+        "refocused, with the guest still asleep in next-edit"
+    );
+
+    // The real host-local trigger: a platform IME session committing text,
+    // exactly the WindowOutput a real input method produces.
+    let applied = bridge.stats().applied_commits;
+    bridge.on_window_event(WindowOutput::ImeCommit {
+        window_id: WINDOW,
+        text: "hello".to_string(),
+    });
+
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the woken guest must resubmit next-edit, receive the edit, and \
+         commit its report -- a guest left asleep here means the wake or \
+         the retry loop is broken"
+    );
+    assert_eq!(
+        label(&bridge),
+        "edit: base=0 result=1 start=0 end=0 repl=hello",
+        "an insertion of \"hello\" at the empty selection of a fresh buffer: \
+         base 0, resulting 1, an empty range at 0, and the exact replacement \
+         -- every field the guest received must match what the host applied, \
+         not merely arrive"
+    );
+
+    // And the edit reached the document itself, not only the label the
+    // guest happened to format correctly.
+    let buffer = bridge
+        .host()
+        .text_resources()
+        .system()
+        .view(view)
+        .expect("the view is still live")
+        .buffer();
+    let contents = bridge
+        .host()
+        .text_resources()
+        .system()
+        .buffer(buffer)
+        .expect("the buffer is still live")
+        .text()
+        .slice(0..5)
+        .expect("five bytes exist now")
+        .materialize();
+    assert_eq!(contents, "hello");
 }
 
 /// Teardown is total, on both terminal paths.

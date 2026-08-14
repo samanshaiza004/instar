@@ -311,6 +311,21 @@ impl TextHost {
         self.sync.len()
     }
 
+    /// Whether a `next-edit` caller is genuinely asleep on this relationship.
+    ///
+    /// Read-only, and it changes nothing: the reason it exists is that "the
+    /// guest is suspended" is otherwise unobservable from outside `TextHost`,
+    /// and a test that wants to fire a host-local edit *while the guest is
+    /// asleep* has no way to confirm that without it -- racing the two and
+    /// hoping suspension wins is indistinguishable, from a passing test, from
+    /// the edit landing first and the queue answering `next-edit`
+    /// immediately, which never touches the wake path at all.
+    pub fn has_waiter(&self, generation: GenerationId, buffer: TextBufferId) -> bool {
+        self.sync
+            .get(&(generation, buffer))
+            .is_some_and(BufferSync::has_waiter)
+    }
+
     /// A key this generation is allowed to use, as a buffer id.
     pub fn resolve_buffer_lease(
         &self,

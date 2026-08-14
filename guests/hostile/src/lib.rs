@@ -28,6 +28,7 @@
 //! | Sleep | Awaits a 30s host operation | that shutdown stays bounded for a guest suspended in a host op |
 //! | Commit text views | Commits the interface with two text-view nodes and a crossed side table | attachment resolution is by identity, not slot position |
 //! | Reverse text table | Re-commits the same tree with the side table reversed | a re-commit that changes the table but not the retained map is a no-op |
+//! | Await edit | Suspends in `next-edit` and reports the exact fields it receives | a real host-local edit reaches a real suspended guest unchanged (C2c) |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -51,7 +52,7 @@ wit_bindgen::generate!({
 });
 
 use instar_ui_protocol::{
-    BatchEncoder, NodeKey, WireAlign, WireEvent, WireLayout, flags, limits, opcode,
+    BatchEncoder, NodeKey, WireAlign, WireEvent, WireLayout, WireSize, flags, limits, opcode,
 };
 
 use crate::instar::kernel::kernel_runtime;
@@ -59,6 +60,7 @@ use crate::instar::kernel::kernel_types::{CommitError, CommitResult, RuntimeErro
 use crate::instar::kernel::kernel_ui;
 use crate::instar::kernel::ops;
 use crate::instar::text::text;
+use crate::instar::text::text_types;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -93,6 +95,9 @@ const TEXT_REVERSE: NodeKey = NodeKey::first(19);
 /// Shared on purpose: the two commits must describe an identical interface so
 /// that the only thing differing between them is the side table.
 const TEXT_ATTACHED_LABEL: &str = "two text views attached";
+/// Suspends in `next-edit` on the guest's first buffer and reports the exact
+/// fields the host sends, for C2c's joined-seam claim.
+const AWAIT_EDIT: NodeKey = NodeKey::first(20);
 /// The first text-view surface the commit buttons attach.
 const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 /// The second text-view surface the commit buttons attach.
@@ -127,6 +132,23 @@ fn container(padding: u16, gap: u16) -> WireLayout {
         align_self: Some(WireAlign::Stretch),
         padding,
         gap,
+        ..WireLayout::default()
+    }
+}
+
+/// A text view's on-screen size, stated explicitly rather than left to
+/// content measurement.
+///
+/// `WireLayout::default()` measures by content, and an attached but empty
+/// document has nothing yet for that measurement to hang a nonzero rect on --
+/// a `TextView` node given the default layout lays out at `0x0`, which a real
+/// pointer event can never hit. A fixed size is a wire-supplied fact any
+/// guest may state, not a new host capability: it only exists so C2c's real
+/// click has somewhere real to land.
+fn text_view_layout() -> WireLayout {
+    WireLayout {
+        width: WireSize::Fixed(200),
+        height: WireSize::Fixed(40),
         ..WireLayout::default()
     }
 }
@@ -174,6 +196,9 @@ struct Hostile {
     grow: bool,
     /// Set to suspend inside a 30s host operation.
     sleep: bool,
+    /// Set to suspend inside `next-edit` on the first held buffer, after the
+    /// next commit.
+    await_edit: bool,
     /// Text capabilities this guest holds.
     ///
     /// Held, not used: B2e-1 proves acquisition and release, and there is no
@@ -214,7 +239,7 @@ impl Hostile {
                 0,
                 None,
                 container(0, 4),
-                (18 + extra_views) as u16,
+                (19 + extra_views) as u16,
             )
             .node(
                 opcode::NODE_TEXT,
@@ -363,22 +388,20 @@ impl Hostile {
                 Some("Sleep on host op"),
                 WireLayout::default(),
                 0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                AWAIT_EDIT,
+                flags::ENABLED,
+                Some("Await edit"),
+                WireLayout::default(),
+                0,
             );
         if let Some(crossed) = crossed {
             let (first_slot, second_slot) = if crossed { (1, 0) } else { (0, 1) };
             encoder
-                .text_view(
-                    TEXT_NODE_A,
-                    flags::ENABLED,
-                    first_slot,
-                    WireLayout::default(),
-                )
-                .text_view(
-                    TEXT_NODE_B,
-                    flags::ENABLED,
-                    second_slot,
-                    WireLayout::default(),
-                );
+                .text_view(TEXT_NODE_A, flags::ENABLED, first_slot, text_view_layout())
+                .text_view(TEXT_NODE_B, flags::ENABLED, second_slot, text_view_layout());
         }
         encoder.finish()
     }
@@ -440,9 +463,21 @@ impl Hostile {
         // finally show it. `Silent` is deliberately not reset; a guest that
         // has stopped speaking has stopped speaking.
         //
+        // `TextCommit`/`TextReverse` are the one other exception, and sticky
+        // rather than one-shot: an attached TextView is not a one-off
+        // misbehaviour, it is what the interface *is* from here on, the same
+        // way a real editor's TextView stays in its tree across unrelated UI
+        // changes. Without this, the very next ordinary commit -- Await edit,
+        // say -- would re-derive the tree from `encode()` with no text views
+        // in it at all, silently detaching the node C2c depends on staying
+        // attached.
+        //
         // Assigned before the side table is borrowed below, because that
         // borrow lives across the await.
-        self.mode = Mode::Normal;
+        self.mode = match mode {
+            Mode::TextCommit | Mode::TextReverse => mode,
+            _ => Mode::Normal,
+        };
 
         // The side table, paired with the slots the batch just encoded so that
         // both text commits resolve to the *same* retained map:
@@ -640,9 +675,48 @@ impl Hostile {
                 self.views.pop();
                 self.label_override = Some(format!("held {} view(s)", self.views.len()));
             }
+            WireEvent::Click { node } if node == AWAIT_EDIT => {
+                self.label_override = Some("awaiting edit...".to_string());
+                self.await_edit = true;
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
+        }
+    }
+}
+
+impl Hostile {
+    /// Suspends in `next-edit` on the first held buffer and formats exactly
+    /// what came back, for the test to read off the label.
+    ///
+    /// Folds every outcome -- edit, desync, or refusal -- into the label
+    /// rather than treating any of them as a guest failure. That is the same
+    /// discipline the other one-shot modes already use (`TEXT_ACQUIRE`'s
+    /// `buffer failed: {error:?}` is the precedent): a real host-local edit
+    /// arriving with the wrong fields shows up as a label mismatch the test
+    /// reports clearly, rather than a guest that fell over on hearing
+    /// anything other than exactly what it expected.
+    async fn await_one_edit(&self) -> String {
+        let Some(buffer) = self.buffers.first() else {
+            return "no buffer to await".to_string();
+        };
+        match text::next_edit(buffer).await {
+            Ok(text_types::EditNotification::Edits(edits)) => match edits.first() {
+                Some(edit) => format!(
+                    "edit: base={} result={} start={} end={} repl={}",
+                    edit.base_revision,
+                    edit.resulting_revision,
+                    edit.edit.range_start,
+                    edit.edit.range_end,
+                    edit.edit.replacement,
+                ),
+                None => "edits: empty".to_string(),
+            },
+            Ok(text_types::EditNotification::Desynchronized(revision)) => {
+                format!("desynchronized: {revision}")
+            }
+            Err(error) => format!("next-edit failed: {error:?}"),
         }
     }
 }
@@ -712,6 +786,7 @@ impl Guest for Component {
             spin: false,
             grow: false,
             sleep: false,
+            await_edit: false,
             buffers: Vec::new(),
             views: Vec::new(),
             label_override: None,
@@ -744,6 +819,11 @@ impl Guest for Component {
                     }
                     if std::mem::take(&mut hostile.sleep) {
                         hostile.sleep_on_host_op().await?;
+                    }
+                    if std::mem::take(&mut hostile.await_edit) {
+                        let outcome = hostile.await_one_edit().await;
+                        hostile.label_override = Some(outcome);
+                        hostile.commit().await?;
                     }
                 }
                 Err(RuntimeError::Shutdown) => return Ok(()),
