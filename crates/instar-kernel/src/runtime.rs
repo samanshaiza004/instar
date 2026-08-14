@@ -621,6 +621,41 @@ impl instar::text::text::Host for GenerationState {
     }
 }
 
+/// The one text function that suspends on an external event (C2b).
+///
+/// Separate from [`instar::text::text::Host`] above, and not by choice:
+/// declaring `next-edit` an `async func` in the WIT moves it to
+/// `HostWithStore` and hands it an `Accessor`, while `create-empty-buffer` and
+/// `create-view` stay on `Host` with `&mut self`. That split is the toolchain
+/// reporting the distinction the interface intends — bounded calls in one
+/// trait, the suspending one in the other — and it is why the `bindgen!`
+/// default was **not** broadened to make this compile. Doing that would have
+/// migrated every existing text import into a different trait and ABI shape to
+/// serve one function.
+///
+/// `Accessor` only permits Store access inside a synchronous `with` closure,
+/// so nothing Store-derived can survive an await. That is the same constraint
+/// B2e-3a already works under, and it is exactly compatible with resolving the
+/// borrowed handle into a stable `TextBufferId` before sleeping.
+impl instar::text::text::HostWithStore<GenerationState>
+    for wasmtime::component::HasSelf<GenerationState>
+{
+    fn next_edit(
+        _accessor: &wasmtime::component::Accessor<GenerationState, Self>,
+        _buffer: Resource<GuestTextBuffer>,
+    ) -> impl std::future::Future<
+        Output = wasmtime::Result<
+            Result<instar::text::text_types::EditNotification, instar::text::text_types::TextError>,
+        >,
+    > + Send {
+        // C2b-0 is a toolchain proof and nothing else. Delivery -- resolving
+        // the borrow, installing the waiter, suspending, and draining -- is
+        // C2b-1. Until then the capability genuinely is not available, and
+        // saying so is better than a stub that pretends to have answered.
+        async move { Ok(Err(instar::text::text_types::TextError::Unavailable)) }
+    }
+}
+
 /// Explicit guest drops.
 ///
 /// The table entry goes first, so the lease is extracted and every borrow is

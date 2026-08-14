@@ -16,6 +16,35 @@ package instar:text@0.1.0;
 // would gradually turn "the text model" into "the guest ABI adapter for text".
 
 interface text-types {
+    /// One replacement of a byte range, as the wire carries it.
+    ///
+    /// UTF-8 byte offsets, because that is what the storage edits in and what
+    /// the revision protocol carries -- see PHASE-3 "Coordinates". A consumer
+    /// wanting row/column derives it from its own text state.
+    record text-edit {
+        range-start: u64,
+        range-end: u64,
+        replacement: string,
+    }
+
+    /// An edit the host applied, and what it moved the replica between.
+    record applied-edit {
+        base-revision: u64,
+        resulting-revision: u64,
+        edit: text-edit,
+    }
+
+    /// What the host owes a guest about one buffer.
+    variant edit-notification {
+        /// Edits to apply, oldest first.
+        edits(list<applied-edit>),
+        /// History was discarded and the guest must re-read. Carries the
+        /// revision the replica has reached. Reporting this does **not** clear
+        /// it: only an authoritative read re-arms, so an edit landing between
+        /// hearing it and reading cannot be lost.
+        desynchronized(u64),
+    }
+
     /// Why a text resource could not be created.
     ///
     /// Deliberately not a generic error string: each variant is a bound the
@@ -55,7 +84,7 @@ interface text-types {
 /// subsystem. `bindgen!`'s `imports: { default: async | trappable }` is that
 /// distinction, and it needs nothing from the WIT.
 interface text {
-    use text-types.{text-error};
+    use text-types.{text-error, edit-notification};
 
     resource text-buffer;
     resource text-view;
@@ -74,4 +103,24 @@ interface text {
     /// Borrowed, because a view does not take ownership of the document: many
     /// views may name one buffer, and the buffer outlives any of them.
     create-view: func(buffer: borrow<text-buffer>) -> result<text-view, text-error>;
+
+    /// Suspends until the host has something to say about this buffer.
+    ///
+    /// **The one `async func` in this interface, and it has to be.** Marking a
+    /// plain import async in `bindgen!` makes only the *host implementation*
+    /// async -- to WebAssembly the call still blocks, so the guest task is
+    /// parked and can do nothing else. A guest must be able to await an edit
+    /// and a UI event at once, which is only expressible when the WIT itself
+    /// says `async`.
+    ///
+    /// The same line the kernel world already draws: `next-event`, `commit`
+    /// and `await-op` are async because they suspend on an external event,
+    /// while `start`, `cancel` and the `create-*` pair are plain because they
+    /// are bounded.
+    ///
+    /// At most one outstanding call per guest per buffer. A second is refused
+    /// rather than queued behind the first: there is nothing for it to read,
+    /// and two sleepers would race to serve the same edits.
+    next-edit: async func(buffer: borrow<text-buffer>)
+        -> result<edit-notification, text-error>;
 }
