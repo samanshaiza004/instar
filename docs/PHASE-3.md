@@ -1751,6 +1751,22 @@ One snapshot mechanism serves queue overflow and "I would rather not replay
 this backlog" alike. No acknowledgement protocol is needed, and the recovery
 path is exercised routinely rather than only after a fault.
 
+##### C4b close-out: `&self` makes the hazard uncompilable, not merely untested
+
+`TextHost::read_range` takes `&self`, not `&mut self` -- there is no `self.sync`
+mutation available to write inside it at all. Confirmed empirically, the same
+discipline as every other mutant in this document: a fault that added
+`self.sync.get_mut(...).poll(...)` to the method body without widening its
+signature was attempted and rejected by the compiler
+(`error[E0596]: cannot borrow self.sync as mutable`), not caught by a test that
+could later regress. The runtime test
+(`text_host::tests::read_range_never_touches_synchronization_state`) stays
+alongside it because it also proves the *read* is correct, not only that
+nothing else moved -- but the double-application hazard above cannot be
+introduced by editing this function's body, only by someone deliberately
+widening its signature, which is a change anyone reading the diff would see
+coming.
+
 #### Bootstrap establishes a baseline, not an edit
 
 > `create-buffer(contents)` establishes a baseline revision. It generates no

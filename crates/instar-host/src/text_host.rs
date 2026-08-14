@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{
-    ApplyEditsOutcome, BridgeAppliedEdit, BridgeTextEdit, NextEditOutcome, OpaqueResourceKey,
-    ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
+    ApplyEditsOutcome, BridgeAppliedEdit, BridgeRangeContents, BridgeTextEdit, NextEditOutcome,
+    OpaqueResourceKey, ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
 };
 use instar_text::{
     AppliedEdit, MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextEdit, TextError, TextSystem,
@@ -404,6 +404,44 @@ impl TextHost {
         Ok(ApplyEditsOutcome::Applied(resulting))
     }
 
+    /// Reads an exact byte range (C4b).
+    ///
+    /// **Strictly observational.** `&self`, not `&mut self`: there is
+    /// nothing here *to* mutate, which is the property itself, stated as a
+    /// type rather than as a rule this method has to remember to follow.
+    /// Verified, not merely asserted: writing `self.sync.get_mut(...)`
+    /// anywhere in this body without widening the signature to `&mut self`
+    /// is `error[E0596]: cannot borrow self.sync as mutable` -- a compile
+    /// error, not a test that could regress. It is not the recovery
+    /// mechanism -- see `read-range`'s WIT doc for the double-application
+    /// hazard that makes it one.
+    ///
+    /// The revision comes from the same `&TextBuffer` the bytes are sliced
+    /// from, in one synchronous call, so it always names the exact state
+    /// those bytes belong to.
+    pub fn read_range(
+        &self,
+        generation: GenerationId,
+        buffer: OpaqueResourceKey,
+        start: u64,
+        end: u64,
+    ) -> Result<BridgeRangeContents, TextRefusal> {
+        let id = self.resolve_buffer_lease(generation, buffer)?;
+        let buffer = self
+            .system
+            .buffer(id)
+            .expect("resolve_buffer_lease already confirmed this buffer is live");
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let revision = buffer.revision().0;
+        let contents = buffer
+            .text()
+            .slice(start..end)
+            .map_err(|_| TextRefusal::InvalidEdit)?
+            .materialize();
+        Ok(BridgeRangeContents { contents, revision })
+    }
+
     /// What one generation still owes on one buffer. Read-only: the state is
     /// advanced by [`TextHost::apply_edit`] and by nothing else.
     pub fn sync_state(&self, generation: GenerationId, buffer: TextBufferId) -> Option<&SyncState> {
@@ -575,6 +613,12 @@ impl TextHost {
                 let edits: Vec<TextEdit> = edits.into_iter().map(edit_from_bridge).collect();
                 match self.apply_guest_edits(generation, buffer, expected_revision, edits) {
                     Ok(outcome) => request.answer(TextAnswer::AppliedEdits(outcome)),
+                    Err(refusal) => request.refuse(refusal),
+                }
+            }
+            TextOperation::ReadRange { buffer, start, end } => {
+                match self.read_range(generation, buffer, start, end) {
+                    Ok(contents) => request.answer(TextAnswer::RangeRead(contents)),
                     Err(refusal) => request.refuse(refusal),
                 }
             }
@@ -942,6 +986,71 @@ mod tests {
                 .queued(),
             1,
             "another generation watching the same buffer must hear about it"
+        );
+    }
+
+    /// C4b: a straightforward read returns the exact bytes and the exact
+    /// revision they came from.
+    #[test]
+    fn read_range_returns_the_exact_bytes_and_revision() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        host.apply_edit(view, TextEdit::insert(0, "hello world"))
+            .expect("applies");
+
+        let read = host.read_range(G17, buffer, 0, 5).expect("valid range");
+        assert_eq!(read.contents, "hello");
+        assert_eq!(read.revision, 1);
+    }
+
+    /// A malformed range gets the same coarse refusal `apply-edits` uses for
+    /// the same underlying check, not `instar-text`'s own taxonomy.
+    #[test]
+    fn read_range_refuses_a_malformed_range() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+
+        assert_eq!(
+            host.read_range(G17, buffer, 9, 3).unwrap_err(),
+            TextRefusal::InvalidEdit
+        );
+    }
+
+    /// `read-range` is strictly observational: reading a buffer whose
+    /// relationship has pending edits queued must not drain, clear, or
+    /// otherwise touch that queue. Draining is `next-edit`'s job; treating a
+    /// read as recovery is exactly the double-application hazard
+    /// `read-range`'s own WIT doc names.
+    #[test]
+    fn read_range_never_touches_synchronization_state() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        host.apply_edit(view, TextEdit::insert(0, "hello"))
+            .expect("applies, and queues this edit for G17's own relationship \
+                     -- host-local edits have no source generation to exempt");
+        let queued_before = host.sync_state(G17, id).unwrap().queued();
+        let synchronized_before = host.sync_state(G17, id).unwrap().is_synchronized();
+        assert_eq!(queued_before, 1, "the fixture must start with something queued");
+
+        let read = host.read_range(G17, buffer, 0, 5).expect("valid range");
+        assert_eq!(read.contents, "hello");
+        assert_eq!(read.revision, 1);
+
+        assert_eq!(
+            host.sync_state(G17, id).unwrap().queued(),
+            queued_before,
+            "a read must not drain or clear the pending queue"
+        );
+        assert_eq!(
+            host.sync_state(G17, id).unwrap().is_synchronized(),
+            synchronized_before,
+            "a read must not change synchronized/desynchronized state"
         );
     }
 

@@ -162,6 +162,14 @@ pub enum TextOperation {
         expected_revision: u64,
         edits: Vec<BridgeTextEdit>,
     },
+    /// Reads an exact byte range. Strictly observational -- see
+    /// `instar-host`'s `TextHost::serve`, which is the authority on why this
+    /// touches no synchronization state.
+    ReadRange {
+        buffer: OpaqueResourceKey,
+        start: u64,
+        end: u64,
+    },
 }
 
 /// Why a text request was refused.
@@ -193,7 +201,9 @@ pub enum TextRefusal {
     EditBatchTooLarge,
     /// One coarse refusal standing in for every way `instar-text` can find a
     /// byte range unusable: inverted, out of bounds, or off a character
-    /// boundary.
+    /// boundary. Reported by `apply-edits` for an edit's range and by
+    /// `read-range` for the range it names -- the same underlying check,
+    /// the same refusal either way.
     ///
     /// Deliberately not three cases mirroring `instar_text::TextError`.
     /// Adding a WIT variant case is itself a breaking interface change, so
@@ -229,6 +239,18 @@ pub enum ApplyEditsOutcome {
     /// `next-edit` or call `resynchronize`. Nothing in the batch was
     /// applied.
     Conflict(u64),
+}
+
+/// The exact bytes of a `read-range` call, and the revision they came from.
+///
+/// `contents` is guaranteed complete, valid UTF-8 -- the same char-boundary
+/// check `apply-edits` enforces on an edit's range applies here to the
+/// range being read, so a successful read never has to represent a partial
+/// code point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeRangeContents {
+    pub contents: String,
+    pub revision: u64,
 }
 
 /// Why a commit's text-view attachments were refused.
@@ -293,6 +315,7 @@ pub enum TextAnswer {
     Released,
     NextEdit(NextEditOutcome),
     AppliedEdits(ApplyEditsOutcome),
+    RangeRead(BridgeRangeContents),
 }
 
 /// Answers exactly once, including on the paths that forget to.

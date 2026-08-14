@@ -723,6 +723,55 @@ impl instar::text::text::Host for GenerationState {
             Err(refusal) => Ok(Err(refusal.into())),
         }
     }
+
+    /// Reads an exact byte range (C4b). Plain `func`, bounded exactly like
+    /// `create-view` and `apply-edits` -- strictly observational, so there is
+    /// nothing here for this glue to get wrong that `TextHost::serve` does
+    /// not already own: this function's only job is translating the request
+    /// and the answer.
+    async fn read_range(
+        &mut self,
+        buffer: Resource<GuestTextBuffer>,
+        start: u64,
+        end: u64,
+    ) -> wasmtime::Result<
+        Result<instar::text::text_types::RangeContents, instar::text::text_types::TextError>,
+    > {
+        use crate::text_bridge::{TextAnswer, TextOperation};
+
+        let buffer_key = self.table.get(&buffer)?.key;
+
+        let answer = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::ReadRange {
+                    buffer: buffer_key,
+                    start,
+                    end,
+                },
+            )
+            .await;
+
+        match answer {
+            Ok(TextAnswer::RangeRead(contents)) => Ok(Ok(contents.into())),
+            // See `create_empty_buffer`: matched by exclusion so a future
+            // answer variant traps here by default.
+            Ok(other) => Err(wasmtime::Error::msg(format!(
+                "text sink answered read-range with {other:?}"
+            ))),
+            Err(refusal) => Ok(Err(refusal.into())),
+        }
+    }
+}
+
+impl From<crate::text_bridge::BridgeRangeContents> for instar::text::text_types::RangeContents {
+    fn from(contents: crate::text_bridge::BridgeRangeContents) -> Self {
+        Self {
+            contents: contents.contents,
+            revision: contents.revision,
+        }
+    }
 }
 
 impl From<crate::text_bridge::ApplyEditsOutcome> for instar::text::text_types::ApplyEditsResult {
