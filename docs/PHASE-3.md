@@ -1840,6 +1840,33 @@ compile-time assertion before this was frozen, so the split is available.
 Deferred chunking stays cheap for the same reason: a future chunked resync can
 pin a snapshot at R and serve ranges while the live rope moves on.
 
+##### C4c close-out: one synchronous call, not yet a two-thread split
+
+`TextHost::resynchronize` materializes UTF-8 synchronously, in the same call
+that captures the revision and re-arms the relationship -- it does not yet
+split the clone from the materialization across two threads. This is a
+deliberate simplification, not a rejection of the design above: `TextHost`
+today is served entirely on the same thread as UI commit processing (via
+`MainThreadSink`), so there is no second "runtime thread" yet for a
+materialize step to be deferred *to*. Splitting the two remains available
+without a protocol change whenever a genuinely separate text-owner thread
+exists to make it worth the latency win -- the revision-then-materialize
+ordering this method already uses is exactly what that split would keep.
+
+What C4c does guarantee now, independent of threading: the revision reported
+in `snapshot` and the revision the relationship is re-armed at are the same
+value, because they are read once and used twice within one `&mut self`
+call. The priority mutant for this package made a real, buildable fault out
+of that claim -- re-arming one revision ahead of what is reported --
+confirmed red in `text_host::tests::resynchronize_re_arms_at_exactly_the_revision_it_reports`,
+then reverted. The literal "unlock; edit; re-arm at the new current
+revision" race the mutant is named for is not otherwise constructible in the
+present single-threaded implementation: nothing can run between the read and
+the re-arm without a second `&mut TextHost` borrow, which the type system
+already refuses. The mutant proves the code that *would* have been wrong is
+recognizably wrong, ahead of whatever architecture eventually makes the race
+representable.
+
 #### Hostcall fuel is containment, not the API limit
 
 B2e-3's close-out recorded that `MAX_TEXT_ATTACHMENTS` bounds Instar's work

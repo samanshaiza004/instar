@@ -763,6 +763,39 @@ impl instar::text::text::Host for GenerationState {
             Err(refusal) => Ok(Err(refusal.into())),
         }
     }
+
+    /// Atomically snapshots the document and re-arms this generation's
+    /// relationship (C4c). Plain `func`, bounded exactly like the rest of
+    /// this trait. The atomicity claim belongs entirely to
+    /// `TextHost::resynchronize`; this glue only translates the request and
+    /// the answer, the same as every other method here.
+    async fn resynchronize(
+        &mut self,
+        buffer: Resource<GuestTextBuffer>,
+    ) -> wasmtime::Result<Result<instar::text::text_types::Snapshot, instar::text::text_types::TextError>>
+    {
+        use crate::text_bridge::{TextAnswer, TextOperation};
+
+        let buffer_key = self.table.get(&buffer)?.key;
+
+        let answer = self
+            .kernel
+            .submit_text(
+                self.generation,
+                TextOperation::Resynchronize { buffer: buffer_key },
+            )
+            .await;
+
+        match answer {
+            Ok(TextAnswer::Resynchronized(snapshot)) => Ok(Ok(snapshot.into())),
+            // See `create_empty_buffer`: matched by exclusion so a future
+            // answer variant traps here by default.
+            Ok(other) => Err(wasmtime::Error::msg(format!(
+                "text sink answered resynchronize with {other:?}"
+            ))),
+            Err(refusal) => Ok(Err(refusal.into())),
+        }
+    }
 }
 
 impl From<crate::text_bridge::BridgeRangeContents> for instar::text::text_types::RangeContents {
@@ -770,6 +803,15 @@ impl From<crate::text_bridge::BridgeRangeContents> for instar::text::text_types:
         Self {
             contents: contents.contents,
             revision: contents.revision,
+        }
+    }
+}
+
+impl From<crate::text_bridge::BridgeSnapshot> for instar::text::text_types::Snapshot {
+    fn from(snapshot: crate::text_bridge::BridgeSnapshot) -> Self {
+        Self {
+            contents: snapshot.contents,
+            revision: snapshot.revision,
         }
     }
 }

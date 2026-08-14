@@ -102,6 +102,21 @@ interface text-types {
         contents: string,
         revision: u64,
     }
+
+    /// The whole document, and the revision this generation is now re-armed
+    /// at.
+    ///
+    /// Structurally identical to `range-contents`, kept as its own type
+    /// anyway: a `range-contents` value carries no promise about
+    /// synchronization state, and a `snapshot` always does -- receiving one
+    /// means the relationship for this buffer was just re-armed at exactly
+    /// `revision`. Conflating the two would invite a reader to assume a
+    /// `read-range` result re-arms something, which is precisely the
+    /// assumption `read-range`'s own doc refuses.
+    record snapshot {
+        contents: string,
+        revision: u64,
+    }
 }
 
 /// Host-owned text resources, leased to a guest as capabilities.
@@ -130,7 +145,9 @@ interface text-types {
 /// and a UI event at the same time -- is worse than the overlapping-subtask
 /// machinery this package otherwise avoids. See its own doc comment for why.
 interface text {
-    use text-types.{text-error, edit-notification, text-edit, apply-edits-result, range-contents};
+    use text-types.{
+        text-error, edit-notification, text-edit, apply-edits-result, range-contents, snapshot,
+    };
 
     resource text-buffer;
     resource text-view;
@@ -237,4 +254,26 @@ interface text {
         start: u64,
         end: u64,
     ) -> result<range-contents, text-error>;
+
+    /// Atomically snapshots the whole document and re-arms this generation's
+    /// relationship at exactly that revision, discarding whatever it owed
+    /// before.
+    ///
+    /// The one call in this interface that both reads *and* changes
+    /// synchronization state, and the only legal way to change it other than
+    /// draining `next-edit` one batch at a time. Legal whether this
+    /// generation is currently synchronized or desynchronized -- a guest
+    /// that would rather not replay a backlog it has just read past may
+    /// discard it the same way a genuinely desynchronized one recovers,
+    /// which is also what keeps this path exercised by ordinary use instead
+    /// of only by faults.
+    ///
+    /// The snapshot and the re-arm are not two calls a guest makes in
+    /// sequence; they are one atomic transition on the thread that owns the
+    /// text subsystem. Nothing can observe or mutate this relationship
+    /// between the two, so the revision reported in `snapshot` and the
+    /// revision this generation is re-armed at are always the same value --
+    /// see `instar-host`'s `TextHost::resynchronize`, which is the authority
+    /// on why that is a property of the code, not merely of testing it.
+    resynchronize: func(buffer: borrow<text-buffer>) -> result<snapshot, text-error>;
 }

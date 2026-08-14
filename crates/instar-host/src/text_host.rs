@@ -36,8 +36,9 @@ use std::collections::{HashMap, HashSet};
 
 use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{
-    ApplyEditsOutcome, BridgeAppliedEdit, BridgeRangeContents, BridgeTextEdit, NextEditOutcome,
-    OpaqueResourceKey, ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
+    ApplyEditsOutcome, BridgeAppliedEdit, BridgeRangeContents, BridgeSnapshot, BridgeTextEdit,
+    NextEditOutcome, OpaqueResourceKey, ScreenedTextRequest, TextAnswer, TextOperation,
+    TextRefusal,
 };
 use instar_text::{
     AppliedEdit, MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextEdit, TextError, TextSystem,
@@ -442,6 +443,50 @@ impl TextHost {
         Ok(BridgeRangeContents { contents, revision })
     }
 
+    /// Atomically snapshots the whole document and re-arms this generation's
+    /// relationship at exactly that revision (C4c).
+    ///
+    /// One synchronous call, on the thread that owns `TextHost`. There is no
+    /// point between reading the buffer and re-arming the relationship at
+    /// which anything else can run `&mut self` here, because both need the
+    /// same exclusive borrow -- the same reasoning `BufferSync::admit`'s own
+    /// doc already gives for why its check-then-install cannot race. Nothing
+    /// in the body reads `revision` a second time: it is bound once and used
+    /// for both the returned snapshot and the re-arm, so the two can never
+    /// diverge. See `crate::text_sync::SyncState::resynchronize`'s own doc
+    /// for the hazard this closes: re-arming at a revision other than the
+    /// one just read would drop an edit without trace and leave the guest
+    /// believing itself synchronized at a revision it was never told about.
+    pub fn resynchronize(
+        &mut self,
+        generation: GenerationId,
+        buffer: OpaqueResourceKey,
+    ) -> Result<BridgeSnapshot, TextRefusal> {
+        let id = self.resolve_buffer_lease(generation, buffer)?;
+        let buf = self
+            .system
+            .buffer(id)
+            .expect("resolve_buffer_lease already confirmed this buffer is live");
+        let revision = buf.revision();
+        let contents = buf
+            .text()
+            .slice(0..buf.len_bytes())
+            .expect("0..len_bytes is always a valid range for its own buffer")
+            .materialize();
+
+        let relationship = self.sync.get_mut(&(generation, id)).expect(
+            "a buffer lease implies a sync relationship: CreateBuffer \
+             installs one and release_generation_leases removes both \
+             together",
+        );
+        relationship.resynchronize(revision);
+
+        Ok(BridgeSnapshot {
+            contents,
+            revision: revision.0,
+        })
+    }
+
     /// What one generation still owes on one buffer. Read-only: the state is
     /// advanced by [`TextHost::apply_edit`] and by nothing else.
     pub fn sync_state(&self, generation: GenerationId, buffer: TextBufferId) -> Option<&SyncState> {
@@ -622,6 +667,12 @@ impl TextHost {
                     Err(refusal) => request.refuse(refusal),
                 }
             }
+            TextOperation::Resynchronize { buffer } => {
+                match self.resynchronize(generation, buffer) {
+                    Ok(snapshot) => request.answer(TextAnswer::Resynchronized(snapshot)),
+                    Err(refusal) => request.refuse(refusal),
+                }
+            }
         }
     }
 
@@ -744,6 +795,7 @@ impl TextHost {
 mod tests {
     use super::*;
     use instar_kernel::text_bridge::{TextOperation, text_request};
+    use instar_text::Revision;
 
     const G17: GenerationId = GenerationId(17);
     const G18: GenerationId = GenerationId(18);
@@ -1052,6 +1104,90 @@ mod tests {
             synchronized_before,
             "a read must not change synchronized/desynchronized state"
         );
+    }
+
+    /// C4c, the priority mutant: the revision `resynchronize` reports and
+    /// the revision it re-arms the relationship at must be the exact same
+    /// value, always. `SyncState::latest_revision` is checked independently
+    /// of `BridgeSnapshot.revision` -- the two come from different places in
+    /// `TextHost`, so this is the one test that would notice if a future
+    /// edit to `TextHost::resynchronize` used two different expressions for
+    /// what must be one value bound once.
+    #[test]
+    fn resynchronize_re_arms_at_exactly_the_revision_it_reports() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        host.apply_edit(view, TextEdit::insert(0, "hello"))
+            .expect("applies");
+
+        let snapshot = host.resynchronize(G17, buffer).expect("live buffer");
+        assert_eq!(snapshot.contents, "hello");
+        assert_eq!(snapshot.revision, 1);
+
+        assert_eq!(
+            host.sync_state(G17, id).unwrap().latest_revision(),
+            Revision(snapshot.revision),
+            "the relationship must be re-armed at exactly the revision the \
+             snapshot reports -- any divergence is the double-application \
+             hazard resynchronize exists to prevent"
+        );
+        assert_eq!(host.sync_state(G17, id).unwrap().queued(), 0);
+    }
+
+    /// A pending backlog is discarded entirely on resync, not trimmed or
+    /// partially kept -- the whole document just arrived as a fresh
+    /// snapshot, so nothing queued before it is still owed.
+    #[test]
+    fn resynchronize_discards_a_pending_backlog() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        for text in ["a", "b", "c"] {
+            host.apply_edit(view, TextEdit::insert(0, text))
+                .expect("applies");
+        }
+        assert_eq!(host.sync_state(G17, id).unwrap().queued(), 3);
+
+        let snapshot = host.resynchronize(G17, buffer).expect("live buffer");
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(
+            host.sync_state(G17, id).unwrap().queued(),
+            0,
+            "the whole backlog is discarded, not trimmed"
+        );
+    }
+
+    /// Resynchronize is the recovery path out of `Desynchronized`, not only
+    /// a convenience while synchronized.
+    #[test]
+    fn resynchronize_recovers_from_desynchronized() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+        let id = buffer_id(buffer);
+
+        host.apply_edit(
+            view,
+            TextEdit::insert(0, "x".repeat(MAX_PENDING_EDIT_BYTES + 1)),
+        )
+        .expect("applies, and overflows the byte bound in one push");
+        assert!(
+            !host.sync_state(G17, id).unwrap().is_synchronized(),
+            "the fixture must start desynchronized"
+        );
+
+        let snapshot = host.resynchronize(G17, buffer).expect("live buffer");
+        assert_eq!(snapshot.revision, 1);
+        assert!(host.sync_state(G17, id).unwrap().is_synchronized());
+        assert_eq!(host.sync_state(G17, id).unwrap().queued(), 0);
     }
 
     /// One generation's edits are not owed to another's relationship.

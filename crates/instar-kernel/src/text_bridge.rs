@@ -170,6 +170,13 @@ pub enum TextOperation {
         start: u64,
         end: u64,
     },
+    /// Atomically snapshots the whole document and re-arms this generation's
+    /// relationship at that revision. See `instar-host`'s
+    /// `TextHost::resynchronize`, which is the authority on why the snapshot
+    /// and the re-arm are one transition rather than two.
+    Resynchronize {
+        buffer: OpaqueResourceKey,
+    },
 }
 
 /// Why a text request was refused.
@@ -253,6 +260,18 @@ pub struct BridgeRangeContents {
     pub revision: u64,
 }
 
+/// The whole document, and the revision a `resynchronize` call re-armed at.
+///
+/// Structurally identical to [`BridgeRangeContents`], kept separate for the
+/// same reason its WIT counterpart is: a `BridgeRangeContents` value carries
+/// no promise about synchronization state, and a `BridgeSnapshot` always
+/// does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSnapshot {
+    pub contents: String,
+    pub revision: u64,
+}
+
 /// Why a commit's text-view attachments were refused.
 ///
 /// A different family from [`TextRefusal`]: that is about text-resource
@@ -316,6 +335,7 @@ pub enum TextAnswer {
     NextEdit(NextEditOutcome),
     AppliedEdits(ApplyEditsOutcome),
     RangeRead(BridgeRangeContents),
+    Resynchronized(BridgeSnapshot),
 }
 
 /// Answers exactly once, including on the paths that forget to.
