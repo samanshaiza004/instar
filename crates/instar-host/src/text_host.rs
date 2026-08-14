@@ -36,14 +36,18 @@ use std::collections::{HashMap, HashSet};
 
 use instar_kernel::runtime::GenerationId;
 use instar_kernel::text_bridge::{
-    OpaqueResourceKey, ScreenedTextRequest, TextAnswer, TextOperation, TextRefusal,
+    BridgeAppliedEdit, NextEditOutcome, OpaqueResourceKey, ScreenedTextRequest, TextAnswer,
+    TextOperation, TextRefusal,
 };
 use instar_text::{
     AppliedEdit, MAX_TEXT_BUFFERS, MAX_TEXT_VIEWS, TextBufferId, TextEdit, TextError, TextSystem,
     TextViewId,
 };
 
-use crate::text_sync::SyncState;
+use crate::text_sync::{
+    BufferSync, EditNotification, MAX_PENDING_EDITS, NextEditAdmission, SyncState, WaitRefusal,
+    WaiterId,
+};
 
 /// What one guest generation currently holds.
 #[derive(Debug, Default)]
@@ -94,7 +98,15 @@ pub struct TextHost {
     /// born with the buffer and die with the generation, which is why they sit
     /// here beside the leases rather than inside `TextSystem` -- the text
     /// model has no idea a guest exists.
-    sync: HashMap<(GenerationId, TextBufferId), SyncState>,
+    sync: HashMap<(GenerationId, TextBufferId), BufferSync>,
+    /// The source of every [`crate::text_sync::WaiterId`] this host mints.
+    ///
+    /// One counter for every buffer rather than one per relationship: a
+    /// `WaiterId` only ever has to be unique *within* the single `BufferSync`
+    /// that compares it, so a global monotonic source is more than sufficient
+    /// and is simpler than keying a counter per buffer for no correctness
+    /// gain.
+    next_waiter_id: u64,
 }
 
 /// A `TextBufferId` and an [`OpaqueResourceKey`] are the same two numbers.
@@ -130,9 +142,42 @@ fn view_id(key: OpaqueResourceKey) -> TextViewId {
     }
 }
 
+/// Translates a resolved [`EditNotification`] into the kernel's fixed-width
+/// vocabulary. `instar-host` is the only layer allowed to perform this
+/// translation, for the same reason it is the only layer that translates an
+/// [`OpaqueResourceKey`] into a [`TextBufferId`]: `instar-kernel` must not
+/// depend on `instar-text`.
+fn bridge_notification(notification: EditNotification) -> NextEditOutcome {
+    match notification {
+        EditNotification::Edits(edits) => {
+            NextEditOutcome::Edits(edits.iter().map(bridge_edit).collect())
+        }
+        EditNotification::Desynchronized(revision) => NextEditOutcome::Desynchronized(revision.0),
+    }
+}
+
+/// One applied edit, translated into fixed-width scalars. Widening only:
+/// `usize -> u64` cannot fail on any platform Instar targets, so there is no
+/// narrowing conversion in this direction to guard.
+fn bridge_edit(applied: &AppliedEdit) -> BridgeAppliedEdit {
+    BridgeAppliedEdit {
+        base_revision: applied.base_revision.0,
+        resulting_revision: applied.resulting_revision.0,
+        start: applied.edit.range.start as u64,
+        end: applied.edit.range.end as u64,
+        replacement: applied.edit.replacement.clone(),
+    }
+}
+
 impl TextHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mints a fresh, never-reused [`WaiterId`].
+    fn next_waiter_id(&mut self) -> WaiterId {
+        self.next_waiter_id += 1;
+        WaiterId(self.next_waiter_id)
     }
 
     pub fn system(&self) -> &TextSystem {
@@ -255,7 +300,7 @@ impl TextHost {
     /// What one generation still owes on one buffer. Read-only: the state is
     /// advanced by [`TextHost::apply_edit`] and by nothing else.
     pub fn sync_state(&self, generation: GenerationId, buffer: TextBufferId) -> Option<&SyncState> {
-        self.sync.get(&(generation, buffer))
+        self.sync.get(&(generation, buffer)).map(BufferSync::state)
     }
 
     /// How many (generation, buffer) synchronization relationships exist.
@@ -328,7 +373,7 @@ impl TextHost {
                     // revision, never an edit.
                     let baseline = self.system.revision(id).unwrap_or_default();
                     self.sync
-                        .insert((generation, id), SyncState::synchronized(baseline));
+                        .insert((generation, id), BufferSync::synchronized(baseline));
                     request.answer(TextAnswer::Created(buffer_key(id)));
                 }
                 Err(_) => request.refuse(TextRefusal::TooManyBuffers(MAX_TEXT_BUFFERS as u32)),
@@ -361,6 +406,34 @@ impl TextHost {
                 };
                 self.release_view(generation, id);
                 request.answer(TextAnswer::Released);
+            }
+            TextOperation::NextEdit { buffer } => {
+                let id = match self.resolve_buffer_lease(generation, buffer) {
+                    Ok(id) => id,
+                    Err(refusal) => return request.refuse(refusal),
+                };
+                // Minted before the lookup below, so it never overlaps the
+                // mutable borrow `admit` needs. Spent whether or not this
+                // call ends up installing a waiter -- ids need only be
+                // unique, never dense, the same policy `OperationRegistry`
+                // already uses for host operation ids.
+                let waiter_id = self.next_waiter_id();
+                let relationship = self.sync.get_mut(&(generation, id)).expect(
+                    "a buffer lease implies a sync relationship: CreateBuffer \
+                     installs one and release_generation_leases removes both \
+                     together",
+                );
+                match relationship.admit(MAX_PENDING_EDITS, waiter_id) {
+                    Ok(NextEditAdmission::Ready(notification)) => {
+                        request.answer(TextAnswer::NextEdit(bridge_notification(notification)));
+                    }
+                    Ok(NextEditAdmission::Wait(rx)) => {
+                        request.answer(TextAnswer::NextEdit(NextEditOutcome::Wait(rx)));
+                    }
+                    Err(WaitRefusal::AlreadyWaiting) => {
+                        request.refuse(TextRefusal::AlreadyWaiting);
+                    }
+                }
             }
         }
     }
@@ -610,6 +683,127 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------- C2b-1b: NextEdit wiring
+
+    /// A synchronized, empty buffer has nothing to report, so `NextEdit`
+    /// resolves to `Wait` rather than an empty batch.
+    #[test]
+    fn next_edit_on_an_idle_buffer_waits() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+
+        match serve(&mut host, G17, TextOperation::NextEdit { buffer }) {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Wait(_))) => {}
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    /// The field-preservation claim: every scalar an `AppliedEdit` carries
+    /// survives translation into the kernel's fixed-width vocabulary
+    /// unchanged. `bridge_edit` is a straight widening copy, and this is the
+    /// test that would fail if a field were ever dropped, swapped, or
+    /// narrowed.
+    ///
+    /// Both queued edits are checked in full, and deliberately for different
+    /// reasons: an insertion has an empty range (`start == end`) and a
+    /// non-empty replacement, a deletion the reverse. Checking only one of
+    /// the two leaves a mutant with nothing to trip -- a swapped start/end is
+    /// unobservable against an insertion's `0..0`, and a replacement forced
+    /// to always be empty is unobservable against a deletion's. Only the pair
+    /// together exercises every field in both directions.
+    #[test]
+    fn next_edit_reports_a_queued_edit_with_every_field_intact() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+
+        host.apply_edit(view, TextEdit::insert(0, "hello world"))
+            .expect("applies");
+        host.apply_edit(view, TextEdit::delete(6..11))
+            .expect("applies");
+
+        match serve(&mut host, G17, TextOperation::NextEdit { buffer }) {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Edits(edits))) => {
+                assert_eq!(edits.len(), 2, "both queued edits are reported");
+
+                let insert = &edits[0];
+                assert_eq!(insert.base_revision, 0);
+                assert_eq!(insert.resulting_revision, 1);
+                assert_eq!(insert.start, 0);
+                assert_eq!(insert.end, 0, "an insertion's range is empty");
+                assert_eq!(insert.replacement, "hello world");
+
+                let delete = &edits[1];
+                assert_eq!(delete.base_revision, 1);
+                assert_eq!(delete.resulting_revision, 2);
+                assert_eq!(delete.start, 6);
+                assert_eq!(delete.end, 11);
+                assert_eq!(delete.replacement, "", "a deletion's replacement is empty");
+            }
+            other => panic!("expected the queued edits, got {other:?}"),
+        }
+    }
+
+    /// The desync marker reaches `serve`'s caller as `Desynchronized`, not as
+    /// an empty `Edits` batch -- the two mean different things to a guest.
+    #[test]
+    fn next_edit_reports_desynchronization() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+        let view = create_view(&mut host, G17, buffer);
+        let view = host.resolve_view_lease(G17, view).expect("leased");
+
+        for i in 0..=crate::text_sync::MAX_PENDING_EDITS {
+            host.apply_edit(view, TextEdit::insert(i, "x"))
+                .expect("applies");
+        }
+
+        match serve(&mut host, G17, TextOperation::NextEdit { buffer }) {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Desynchronized(_))) => {}
+            other => panic!("expected the desync marker, got {other:?}"),
+        }
+    }
+
+    /// Ownership before identity, the same rule every other operation
+    /// enforces: a generation that never leased the buffer is refused before
+    /// any sync state is touched.
+    #[test]
+    fn next_edit_on_a_buffer_this_generation_does_not_lease_is_refused() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+
+        assert!(matches!(
+            serve(&mut host, G18, TextOperation::NextEdit { buffer }),
+            Err(TextRefusal::NoSuchResource)
+        ));
+    }
+
+    /// At most one outstanding `NextEdit` per (generation, buffer): the
+    /// second is a deterministic refusal, not a second sleeper racing the
+    /// first.
+    ///
+    /// The first receiver has to stay alive for this to test anything: a
+    /// dropped one is an *abandoned* waiter, which `admit` evicts and
+    /// replaces rather than refuses (see C2a's
+    /// `an_abandoned_waiter_is_replaced_rather_than_counted`). Only a
+    /// genuinely live sleeper produces `AlreadyWaiting`.
+    #[test]
+    fn a_second_next_edit_while_one_waits_is_refused() {
+        let mut host = TextHost::new();
+        let buffer = create_buffer(&mut host, G17);
+
+        let _first_receiver = match serve(&mut host, G17, TextOperation::NextEdit { buffer }) {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Wait(rx))) => rx,
+            other => panic!("expected the first call to wait, got {other:?}"),
+        };
+
+        assert!(matches!(
+            serve(&mut host, G17, TextOperation::NextEdit { buffer }),
+            Err(TextRefusal::AlreadyWaiting)
+        ));
+    }
+
     #[test]
     fn creating_a_buffer_and_a_view_registers_both_leases() {
         let mut host = TextHost::new();
@@ -646,10 +840,10 @@ mod tests {
         let buffer = create_buffer(&mut host, G17);
         let view = create_view(&mut host, G17, buffer);
 
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
             Ok(TextAnswer::Released)
-        );
+        ));
 
         let counts = host.counts();
         assert_eq!(counts.guest_buffer_leases, 0, "the lease is gone");
@@ -660,10 +854,10 @@ mod tests {
         );
 
         // Now the view goes too, and nothing is left to keep the buffer.
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
             Ok(TextAnswer::Released)
-        );
+        ));
         assert_eq!(host.counts(), TextResourceCounts::default());
     }
 
@@ -674,10 +868,10 @@ mod tests {
         let mut host = TextHost::new();
         let buffer = create_buffer(&mut host, G17);
         let first = create_view(&mut host, G17, buffer);
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: first }),
             Ok(TextAnswer::Released)
-        );
+        ));
 
         let second = create_view(&mut host, G17, buffer);
         assert_eq!(second.slot, first.slot, "the slot was reused");
@@ -710,8 +904,8 @@ mod tests {
              answers which resource, never whose"
         );
         assert_eq!(
-            serve(&mut host, G18, TextOperation::ReleaseView { key: view }),
-            Err(TextRefusal::NoSuchResource)
+            serve(&mut host, G18, TextOperation::ReleaseView { key: view }).unwrap_err(),
+            TextRefusal::NoSuchResource
         );
     }
 
@@ -780,8 +974,8 @@ mod tests {
         let stale = request.screen(GenerationId(0)).expect_err("retired");
         assert_eq!(stale, G17);
         assert_eq!(
-            wait.blocking_recv().expect("answered"),
-            Err(TextRefusal::StaleGeneration)
+            wait.blocking_recv().expect("answered").unwrap_err(),
+            TextRefusal::StaleGeneration
         );
         assert_eq!(
             host.counts(),
@@ -826,8 +1020,8 @@ mod tests {
         let buffer = create_buffer(&mut host, G17);
 
         assert_eq!(
-            serve(&mut host, G18, TextOperation::CreateView { buffer }),
-            Err(TextRefusal::NoSuchResource)
+            serve(&mut host, G18, TextOperation::CreateView { buffer }).unwrap_err(),
+            TextRefusal::NoSuchResource
         );
         assert_eq!(host.counts().live_views, 0, "and nothing was allocated");
     }
@@ -844,10 +1038,10 @@ mod tests {
         assert!(host.retain_view_attachment(view_id));
         assert_eq!(host.counts().retained_view_attachments, 1);
 
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
             Ok(TextAnswer::Released)
-        );
+        ));
 
         let counts = host.counts();
         assert_eq!(counts.guest_view_leases, 0, "the lease is gone");
@@ -856,10 +1050,10 @@ mod tests {
         assert_eq!(counts.live_buffers, 1, "and it keeps the buffer too");
 
         assert!(host.release_view_attachment(view_id));
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
             Ok(TextAnswer::Released)
-        );
+        ));
         assert_eq!(
             host.counts(),
             TextResourceCounts::default(),
@@ -887,14 +1081,14 @@ mod tests {
         assert_eq!(counts.guest_view_leases, 1, "the lease is not");
         assert_eq!(counts.live_views, 1);
 
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
             Ok(TextAnswer::Released)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
             Ok(TextAnswer::Released)
-        );
+        ));
         assert_eq!(host.counts(), TextResourceCounts::default());
     }
 
@@ -934,10 +1128,10 @@ mod tests {
 
         // Drop first's guest lease while it is still attached. The attachment
         // is the second owner, so the view survives until it is replaced.
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: first }),
             Ok(TextAnswer::Released)
-        );
+        ));
         assert_eq!(host.counts().live_views, 2);
 
         assert!(host.replace_view_attachment(Some(first_id), Some(second_id)));
@@ -1003,14 +1197,14 @@ mod tests {
         assert_eq!(host.counts().live_views, 1);
 
         assert!(host.release_view_attachment(view_id));
-        assert_eq!(
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseView { key: view }),
             Ok(TextAnswer::Released)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             serve(&mut host, G17, TextOperation::ReleaseBuffer { key: buffer }),
             Ok(TextAnswer::Released)
-        );
+        ));
         assert_eq!(
             host.counts(),
             TextResourceCounts::default(),

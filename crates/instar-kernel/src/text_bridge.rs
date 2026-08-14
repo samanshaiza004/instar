@@ -105,9 +105,23 @@ pub struct GuestTextView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextOperation {
     CreateBuffer,
-    CreateView { buffer: OpaqueResourceKey },
-    ReleaseBuffer { key: OpaqueResourceKey },
-    ReleaseView { key: OpaqueResourceKey },
+    CreateView {
+        buffer: OpaqueResourceKey,
+    },
+    ReleaseBuffer {
+        key: OpaqueResourceKey,
+    },
+    ReleaseView {
+        key: OpaqueResourceKey,
+    },
+    /// Asks whoever owns the text subsystem what it owes this buffer.
+    ///
+    /// Still `Copy + Eq`: the operation itself carries only the key, never the
+    /// answer. What can suspend is the *reply* — see [`NextEditOutcome`] and
+    /// [`TextAnswer`], which is why the loss of those derives stops here.
+    NextEdit {
+        buffer: OpaqueResourceKey,
+    },
 }
 
 /// Why a text request was refused.
@@ -127,6 +141,13 @@ pub enum TextRefusal {
     TooManyViews(u32),
     /// The key named nothing this generation can reach.
     NoSuchResource,
+    /// A live `next-edit` is already asleep on this buffer.
+    ///
+    /// Refused rather than queued behind the sleeper: there is nothing left
+    /// for a second caller to read, and two sleepers would race to serve the
+    /// same edits. See `instar-host`'s `BufferSync::admit`, which is the
+    /// authority this refusal reports.
+    AlreadyWaiting,
 }
 
 /// Why a commit's text-view attachments were refused.
@@ -149,11 +170,47 @@ pub enum AttachmentRefusal {
     TextViewAlreadyAttached,
 }
 
+/// One applied edit, as fixed-width scalars.
+///
+/// Deliberately not `instar_text::AppliedEdit`: that type carries `Revision`,
+/// and its `TextEdit` carries a `Range<usize>` and a `String` — `instar-text`
+/// vocabulary, and importing it would punch exactly the dependency edge
+/// [`OpaqueResourceKey`] exists to avoid. `instar-host` is the only layer that
+/// converts between the two, with a checked cast where one is possible: `u64`
+/// only ever *widens* a `usize` on the way out of the host, so the conversion
+/// in this direction cannot fail — nothing here is a claim that the reverse
+/// direction would be as free.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeAppliedEdit {
+    pub base_revision: u64,
+    pub resulting_revision: u64,
+    pub start: u64,
+    pub end: u64,
+    pub replacement: String,
+}
+
+/// What a `next-edit` call resolves to, or the promise of a wake.
+///
+/// The `Wait` case is why [`TextAnswer`] cannot be `Copy` or `Eq`: a
+/// `oneshot::Receiver<()>` carries no such thing, and pretending otherwise by
+/// routing edits through it instead would make cancellation part of
+/// synchronization correctness — see `instar-host`'s `text_sync` module,
+/// which is the authority on why the channel is signal-only.
+#[derive(Debug)]
+pub enum NextEditOutcome {
+    Edits(Vec<BridgeAppliedEdit>),
+    Desynchronized(u64),
+    /// Nothing to report yet. The runtime resubmits `NextEdit` once this
+    /// resolves; it never treats the wake itself as the answer.
+    Wait(oneshot::Receiver<()>),
+}
+
 /// What the text subsystem did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TextAnswer {
     Created(OpaqueResourceKey),
     Released,
+    NextEdit(NextEditOutcome),
 }
 
 /// Answers exactly once, including on the paths that forget to.
@@ -287,9 +344,12 @@ mod tests {
         let stale = request.screen(GEN2).expect_err("generation 1 is gone");
 
         assert_eq!(stale, GEN1);
+        // `TextAnswer` carries a `oneshot::Receiver` in its `NextEdit` case
+        // and so cannot be `PartialEq`; comparing only the refusal (itself
+        // still `Eq`) needs no equality on the answer at all.
         assert_eq!(
-            wait.await.expect("answered"),
-            Err(TextRefusal::StaleGeneration)
+            wait.await.expect("answered").unwrap_err(),
+            TextRefusal::StaleGeneration
         );
     }
 
@@ -299,8 +359,8 @@ mod tests {
         let (request, wait) = text_request(GEN1, TextOperation::CreateBuffer);
         drop(request);
         assert_eq!(
-            wait.await.expect("answered"),
-            Err(TextRefusal::HostUnavailable),
+            wait.await.expect("answered").unwrap_err(),
+            TextRefusal::HostUnavailable,
             "a capability boundary that can hang is worse than one that refuses"
         );
     }
@@ -323,12 +383,59 @@ mod tests {
             incarnation: 0,
         }));
 
+        match wait.await.expect("answered") {
+            Ok(TextAnswer::Created(key)) => assert_eq!(
+                key,
+                OpaqueResourceKey {
+                    slot: 9,
+                    incarnation: 0
+                }
+            ),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    /// `NextEdit` round-trips through the same generic plumbing every other
+    /// operation does — this module has no opinion about what a buffer owes,
+    /// only about the generation screen and the answer-once guarantee, and
+    /// both apply identically here.
+    #[tokio::test]
+    async fn a_next_edit_operation_carries_its_buffer_and_answers_once() {
+        let buffer = OpaqueResourceKey {
+            slot: 4,
+            incarnation: 0,
+        };
+        let (request, wait) = text_request(GEN1, TextOperation::NextEdit { buffer });
+
+        let screened = request.screen(GEN1).expect("current generation");
+        assert_eq!(screened.operation(), TextOperation::NextEdit { buffer });
+
+        screened.answer(TextAnswer::NextEdit(NextEditOutcome::Desynchronized(7)));
+
+        match wait.await.expect("answered") {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Desynchronized(revision))) => {
+                assert_eq!(revision, 7)
+            }
+            other => panic!("expected the desync marker, got {other:?}"),
+        }
+    }
+
+    /// A refused `NextEdit` is refused before the buffer key is even worth
+    /// naming in the reply — the same generation-screen discipline every
+    /// other operation gets, proven for the newest one.
+    #[tokio::test]
+    async fn a_stale_next_edit_is_refused_before_screening() {
+        let buffer = OpaqueResourceKey {
+            slot: 4,
+            incarnation: 0,
+        };
+        let (request, wait) = text_request(GEN1, TextOperation::NextEdit { buffer });
+
+        request.screen(GEN2).expect_err("generation 1 is gone");
+
         assert_eq!(
-            wait.await.expect("answered"),
-            Ok(TextAnswer::Created(OpaqueResourceKey {
-                slot: 9,
-                incarnation: 0
-            }))
+            wait.await.expect("answered").unwrap_err(),
+            TextRefusal::StaleGeneration
         );
     }
 }

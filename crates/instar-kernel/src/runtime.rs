@@ -518,6 +518,7 @@ impl From<crate::text_bridge::TextRefusal> for instar::text::text_types::TextErr
             // A guest whose generation died while a request was in flight is
             // told the host could not serve it, not that its handle was bad.
             TextRefusal::StaleGeneration | TextRefusal::HostUnavailable => Self::Unavailable,
+            TextRefusal::AlreadyWaiting => Self::AlreadyWaiting,
         }
     }
 }
@@ -554,13 +555,16 @@ impl instar::text::text::Host for GenerationState {
             .await;
         let key = match answer {
             Ok(TextAnswer::Created(key)) => key,
-            Ok(TextAnswer::Released) => {
-                // The sink answered a creation with a release. That is not a
-                // refusal a guest can act on; it is the host contradicting
-                // itself, which is what traps are for.
-                return Err(wasmtime::Error::msg(
-                    "text sink answered create-empty-buffer with a release",
-                ));
+            // The sink answered a creation with anything else. That is not a
+            // refusal a guest can act on; it is the host contradicting
+            // itself, which is what traps are for. Matched by exclusion
+            // rather than by naming `Released`/`NextEdit` so a future answer
+            // variant traps here by default instead of silently compiling
+            // into a wrong `key`.
+            Ok(other) => {
+                return Err(wasmtime::Error::msg(format!(
+                    "text sink answered create-empty-buffer with {other:?}"
+                )));
             }
             Err(refusal) => return Ok(Err(refusal.into())),
         };
@@ -600,10 +604,12 @@ impl instar::text::text::Host for GenerationState {
             .await;
         let key = match answer {
             Ok(TextAnswer::Created(key)) => key,
-            Ok(TextAnswer::Released) => {
-                return Err(wasmtime::Error::msg(
-                    "text sink answered create-view with a release",
-                ));
+            // See `create_empty_buffer`: matched by exclusion so a future
+            // answer variant traps here by default.
+            Ok(other) => {
+                return Err(wasmtime::Error::msg(format!(
+                    "text sink answered create-view with {other:?}"
+                )));
             }
             Err(refusal) => return Ok(Err(refusal.into())),
         };
@@ -617,6 +623,20 @@ impl instar::text::text::Host for GenerationState {
                     .await;
                 Err(error.into())
             }
+        }
+    }
+}
+
+impl From<crate::text_bridge::BridgeAppliedEdit> for instar::text::text_types::AppliedEdit {
+    fn from(edit: crate::text_bridge::BridgeAppliedEdit) -> Self {
+        Self {
+            base_revision: edit.base_revision,
+            resulting_revision: edit.resulting_revision,
+            edit: instar::text::text_types::TextEdit {
+                range_start: edit.start,
+                range_end: edit.end,
+                replacement: edit.replacement,
+            },
         }
     }
 }
@@ -636,23 +656,96 @@ impl instar::text::text::Host for GenerationState {
 /// `Accessor` only permits Store access inside a synchronous `with` closure,
 /// so nothing Store-derived can survive an await. That is the same constraint
 /// B2e-3a already works under, and it is exactly compatible with resolving the
-/// borrowed handle into a stable `TextBufferId` before sleeping.
+/// borrowed handle into a stable [`OpaqueResourceKey`] before sleeping.
 impl instar::text::text::HostWithStore<GenerationState>
     for wasmtime::component::HasSelf<GenerationState>
 {
     fn next_edit(
-        _accessor: &wasmtime::component::Accessor<GenerationState, Self>,
-        _buffer: Resource<GuestTextBuffer>,
+        accessor: &wasmtime::component::Accessor<GenerationState, Self>,
+        buffer: Resource<GuestTextBuffer>,
     ) -> impl std::future::Future<
         Output = wasmtime::Result<
             Result<instar::text::text_types::EditNotification, instar::text::text_types::TextError>,
         >,
     > + Send {
-        // C2b-0 is a toolchain proof and nothing else. Delivery -- resolving
-        // the borrow, installing the waiter, suspending, and draining -- is
-        // C2b-1. Until then the capability genuinely is not available, and
-        // saying so is better than a stub that pretends to have answered.
-        async move { Ok(Err(instar::text::text_types::TextError::Unavailable)) }
+        Box::pin(next_edit_impl(accessor, buffer))
+    }
+}
+
+/// The body of `next-edit`, as a plain async function for the same reason
+/// `commit_impl` is one: a loop that both suspends and returns early reads
+/// far worse juggled through a boxed future inline.
+///
+/// # The retry loop is the delivery contract, not a workaround
+///
+/// [`NextEditOutcome::Wait`] carries a signal and never a batch (C2b-1a): a
+/// woken caller has been told *that* something changed, not *what*. So a
+/// wake is followed by resubmitting [`TextOperation::NextEdit`] and reading
+/// the authoritative state fresh — the queue in `instar-host`'s `BufferSync`
+/// stays the single source of truth, and a caller that treated the wake
+/// itself as the answer would have invented a second, unsynchronized copy of
+/// it.
+async fn next_edit_impl(
+    accessor: &wasmtime::component::Accessor<
+        GenerationState,
+        wasmtime::component::HasSelf<GenerationState>,
+    >,
+    buffer: Resource<GuestTextBuffer>,
+) -> wasmtime::Result<
+    Result<instar::text::text_types::EditNotification, instar::text::text_types::TextError>,
+> {
+    use crate::text_bridge::{NextEditOutcome, TextAnswer, TextOperation};
+
+    // Resolved once, before the loop: the borrow names one buffer for the
+    // life of this call, and nothing table-derived may cross an await. Every
+    // resubmission below reuses this key rather than re-touching the table.
+    let extracted: wasmtime::Result<(Arc<SharedKernel>, GenerationId, OpaqueResourceKey)> =
+        accessor.with(|mut access| {
+            let state = access.get();
+            let key = state.table.get(&buffer)?.key;
+            Ok((Arc::clone(&state.kernel), state.generation, key))
+        });
+    let (kernel, generation, buffer_key) = extracted?;
+
+    loop {
+        let answer = kernel
+            .submit_text(generation, TextOperation::NextEdit { buffer: buffer_key })
+            .await;
+        match answer {
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Edits(edits))) => {
+                return Ok(Ok(instar::text::text_types::EditNotification::Edits(
+                    edits.into_iter().map(Into::into).collect(),
+                )));
+            }
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Desynchronized(revision))) => {
+                return Ok(Ok(
+                    instar::text::text_types::EditNotification::Desynchronized(revision),
+                ));
+            }
+            Ok(TextAnswer::NextEdit(NextEditOutcome::Wait(rx))) => {
+                if rx.await.is_err() {
+                    // The relationship was torn down while this call slept,
+                    // without the generation itself dying -- the ordinary
+                    // teardown path destroys this Store before a suspended
+                    // guest could observe anything at all, this included.
+                    // Reachable only if something else drops the buffer's
+                    // sync state out from under a live generation.
+                    return Ok(Err(instar::text::text_types::TextError::Unavailable));
+                }
+                continue;
+            }
+            // The sink answered next-edit with a creation or release
+            // verdict. Not a refusal a guest can act on; the host
+            // contradicting itself is what traps are for. Matched by
+            // exclusion, as the sibling methods above do, so a future
+            // `TextAnswer` variant traps here by default.
+            Ok(other) => {
+                return Err(wasmtime::Error::msg(format!(
+                    "text sink answered next-edit with {other:?}"
+                )));
+            }
+            Err(refusal) => return Ok(Err(refusal.into())),
+        }
     }
 }
 
@@ -1606,5 +1699,172 @@ mod tests {
             1,
             "the headless path records exactly the one commit"
         );
+    }
+
+    // -------------------------------------------- C2b-1b: next-edit delivery
+
+    /// A sink that accepts text requests and lets the test answer them by
+    /// hand, the text-bridge analogue of `HeldSink`.
+    #[derive(Default)]
+    struct HeldTextSink {
+        held: Mutex<Vec<crate::text_bridge::TextRequest>>,
+    }
+
+    impl crate::text_bridge::TextSink for HeldTextSink {
+        fn submit(
+            &self,
+            request: crate::text_bridge::TextRequest,
+        ) -> Result<(), crate::text_bridge::TextRequest> {
+            self.held
+                .lock()
+                .expect("held text sink poisoned")
+                .push(request);
+            Ok(())
+        }
+    }
+
+    impl HeldTextSink {
+        async fn wait_for_one(&self) -> crate::text_bridge::TextRequest {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let mut held = self.held.lock().expect("held text sink poisoned");
+                        if !held.is_empty() {
+                            return held.remove(0);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the sink never received the request")
+        }
+    }
+
+    fn kernel_with_text_sink() -> (Arc<SharedKernel>, Arc<HeldTextSink>) {
+        let kernel = Arc::new(SharedKernel::default());
+        let sink = Arc::new(HeldTextSink::default());
+        kernel
+            .install_text_sink(sink.clone())
+            .expect("installs once");
+        (kernel, sink)
+    }
+
+    /// Drives the real `HostWithStore::next_edit` implementation, the same
+    /// path a guest's call enters, from an inert store holding one buffer
+    /// handle.
+    async fn call_host_next_edit(
+        mut state: GenerationState,
+        key: OpaqueResourceKey,
+    ) -> wasmtime::Result<
+        Result<instar::text::text_types::EditNotification, instar::text::text_types::TextError>,
+    > {
+        let handle = state
+            .table
+            .push(GuestTextBuffer { key })
+            .expect("the empty table accepts one handle");
+        let engine = crate::engine::configured_engine().expect("engine");
+        let mut store = Store::new(&engine, state);
+        let outcome = store
+            .run_concurrent(async move |accessor| {
+                <wasmtime::component::HasSelf<GenerationState>
+                        as instar::text::text::HostWithStore<GenerationState>>::next_edit(
+                        accessor,
+                        handle,
+                    )
+                    .await
+            })
+            .await?;
+        outcome
+    }
+
+    /// No sink installed is the same refusal `create-empty-buffer` gets: a
+    /// capability boundary that can hang is worse than one that says no, and
+    /// `next-edit` is not exempt from that rule merely because it suspends by
+    /// design.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_edit_with_no_text_sink_is_unavailable() {
+        let kernel = Arc::new(SharedKernel::default());
+        let state = inert_state(
+            kernel,
+            GenerationId(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let key = OpaqueResourceKey {
+            slot: 0,
+            incarnation: 0,
+        };
+
+        let result = call_host_next_edit(state, key)
+            .await
+            .expect("the host method answers with a verdict, not a trap");
+
+        assert!(matches!(
+            result,
+            Err(instar::text::text_types::TextError::Unavailable)
+        ));
+    }
+
+    /// The retry loop is the point of C2b-1b, and this is the test that
+    /// proves it exists rather than merely compiles: a wake with nothing
+    /// behind it must be followed by a *second* `NextEdit` submission, not
+    /// treated as the answer.
+    ///
+    /// Two submissions are driven by hand through a held sink. The first is
+    /// answered with `Wait`, and the test itself holds the sender -- so
+    /// nothing resolves the suspended call until the test explicitly wakes
+    /// it. Only after that wake does a second request arrive to answer with
+    /// the real verdict, which is the one `call_host_next_edit` must return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_edit_resubmits_after_being_woken_and_returns_the_real_answer() {
+        use crate::text_bridge::{NextEditOutcome, TextAnswer, TextOperation};
+
+        let (kernel, sink) = kernel_with_text_sink();
+        let state = inert_state(
+            Arc::clone(&kernel),
+            GenerationId(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let key = OpaqueResourceKey {
+            slot: 4,
+            incarnation: 0,
+        };
+
+        let call = tokio::spawn(call_host_next_edit(state, key));
+
+        let first = sink.wait_for_one().await;
+        let screened = first.screen(GenerationId(1)).expect("current");
+        assert_eq!(
+            screened.operation(),
+            TextOperation::NextEdit { buffer: key }
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        screened.answer(TextAnswer::NextEdit(NextEditOutcome::Wait(rx)));
+
+        // The guest task is asleep on `rx` now, not on a second submission.
+        // Waking it -- not answering it -- is what has to bring it back.
+        tx.send(()).expect("the guest is still awaiting this");
+
+        let second = sink.wait_for_one().await;
+        let screened = second.screen(GenerationId(1)).expect("current");
+        assert_eq!(
+            screened.operation(),
+            TextOperation::NextEdit { buffer: key },
+            "the wake must be followed by a real resubmission, not treated \
+             as the answer"
+        );
+        screened.answer(TextAnswer::NextEdit(NextEditOutcome::Desynchronized(42)));
+
+        let result = call
+            .await
+            .expect("the guest task did not panic")
+            .expect("the host method answers with a verdict, not a trap");
+
+        assert!(matches!(
+            result,
+            Ok(instar::text::text_types::EditNotification::Desynchronized(
+                42
+            ))
+        ));
     }
 }

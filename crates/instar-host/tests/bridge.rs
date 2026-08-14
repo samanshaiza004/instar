@@ -1391,8 +1391,8 @@ fn a_text_request_from_a_dead_generation_allocates_nothing() {
         "the request was screened rather than served"
     );
     assert_eq!(
-        reply.blocking_recv().expect("answered"),
-        Err(TextRefusal::StaleGeneration),
+        reply.blocking_recv().expect("answered").unwrap_err(),
+        TextRefusal::StaleGeneration,
         "and the guest was told, rather than left parked"
     );
     assert_eq!(

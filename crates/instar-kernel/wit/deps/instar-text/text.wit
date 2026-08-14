@@ -61,6 +61,11 @@ interface text-types {
         /// The host could not answer -- it is shutting down, or the thread
         /// that owns the text subsystem is gone.
         unavailable,
+        /// A live `next-edit` is already asleep on this buffer. At most one
+        /// outstanding call per guest per buffer; a second is refused rather
+        /// than queued behind the first, because there is nothing left for it
+        /// to read and two sleepers would race to serve the same edits.
+        already-waiting,
     }
 }
 
@@ -75,14 +80,20 @@ interface text-types {
 /// document itself ends is the host's decision, which is what makes guest
 /// restart survivable later.
 ///
-/// # Synchronous here, async in the host
+/// # Synchronous here, async in the host -- except the one that must suspend
 ///
-/// None of these is a WIT `async func`. Declaring one would opt into Component
-/// Model async semantics -- overlapping subtasks and a different ABI -- when
-/// what is actually wanted is the opposite: the guest suspends inside the call
-/// while the host's Rust future awaits the thread that owns the text
-/// subsystem. `bindgen!`'s `imports: { default: async | trappable }` is that
-/// distinction, and it needs nothing from the WIT.
+/// `create-empty-buffer` and `create-view` are not WIT `async func`s.
+/// Declaring one would opt into Component Model async semantics -- overlapping
+/// subtasks and a different ABI -- when what is actually wanted is the
+/// opposite: the guest suspends inside the call while the host's Rust future
+/// awaits the thread that owns the text subsystem. `bindgen!`'s
+/// `imports: { default: async | trappable }` is that distinction, and it
+/// needs nothing from the WIT.
+///
+/// `next-edit` breaks that pattern on purpose (C2). It genuinely is a WIT
+/// `async func`, because the alternative -- a guest that cannot await an edit
+/// and a UI event at the same time -- is worse than the overlapping-subtask
+/// machinery this package otherwise avoids. See its own doc comment for why.
 interface text {
     use text-types.{text-error, edit-notification};
 
