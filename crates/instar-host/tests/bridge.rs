@@ -1197,6 +1197,13 @@ const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 const TEXT_NODE_B: NodeKey = NodeKey::first(31);
 /// Suspends the guest in `next-edit` and reports exactly what it receives.
 const AWAIT_EDIT: NodeKey = NodeKey::first(20);
+/// Calls `apply-edits` with a well-formed insertion at revision 0.
+const APPLY_EDITS: NodeKey = NodeKey::first(21);
+/// Calls `apply-edits` with an inverted range, at the correct revision.
+const APPLY_EDITS_MALFORMED: NodeKey = NodeKey::first(22);
+/// Calls `apply-edits` with a well-formed edit at a revision that cannot be
+/// current.
+const APPLY_EDITS_STALE: NodeKey = NodeKey::first(23);
 
 /// The window's retained `NodeKey -> TextViewId` map.
 fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
@@ -1495,6 +1502,162 @@ fn a_real_host_local_edit_reaches_a_suspended_guest_unchanged() {
         .expect("five bytes exist now")
         .materialize();
     assert_eq!(contents, "hello");
+}
+
+/// C3c: the closure gate for `apply-edits`, and the reason it exists.
+///
+/// C3b proved the full frozen precedence order and the no-echo fan-out
+/// directly against `TextHost::apply_guest_edits` -- but that proof never
+/// touches wit-bindgen's generated `result`/`variant` types or the
+/// `Host::apply_edits` glue in `instar-kernel/src/runtime.rs`, and that is
+/// exactly where a field left unmapped or a variant case swapped can hide
+/// behind an otherwise-green host suite. This is the test that goes through
+/// all of it, from a real guest:
+///
+/// ```text
+/// a real guest calls apply-edits
+///   -> the WIT import                  wit-bindgen's generated call
+///   -> Host::apply_edits               runtime.rs, the field translation
+///   -> TextOperation::ApplyEdits       the kernel bridge vocabulary
+///   -> TextHost::apply_guest_edits     the frozen order (C3b)
+///   -> ApplyEditsOutcome               translated back to apply-edits-result
+///   -> the same real guest             reports the exact outcome
+/// ```
+///
+/// # What this does, and does not, prove about the no-echo fan-out
+///
+/// No-echo has two halves: the source never hears its own batch, and every
+/// *other* relationship on the buffer does. This test proves the first half
+/// through the real guest: `AWAIT_EDIT` on the same buffer, right after a
+/// successful `apply-edits`, must still genuinely suspend -- checked with
+/// `await_waiter`, not with a label read, for the same reason C2c's own
+/// suspension check is: a source that received its own batch would resolve
+/// `next-edit` immediately, on the same synchronous turn, so a `false`-taking
+/// waiter check is the only race-free way to observe it, one way or the
+/// other.
+///
+/// It cannot prove the second half: no guest-facing API grants a second
+/// generation a lease on a buffer another generation created -- a known,
+/// deliberate gap (`docs/PHASE-3.md`, "Generation teardown") -- so there is
+/// no way to seat a real second guest on this buffer at all. That half is
+/// proven at the host level instead, by
+/// `text_host::tests::a_guest_batch_reaches_every_other_relationship_but_not_its_source`,
+/// which installs a second relationship directly and checks both fan-out
+/// directions. The two tests are complementary, not redundant: one is real
+/// end to end and can only see one generation; the other sees two
+/// generations and starts one layer in.
+#[test]
+fn a_real_guest_calls_apply_edits_and_the_result_round_trips_unchanged() {
+    let (mut bridge, _wakes) = ready();
+
+    // `await_text` is a `TextHost`-state signal, not a commit signal: the
+    // guest's `create-view` calls resolve synchronously inside `handle`,
+    // before its own "held 2 view(s)" commit is even sent. Waiting on it
+    // alone would let the *next* baseline capture race the still-in-flight
+    // acquire commit -- exactly the pitfall `await_commit_after`'s own doc
+    // comment names. Pairing it with an explicit commit wait closes that.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, TEXT_ACQUIRE);
+    assert!(
+        await_text(&mut bridge, |c| c.live_views == 2),
+        "the guest acquired its buffer and views"
+    );
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the acquire commit must land before anything below captures its \
+         own baseline against it"
+    );
+    let buffer = bridge
+        .host()
+        .text_resources()
+        .system()
+        .buffers()
+        .next()
+        .expect("the guest's buffer is live");
+    let generation = bridge.generation();
+
+    // A malformed batch, at the correct revision: `invalid-edit`, the one
+    // coarse public refusal -- never `instar-text`'s own `InvertedRange`.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, APPLY_EDITS_MALFORMED);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the malformed-batch report must commit"
+    );
+    assert_eq!(
+        label(&bridge),
+        "apply: refused TextError::InvalidEdit",
+        "the coarse public refusal, not the storage layer's own taxonomy"
+    );
+
+    // A well-formed edit at a revision that cannot be current: `conflict`,
+    // decided before the batch is ever inspected, and nothing landed.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, APPLY_EDITS_STALE);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the stale-revision report must commit"
+    );
+    assert_eq!(label(&bridge), "apply: conflict(0)");
+    assert_eq!(
+        bridge
+            .host()
+            .text_resources()
+            .system()
+            .buffer(buffer)
+            .expect("the buffer is live")
+            .text()
+            .len_bytes(),
+        0,
+        "a refused batch -- malformed or stale -- left the document exactly \
+         as it was"
+    );
+
+    // The real trigger: a well-formed batch at the true revision.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, APPLY_EDITS);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the apply-edits report must commit"
+    );
+    assert_eq!(
+        label(&bridge),
+        "apply: applied(1)",
+        "the exact revision the host moved the buffer to, not merely that \
+         it moved"
+    );
+
+    // The edit reached the document itself, not only the label the guest
+    // happened to format correctly -- this is what a dropped or corrupted
+    // `replacement` field would fail, while the label above stays truthful.
+    let contents = bridge
+        .host()
+        .text_resources()
+        .system()
+        .buffer(buffer)
+        .expect("the buffer is still live")
+        .text()
+        .slice(0..2)
+        .expect("two bytes exist now")
+        .materialize();
+    assert_eq!(contents, "hi");
+
+    // No echo: the source generation's own next-edit must still suspend
+    // after its own batch was applied, not report the batch back to it.
+    let applied = bridge.stats().applied_commits;
+    click(&mut bridge, AWAIT_EDIT);
+    assert!(
+        await_commit_after(&mut bridge, applied),
+        "the 'awaiting edit...' commit must land before the guest suspends, \
+         or the click never actually reached the guest"
+    );
+    assert_eq!(label(&bridge), "awaiting edit...");
+    assert!(
+        await_waiter(&mut bridge, generation, buffer),
+        "the guest must genuinely suspend in next-edit on its own buffer -- \
+         if its own batch had been echoed back to it, this would resolve \
+         immediately instead of ever installing a waiter"
+    );
 }
 
 /// Teardown is total, on both terminal paths.

@@ -29,6 +29,9 @@
 //! | Commit text views | Commits the interface with two text-view nodes and a crossed side table | attachment resolution is by identity, not slot position |
 //! | Reverse text table | Re-commits the same tree with the side table reversed | a re-commit that changes the table but not the retained map is a no-op |
 //! | Await edit | Suspends in `next-edit` and reports the exact fields it receives | a real host-local edit reaches a real suspended guest unchanged (C2c) |
+//! | Apply edits | Calls `apply-edits` with a well-formed batch | a real guest's batch round-trips through the WIT/bridge mapping unchanged (C3c) |
+//! | Apply malformed edit | Calls `apply-edits` with an inverted range | a real guest sees `invalid-edit`, not the storage layer's own taxonomy |
+//! | Apply stale revision | Calls `apply-edits` with a revision that cannot be current | a real guest sees `conflict`, and nothing it sent lands |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -98,6 +101,13 @@ const TEXT_ATTACHED_LABEL: &str = "two text views attached";
 /// Suspends in `next-edit` on the guest's first buffer and reports the exact
 /// fields the host sends, for C2c's joined-seam claim.
 const AWAIT_EDIT: NodeKey = NodeKey::first(20);
+/// Calls `apply-edits` with a well-formed insertion at revision 0.
+const APPLY_EDITS: NodeKey = NodeKey::first(21);
+/// Calls `apply-edits` with an inverted range, at the correct revision.
+const APPLY_EDITS_MALFORMED: NodeKey = NodeKey::first(22);
+/// Calls `apply-edits` with a well-formed edit but a revision that cannot be
+/// current.
+const APPLY_EDITS_STALE: NodeKey = NodeKey::first(23);
 /// The first text-view surface the commit buttons attach.
 const TEXT_NODE_A: NodeKey = NodeKey::first(30);
 /// The second text-view surface the commit buttons attach.
@@ -239,7 +249,7 @@ impl Hostile {
                 0,
                 None,
                 container(0, 4),
-                (19 + extra_views) as u16,
+                (22 + extra_views) as u16,
             )
             .node(
                 opcode::NODE_TEXT,
@@ -394,6 +404,30 @@ impl Hostile {
                 AWAIT_EDIT,
                 flags::ENABLED,
                 Some("Await edit"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                APPLY_EDITS,
+                flags::ENABLED,
+                Some("Apply edits"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                APPLY_EDITS_MALFORMED,
+                flags::ENABLED,
+                Some("Apply malformed edit"),
+                WireLayout::default(),
+                0,
+            )
+            .node(
+                opcode::NODE_BUTTON,
+                APPLY_EDITS_STALE,
+                flags::ENABLED,
+                Some("Apply stale revision"),
                 WireLayout::default(),
                 0,
             );
@@ -679,6 +713,40 @@ impl Hostile {
                 self.label_override = Some("awaiting edit...".to_string());
                 self.await_edit = true;
             }
+            // `apply-edits` is a plain `func`, not `async` -- the WIT freeze
+            // for C3 is explicit that only `next-edit` suspends the guest
+            // task, so these three report their outcome synchronously inside
+            // `handle`, the same way `TEXT_ACQUIRE` does for `create-view`.
+            WireEvent::Click { node } if node == APPLY_EDITS => {
+                let edits = vec![text_types::TextEdit {
+                    range_start: 0,
+                    range_end: 0,
+                    replacement: "hi".to_string(),
+                }];
+                self.label_override = Some(self.apply_edits_report(0, edits));
+            }
+            WireEvent::Click { node } if node == APPLY_EDITS_MALFORMED => {
+                // Inverted: start after end. `instar-text`'s storage layer
+                // would call this `InvertedRange`; the guest must see only
+                // the coarse `invalid-edit`.
+                let edits = vec![text_types::TextEdit {
+                    range_start: 9,
+                    range_end: 3,
+                    replacement: "nope".to_string(),
+                }];
+                self.label_override = Some(self.apply_edits_report(0, edits));
+            }
+            WireEvent::Click { node } if node == APPLY_EDITS_STALE => {
+                // The edit itself is well-formed; only the revision is wrong,
+                // so a `conflict` here can only be attributed to the
+                // revision check, not to the batch.
+                let edits = vec![text_types::TextEdit {
+                    range_start: 0,
+                    range_end: 0,
+                    replacement: "should not land".to_string(),
+                }];
+                self.label_override = Some(self.apply_edits_report(42, edits));
+            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
@@ -717,6 +785,26 @@ impl Hostile {
                 format!("desynchronized: {revision}")
             }
             Err(error) => format!("next-edit failed: {error:?}"),
+        }
+    }
+
+    /// Calls `apply-edits` on the first held buffer and formats exactly what
+    /// came back, the same discipline `await_one_edit` uses: every outcome —
+    /// applied, conflict, or refused — is folded into the label rather than
+    /// treated as a guest failure, so a wrong field shows up as a label
+    /// mismatch the test reports clearly.
+    fn apply_edits_report(&self, expected_revision: u64, edits: Vec<text_types::TextEdit>) -> String {
+        let Some(buffer) = self.buffers.first() else {
+            return "no buffer to apply against".to_string();
+        };
+        match text::apply_edits(buffer, expected_revision, &edits) {
+            Ok(text_types::ApplyEditsResult::Applied(revision)) => {
+                format!("apply: applied({revision})")
+            }
+            Ok(text_types::ApplyEditsResult::Conflict(revision)) => {
+                format!("apply: conflict({revision})")
+            }
+            Err(error) => format!("apply: refused {error:?}"),
         }
     }
 }
