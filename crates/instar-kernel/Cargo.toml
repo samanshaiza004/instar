@@ -28,7 +28,7 @@ tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [build-dependencies]
-instar-guest-build = { path = "../instar-guest-build" }
+instar-guest-build = { path = "../instar-guest-build", version = "0.0.2" }
 
 [features]
 # Off by default in every production build. Registers the benchmark-only

@@ -22,19 +22,19 @@ name = "uibench"
 path = "src/bin/uibench.rs"
 
 [dependencies]
-instar-host = { path = "../instar-host" }
-instar-paint = { path = "../instar-paint" }
-instar-window = { path = "../instar-window" }
+instar-host = { path = "../instar-host", version = "0.0.2" }
+instar-paint = { path = "../instar-paint", version = "0.0.2" }
+instar-window = { path = "../instar-window", version = "0.0.2" }
 
 # The benchmark example (`src/bin/uibench.rs`) drives the UI tree and the wire
 # format directly, so this workspace crate is a dependency of the shell, not
 # just of its test targets.
-instar-ui = { path = "../instar-ui" }
+instar-ui = { path = "../instar-ui", version = "0.0.2" }
 
 # The renderer, and the one place its `glyph-run` feature is switched on:
 # `instar-host` emits GlyphRun commands, and this is the crate that has to be
 # able to rasterize them.
-instar-render-vello-cpu = { path = "../instar-render-vello-cpu", features = ["glyph-run"] }
+instar-render-vello-cpu = { path = "../instar-render-vello-cpu", version = "0.0.2", features = ["glyph-run"] }
 
 # Presentation. softbuffer draws into the window a winit `Window` owns, which
 # is why both live here and nowhere below.
@@ -48,4 +48,4 @@ accesskit = "0.24.1"
 accesskit_winit = "0.33.2"
 
 [build-dependencies]
-instar-guest-build = { path = "../instar-guest-build" }
+instar-guest-build = { path = "../instar-guest-build", version = "0.0.2" }

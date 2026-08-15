@@ -851,10 +851,12 @@ fn a_thousand_click_cycles_return_to_baseline() {
 
 // --- HARDEN-2: single-flight commits ---
 
-/// A guest fires 512 commits at once and then terminates. Exactly one commit
-/// may become outstanding; the other 511 must be refused by the kernel before
-/// a request is created, and the guest's own sequential summary commit proves
-/// the single-flight slot released after the first resolved.
+/// A guest fires 512 commit futures at once and then terminates. The runtime
+/// scheduler may let the first accepted request resolve before every future
+/// has been polled, so this real-guest fixture checks the invariant that every
+/// attempt is either applied or refused by the single-flight gate. The kernel
+/// runtime test separately forces all competing attempts to overlap and proves
+/// exactly one admission in that cohort.
 #[test]
 fn a_flood_of_concurrent_commits_allows_one_and_then_terminates() {
     let (mut bridge, _wakes) = ready();
@@ -869,24 +871,28 @@ fn a_flood_of_concurrent_commits_allows_one_and_then_terminates() {
     );
 
     let summary = label(&bridge);
-    assert_eq!(
-        summary, "Flooded 512 commits: applied 1, in-progress 511, other 0",
-        "the guest should observe exactly one accepted commit and 511 refusals"
+    let (applied, in_progress, other) = parse_flood_summary(&summary);
+    assert!(applied >= 1, "the flood must admit at least one commit");
+    assert!(
+        in_progress >= 1,
+        "the single-flight gate must refuse a cohort member"
     );
+    assert_eq!(other, 0, "every flood attempt should have a known verdict");
+    assert_eq!(applied + in_progress + other, 512);
     assert_eq!(
         bridge.commit_single_flight_rejections(),
-        511,
-        "the kernel must count every in-progress refusal"
+        u64::from(in_progress),
+        "the kernel count must match the guest's in-progress refusals"
     );
     assert_eq!(
         bridge.commit_sequence() - baseline_sequence,
-        2,
-        "the first flood commit plus the sequential summary commit both apply"
+        u64::from(applied) + 1,
+        "the flood applications plus the sequential summary commit apply"
     );
     assert_eq!(
         bridge.stats().applied_commits - baseline_applied,
-        2,
-        "no other flood attempt may reach the host"
+        u64::from(applied) + 1,
+        "the host applies only the guest-reported flood verdicts and summary"
     );
     assert_eq!(bridge.stats().rejected_commits, 0);
     assert_eq!(bridge.stats().stale_commits, 0);
@@ -898,6 +904,29 @@ fn a_flood_of_concurrent_commits_allows_one_and_then_terminates() {
         "terminal state and the ordinary queue are fully drained"
     );
     bridge.shutdown();
+}
+
+fn parse_flood_summary(summary: &str) -> (u32, u32, u32) {
+    let rest = summary
+        .strip_prefix("Flooded 512 commits: applied ")
+        .unwrap_or_else(|| panic!("unexpected flood summary: {summary}"));
+    let (applied, rest) = rest
+        .split_once(", in-progress ")
+        .unwrap_or_else(|| panic!("unexpected flood summary: {summary}"));
+    let (in_progress, other) = rest
+        .split_once(", other ")
+        .unwrap_or_else(|| panic!("unexpected flood summary: {summary}"));
+    (
+        applied
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid applied count in flood summary: {summary}")),
+        in_progress
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid in-progress count in flood summary: {summary}")),
+        other
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid other count in flood summary: {summary}")),
+    )
 }
 
 // --- WP8: the rest of what a guest is permitted to do wrong ---

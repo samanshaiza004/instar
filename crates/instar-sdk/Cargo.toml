@@ -9,4 +9,4 @@ description = "A thin guest-side builder for Instar interfaces: owns child count
 # The wire format, and nothing else, ever. An SDK that reached the host's UI
 # implementation would put a layout engine in every guest, which is the whole
 # arrangement this project exists to avoid. See docs/PHASE-1.md, "UI layering".
-instar-ui-protocol = { path = "../instar-ui-protocol" }
+instar-ui-protocol = { path = "../instar-ui-protocol", version = "0.0.2" }

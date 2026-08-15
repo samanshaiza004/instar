@@ -41,6 +41,9 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-wasip2
+      - name: Install Linux font dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes pkg-config libfontconfig1-dev
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint
@@ -95,6 +98,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: wasm32-wasip2
+
+      - name: Install Linux font dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes pkg-config libfontconfig1-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -159,7 +166,7 @@ jobs:
             found=$((found + 1))
             echo "validating $wasm"
             wasm-tools validate --features all "$wasm"
-          done < <(find target/debug/build -name '*.wasm' -path '*wasm32-wasip2*')
+          done < <(find target/debug/build -type f -path '*/out/artifacts/*.wasm' -print)
 
           if [ "$found" -eq 0 ]; then
             echo "no components found under target/debug/build -- the guests did not build" >&2
@@ -174,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          wasm=$(find target/debug/build -name 'counter.wasm' -path '*wasm32-wasip2*' | head -1)
+          wasm=$(find target/debug/build -type f -path '*/out/artifacts/counter.wasm' -print -quit)
           [ -n "$wasm" ] || { echo "no counter component built" >&2; exit 1; }
           wasm-tools component wit "$wasm" | grep -q 'export run: async func' \
             || { echo "the counter guest lost its async export" >&2; exit 1; }

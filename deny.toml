@@ -3,6 +3,10 @@ all-features = true
 
 [advisories]
 version = 2
+# Current chain: winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser ->
+# ttf-parser. There is no patched release; remove this exception when the
+# stack no longer depends on ttf-parser (or the host adopts an alternative).
+ignore = ["RUSTSEC-2026-0192"]
 
 [licenses]
 version = 2
@@ -15,7 +19,6 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
-    "CDLA-Permissive-2.0",
 ]
 
 [bans]

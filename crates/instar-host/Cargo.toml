@@ -7,17 +7,17 @@ description = "Instar's orchestration layer: routes window input to the UI layer
 
 [dependencies]
 # The three layers this crate composes, and the only place they meet.
-instar-kernel = { path = "../instar-kernel" }
-instar-ui = { path = "../instar-ui" }
-instar-window = { path = "../instar-window" }
-instar-text-layout = { path = "../instar-text-layout" }
-instar-surface-protocol = { path = "../instar-surface-protocol" }
+instar-kernel = { path = "../instar-kernel", version = "0.0.2" }
+instar-ui = { path = "../instar-ui", version = "0.0.2" }
+instar-window = { path = "../instar-window", version = "0.0.2" }
+instar-text-layout = { path = "../instar-text-layout", version = "0.0.2" }
+instar-surface-protocol = { path = "../instar-surface-protocol", version = "0.0.2" }
 
 # Paint *intent* only: scene types, no renderer. This crate is the layer that
 # bridges logical presentation to physical rendering (docs/PHASE-1.md), so
 # lowering a laid-out tree to a PaintScene belongs here -- but choosing a
 # backend does not, and nothing here links Vello, softbuffer, or a font stack.
-instar-paint = { path = "../instar-paint" }
+instar-paint = { path = "../instar-paint", version = "0.0.2" }
 
 # The runtime thread's executor, and the queue the main thread sends commands
 # over. Nothing async escapes into the main-thread half of this crate: winit
@@ -44,7 +44,7 @@ accesskit = "0.24.1"
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [build-dependencies]
-instar-guest-build = { path = "../instar-guest-build" }
+instar-guest-build = { path = "../instar-guest-build", version = "0.0.2" }
 
 [features]
 # Off by default in every production build. See instar-kernel's feature of

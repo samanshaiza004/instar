@@ -6,5 +6,5 @@ license.workspace = true
 description = "Host-only immutable text shaping and query geometry, with Parley hidden behind Instar-owned types."
 
 [dependencies]
-instar-ui-protocol = { path = "../instar-ui-protocol" }
+instar-ui-protocol = { path = "../instar-ui-protocol", version = "0.0.2" }
 parley = "0.11"

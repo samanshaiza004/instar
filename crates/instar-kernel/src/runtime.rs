@@ -1489,6 +1489,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forced_overlap_cohort_admits_one_and_refuses_the_rest() {
+        const COHORT: usize = 512;
+        let (kernel, sink) = kernel_with_sink();
+        let slot = Arc::new(tokio::sync::Semaphore::new(1));
+        kernel.current.store(1, Ordering::SeqCst);
+
+        let first = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"first".to_vec())
+                    .await
+            }
+        });
+        let first_request = sink.wait_for_one().await;
+
+        let mut refusals = Vec::with_capacity(COHORT - 1);
+        for _ in 1..COHORT {
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            refusals.push(tokio::spawn(async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"cohort".to_vec())
+                    .await
+            }));
+        }
+        for refusal in refusals {
+            assert!(
+                matches!(
+                    refusal.await.expect("cohort task ran"),
+                    Err(CommitError::CommitInProgress)
+                ),
+                "every competing admission must be refused while the first reply is held"
+            );
+        }
+        assert_eq!(
+            kernel.commit_single_flight_rejections(),
+            (COHORT - 1) as u64
+        );
+        assert_eq!(
+            sink.held.lock().expect("held sink poisoned").len(),
+            0,
+            "the held sink must receive no competing request"
+        );
+
+        let screened = first_request
+            .screen(kernel.current_generation())
+            .expect("gen1 is current");
+        screened.accept(12);
+        assert_eq!(
+            first
+                .await
+                .expect("first task ran")
+                .expect("first commit resolves")
+                .revision,
+            12
+        );
+
+        // A permit is reusable after the overlap cohort resolves; this is not
+        // a one-commit-per-generation latch.
+        let second = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let slot = Arc::clone(&slot);
+            async move {
+                kernel
+                    .commit_batch(GenerationId(1), slot, b"second".to_vec())
+                    .await
+            }
+        });
+        let second_request = sink.wait_for_one().await;
+        second_request
+            .screen(kernel.current_generation())
+            .expect("gen1 is current")
+            .accept(13);
+        assert_eq!(
+            second
+                .await
+                .expect("second task ran")
+                .expect("second commit resolves")
+                .revision,
+            13
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_an_in_flight_commit_releases_the_slot() {
         let (kernel, sink) = kernel_with_sink();
         let slot = Arc::new(tokio::sync::Semaphore::new(1));

@@ -8,8 +8,8 @@ description = "Instar's retained semantic UI tree and its wire encoding: what a 
 [dependencies]
 # The wire format, shared verbatim with guests. This crate adds meaning on
 # top; the protocol crate stays dependency-free so guests stay light.
-instar-ui-protocol = { path = "../instar-ui-protocol" }
-instar-text-layout = { path = "../instar-text-layout" }
+instar-ui-protocol = { path = "../instar-ui-protocol", version = "0.0.2" }
+instar-text-layout = { path = "../instar-text-layout", version = "0.0.2" }
 thiserror = "2"
 # Layout, and an implementation detail of src/layout.rs: no Taffy type appears
 # in this crate's public API. See docs/PHASE-1.md -- LayoutSnapshot is an
@@ -23,8 +23,8 @@ accesskit = "0.24.1"
 # forbidden-dependency list). The kernel carries committed batches as opaque
 # bytes and must not know what they mean; this crate is what gives them
 # meaning, so the interaction tests live here rather than in the kernel.
-instar-kernel = { path = "../instar-kernel" }
+instar-kernel = { path = "../instar-kernel", version = "0.0.2" }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [build-dependencies]
-instar-guest-build = { path = "../instar-guest-build" }
+instar-guest-build = { path = "../instar-guest-build", version = "0.0.2" }
