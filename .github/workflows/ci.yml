@@ -47,7 +47,7 @@ jobs:
       - run: cargo fmt --all --check
       # --all-targets so tests and build scripts are linted too. The guests are
       # separate workspaces and are linted in their own job below.
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # The guests are their own workspaces, so the command above never sees them.
   # They are the code most likely to rot unnoticed — nothing imports them, and
@@ -72,7 +72,7 @@ jobs:
             [ -f "$guest/Cargo.toml" ] || continue
             echo "::group::$guest"
             (cd "$guest" && cargo fmt --all --check)
-            (cd "$guest" && cargo clippy --target wasm32-wasip2 --all-targets)
+            (cd "$guest" && cargo clippy --target wasm32-wasip2 --all-targets -- -D warnings)
             (cd "$guest" && cargo build --target wasm32-wasip2)
             echo "::endgroup::"
           done

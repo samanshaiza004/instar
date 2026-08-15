@@ -50,6 +50,33 @@ of text per node, and bounded layout lengths. The protocol crate owns encoding,
 decoding, and bounds; `instar-ui` owns semantic validation and interaction
 meaning.
 
+## Planned primitive direction (not current protocol)
+
+The current protocol has no `Action` opcode, no host-side widget catalogue, and
+no portable semantic-metadata wire. Those are deliberately not implied by the
+current `BUTTON` kind or `IUE1` activation event.
+
+The proposed next direction keeps the complete declarative snapshot and its
+atomic admission unchanged. A future `Action` mechanism would describe a
+composable activatable region; the host would provide hit testing, disabled
+gating, press/release, focus, hover, pressed, focus-visible, and one completed
+`Activate(NodeKey)` event, while the guest would retain content, enabled/value
+state, semantic role, appearance, and application response. `Action` is not
+defined as accessibility role `Button`.
+
+Host-local appearance variants and portable semantic metadata are future work,
+not wire fields or opcodes today. Their exact structs, encoding, limits, and
+role vocabulary require implementation spikes and tests. In particular, do
+not expose AccessKit types on the guest boundary or add one `NodeKind` per
+accessibility role.
+
+The planned `instar-controls` crate is also future guest-side userland, not a
+privileged protocol surface. It will compose public mechanisms and remain
+replaceable by third-party controls. `Surface` remains the current custom
+presentation/input escape hatch; a future guest-authored Surface semantic
+projection must be a separate retained contract and must not be inferred from
+scene paint commands.
+
 ## Surface input and scene protocols
 
 `Surface` is a semantic leaf whose scene is independently replaceable. Its

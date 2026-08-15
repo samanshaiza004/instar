@@ -412,16 +412,93 @@ between the finger going down and an outcome existing belongs to the host.
 This is not a policy the code follows — there is no branch in the scroll path
 that can reach the guest at all. The zero-`SendToGuest` property holds because
 the path does not exist, rather than because a test watches one that does.
-Hover, focus, caret blink, selection, sliders, and drag previews inherit the
-same arrangement.
+Hover, focus, pressed state, pointer capture, caret blink, and drag previews
+for ordinary host-interactive nodes inherit the same arrangement. A Surface's
+selection, slider value, or drag policy remains guest-owned when it changes
+application meaning.
 
 ### Transient interaction state is host-owned
 
 A pressed button is drawn pressed, and that frame is requested without consulting
 the guest. The guest hears about *completed* interactions; anything between the
 finger going down and the outcome existing belongs to the host. This
-generalizes to hover, scrolling, caret blink, selection, sliders, and drag
-previews.
+generalizes to hover, scrolling, caret blink, and drag previews for ordinary
+host-interactive nodes. It does not move a Surface's application selection,
+slider value, or custom drag policy into the host.
+
+That rule applies to host-interactive ordinary nodes, not to application
+meaning hidden inside a custom `Surface`. The ownership test is:
+
+> If state can change without changing what the application means, the host is
+> a strong candidate to own it. If changing it changes application truth or
+> custom interaction semantics, the guest is the strong candidate.
+
+For ordinary host mechanisms, hover, pressed, focus, focus-visible, pointer
+capture, scroll offset, hit testing, standard activation mechanics, and native
+accessibility adaptation are host-local. A checkbox value, slider value,
+document, selection, undo stack, activation response, or custom drag policy is
+guest state and policy. The host must not infer those facts from paint commands
+or silently mutate them.
+
+### UI primitives are mechanisms; controls remain userland
+
+The retained declarative snapshot is the boundary between guest-authored
+meaning and host-owned realization:
+
+```text
+guest-authored snapshot
+        -> atomic host admission
+        -> retained realization
+        -> layout / interaction / accessibility
+        -> pixels
+```
+
+This architecture does not grow a host widget catalogue. `Checkbox`, `Slider`,
+`Menu`, `TextField`, and similar policy-bearing controls are not planned
+`NodeKind`s. The first host primitive under consideration is **`Action`**: a
+composable activatable region that may contain an icon, text, or arbitrary
+ordinary children. The host would own hit testing, disabled gating, press and
+release mechanics, keyboard activation, focus, hover, pressed, focus-visible,
+and one semantic `Activate(NodeKey)` event. The guest would own the children,
+enabled/value state, appearance description, and response to activation.
+
+`Action` is not frozen to the accessibility role `Button`. Activation mechanics
+and semantic role are separate concerns; a button, menu item, or list row may
+share the former while differing in the latter.
+
+The host-local appearance mechanism is intentionally future direction, not
+current protocol: a bounded set of already-admitted variants may eventually be
+selected from the host's tiny transient state vocabulary — normal, hovered,
+pressed, focus-visible, and disabled. This is a small generic state-style
+facility, initially exercised by `Action`, rather than an Action-specific CSS
+system. There is no selector, cascade, specificity, arbitrary state machine,
+or host-side application state.
+
+The planned first-party `instar-controls` crate is userland, not privileged
+host functionality. It may eventually provide ergonomic Button, Checkbox,
+Switch, RadioGroup, Slider, Tabs, FormField, Menu, and standard text controls
+by composing public primitives. Applications and third parties may replace
+those controls. A control that the host has never heard of must pass the
+Novel-Widget Test without host changes unless genuinely new native machinery
+is required.
+
+### Surface is the custom-rendering escape hatch
+
+`Surface` remains a semantic leaf with an independently replaceable bounded
+scene and neutral raw input. It is the right mechanism for editors, terminals,
+timelines, waveforms, dense grids, node graphs, CAD/image tools, games, and
+other views whose interaction policy is genuinely custom. It must not become a
+second hidden UI framework with generic hover, drag, or selection policy, and
+ordinary applications should not be forced to build every control inside it.
+
+The long-term accessibility direction is explicit but unimplemented: ordinary
+declarative nodes should continue to project into AccessKit, eventually using a
+portable semantic metadata vocabulary rather than AccessKit types or one node
+kind per role. A custom Surface will eventually need a guest-authored semantic
+projection alongside its retained visual scene. The host may map that
+projection to native accessibility, but must not infer application meaning from
+rectangles, text runs, or paint commands. Visual and semantic Surface
+revisions will need an explicit coherency rule before that projection ships.
 
 ### The crash surface is host-owned and is not a UI tree
 
