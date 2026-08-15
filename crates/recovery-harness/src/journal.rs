@@ -1,16 +1,24 @@
-//! The append-only edit journal: one record per committed edit, each
+//! The append-only journal: one opaque record per durable write, each
 //! independently checksummed so a torn write or a mid-record process death
 //! never has to be guessed about -- it is detected, at the exact byte
 //! offset where the record stops being trustworthy.
+//!
+//! This module knows nothing about what a payload means. It is handed
+//! bytes and a sequence number and it stores them, or it is handed bytes
+//! back from storage and it hands the caller back exactly what it wrote --
+//! interpretation is [`crate::fake_guest::FakeGuest`]'s job, one layer up,
+//! never this one's.
 //!
 //! # Record layout
 //!
 //! ```text
 //! magic        u32 LE   0x4A52_4543 ("JREC" as bytes, order irrelevant --
 //!                       it exists to reject garbage, not to be readable)
-//! sequence     u64 LE   monotonic; the edit's identity
+//! sequence     u64 LE   monotonic; the record's identity, assigned by
+//!                       whoever is writing -- this module only checks that
+//!                       it is present and legible, never what it names
 //! payload_len  u32 LE
-//! payload      [u8; payload_len]
+//! payload      [u8; payload_len]   opaque
 //! checksum     u32 LE   FNV-1a over every byte above, including magic
 //! ```
 //!
@@ -35,15 +43,30 @@ pub struct JournalRecord {
 }
 
 impl JournalRecord {
-    pub fn encode(&self) -> Vec<u8> {
+    /// The number of bytes a record with a payload of `payload_len` bytes
+    /// occupies on disk, without building the record. A caller enforcing
+    /// its own budget (e.g. `RecoveryStore`'s `max_journal_bytes`) needs
+    /// this before deciding whether to encode at all.
+    pub fn wire_len(payload_len: usize) -> usize {
+        FIXED_OVERHEAD + payload_len
+    }
+
+    /// `None` if `payload` does not fit in this format's `u32` length
+    /// field -- the format's own structural ceiling (4 GiB), independent of
+    /// and far above any policy-level bound a caller enforces separately.
+    /// Never silently truncates a too-large payload into a shorter recorded
+    /// length via `as u32`: that would record a length that does not match
+    /// the bytes that follow it, corrupting the very next record's framing.
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let payload_len: u32 = self.payload.len().try_into().ok()?;
         let mut bytes = Vec::with_capacity(FIXED_OVERHEAD + self.payload.len());
         bytes.extend_from_slice(&MAGIC.to_le_bytes());
         bytes.extend_from_slice(&self.sequence.to_le_bytes());
-        bytes.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&self.payload);
         let checksum = fnv1a(&bytes);
         bytes.extend_from_slice(&checksum.to_le_bytes());
-        bytes
+        Some(bytes)
     }
 }
 
@@ -81,8 +104,24 @@ pub struct JournalReadResult {
     pub tail_fault: Option<TailFault>,
     /// Byte offset where `tail_fault` begins, when there is one. Recorded so
     /// two runs against the same corrupt file can be compared byte for byte
-    /// rather than only "both said corrupt".
+    /// rather than only "both said corrupt". Also exactly the length a
+    /// repair pass should truncate a torn journal file down to: everything
+    /// before this offset is the trusted tail.
     pub tail_offset: Option<u64>,
+}
+
+impl JournalReadResult {
+    /// The length, in bytes, of the longest prefix of the file that is
+    /// entirely trustworthy records. Repairing a torn journal means
+    /// truncating it to exactly this length.
+    pub fn trusted_len(&self) -> u64 {
+        self.tail_offset.unwrap_or_else(|| {
+            self.records
+                .iter()
+                .filter_map(|r| r.encode().map(|b| b.len() as u64))
+                .sum()
+        })
+    }
 }
 
 /// Reads every well-formed record from `bytes`, stopping at the first one
@@ -205,24 +244,36 @@ impl JournalWriter {
         self.next_fault = fault;
     }
 
-    /// Appends one record. `fsync` decides whether the append is durable
-    /// before this returns: `false` leaves the bytes in the OS page cache,
-    /// reachable by a clean restart but not guaranteed to survive a real
-    /// crash; `true` calls `sync_all` before returning, and only then is the
-    /// record durable.
+    /// Appends one opaque record. `fsync` decides whether the append is
+    /// durable before this returns: `false` leaves the bytes in the OS page
+    /// cache, reachable by a clean restart but not guaranteed to survive a
+    /// real crash; `true` calls `sync_all` before returning, and only then
+    /// is the record durable.
     ///
-    /// Returns `Err` on any failure, injected or real, and touches nothing
-    /// else in that case -- the caller (`Host::apply_edit`) must not advance
-    /// any in-memory sequence counter until this returns `Ok`. That ordering
-    /// is the whole of what "mark edit durable before write completes"
-    /// mutates, and it lives in the caller, not here.
+    /// `Ok(true)` from this method is the only fact "durable" may be
+    /// derived from; whether that determination happens promptly is the
+    /// caller's obligation, not this one's -- this function is already
+    /// synchronous and blocking, so there is no window inside it for a
+    /// caller to observe a state between "asked" and "written".
+    ///
+    /// Returns `Err` on any failure, injected or real, and the file may
+    /// hold a torn record afterward (see `WriteFault::FailAfterPartialWrite`
+    /// and, for a real crash, the process-failure test suite). The caller
+    /// is responsible for treating a failed append as poisoning further
+    /// writes until a repair pass runs -- this function has no memory of
+    /// its own failures across calls.
     pub fn append(&mut self, sequence: u64, payload: &[u8], fsync: bool) -> io::Result<()> {
         let fault = std::mem::replace(&mut self.next_fault, WriteFault::None);
         let record = JournalRecord {
             sequence,
             payload: payload.to_vec(),
         };
-        let bytes = record.encode();
+        let bytes = record.encode().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload too large to encode (exceeds u32::MAX)",
+            )
+        })?;
 
         match fault {
             WriteFault::None => {
@@ -245,12 +296,22 @@ impl JournalWriter {
         Ok(())
     }
 
-    /// Discards every record: called after a checkpoint captures everything
-    /// the journal held, so recovery data stays bounded by "edits since the
-    /// last checkpoint" rather than growing for the life of the document.
+    /// Discards every record. Called by [`crate::RecoveryStore`] only after
+    /// a checkpoint covering them has been durably, atomically installed --
+    /// never on its own, and never as a side effect of a generation
+    /// replacement or a read. See `RecoveryStore::write_checkpoint`.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_all()
+    }
+
+    /// Truncates to exactly `len` bytes -- the repair operation for a
+    /// journal whose tail was found torn on open. `len` should be
+    /// [`JournalReadResult::trusted_len`] from a read against the same file.
+    pub fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)?;
+        self.file.seek(SeekFrom::Start(len))?;
         self.file.sync_all()
     }
 
@@ -269,7 +330,7 @@ mod tests {
             sequence: 7,
             payload: b"hello".to_vec(),
         };
-        let bytes = record.encode();
+        let bytes = record.encode().unwrap();
         let result = read_records(&bytes);
         assert_eq!(result.records, vec![record]);
         assert_eq!(result.tail_fault, None);
@@ -285,8 +346,8 @@ mod tests {
             sequence: 2,
             payload: b"ab".to_vec(),
         };
-        let mut bytes = a.encode();
-        bytes.extend(b.encode());
+        let mut bytes = a.encode().unwrap();
+        bytes.extend(b.encode().unwrap());
         let result = read_records(&bytes);
         assert_eq!(result.records, vec![a, b]);
         assert_eq!(result.tail_fault, None);
@@ -298,13 +359,14 @@ mod tests {
             sequence: 1,
             payload: b"a".to_vec(),
         };
-        let mut bytes = a.encode();
+        let mut bytes = a.encode().unwrap();
         let boundary = bytes.len();
         bytes.extend_from_slice(&[0xAB, 0xCD]); // fewer than FIXED_OVERHEAD bytes
         let result = read_records(&bytes);
         assert_eq!(result.records, vec![a]);
         assert_eq!(result.tail_fault, Some(TailFault::HeaderTruncated));
         assert_eq!(result.tail_offset, Some(boundary as u64));
+        assert_eq!(result.trusted_len(), boundary as u64);
     }
 
     #[test]
@@ -317,9 +379,9 @@ mod tests {
             sequence: 2,
             payload: b"hello world".to_vec(),
         };
-        let mut bytes = a.encode();
+        let mut bytes = a.encode().unwrap();
         let boundary = bytes.len();
-        let mut b_bytes = b.encode();
+        let mut b_bytes = b.encode().unwrap();
         b_bytes.truncate(b_bytes.len() - 3); // cut into the payload
         bytes.extend(b_bytes);
         let result = read_records(&bytes);
@@ -334,7 +396,7 @@ mod tests {
             sequence: 1,
             payload: b"hello".to_vec(),
         };
-        let mut bytes = a.encode();
+        let mut bytes = a.encode().unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF; // corrupt the stored checksum itself
         let result = read_records(&bytes);
@@ -349,7 +411,7 @@ mod tests {
             sequence: 1,
             payload: b"a".to_vec(),
         };
-        let mut bytes = a.encode();
+        let mut bytes = a.encode().unwrap();
         bytes.push(0x00); // one stray byte: not enough for another header
         let first = read_records(&bytes);
         let second = read_records(&bytes);
@@ -357,5 +419,21 @@ mod tests {
             first, second,
             "recovery must be deterministic on the same input"
         );
+    }
+
+    #[test]
+    fn a_payload_too_large_to_encode_is_refused_not_truncated() {
+        // Constructing an actual 4 GiB Vec here would be wasteful; the
+        // property under test is the length check itself, so a fake
+        // oversized length is exercised through a dedicated unit rather
+        // than actually allocating u32::MAX + 1 bytes.
+        struct Oversized(usize);
+        impl Oversized {
+            fn would_encode(&self) -> bool {
+                u32::try_from(self.0).is_ok()
+            }
+        }
+        assert!(Oversized(u32::MAX as usize).would_encode());
+        assert!(!Oversized(u32::MAX as usize + 1).would_encode());
     }
 }

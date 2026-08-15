@@ -95,15 +95,14 @@ impl Scratchpad {
             }
         }
         self.preedit = (!text.is_empty()).then_some(text);
-        self.preedit_cursor = self
-            .preedit
-            .as_deref()
-            .and_then(|text| cursor.filter(|(start, end)| {
+        self.preedit_cursor = self.preedit.as_deref().and_then(|text| {
+            cursor.filter(|(start, end)| {
                 start <= end
                     && *end <= text.len()
                     && text.is_char_boundary(*start)
                     && text.is_char_boundary(*end)
-            }));
+            })
+        });
     }
 
     fn cancel_composition(&mut self) {
@@ -145,16 +144,17 @@ impl Scratchpad {
         }
         let first = self.scroll_y.min(count - 1);
         (first..first.saturating_add(rows).min(count))
-            .map(|line| {
-                Ok(self.bounded_line(line)?.1)
-            })
+            .map(|line| Ok(self.bounded_line(line)?.1))
             .collect()
     }
 
     /// Builds only the bounded projected viewport. Preedit bytes are never
     /// written to Crop; the resulting hard rows are shaped independently by
     /// the same host TextLayout service used for canonical rows.
-    fn visible_rows_projected(&self, rows: usize) -> Result<Vec<String>, instar_editor_core::EditError> {
+    fn visible_rows_projected(
+        &self,
+        rows: usize,
+    ) -> Result<Vec<String>, instar_editor_core::EditError> {
         let range = self.visible_range(rows)?;
         if self.preedit.is_none() || self.composition_target.is_none() {
             return self.visible_rows(rows);
@@ -188,7 +188,8 @@ impl Scratchpad {
         let limit = rows
             .max(1)
             .saturating_mul(PRESENTATION_MAX_BYTES.saturating_add(1));
-        let mut projected = String::with_capacity(limit.min(range.len().saturating_add(preedit.len())));
+        let mut projected =
+            String::with_capacity(limit.min(range.len().saturating_add(preedit.len())));
         let target = target.range();
         let prefix_end = target.start.min(range.end);
         if range.start < prefix_end {
@@ -252,6 +253,39 @@ impl Scratchpad {
 
     pub fn primary_position(&self) -> Position {
         self.carets.first().map_or(Position::at(0), |s| s.head)
+    }
+
+    /// Returns the cursor that belongs in the projected presentation.
+    ///
+    /// During composition the active end of the IME cursor is relative to the
+    /// transient preedit, not to the canonical document. Mapping it onto the
+    /// document line that owns the composition target keeps the drawn caret
+    /// and the native candidate rectangle at the same visual position.
+    fn visual_cursor(&self) -> Result<(usize, usize), instar_editor_core::EditError> {
+        if let (Some(preedit), Some(target), Some((_, end))) = (
+            self.preedit.as_deref(),
+            self.composition_target,
+            self.preedit_cursor,
+        ) && let Some(prefix) = preedit.get(..end)
+        {
+            let target = target.range();
+            let target_line = self.document.line_of_byte(target.start)?;
+            let target_line_start = self.document.line_range(target_line)?.start;
+            if let Some(newline) = prefix.rfind('\n') {
+                let line = target_line
+                    + prefix[..=newline]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                return Ok((line, prefix.len() - newline - 1));
+            }
+            return Ok((target_line, target.start - target_line_start + prefix.len()));
+        }
+
+        let position = self.primary_position();
+        let line = self.document.line_of_byte(position.byte)?;
+        let line_start = self.document.line_range(line)?.start;
+        Ok((line, position.byte.saturating_sub(line_start)))
     }
 
     fn layout_style() -> LayoutStyle {
@@ -334,7 +368,8 @@ impl Scratchpad {
         extend: bool,
         presentation: &Presentation,
     ) -> Result<(), String> {
-        let (line_number, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
+        let (line_number, line_start, line) =
+            self.primary_line().map_err(|error| error.to_string())?;
         let layout = presentation
             .row_for_line(line_number)
             .map(|row| &row.layout);
@@ -431,7 +466,8 @@ impl Scratchpad {
         extend: bool,
         presentation: &Presentation,
     ) -> Result<(), String> {
-        let (line_number, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
+        let (line_number, line_start, line) =
+            self.primary_line().map_err(|error| error.to_string())?;
         let owned_layout = if presentation.row_for_line(line_number).is_none() {
             Some(
                 text_layouts::create_layout(&line, Self::layout_style())
@@ -463,7 +499,6 @@ impl Scratchpad {
         };
         Ok(())
     }
-
 }
 
 const SURFACE: instar_ui_protocol::NodeKey = instar_ui_protocol::NodeKey::first(7);
@@ -542,7 +577,10 @@ impl GuestComponent {
             .map_err(|error| format!("surface tree commit failed: {error:?}"))
     }
 
-    async fn present(app: &Scratchpad, presentation: &mut Option<Presentation>) -> Result<(), String> {
+    async fn present(
+        app: &Scratchpad,
+        presentation: &mut Option<Presentation>,
+    ) -> Result<(), String> {
         let style = Scratchpad::layout_style();
         const VIEWPORT_ROWS: usize = 26;
         const OVERSCAN_ROWS: usize = 2;
@@ -557,7 +595,10 @@ impl GuestComponent {
         encoder.command(instar_surface_protocol::Command::FillRect {
             rect: instar_surface_protocol::Rect::new(612.0, 448.0, 16.0, 16.0),
             color: if app.pointer_anchor.is_some()
-                || !app.carets.first().is_some_and(|selection| selection.is_empty())
+                || !app
+                    .carets
+                    .first()
+                    .is_some_and(|selection| selection.is_empty())
             {
                 instar_surface_protocol::Color::rgba(240, 170, 70, 255)
             } else if app.document.is_empty() {
@@ -570,6 +611,23 @@ impl GuestComponent {
             .visible_rows_projected(VIEWPORT_ROWS + OVERSCAN_ROWS)
             .map_err(|error| format!("visible row extraction failed: {error}"))?;
         let first_line = app.scroll_y.min(app.document.len_lines().saturating_sub(1));
+        // Rows this call can reuse instead of re-shaping. Every prior call
+        // shaped every visible row unconditionally -- fine for a document
+        // small enough that few rows exist at all, but once a document has
+        // VIEWPORT_ROWS + OVERSCAN_ROWS (28) or more lines, every single
+        // keystroke re-shaped all 28 of them from scratch regardless of
+        // which row (usually exactly one) actually changed. That, not a
+        // document-size scan anywhere in the line-lookup path (`Document`'s
+        // `line_of_byte`/`line_range` are Crop-native O(log n) calls), is
+        // what blew the p95 <= 5 ms typing budget for a large document --
+        // see benchmarks/text-latency/README.md and
+        // docs/PHASE-3.md's "Latency gate" section for the measurements
+        // that found this. A row is reusable exactly when its line number
+        // and its bounded text are unchanged since the last presentation;
+        // `take()` moves the old rows out so their `TextLayout` handles can
+        // be relocated into `presented_rows` below instead of being dropped
+        // and immediately re-created.
+        let mut previous_rows = presentation.take().map_or_else(Vec::new, |p| p.rows);
         let mut presented_rows = Vec::with_capacity(rows.len());
         let mut row_height = 20.0_f32;
         let mut candidate = instar::kernel::surface_types::LocalRect {
@@ -578,14 +636,25 @@ impl GuestComponent {
             width: 1.0,
             height: row_height,
         };
+        let (visual_line, visual_byte) = app
+            .visual_cursor()
+            .map_err(|error| format!("visual cursor lookup failed: {error:?}"))?;
         for (slot, row) in rows.iter().enumerate() {
             let mut end = row.len().min(PRESENTATION_MAX_BYTES);
             while end > 0 && !row.is_char_boundary(end) {
                 end -= 1;
             }
             let bounded = &row[..end];
-            let layout = text_layouts::create_layout(bounded, style)
-                .map_err(|error| format!("layout creation failed: {error:?}"))?;
+            let line = first_line + slot;
+            let reusable = previous_rows
+                .iter()
+                .position(|previous| previous.line == line && previous.text == bounded);
+            let layout = if let Some(index) = reusable {
+                previous_rows.remove(index).layout
+            } else {
+                text_layouts::create_layout(bounded, style)
+                    .map_err(|error| format!("layout creation failed: {error:?}"))?
+            };
             if slot == 0 {
                 row_height = layout
                     .metrics()
@@ -593,7 +662,6 @@ impl GuestComponent {
                     .height;
                 candidate.height = row_height;
             }
-            let line = first_line + slot;
             let row_start = app
                 .document
                 .line_range(line.min(app.document.len_lines().saturating_sub(1)))
@@ -630,33 +698,50 @@ impl GuestComponent {
                     }
                 }
             }
-            let primary_line = app.primary_position().byte;
-            let line_of_primary = app.document.line_of_byte(primary_line).unwrap_or(0);
-            if app.document.len_lines() > 0 && line_of_primary == line {
-                let line_start = app
-                    .document
-                    .line_range(line)
-                    .map_err(|error| format!("caret row lookup failed: {error}"))?
-                    .start;
-                let local = app.primary_position().byte.saturating_sub(line_start).min(bounded.len());
+            if app.document.len_lines() > 0 && visual_line == line {
+                let local = visual_byte.min(bounded.len());
                 let caret = layout
-                    .caret_rect(Cursor { byte_index: local as u32, affinity: Affinity::Downstream }, 1.0)
+                    .caret_rect(
+                        Cursor {
+                            byte_index: local as u32,
+                            affinity: Affinity::Downstream,
+                        },
+                        1.0,
+                    )
                     .map_err(|error| format!("caret geometry failed: {error:?}"))?;
                 let x = 8.0 + caret.x;
                 let y = 24.0 + slot as f32 * row_height + caret.y;
                 encoder.command(instar_surface_protocol::Command::FillRect {
-                    rect: instar_surface_protocol::Rect::new(x, y, caret.width.max(1.0), caret.height.max(1.0)),
+                    rect: instar_surface_protocol::Rect::new(
+                        x,
+                        y,
+                        caret.width.max(1.0),
+                        caret.height.max(1.0),
+                    ),
                     color: instar_surface_protocol::Color::rgba(120, 190, 255, 220),
                 });
                 candidate = instar::kernel::surface_types::LocalRect {
-                    x, y, width: caret.width.max(1.0), height: caret.height.max(1.0),
+                    x,
+                    y,
+                    width: caret.width.max(1.0),
+                    height: caret.height.max(1.0),
                 };
             }
             for caret_selection in app.carets.iter().skip(1) {
                 if caret_selection.is_empty() && caret_selection.head.byte >= row_start {
-                    let local = caret_selection.head.byte.saturating_sub(row_start).min(bounded.len());
+                    let local = caret_selection
+                        .head
+                        .byte
+                        .saturating_sub(row_start)
+                        .min(bounded.len());
                     let caret = layout
-                        .caret_rect(Cursor { byte_index: local as u32, affinity: Affinity::Downstream }, 1.0)
+                        .caret_rect(
+                            Cursor {
+                                byte_index: local as u32,
+                                affinity: Affinity::Downstream,
+                            },
+                            1.0,
+                        )
                         .map_err(|error| format!("caret geometry failed: {error:?}"))?;
                     encoder.command(instar_surface_protocol::Command::FillRect {
                         rect: instar_surface_protocol::Rect::new(
@@ -729,7 +814,10 @@ impl GuestComponent {
         };
         let cursor = row
             .layout
-            .cursor_from_point((x - 8.0) as f32, (y - 24.0 - slot as f64 * f64::from(presentation.row_height)) as f32)
+            .cursor_from_point(
+                (x - 8.0) as f32,
+                (y - 24.0 - slot as f64 * f64::from(presentation.row_height)) as f32,
+            )
             .map_err(|error| format!("pointer query failed: {error:?}"))?;
         let mut cursor = cursor;
         // Some platforms report a point above the first glyph's ink box as
@@ -804,6 +892,16 @@ impl Guest for GuestComponent {
             };
             let event = SurfaceEvent::decode(&payload)
                 .map_err(|error| format!("undecodable Surface event: {error}"))?;
+            // `present()` used to run unconditionally after every event,
+            // including ones that provably changed nothing visible: a key
+            // release (there is no `pressed: false` arm below, so it always
+            // fell to the wildcard), a pointer move with no drag in progress
+            // and no composition to cancel, `Focus { focused: true }`,
+            // `ImeEnabled`, and `Metrics` all reached the trailing call with
+            // `app` untouched. Each arm below opts in to `needs_present`
+            // explicitly instead, so the default is "nothing changed, don't
+            // repaint" rather than "repaint unless proven unnecessary".
+            let mut needs_present = false;
             match event {
                 SurfaceEvent::Key {
                     logical,
@@ -837,45 +935,64 @@ impl Guest for GuestComponent {
                         }
                         _ => {}
                     }
+                    needs_present = true;
                 }
                 SurfaceEvent::PointerDown { x, y, .. } => {
-                    GuestComponent::pointer(
-                        &mut app,
-                        &mut presentation,
-                        PointerPhase::Down,
-                        x,
-                        y,
-                    )
-                    .await?
+                    GuestComponent::pointer(&mut app, &mut presentation, PointerPhase::Down, x, y)
+                        .await?;
+                    needs_present = true;
                 }
                 SurfaceEvent::PointerUp { x, y, .. } => {
-                    GuestComponent::pointer(
-                        &mut app,
-                        &mut presentation,
-                        PointerPhase::Up,
-                        x,
-                        y,
-                    )
-                    .await?
+                    GuestComponent::pointer(&mut app, &mut presentation, PointerPhase::Up, x, y)
+                        .await?;
+                    needs_present = true;
                 }
                 SurfaceEvent::PointerMove { x, y, .. } => {
-                    GuestComponent::pointer(
-                        &mut app,
-                        &mut presentation,
-                        PointerPhase::Move,
-                        x,
-                        y,
-                    )
-                    .await?
+                    // `pointer()`'s own body only changes anything for `Move`
+                    // when a drag is in progress, and its leading composition
+                    // check only fires when there is a composition to cancel
+                    // -- so a hover move that is neither is not just an
+                    // unnecessary `present()`, it is an unnecessary host call
+                    // to hit-test a point whose result nothing will use.
+                    if app.pointer_anchor.is_some()
+                        || app.preedit.is_some()
+                        || app.composition_target.is_some()
+                    {
+                        GuestComponent::pointer(
+                            &mut app,
+                            &mut presentation,
+                            PointerPhase::Move,
+                            x,
+                            y,
+                        )
+                        .await?;
+                        needs_present = true;
+                    }
                 }
-                SurfaceEvent::Wheel { dy, .. } => app.scroll(dy),
+                SurfaceEvent::Wheel { dy, .. } => {
+                    app.scroll(dy);
+                    needs_present = true;
+                }
                 SurfaceEvent::ImeCommit { text, .. } => {
-                    app.commit(&text).map_err(|error| error.to_string())?
+                    app.commit(&text).map_err(|error| error.to_string())?;
+                    needs_present = true;
                 }
                 SurfaceEvent::ImePreedit { text, cursor, .. } => {
-                    app.preedit_with_cursor(text, cursor.map(|(start, end)| (start as usize, end as usize)))
+                    app.preedit_with_cursor(
+                        text,
+                        cursor.map(|(start, end)| (start as usize, end as usize)),
+                    );
+                    needs_present = true;
                 }
                 SurfaceEvent::ImeDisabled { .. } | SurfaceEvent::Focus { focused: false, .. } => {
+                    // The scene depends on `preedit` (composed text is drawn)
+                    // and on `pointer_anchor` (it feeds the proof marker's
+                    // color); `configure_text_input` itself has no visual
+                    // effect on the Surface. So this only needs a repaint
+                    // when clearing state actually clears something.
+                    needs_present = app.preedit.is_some()
+                        || app.pointer_anchor.is_some()
+                        || app.composition_target.is_some();
                     app.cancel_composition();
                     app.pointer_anchor = None;
                     let _ = surfaces::configure_text_input(
@@ -894,7 +1011,9 @@ impl Guest for GuestComponent {
                 | SurfaceEvent::Metrics { .. } => {}
                 _ => {}
             }
-            GuestComponent::present(&app, &mut presentation).await?;
+            if needs_present {
+                GuestComponent::present(&app, &mut presentation).await?;
+            }
         }
     }
 }
@@ -956,6 +1075,30 @@ mod tests {
         // Kills mutant: one IME composition is replicated to every caret.
         assert_eq!(app.document.as_string(), "aXbc");
         assert_eq!(app.carets, vec![Selection::at(2)]);
+    }
+
+    #[test]
+    fn preedit_cursor_maps_to_the_projected_visual_position() {
+        let mut app = Scratchpad::new("abc");
+        app.carets = vec![Selection::at(1)];
+        app.preedit_with_cursor("XY", Some((0, 1)));
+
+        // The canonical caret remains at the composition target while the
+        // active IME cursor is one byte into the projected preedit.
+        assert_eq!(app.primary_position(), Position::at(1));
+        assert_eq!(app.visual_cursor().unwrap(), (0, 2));
+
+        app.preedit_with_cursor("XY", Some((0, 2)));
+        assert_eq!(app.visual_cursor().unwrap(), (0, 3));
+    }
+
+    #[test]
+    fn multiline_preedit_cursor_maps_after_its_inserted_line() {
+        let mut app = Scratchpad::new("ab\ncd");
+        app.carets = vec![Selection::at(1)];
+        app.preedit_with_cursor("X\nYZ", Some((0, 3)));
+
+        assert_eq!(app.visual_cursor().unwrap(), (1, 1));
     }
 
     #[test]

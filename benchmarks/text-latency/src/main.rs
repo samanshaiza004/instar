@@ -230,6 +230,27 @@ fn main() {
         |h| workloads::ascii_typing(h, 'y')
     );
 
+    // Control, not part of the graded gate: a document small enough that it
+    // is entirely visible at once (VIEWPORT_ROWS + OVERSCAN_ROWS = 28 rows in
+    // `guests/scratchpad`), so unlike the three workloads immediately above
+    // there is nothing off-screen and no scrolling involved. It isolates a
+    // question the *_after_1mib_doc / *_after_10mib_doc names imply but do
+    // not on their own establish: is the keystroke's cost driven by the
+    // document's total size, or by how many rows a presentation touches --
+    // which is capped at 28 by the viewport regardless of document size?
+    // If this control's latency lands anywhere near the 1 MiB / 10 MiB
+    // workloads' instead of near `ascii_typing`'s, the earlier ones were
+    // never measuring O(document-size) work at all.
+    workload!(
+        "keystroke_tiny_28_line_doc_control",
+        "one keystroke, ~6 KiB / 28-line document preloaded (small enough to be \
+         entirely on-screen at once -- see comment above)",
+        false,
+        iterations.min(50),
+        |run: &mut GateRun| workloads::preload_document_with_lines(run, 6 << 10, 28),
+        |h| workloads::ascii_typing(h, 'y')
+    );
+
     // Diagnostic matrix, not part of the graded gate (`graded: false`):
     // isolates whether the large-document regression above tracks document
     // *bytes*, *line count*, or *caret position*, per the request that

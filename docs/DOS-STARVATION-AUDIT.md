@@ -17,6 +17,20 @@ them for a specific decision; reproduction notes are given per finding. The
 measurement code itself was added as temporary `#[ignore]`d tests, run once,
 and reverted — it is intentionally not part of the permanent suite.
 
+## Implementation gate before G1–G4
+
+The main-thread starvation mechanism in F3 is real: `serve_presentation`
+runs synchronously on the winit-owning thread, and the pump's deadline is
+only checked between items. This document is not, however, permission to
+implement the earlier G1–G4 recommendations as written. F1's line-limit
+fixture and timing need a reproducible correction, F2's `create-layout`
+concurrency premise still needs a hostile-guest measurement, and F9 exposes
+a resource-accounting gap that the original recommendations did not cover.
+
+Until those evidence gaps are closed, treat G1/G2 as hypotheses and
+measurement work. G3 (rolling wall-clock refusal) and G4 (queue surgery) are
+explicitly deferred; neither should be implemented from this audit.
+
 **This document was corrected after review.** The first pass mis-transcribed
 one measurement (see "Corrections" below), which weakened F1 in one specific
 respect and led to reprioritizing this whole audit. The corrections are kept
@@ -26,17 +40,20 @@ of the record as the original numbers.
 
 ## Corrections after review
 
-1. **F1's "refused, `TooManyLines`" reading was wrong.** The original pass
-   reported the 2048x`"a\n"` case (4096 B, 2048 hard breaks) as refused at
-   8.7-10 ms. Rerunning it: that input is **accepted** (`lines=2049,
-   clusters=4096`, both under their 4096 caps), not refused — the original
+1. **F1's "refused, `TooManyLines`" reading was wrong, and the replacement
+   fixture is not yet a frozen benchmark.** The original pass reported the
+   2048x`"a\n"` case (4096 B, 2048 newline characters) as refused at 8.7-10
+   ms. As written, that input has 2049 hard lines, not more than 4096, and a
+   rerun accepts it (`clusters=4096`, both under their 4096 caps). The original
    report printed `result.err()`, which was `None`, and that `None` got
-   mistranscribed into prose as a rejection. A corrected reproducer that
-   actually exceeds `MAX_LAYOUT_LINES` (4096 consecutive `\n` bytes, 0 content
-   — see F1 below) **is** refused, and is warm-cheap (~0.7-1.1 ms), not
-   expensive. The "expensive to reject, repeatable at zero live-layout cost"
-   claim in the original F1 is **not supported** by any input found so far —
-   see the revised F1.
+   mistranscribed into prose as a rejection. A candidate corrected fixture
+   that should exceed `MAX_LAYOUT_LINES` is 4096 consecutive `\n` bytes,
+   which should produce 4097 hard lines — but this fixture still needs a
+   committed, independently reproducible test. Do not freeze a `<1 ms`
+   refusal assertion around the provisional ~0.7-1.1 ms observation until
+   that reproduction exists. The "expensive to reject, repeatable at zero
+   live-layout cost" claim in the original F1 is **not supported** by the
+   current evidence — see the revised F1.
 2. **The original single-sample readings for the width-constrained cases
    (12.0 ms, 12.7 ms) are now suspect.** Warm-repeating the 2048x`"a\n"` case
    10 times gave 1.43 ms/call average, after a single first-call reading of
@@ -99,7 +116,7 @@ Measured, warm (repeated 10x, not single-sample), release,
 | Input at `MAX_LAYOUT_TEXT_BYTES` (4096 B) | Outcome | Time |
 |---|---|---:|
 | Single unbroken 4096 B word, no wrap width | accepted | 4.75-7.29 ms (5 samples) |
-| 4096x `\n`, 0 content bytes (`lines=4097`, over the 4096 cap) | **refused**, `TooManyLines(4097)` | ~0.7-1.1 ms/call, 10/10 refused |
+| Candidate corrected fixture: 4096x `\n`, 0 content bytes (expected `lines=4097`) | refusal outcome and timing **pending reproduction** | do not freeze the provisional ~0.7-1.1 ms observation |
 | 2048x `"a\n"` (`lines=2049`, `clusters=4096`, both under cap) | accepted | 1.43 ms/call avg over 10 (single first-call reading was 31-33 ms — see corrections) |
 | 4096x `"a"`, plain ASCII (max possible 1-byte clusters) | accepted, `clusters=4096` (never exceeds) | not separately timed |
 
@@ -114,8 +131,10 @@ Retracted pending a proper warm-repeated rerun (not currently trusted):
 single long unbroken run at the byte cap) reliably costs 4.75-7.29 ms warm —
 on its own, at or above a p95 <= 5 ms budget. What does **not** currently
 survive: the claim that a refused request can be made expensive and repeated
-for free. No input tried so far demonstrates that; the two constructions
-tested were either cheap-and-refused or cheap-and-accepted. The
+for free. No corrected over-limit fixture has yet been promoted to a
+reproducible timing benchmark; the original construction was not actually
+over the line cap. The two constructions tested were either cheap-and-refused
+or cheap-and-accepted. The
 width-constrained cases might still be genuinely expensive — they are simply
 unverified, not confirmed.
 
@@ -377,20 +396,31 @@ layout remains fully resident*, retained by the Surface, indefinitely (until
 that Surface's scene is replaced by an update that no longer references it,
 or the Surface node itself is removed from the tree).
 
-This is not a contrived attack pattern — it's what any ordinary
-text-rendering guest does continuously: create a fresh layout for updated
-visible content, attach it to a Surface, drop the old resource handle. Every
-cycle of that pattern that changes which layout is attached leaves the
-*previous* one uncounted by `MAX_LIVE_LAYOUTS` for as long as anything still
-references it, and the guest can trivially construct sequences where nothing
-ever stops referencing anything: create, attach to Surface A, drop handle,
-create, attach to Surface B, drop handle... `live` never exceeds 1, while
-`self.slots` accumulates a `SharedLayout` (shaped glyph data, not just 4 KiB
-of source text — larger) per cycle, retained for as long as its owning
-Surface's current scene names it. Bounded only by the indirect product of
+The precise claim, stated so it cannot be read as more than it is: **dropping
+a guest lease removes the layout from the admission count even while one or
+more currently retained Surface scenes still keep it resident.** That is not,
+by itself, unbounded growth — `update-surface` replaces a Surface's old
+retained scene and immediately calls `self.layouts.collect()`, so a layout
+referenced only by that superseded scene becomes reclaimable at once. An
+ordinary text-rendering guest updating *one* Surface as its content changes —
+create a fresh layout, attach it, drop the old handle, repeat — does not
+accumulate: each `update-surface` call retires the previous layout's last
+reference in the same step that installs the new one.
+
+The unbounded case needs *concurrently* retained references, not merely
+sequential ones. The guest can trivially construct that instead: create,
+attach to Surface A, drop handle, create, attach to Surface B, drop handle...
+`live` never exceeds 1, while `self.slots` accumulates a `SharedLayout`
+(shaped glyph data, not just 4 KiB of source text — larger) per cycle, each
+retained for as long as its owning Surface's *current* scene — a different
+Surface each time — still names it. Bounded only by the indirect product of
 existing per-request caps — up to `MAX_NODES = 4096` Surfaces, each able to
 name up to `MAX_RESOURCE_REFERENCES = 4096` distinct layouts in one scene —
-not by any direct aggregate cap.
+not by any direct aggregate cap. A single long-lived Surface whose scene
+names many distinct layouts at once (rather than replacing one with another)
+reaches the same unbounded shape without needing multiple Surfaces at all.
+The existing 1 MiB scene-size limit does not change this conclusion: it is a
+per-scene admission bound, not a total retained-Surface window bound.
 
 `MAX_LIVE_LAYOUTS` as currently implemented means "layouts the guest currently
 has an open handle to," not "layouts this generation is responsible for
@@ -402,7 +432,7 @@ the one the constant's name and the containment story imply.
 | Operation | Legal max | Measured warm cost | vs. p95 <= 5 ms |
 |---|---|---:|---|
 | `create_layout`, single 4096 B unbroken run | accepted | 4.75-7.29 ms | at/above budget alone |
-| `create_layout`, 4096x `\n` (over line cap) | refused | ~0.7-1.1 ms | within budget |
+| `create_layout`, candidate 4096x `\n` (expected over line cap) | pending reproduction | provisional ~0.7-1.1 ms not a budget result | do not classify yet |
 | `create_layout`, 2048x `"a\n"` (at line/cluster cap, accepted) | accepted | 1.43 ms warm avg | within budget |
 | `create_layout`, narrow wrap width variants | accepted | **unverified**, retracted single-sample reads of 12.0/12.7 ms | unknown |
 | `Scene::decode`, 65,534 commands | accepted | 1.99 ms | within budget |
@@ -431,12 +461,14 @@ addressed. Priority order:
    freeing condition (still correctly waits for `strong_count == 1`), so a
    Surface-retained layout keeps counting against the generation's budget for
    exactly as long as it's actually resident.
-2. **Add an aggregate retained-Surface budget** (total bytes/commands/resource
-   references across all of one window's `surface_scenes`, not just the
-   1 MiB-per-request cap), admitted the same way an individual scene is:
-   compute the prospective total before accepting a replacement, refuse and
-   preserve the old scene if it would exceed the budget. Choose the number
-   from measurement (item 4), not a guess.
+2. **Add an aggregate retained-Surface budget** (total retained layout bytes,
+   command/resource-reference count, or another explicitly measured resident
+   resource proxy across all of one generation/window's `surface_scenes`, not
+   just the 1 MiB-per-request cap). A per-scene 1 MiB bound is not an aggregate
+   window bound: many individually legal scenes can exceed any useful total.
+   Compute the prospective total before accepting a replacement, refuse and
+   preserve the old scene if it would exceed the aggregate budget. Choose the
+   budget and accounting unit from measurement (item 4), not a guess.
 3. **Prove or disprove F2's `create-layout` ABI-serialization claim** with an
    actual hostile `wasm32-wasip2` guest component: attempt N overlapping
    `create-layout` calls, record the actual maximum concurrently outstanding
