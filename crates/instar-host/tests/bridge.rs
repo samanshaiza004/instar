@@ -43,18 +43,14 @@
 //! will stay that way until there are numbers from a real windowed host to
 //! calibrate against. See its docs for why.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use instar_host::bridge::{HostBridge, HostUserEvent, QUEUE_CAPACITY, TerminalOutcome, Wake};
-use instar_host::text_host::TextResourceCounts;
 use instar_host::{HostEffect, HostWindow, PresentationState};
 use instar_kernel::bridge::{CommitRejection, commit_request};
 use instar_kernel::runtime::{EVENT_QUEUE_CAPACITY, GenerationId};
-use instar_kernel::text_bridge::{TextOperation, TextRefusal, text_request};
-use instar_text::TextViewId;
 use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
 use instar_ui::{NodeKey, NodeKind};
 use instar_window::{
@@ -462,11 +458,7 @@ fn an_invalid_commit_changes_nothing() {
     let before = label(&bridge);
     let commit_sequence = bridge.commit_sequence();
 
-    let (request, reply) = commit_request(
-        bridge.generation(),
-        b"not a batch at all".to_vec(),
-        Vec::new(),
-    );
+    let (request, reply) = commit_request(bridge.generation(), b"not a batch at all".to_vec());
     let effects = bridge.on_user_event(HostUserEvent::UiCommit {
         generation: bridge.generation(),
         request,
@@ -679,11 +671,7 @@ fn a_trap_stops_an_in_flight_commit_from_mutating_anything() {
     // A commit from the live generation, held back rather than delivered --
     // the state a batch is in between leaving the runtime thread and being
     // applied.
-    let (request, reply) = commit_request(
-        generation,
-        foreign_batch("applied after the trap"),
-        Vec::new(),
-    );
+    let (request, reply) = commit_request(generation, foreign_batch("applied after the trap"));
 
     click(&mut bridge, CRASH);
     let started = Instant::now();
@@ -781,7 +769,7 @@ fn an_old_generation_commit_is_rejected_before_decoding() {
         "with no guest running, no generation is current"
     );
 
-    let (request, reply) = commit_request(old, b"\xff\xff\xff undecodable".to_vec(), Vec::new());
+    let (request, reply) = commit_request(old, b"\xff\xff\xff undecodable".to_vec());
     let before = label(&bridge);
     bridge.on_user_event(HostUserEvent::UiCommit {
         generation: old,
@@ -1127,277 +1115,5 @@ fn trace_one_warm_click() {
     println!(
         "\nexactly one label changed, so `rebuilt` should be 1. If it is \
          {text_nodes}, the cache is not surviving the commit boundary."
-    );
-}
-
-// ------------------------------------------------- B2e-1b: the joined path
-
-/// The node keys `guests/hostile` gives its text buttons.
-const TEXT_ACQUIRE: NodeKey = NodeKey::first(16);
-const TEXT_RELEASE_VIEW: NodeKey = NodeKey::first(17);
-
-/// Waits until the host's text counts satisfy `done`, or gives up.
-fn await_text(bridge: &mut HostBridge, done: impl Fn(TextResourceCounts) -> bool) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < PATIENCE {
-        if done(bridge.host().text_resources().counts()) {
-            return true;
-        }
-        bridge.wait(Duration::from_millis(25));
-    }
-    false
-}
-
-/// The whole B2e-1 claim, through a real guest.
-///
-/// Every earlier test in this package proved one half against a hand-built
-/// request. This is the first that goes guest -> WIT import -> kernel sink ->
-/// bounded queue -> generation screen -> TextHost -> TextSystem, and back with
-/// a handle the guest holds.
-#[test]
-fn a_real_guest_acquires_and_releases_text_capabilities() {
-    let (mut bridge, _wakes) = ready();
-    assert_eq!(
-        bridge.host().text_resources().counts(),
-        TextResourceCounts::default(),
-        "nothing exists before the guest asks"
-    );
-
-    click(&mut bridge, TEXT_ACQUIRE);
-    assert!(
-        await_text(&mut bridge, |c| c.live_views == 2),
-        "a click reached the guest, and its create calls reached TextSystem: {:?}",
-        bridge.host().text_resources().counts()
-    );
-    let counts = bridge.host().text_resources().counts();
-    assert_eq!(counts.guest_buffer_leases, 1);
-    assert_eq!(counts.guest_view_leases, 2);
-    assert_eq!(counts.live_buffers, 1);
-
-    // Dropping one handle in the guest releases exactly one lease. The
-    // generated resource destructor is what carries that across.
-    click(&mut bridge, TEXT_RELEASE_VIEW);
-    assert!(
-        await_text(&mut bridge, |c| c.live_views == 1),
-        "dropping a guest handle released one view: {:?}",
-        bridge.host().text_resources().counts()
-    );
-    assert_eq!(
-        bridge.host().text_resources().counts().guest_view_leases,
-        1,
-        "and only one"
-    );
-}
-
-/// The node keys for the two commits that carry capabilities.
-const TEXT_COMMIT: NodeKey = NodeKey::first(18);
-const TEXT_REVERSE: NodeKey = NodeKey::first(19);
-/// The two text-view surfaces `guests/hostile` attaches.
-const TEXT_NODE_A: NodeKey = NodeKey::first(30);
-const TEXT_NODE_B: NodeKey = NodeKey::first(31);
-
-/// The window's retained `NodeKey -> TextViewId` map.
-fn attachments(bridge: &HostBridge) -> BTreeMap<NodeKey, TextViewId> {
-    bridge
-        .host()
-        .window(WINDOW)
-        .map(|window| window.text_attachments().clone())
-        .unwrap_or_default()
-}
-
-/// Waits until the retained attachment map satisfies `done`, or gives up.
-fn await_attachments(
-    bridge: &mut HostBridge,
-    done: impl Fn(&BTreeMap<NodeKey, TextViewId>) -> bool,
-) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < PATIENCE {
-        if done(&attachments(bridge)) {
-            return true;
-        }
-        bridge.wait(Duration::from_millis(25));
-    }
-    false
-}
-
-/// Waits until another commit has been *accepted*, or gives up.
-///
-/// The signal has to be the commit itself. Waiting on something that was
-/// already true — the view count, say — reads the retained state before the
-/// commit under test has been applied, and then every assertion about "did
-/// this change anything?" is answered by the previous commit.
-fn await_commit_after(bridge: &mut HostBridge, applied: u64) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < PATIENCE {
-        if bridge.stats().applied_commits > applied {
-            return true;
-        }
-        bridge.wait(Duration::from_millis(25));
-    }
-    false
-}
-
-/// The whole of B2e-3, through a real guest.
-///
-/// This is the closure gate the phase rule demands: every new cross-thread or
-/// cross-crate authority check needs one test at the final joined seam, even
-/// when both halves have exhaustive unit tests. Twice in this phase a
-/// unit-level proof stood in for an integration-level one and the fault
-/// injection found it.
-///
-/// The path, end to end:
-///
-/// ```text
-/// guest holds two borrowed text-view handles
-///   -> kernel-ui.commit(batch, text-views)
-///   -> the bound check and the two gates
-///   -> Resource<GuestTextView> -> OpaqueResourceKey, borrows dropped
-///   -> the bounded queue and the generation screen
-///   -> TextHost lease resolution
-///   -> slot resolution and uniqueness
-///   -> atomic promotion
-/// ```
-///
-/// Two views rather than one, because that is what lets the *second* commit
-/// say something: it moves every slot number and every table position while
-/// keeping each node on the same view, so anything comparing positions rather
-/// than resolved identity produces a change where there is none.
-///
-/// The cross-generation authority fault is deliberately **not** injected here.
-/// A new generation gets a fresh `Store` and `ResourceTable` and cannot hold
-/// its predecessor's `Resource<GuestTextView>`, and the old generation's own
-/// commit dies at `StaleGeneration` long before the resolver is reached — so
-/// no real guest can express it without test-only machinery for smuggling a
-/// foreign key into a new Store. That check is covered one seam lower, where
-/// an `OpaqueResourceKey` can be constructed legitimately, by
-/// `bridge::tests::a_live_view_another_generation_owns_is_refused`.
-#[test]
-fn a_real_guest_commits_two_borrowed_views_and_the_table_order_does_not_matter() {
-    let (mut bridge, _wakes) = ready();
-
-    click(&mut bridge, TEXT_ACQUIRE);
-    assert!(
-        await_text(&mut bridge, |c| c.live_views == 2),
-        "the guest acquired both views: {:?}",
-        bridge.host().text_resources().counts()
-    );
-    assert!(
-        attachments(&bridge).is_empty(),
-        "holding a capability is not attaching it"
-    );
-
-    // node A -> slot 1, node B -> slot 0, table [V8, V7].
-    click(&mut bridge, TEXT_COMMIT);
-    assert!(
-        await_attachments(&mut bridge, |map| map.len() == 2),
-        "both text views reached the retained map: {:?}",
-        attachments(&bridge)
-    );
-
-    let first = attachments(&bridge);
-    let node_a = *first.get(&TEXT_NODE_A).expect("node A is attached");
-    let node_b = *first.get(&TEXT_NODE_B).expect("node B is attached");
-    assert_ne!(
-        node_a, node_b,
-        "two nodes, two distinct views -- one view attached twice would be one \
-         caret and one selection in two places"
-    );
-
-    let revision = bridge.host().window(WINDOW).unwrap().tree_revision();
-    let applied = bridge.stats().applied_commits;
-
-    // The same tree and the same two views, with every slot number and every
-    // table position moved: node A -> slot 0, node B -> slot 1, table [V7, V8].
-    click(&mut bridge, TEXT_REVERSE);
-    assert!(
-        await_commit_after(&mut bridge, applied),
-        "the permuted commit was accepted -- without waiting for the commit \
-         itself, every assertion below would be answered by the previous one"
-    );
-
-    assert_eq!(
-        attachments(&bridge),
-        first,
-        "the whole side table was permuted and the retained map did not move; \
-         anything comparing slot numbers or table positions fails here"
-    );
-    assert_eq!(
-        bridge.host().window(WINDOW).unwrap().tree_revision(),
-        revision,
-        "and a commit that changed neither the tree nor the attachments is a \
-         no-op for the retained state, not a new revision"
-    );
-}
-
-/// Teardown is total, on both terminal paths.
-///
-/// Store destruction runs no guest destructors on the trap path, so this is
-/// exactly the case where relying on them would leak everything.
-#[test]
-fn a_dead_generation_returns_every_text_resource() {
-    for mode in ["clean exit", "trap"] {
-        let (mut bridge, _wakes) = ready();
-        click(&mut bridge, TEXT_ACQUIRE);
-        assert!(
-            await_text(&mut bridge, |c| c.live_views == 2),
-            "{mode}: the guest acquired first"
-        );
-
-        // CRASH panics; SILENT stops committing, so a clean exit needs the
-        // guest to return -- FLOOD returns an error from `run`, which is the
-        // clean-exit path this fixture has.
-        click(&mut bridge, if mode == "trap" { CRASH } else { FLOOD });
-        await_guest_gone(&mut bridge);
-
-        assert_eq!(
-            bridge.host().text_resources().counts(),
-            TextResourceCounts::default(),
-            "{mode}: every lease and every resource returned to baseline"
-        );
-    }
-}
-
-/// A text request from a retired generation never reaches `TextSystem`.
-///
-/// Written because the fault injection for it initially passed. The two tests
-/// above acquire *before* terminalization, so no request is ever in flight
-/// against a dead generation, and removing the screening check in
-/// `on_text_request` broke nothing. The race is covered as a unit in
-/// `text_host`; this is the same rule at the joined level, where the queue is
-/// real and the request arrives after the generation is gone.
-#[test]
-fn a_text_request_from_a_dead_generation_allocates_nothing() {
-    let (mut bridge, _wakes) = ready();
-    let live = bridge.generation();
-
-    click(&mut bridge, CRASH);
-    await_guest_gone(&mut bridge);
-    assert_ne!(
-        bridge.generation(),
-        live,
-        "the bridge retired the generation, which is what makes the request stale"
-    );
-
-    let before = bridge.stats().stale_text_requests;
-    let (request, reply) = text_request(live, TextOperation::CreateBuffer);
-    bridge.on_user_event(HostUserEvent::TextRequest {
-        generation: live,
-        request,
-    });
-
-    assert_eq!(
-        bridge.stats().stale_text_requests,
-        before + 1,
-        "the request was screened rather than served"
-    );
-    assert_eq!(
-        reply.blocking_recv().expect("answered"),
-        Err(TextRefusal::StaleGeneration),
-        "and the guest was told, rather than left parked"
-    );
-    assert_eq!(
-        bridge.host().text_resources().counts(),
-        TextResourceCounts::default(),
-        "nothing was allocated on a dead generation's behalf"
     );
 }

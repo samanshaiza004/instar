@@ -10,15 +10,8 @@ description = "Instar's orchestration layer: routes window input to the UI layer
 instar-kernel = { path = "../instar-kernel" }
 instar-ui = { path = "../instar-ui" }
 instar-window = { path = "../instar-window" }
-
-# The text resource subsystem, composed with instar-ui rather than layered
-# under it. This crate is the only place they meet: instar-text chooses which
-# bytes a view must shape and knows nothing of fonts; instar-ui shapes a
-# string and knows nothing of documents. A layering test holds
-# `instar-ui -> instar-text` absent.
-instar-text = { path = "../instar-text" }
-
-unicode-segmentation = "1.13.3"
+instar-text-layout = { path = "../instar-text-layout" }
+instar-surface-protocol = { path = "../instar-surface-protocol" }
 
 # Paint *intent* only: scene types, no renderer. This crate is the layer that
 # bridges logical presentation to physical rendering (docs/PHASE-1.md), so
@@ -48,12 +41,6 @@ wasmtime = { version = "47.0.3", default-features = false, features = [
 accesskit = "0.24.1"
 
 [dev-dependencies]
-# B2e-3a's attachment-bound test asserts
-# `instar_kernel::text_bridge::MAX_TEXT_ATTACHMENTS ==
-# instar_ui_protocol::limits::MAX_NODES`. instar-host is the only crate where
-# both sides are visible, which is exactly why the kernel hard-codes its 4096
-# instead of naming the protocol bound.
-instar-ui-protocol = { path = "../instar-ui-protocol" }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [build-dependencies]

@@ -21,10 +21,6 @@ path = "src/bin/overhead.rs"
 name = "uibench"
 path = "src/bin/uibench.rs"
 
-[[example]]
-name = "textbench"
-path = "src/bin/textbench.rs"
-
 [dependencies]
 instar-host = { path = "../instar-host" }
 instar-paint = { path = "../instar-paint" }
@@ -50,13 +46,6 @@ winit = "=0.30.13"
 # adapter, because the adapter belongs to a native window.
 accesskit = "0.24.1"
 accesskit_winit = "0.33.2"
-
-[dev-dependencies]
-# `textbench` benchmarks the text subsystem and nothing else, so this is a
-# dev-dependency rather than a dependency: the host does not use `instar-text`
-# yet, and putting it here keeps `crop` out of the shipped `instar` binary
-# that package I0 just finished measuring.
-instar-text = { path = "../instar-text" }
 
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }

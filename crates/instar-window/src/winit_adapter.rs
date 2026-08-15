@@ -11,11 +11,11 @@
 //! part that cannot be tested in CI is the part with no logic in it.
 
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key as WinitKey, NamedKey};
+use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
 
 use crate::{
-    Key, PhysicalSize, PointerButton, PointerState, RawPointerMoved, ScrollDelta, WindowId,
-    WindowOutput, WindowState,
+    Key, KeyLocation, PhysicalSize, PointerButton, PointerState, RawPointerMoved, ScrollDelta,
+    StableCode, StableKey, WindowId, WindowOutput, WindowState,
 };
 
 impl From<winit::window::WindowId> for WindowId {
@@ -176,11 +176,15 @@ pub fn translate(
         // is in the user's layout, and a physical-position mapping is for
         // games that want WASD to stay where it is regardless of what the
         // keycaps say.
-        WindowEvent::KeyboardInput { event, .. } => Some(WindowOutput::Key(state.on_key(
-            instar_key(&event.logical_key),
-            event.state.is_pressed(),
-            event.repeat,
-        ))),
+        WindowEvent::KeyboardInput { event, .. } => {
+            Some(WindowOutput::Key(state.on_key_with_details(
+                stable_key(&event.logical_key),
+                stable_code(event.physical_key),
+                key_location(event.location),
+                event.state.is_pressed(),
+                event.repeat,
+            )))
+        }
 
         // IME input crosses the seam as text, not as keys: winit delivers the
         // full preedit string, the byte-wise caret range inside it, and the
@@ -232,6 +236,56 @@ pub fn instar_key(logical: &WinitKey) -> Key {
         // Carried rather than dropped: the host is entitled to know a key
         // happened without this crate growing an opinion about which one.
         _ => Key::Other,
+    }
+}
+
+pub fn stable_key(logical: &WinitKey) -> StableKey {
+    match logical {
+        WinitKey::Named(NamedKey::Tab) => StableKey::Tab,
+        WinitKey::Named(NamedKey::Enter) => StableKey::Enter,
+        WinitKey::Named(NamedKey::Space) => StableKey::Space,
+        WinitKey::Named(NamedKey::Escape) => StableKey::Escape,
+        WinitKey::Named(NamedKey::ArrowLeft) => StableKey::ArrowLeft,
+        WinitKey::Named(NamedKey::ArrowRight) => StableKey::ArrowRight,
+        WinitKey::Named(NamedKey::ArrowUp) => StableKey::ArrowUp,
+        WinitKey::Named(NamedKey::ArrowDown) => StableKey::ArrowDown,
+        WinitKey::Named(NamedKey::Home) => StableKey::Home,
+        WinitKey::Named(NamedKey::End) => StableKey::End,
+        WinitKey::Named(NamedKey::Backspace) => StableKey::Backspace,
+        WinitKey::Named(NamedKey::Delete) => StableKey::Delete,
+        WinitKey::Character(text) => text
+            .chars()
+            .next()
+            .map_or(StableKey::Unidentified, StableKey::Character),
+        _ => StableKey::Unidentified,
+    }
+}
+
+pub fn stable_code(physical: PhysicalKey) -> StableCode {
+    match physical {
+        PhysicalKey::Code(KeyCode::Enter) => StableCode::Enter,
+        PhysicalKey::Code(KeyCode::Space) => StableCode::Space,
+        PhysicalKey::Code(KeyCode::Tab) => StableCode::Tab,
+        PhysicalKey::Code(KeyCode::Escape) => StableCode::Escape,
+        PhysicalKey::Code(KeyCode::ArrowLeft) => StableCode::ArrowLeft,
+        PhysicalKey::Code(KeyCode::ArrowRight) => StableCode::ArrowRight,
+        PhysicalKey::Code(KeyCode::ArrowUp) => StableCode::ArrowUp,
+        PhysicalKey::Code(KeyCode::ArrowDown) => StableCode::ArrowDown,
+        PhysicalKey::Code(KeyCode::Home) => StableCode::Home,
+        PhysicalKey::Code(KeyCode::End) => StableCode::End,
+        PhysicalKey::Code(KeyCode::Backspace) => StableCode::Backspace,
+        PhysicalKey::Code(KeyCode::Delete) => StableCode::Delete,
+        PhysicalKey::Code(_) => StableCode::Unidentified,
+        PhysicalKey::Unidentified(_) => StableCode::Unidentified,
+    }
+}
+
+fn key_location(location: winit::keyboard::KeyLocation) -> KeyLocation {
+    match location {
+        winit::keyboard::KeyLocation::Left => KeyLocation::Left,
+        winit::keyboard::KeyLocation::Right => KeyLocation::Right,
+        winit::keyboard::KeyLocation::Numpad => KeyLocation::Numpad,
+        winit::keyboard::KeyLocation::Standard => KeyLocation::Standard,
     }
 }
 

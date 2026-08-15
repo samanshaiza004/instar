@@ -44,10 +44,6 @@
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
     world: "kernel",
-    // The world now spans two packages: instar:kernel and the optional
-    // instar:text capability. Without this, types from the second are an
-    // error rather than generated bindings.
-    generate_all,
 });
 
 use instar_sdk::{Routes, Ui};
@@ -350,7 +346,7 @@ impl Calculator {
     async fn commit(&mut self) -> Result<(), String> {
         let (bytes, routes) = self.view();
         self.routes = Some(routes);
-        kernel_ui::commit(bytes, Vec::new())
+        kernel_ui::commit(bytes)
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))

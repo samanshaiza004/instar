@@ -1,0 +1,9 @@
+[package]
+name = "instar-surface-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dependency-free bounded wire format for independent Instar Surface scenes."
+
+# This is guest/host shared vocabulary. Keep it dependency-free.
+[dependencies]

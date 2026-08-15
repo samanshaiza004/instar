@@ -329,17 +329,6 @@ impl RuntimeHarness {
         self.bridge.stats()
     }
 
-    /// Read-only production snapshots for the Package B vertical proof.
-    pub fn text_resource_counts(&self) -> instar_host::text_host::TextResourceCounts {
-        self.bridge.host().text_resources().counts()
-    }
-
-    pub fn text_attachments(
-        &self,
-    ) -> &std::collections::BTreeMap<NodeKey, instar_host::TextViewId> {
-        self.window().text_attachments()
-    }
-
     pub fn scene(&self) -> Option<&instar_paint::PaintScene> {
         self.window().scene()
     }

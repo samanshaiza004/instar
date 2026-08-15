@@ -27,7 +27,7 @@ use instar_ui_protocol::{NodeKey, WireAlign, WireBasis, WireDisplay, WireJustify
 use taffy::prelude::*;
 
 use crate::scroll::{SCROLLBAR_THICKNESS, ScrollbarStyle};
-use crate::text::{self, FontRole, ShapedText, ShapingStyle, TextContext};
+use crate::text::{self, FontRole, ShapedText, ShapingStyle, TextEngine};
 use crate::{Node, NodeKind, Tree};
 
 /// The logical-pixel viewport layout is computed against.
@@ -350,7 +350,7 @@ fn style(node: &Node, parent: ChildOf, scrollbars: ScrollbarStyle) -> Style {
 /// Deterministic: the same tree and viewport always produce the same snapshot,
 /// which is what makes hit-testing reproducible and these tests meaningful.
 pub fn compute(
-    text: &mut TextContext,
+    text: &mut TextEngine,
     tree: &Tree,
     viewport: Viewport,
     scrollbars: ScrollbarStyle,
@@ -463,7 +463,7 @@ pub fn compute(
 /// there is nothing for Taffy to do; what has changed is where glyphs sit
 /// inside boxes that already exist. Reuses each node's recorded width, so the
 /// cached line break survives and only `Layout::align` and the extraction run.
-pub fn refinalize_text(text: &mut TextContext, tree: &Tree, snapshot: &mut LayoutSnapshot) {
+pub fn refinalize_text(text: &mut TextEngine, tree: &Tree, snapshot: &mut LayoutSnapshot) {
     for node in tree.iter() {
         if !matches!(node.kind, NodeKind::Text { .. } | NodeKind::Button { .. }) {
             continue;
@@ -486,7 +486,7 @@ pub fn refinalize_text(text: &mut TextContext, tree: &Tree, snapshot: &mut Layou
 }
 
 fn finalize_text(
-    text: &mut TextContext,
+    text: &mut TextEngine,
     tree: &Tree,
     taffy: &TaffyTree<MeasureContext>,
     id_by_key: &HashMap<NodeKey, taffy::NodeId>,
@@ -624,7 +624,7 @@ fn accumulate(
 #[cfg(test)]
 mod intrinsic_sizing {
     use super::*;
-    use crate::{Node, TextContext, Tree};
+    use crate::{Node, TextEngine, Tree};
 
     /// A viewport can be bounded by its parent instead of by a literal.
     ///
@@ -666,7 +666,7 @@ mod intrinsic_sizing {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let snapshot = compute(
             &mut text,
             &tree,
@@ -746,7 +746,7 @@ mod intrinsic_sizing {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let snapshot = compute(
             &mut text,
             &tree,
@@ -788,7 +788,7 @@ mod intrinsic_sizing {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let snapshot = compute(
             &mut text,
             &tree,
@@ -832,7 +832,7 @@ mod intrinsic_sizing {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let snapshot = compute(
             &mut text,
             &tree,
@@ -882,7 +882,7 @@ mod intrinsic_sizing {
             ],
         ));
 
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let overlay = tree.layout_with(
             &mut text,
             Viewport::new(400.0, 300.0),
@@ -961,7 +961,7 @@ mod intrinsic_sizing {
             ],
         ));
 
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         for scrollbars in [ScrollbarStyle::Overlay, ScrollbarStyle::Inset] {
             let snapshot = tree.layout_with(&mut text, Viewport::new(400.0, 300.0), scrollbars);
             for (viewport, content_height) in [(NodeKey::first(10), 600), (NodeKey::first(20), 400)]
@@ -1014,7 +1014,7 @@ mod intrinsic_sizing {
             .collect();
 
         let tree = Tree::new(Node::root(0, children));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         // Far more room than any of these needs, so a wrap can only come from
         // the node being sized short of its own measurement.
         let snapshot = compute(

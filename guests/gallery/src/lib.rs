@@ -42,10 +42,6 @@
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
     world: "kernel",
-    // The world now spans two packages: instar:kernel and the optional
-    // instar:text capability. Without this, types from the second are an
-    // error rather than generated bindings.
-    generate_all,
 });
 
 use instar_ui_protocol::{
@@ -682,7 +678,7 @@ impl Gallery {
     }
 
     async fn commit(&self) -> Result<(), String> {
-        kernel_ui::commit(self.encode(), Vec::new())
+        kernel_ui::commit(self.encode())
             .await
             .map(|_| ())
             .map_err(|error| format!("commit failed: {error:?}"))

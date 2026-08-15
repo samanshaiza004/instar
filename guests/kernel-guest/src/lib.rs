@@ -8,10 +8,6 @@
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
     world: "kernel",
-    // The world now spans two packages: instar:kernel and the optional
-    // instar:text capability. Without this, types from the second are an
-    // error rather than generated bindings.
-    generate_all,
 });
 
 use crate::instar::kernel::kernel_runtime;
@@ -93,7 +89,7 @@ async fn handle(payload: Vec<u8>) -> Result<Vec<u8>, String> {
 
 impl Guest for Component {
     async fn run() -> Result<(), String> {
-        kernel_ui::commit(b"ready".to_vec(), Vec::new())
+        kernel_ui::commit(b"ready".to_vec())
             .await
             .map_err(|e| format!("initial commit failed: {e:?}"))?;
 
@@ -101,7 +97,7 @@ impl Guest for Component {
             match kernel_runtime::next_event().await {
                 Ok(payload) => {
                     let response = handle(payload).await?;
-                    kernel_ui::commit(response, Vec::new())
+                    kernel_ui::commit(response)
                         .await
                         .map_err(|e| format!("commit failed: {e:?}"))?;
                 }

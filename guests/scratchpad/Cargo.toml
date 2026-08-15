@@ -1,0 +1,11 @@
+[package]
+name = "instar-scratchpad"
+version = "0.0.2"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+instar-editor-core = { path = "../../crates/instar-editor-core" }
+instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }

@@ -1,0 +1,10 @@
+[package]
+name = "instar-text-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-only immutable text shaping and query geometry, with Parley hidden behind Instar-owned types."
+
+[dependencies]
+instar-ui-protocol = { path = "../instar-ui-protocol" }
+parley = "0.11"

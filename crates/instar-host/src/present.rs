@@ -47,14 +47,11 @@ use instar_paint::{
     AffineTransform, Color, FontId, FontKey, FontResource, GlyphPosition, GlyphRun, PaintCommand,
     PaintScene, PhysicalSize, Rect,
 };
-use instar_text::{Revision, Selection, TextPosition};
 use instar_ui::{
     Available, BUTTON_PADDING, LayoutSnapshot, NodeKey, NodeKind, ScrollOffset, ScrollState,
-    ScrollbarPart, ShapedText, ShapingStyle, TextContext, Tree,
+    ScrollbarPart, ShapedText, ShapingStyle, TextEngine, Tree,
 };
 use instar_window::WindowMetricsChanged;
-
-use crate::text_view::{HostTextSurface, TextPaint};
 
 /// What the window is showing.
 ///
@@ -100,9 +97,6 @@ pub struct Theme {
     pub scrollbar_thumb_hover: Color,
     pub scrollbar_thumb_active: Color,
     pub focus_ring: Color,
-    /// The caret and selection highlight of a host-presented text view.
-    pub text_caret: Color,
-    pub text_selection: Color,
     pub crash_background: Color,
     pub crash_text: Color,
 }
@@ -128,13 +122,6 @@ impl Default for Theme {
             scrollbar_thumb_hover: Color::opaque(0x74, 0x74, 0x82),
             scrollbar_thumb_active: Color::opaque(0x8e, 0x8e, 0x9c),
             focus_ring: Color::opaque(0x6c, 0xa8, 0xff),
-            text_caret: Color::opaque(0xf0, 0xf0, 0xf4),
-            text_selection: Color {
-                r: 0x6c,
-                g: 0xa8,
-                b: 0xff,
-                a: 90,
-            },
             // Deliberately unlike anything the app palette can produce. A
             // crash screen that could be mistaken for a running app is a
             // crash screen that gets ignored.
@@ -142,20 +129,6 @@ impl Default for Theme {
             crash_text: Color::opaque(0xff, 0xd8, 0xd8),
         }
     }
-}
-
-/// One attached text view, positioned for the scene's paint pass.
-///
-/// The scene builder owns no text resources: the host reads the view's caret
-/// and selection into this frame and hands them over, so the paint pass stays
-/// a pure function of geometry and already-settled interaction state.
-pub struct TextSurfaceFrame<'a> {
-    pub node: NodeKey,
-    pub surface: &'a mut HostTextSurface,
-    pub caret: Option<TextPosition>,
-    pub selection: Option<Selection>,
-    pub revision: Revision,
-    pub composition: Option<crate::text_view::CompositionPaint>,
 }
 
 /// The most trap text the crash surface will retain and draw.
@@ -250,6 +223,33 @@ fn physical(rect: instar_ui::Rect, scale: f32) -> Rect {
     }
 }
 
+fn surface_rect(rect: instar_surface_protocol::Rect, origin: (f32, f32), scale: f32) -> Rect {
+    Rect {
+        x: (origin.0 + rect.x * scale).round() as i32,
+        y: (origin.1 + rect.y * scale).round() as i32,
+        width: (rect.width * scale).round().max(0.0) as u32,
+        height: (rect.height * scale).round().max(0.0) as u32,
+    }
+}
+
+fn surface_radii(radii: instar_surface_protocol::Radii, scale: f32) -> instar_paint::CornerRadii {
+    instar_paint::CornerRadii {
+        top_left: radii.top_left * scale,
+        top_right: radii.top_right * scale,
+        bottom_right: radii.bottom_right * scale,
+        bottom_left: radii.bottom_left * scale,
+    }
+}
+
+fn surface_color(color: instar_surface_protocol::Color) -> Color {
+    Color {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a,
+    }
+}
+
 /// Builds the paint intent for one frame.
 ///
 /// Fonts are not owned here: the shaped text carries every face it used, and
@@ -272,44 +272,6 @@ impl SceneBuilder {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
-    }
-
-    /// Lowers the guest's interface, including every attached text surface.
-    ///
-    /// The text views are painted at their node's place in the tree, inside
-    /// the node's own clip, so a caret cannot leak out of an editor box any
-    /// more than it can leak out of a scrolled viewport.
-    #[allow(clippy::too_many_arguments)]
-    pub fn app_scene_with_text(
-        &self,
-        tree: &Tree,
-        layout: &LayoutSnapshot,
-        scroll: &ScrollState,
-        metrics: &WindowMetricsChanged,
-        pressed: Option<instar_ui::NodeKey>,
-        focus_ring: Option<instar_ui::NodeKey>,
-        text_frames: &mut [TextSurfaceFrame<'_>],
-    ) -> PaintScene {
-        let scale = metrics.scale_factor as f32;
-        let mut commands = vec![PaintCommand::Clear {
-            color: self.theme.background,
-        }];
-        let mut fonts = Vec::new();
-        let mut font_ids = HashMap::new();
-        self.paint_node(
-            &tree.root,
-            layout,
-            scroll,
-            ScrollOffset::ZERO,
-            pressed,
-            focus_ring,
-            text_frames,
-            scale,
-            &mut commands,
-            &mut fonts,
-            &mut font_ids,
-        );
-        scene(metrics, commands, fonts)
     }
 
     /// Lowers the guest's interface to paint intent.
@@ -343,7 +305,134 @@ impl SceneBuilder {
         pressed: Option<instar_ui::NodeKey>,
         focus_ring: Option<instar_ui::NodeKey>,
     ) -> PaintScene {
-        self.app_scene_with_text(tree, layout, scroll, metrics, pressed, focus_ring, &mut [])
+        let scale = metrics.scale_factor as f32;
+        let mut commands = vec![PaintCommand::Clear {
+            color: self.theme.background,
+        }];
+        let mut fonts = Vec::new();
+        let mut font_ids = HashMap::new();
+        self.paint_node(
+            &tree.root,
+            layout,
+            scroll,
+            ScrollOffset::ZERO,
+            pressed,
+            focus_ring,
+            scale,
+            &mut commands,
+            &mut fonts,
+            &mut font_ids,
+        );
+        scene(metrics, commands, fonts)
+    }
+
+    /// Paints independently retained Surface scenes using their immutable
+    /// layouts. The semantic tree remains the source of bounds and clipping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_scene_with_surfaces(
+        &self,
+        tree: &Tree,
+        layout: &LayoutSnapshot,
+        scroll: &ScrollState,
+        metrics: &WindowMetricsChanged,
+        pressed: Option<instar_ui::NodeKey>,
+        focus_ring: Option<instar_ui::NodeKey>,
+        surfaces: &HashMap<NodeKey, crate::presentation_host::RetainedSurfaceScene>,
+    ) -> PaintScene {
+        let mut scene = self.app_scene_focused(tree, layout, scroll, metrics, pressed, focus_ring);
+        let scale = metrics.scale_factor as f32;
+        let mut fonts = scene.fonts.clone();
+        let mut font_ids: HashMap<u64, FontId> = fonts
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.key.0, FontId(i as u32)))
+            .collect();
+        for node in tree.iter() {
+            let Some(retained) = surfaces.get(&node.key) else {
+                continue;
+            };
+            let Some(rect) = layout.get(node.key) else {
+                continue;
+            };
+            let origin = (rect.x as f32 * scale, rect.y as f32 * scale);
+            for command in &retained.commands {
+                match (&command.command, &command.layout) {
+                    (instar_surface_protocol::Command::FillRect { rect, color }, _) => {
+                        scene.commands.push(PaintCommand::FillRect {
+                            rect: surface_rect(*rect, origin, scale),
+                            color: surface_color(*color),
+                        })
+                    }
+                    (instar_surface_protocol::Command::StrokeRect { rect, color, width }, _) => {
+                        scene.commands.push(PaintCommand::StrokeRect {
+                            rect: surface_rect(*rect, origin, scale),
+                            width: width * scale,
+                            color: surface_color(*color),
+                        })
+                    }
+                    (
+                        instar_surface_protocol::Command::FillRoundedRect { rect, radii, color },
+                        _,
+                    ) => scene.commands.push(PaintCommand::FillRoundedRect {
+                        rect: surface_rect(*rect, origin, scale),
+                        radii: surface_radii(*radii, scale),
+                        color: surface_color(*color),
+                    }),
+                    (
+                        instar_surface_protocol::Command::StrokeRoundedRect {
+                            rect,
+                            radii,
+                            color,
+                            width,
+                        },
+                        _,
+                    ) => scene.commands.push(PaintCommand::StrokeRoundedRect {
+                        rect: surface_rect(*rect, origin, scale),
+                        radii: surface_radii(*radii, scale),
+                        width: width * scale,
+                        color: surface_color(*color),
+                    }),
+                    (instar_surface_protocol::Command::PushClip { rect }, _) => {
+                        scene.commands.push(PaintCommand::PushClip {
+                            rect: surface_rect(*rect, origin, scale),
+                        })
+                    }
+                    (instar_surface_protocol::Command::PopClip, _) => {
+                        scene.commands.push(PaintCommand::PopClip)
+                    }
+                    (instar_surface_protocol::Command::PushTransform { transform }, _) => {
+                        scene.commands.push(PaintCommand::PushTransform {
+                            transform: AffineTransform {
+                                xx: transform.matrix[0],
+                                yx: transform.matrix[2],
+                                xy: transform.matrix[1],
+                                yy: transform.matrix[3],
+                                dx: transform.matrix[4] * scale + origin.0,
+                                dy: transform.matrix[5] * scale + origin.1,
+                            },
+                        })
+                    }
+                    (instar_surface_protocol::Command::PopTransform, _) => {
+                        scene.commands.push(PaintCommand::PopTransform)
+                    }
+                    (
+                        instar_surface_protocol::Command::DrawTextLayout { x, y, color, .. },
+                        Some(layout),
+                    ) => push_shaped(
+                        &mut scene.commands,
+                        &mut fonts,
+                        &mut font_ids,
+                        layout.shaped(),
+                        (origin.0 + x * scale, origin.1 + y * scale),
+                        scale,
+                        surface_color(*color),
+                    ),
+                    (instar_surface_protocol::Command::DrawTextLayout { .. }, None) => {}
+                }
+            }
+        }
+        scene.fonts = fonts;
+        scene
     }
 
     /// Emits one node and its subtree, in paint order.
@@ -369,7 +458,6 @@ impl SceneBuilder {
         translation: ScrollOffset,
         pressed: Option<instar_ui::NodeKey>,
         focus_ring: Option<instar_ui::NodeKey>,
-        text_frames: &mut [TextSurfaceFrame<'_>],
         scale: f32,
         commands: &mut Vec<PaintCommand>,
         fonts: &mut Vec<FontResource>,
@@ -433,38 +521,8 @@ impl SceneBuilder {
             | NodeKind::Column
             | NodeKind::Row
             | NodeKind::Stack
-            | NodeKind::Scroll => {}
-            // A text view's contents are drawn from its attached resource
-            // through the B2d presentation path. The frame was built from the
-            // attachment by the host; the node itself still carries no
-            // resource identity. The node's own clip keeps a caret from
-            // leaking past the editor box.
-            NodeKind::TextView => {
-                commands.push(PaintCommand::PushClip {
-                    rect: physical(rect, scale),
-                });
-                if let Some(frame) = text_frames.iter_mut().find(|f| f.node == node.key) {
-                    crate::text_view::push_text(
-                        &mut frame.surface.presentation,
-                        &TextPaint {
-                            origin_x: rect.x as f32,
-                            origin_y: rect.y as f32,
-                            scale,
-                            ink: self.theme.text,
-                            caret_color: self.theme.text_caret,
-                            selection_color: self.theme.text_selection,
-                            caret: frame.caret,
-                            selection: frame.selection,
-                            revision: frame.revision,
-                            composition: frame.composition,
-                        },
-                        commands,
-                        fonts,
-                        font_ids,
-                    );
-                }
-                commands.push(PaintCommand::PopClip);
-            }
+            | NodeKind::Scroll
+            | NodeKind::Surface { .. } => {}
             NodeKind::Text { .. } => {
                 let foreground = node.style.paint.foreground.map(paint_color);
                 if let Some(shaped) = layout.text(node.key) {
@@ -570,7 +628,6 @@ impl SceneBuilder {
                 child_translation,
                 pressed,
                 focus_ring,
-                text_frames,
                 scale,
                 commands,
                 fonts,
@@ -641,12 +698,12 @@ impl SceneBuilder {
     ///
     /// Takes no tree and no layout, which is the point: it is reachable when
     /// there is no guest left to ask, and it must not depend on one. Text is
-    /// shaped through the host's long-lived [`TextContext`]; the reserved key
+    /// shaped through the host's long-lived [`TextEngine`]; the reserved key
     /// is far outside the protocol's node range, and the entry is overwritten
     /// whenever a new trap replaces the screen.
     pub fn crash_scene(
         &self,
-        text: &mut TextContext,
+        text: &mut TextEngine,
         generation: GenerationId,
         message: &str,
         metrics: &WindowMetricsChanged,
@@ -797,7 +854,7 @@ fn scene(
 /// Fonts are deduplicated across the whole scene by [`instar_ui::FontFace::key`],
 /// and each run indexes the scene's table. `FontFace::data` is an `Arc<[u8]>`,
 /// so this is a refcount bump, never a copy of font bytes.
-pub(crate) fn push_shaped(
+fn push_shaped(
     commands: &mut Vec<PaintCommand>,
     fonts: &mut Vec<FontResource>,
     font_ids: &mut HashMap<u64, FontId>,
@@ -850,7 +907,6 @@ pub(crate) fn push_shaped(
 mod tests {
     use super::*;
     use instar_paint::PaintSceneError;
-    use instar_ui::DecodedUiSnapshot;
     use instar_ui::Viewport;
     use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
     use instar_window::{LogicalSize, WindowId};
@@ -859,10 +915,6 @@ mod tests {
     const LABEL: NodeKey = NodeKey::first(2);
     const BUTTON: NodeKey = NodeKey::first(3);
     const DISABLED: NodeKey = NodeKey::first(4);
-
-    fn decode_tree(bytes: &[u8]) -> Result<Tree, instar_ui::TreeError> {
-        DecodedUiSnapshot::decode(bytes).map(|snapshot| snapshot.tree)
-    }
 
     fn metrics(scale: f64) -> WindowMetricsChanged {
         WindowMetricsChanged {
@@ -912,13 +964,13 @@ mod tests {
                 WireLayout::default(),
                 0,
             );
-        decode_tree(&encoder.finish()).expect("the fixture batch is valid")
+        Tree::decode(&encoder.finish()).expect("the fixture batch is valid")
     }
 
     fn scene(scale: f64, pressed: Option<NodeKey>) -> PaintScene {
         let tree = tree();
         let metrics = metrics(scale);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1066,7 +1118,7 @@ mod tests {
     fn every_glyph_lands_inside_the_box_layout_computed_for_it() {
         let tree = tree();
         let metrics = metrics(1.0);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1212,7 +1264,7 @@ mod tests {
             ],
         ));
         let metrics = metrics(1.0);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1259,7 +1311,7 @@ mod tests {
             )],
         ));
         let metrics = metrics(1.0);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1301,7 +1353,7 @@ mod tests {
             )],
         ));
         let metrics = metrics(1.0);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1343,7 +1395,7 @@ mod tests {
     fn without_shaped_text_everything_but_the_text_is_still_painted() {
         let tree = tree();
         let metrics = metrics(1.0);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let mut layout = tree.layout(
             &mut text,
             Viewport::new(
@@ -1371,7 +1423,7 @@ mod tests {
 
     #[test]
     fn a_crash_scene_needs_no_tree_and_no_layout() {
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let scene = SceneBuilder::new().crash_scene(
             &mut text,
             GenerationId(3),
@@ -1396,7 +1448,7 @@ mod tests {
     #[test]
     fn a_long_trap_message_is_wrapped_rather_than_run_off_the_edge() {
         let message = "trap: ".to_string() + &"detail ".repeat(200);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let scene =
             SceneBuilder::new().crash_scene(&mut text, GenerationId(1), &message, &metrics(1.0));
 
@@ -1492,7 +1544,7 @@ mod tests {
     #[test]
     fn a_clamped_diagnostic_still_produces_a_drawable_crash_screen() {
         let flood = "trap\n".repeat(MAX_CRASH_MESSAGE_LINES * 8);
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let scene = SceneBuilder::new().crash_scene(
             &mut text,
             GenerationId(1),
@@ -1512,7 +1564,7 @@ mod tests {
             .map(|n| format!("frame {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let scene =
             SceneBuilder::new().crash_scene(&mut text, GenerationId(1), &message, &metrics(1.0));
 

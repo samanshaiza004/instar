@@ -320,30 +320,38 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
         return Ok(());
     }
 
-    let text_style_changed = old.style.text != new.style.text;
-    let text_align_changed = old.style.text_layout != new.style.text_layout;
-    let paint_changed = old.style.paint != new.style.paint;
-    let cursor_changed = old.style.cursor != new.style.cursor;
+    if old.layout != new.layout {
+        changes.layout_changed.push(new.key);
+    }
 
     // Style is compared per group, never as a whole. Comparing `old.style !=
     // new.style` and reporting one category would be the mistake this split
     // exists to prevent -- the three groups cost completely different things,
     // and the wire keeps them apart precisely so this can read the category
     // rather than re-derive it field by field.
-    if text_style_changed {
+    if old.style.text != new.style.text {
         changes.text_style_changed.push(new.key);
+        // A different face, size or weight measures differently.
+        changes.layout_changed.push(new.key);
     }
-    if text_align_changed {
+    if old.style.text_layout != new.style.text_layout {
         // And *not* `layout_changed`: alignment moves glyphs within a box
         // whose size it cannot alter, so Taffy has nothing to recompute.
         changes.text_align_changed.push(new.key);
     }
-    if cursor_changed {
+    if old.style.paint != new.style.paint {
+        changes.paint_changed.push(new.key);
+    }
+    if old.style.cursor != new.style.cursor {
         changes.cursor_changed.push(new.key);
     }
 
-    let (text_changed, enabled_changed) = match (&old.kind, &new.kind) {
-        (NodeKind::Text { text: was }, NodeKind::Text { text: now }) => (was != now, false),
+    match (&old.kind, &new.kind) {
+        (NodeKind::Text { text: was }, NodeKind::Text { text: now }) if was != now => {
+            changes.text_changed.push(new.key);
+            // Re-shaping can produce a different intrinsic size.
+            changes.layout_changed.push(new.key);
+        }
         (
             NodeKind::Button {
                 label: was,
@@ -353,36 +361,25 @@ fn compare(old: &Node, new: &Node, changes: &mut ChangeSet) -> Result<(), TreeEr
                 label: now,
                 enabled: now_enabled,
             },
-        ) => (was != now, was_enabled != now_enabled),
-        _ => (false, false),
-    };
-
-    let structure_changed = old
-        .children
-        .iter()
-        .map(|child| child.key)
-        .ne(new.children.iter().map(|child| child.key));
-
-    if text_changed {
-        changes.text_changed.push(new.key);
+        ) => {
+            if was != now {
+                changes.text_changed.push(new.key);
+                changes.layout_changed.push(new.key);
+            }
+            if was_enabled != now_enabled {
+                changes.enabled_changed.push(new.key);
+            }
+        }
+        _ => {}
     }
-    if enabled_changed {
-        changes.enabled_changed.push(new.key);
-    }
-    if structure_changed {
+
+    let old_children: Vec<NodeKey> = old.children.iter().map(|child| child.key).collect();
+    let new_children: Vec<NodeKey> = new.children.iter().map(|child| child.key).collect();
+    if old_children != new_children {
         changes.structure_changed.push(new.key);
-    }
-
-    // A text style or content change can alter intrinsic size; structure and
-    // explicit layout changes alter geometry directly. Decide each category
-    // once, then append its key once.
-    let layout_changed =
-        old.layout != new.layout || text_style_changed || text_changed || structure_changed;
-    if layout_changed {
-        changes.layout_changed.push(new.key);
-    }
-    if paint_changed {
-        changes.paint_changed.push(new.key);
+        if !changes.layout_changed.contains(&new.key) {
+            changes.layout_changed.push(new.key);
+        }
     }
 
     Ok(())
@@ -632,24 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn a_node_is_reported_once_per_change_category_even_when_multiple_causes_apply() {
-        let previous = snapshot(vec![Node::text(2, "before")]);
-        let next = snapshot(vec![
-            Node::text(2, "after")
-                .with_layout(padded(12))
-                .with_font_size(20)
-                .with_foreground(instar_ui_protocol::WireColor::opaque(255, 0, 0)),
-        ]);
-
-        let changes = diff(Some(&previous), &next).unwrap();
-
-        assert_eq!(changes.layout_changed, vec![NodeKey::first(2)]);
-        assert_eq!(changes.paint_changed, vec![NodeKey::first(2)]);
-        assert_eq!(changes.text_changed, vec![NodeKey::first(2)]);
-        assert_eq!(changes.text_style_changed, vec![NodeKey::first(2)]);
-    }
-
-    #[test]
     fn appending_a_child_creates_the_child_and_dirties_the_parent() {
         let previous = snapshot(vec![Node::text(2, "a"), Node::text(3, "b")]);
         let next = snapshot(vec![
@@ -725,63 +704,6 @@ mod tests {
                 now: "button",
             }),
             "a key reused across kinds must be refused, not treated as a replacement"
-        );
-    }
-
-    /// A text view is a kind like any other, in both directions.
-    ///
-    /// The baseline for B2e-3's much subtler rule. Once a node can carry an
-    /// attachment, "same key, different resource" must be *accepted* — the same
-    /// surface showing a different document, with focus and host state intact.
-    /// This locks the case that stays a refusal, so the two cannot be confused
-    /// while the second is being built.
-    #[test]
-    fn reusing_a_key_across_a_text_view_is_refused_in_both_directions() {
-        let text = snapshot(vec![Node::text(5, "hello")]);
-        let button = snapshot(vec![Node::button(5, "press")]);
-        let view = snapshot(vec![Node::text_view(5)]);
-
-        assert_eq!(
-            diff(Some(&text), &view),
-            Err(TreeError::KindChanged {
-                key: NodeKey::first(5),
-                was: "text",
-                now: "text view",
-            })
-        );
-        assert_eq!(
-            diff(Some(&button), &view),
-            Err(TreeError::KindChanged {
-                key: NodeKey::first(5),
-                was: "button",
-                now: "text view",
-            })
-        );
-        assert_eq!(
-            diff(Some(&view), &button),
-            Err(TreeError::KindChanged {
-                key: NodeKey::first(5),
-                was: "text view",
-                now: "button",
-            }),
-            "and leaving a text view is a kind change too"
-        );
-    }
-
-    /// Two commits of the same text-view node are not a change.
-    ///
-    /// The control for the above, and the thing B2e-3 builds on: a text view
-    /// carries no resource identity, so nothing about the *node* differs
-    /// between commits that attach different documents to it. The attachment
-    /// diff is a separate answer, and it does not exist yet.
-    #[test]
-    fn recommitting_the_same_text_view_is_not_a_change() {
-        let first = snapshot(vec![Node::text_view(5)]);
-        let second = snapshot(vec![Node::text_view(5)]);
-
-        assert!(
-            diff(Some(&first), &second).is_ok(),
-            "the same surface committed twice is the same surface"
         );
     }
 

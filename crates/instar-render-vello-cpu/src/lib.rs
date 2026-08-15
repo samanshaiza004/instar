@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(not(feature = "glyph-run"))]
+use instar_paint::AffineTransform;
 #[cfg(feature = "glyph-run")]
 use instar_paint::{AffineTransform, FontId, FontKey, FontResource, GlyphPosition, GlyphRun};
 use instar_paint::{
@@ -101,6 +103,7 @@ pub struct VelloCpuBackend {
     /// steady-state frame allocates no new mask pixmaps (only grows when a
     /// larger mask than seen before arrives).
     pool: Vec<Arc<Pixmap>>,
+    transforms: Vec<Affine>,
     /// Backend-owned conversion of the scene's [`FontResource`]s into Vello
     /// font handles, keyed by stable semantic `(FontKey, collection index)`.
     /// Converted once per resource and reused across frames; cleared whenever
@@ -133,6 +136,7 @@ impl VelloCpuBackend {
             },
             registered: Vec::new(),
             pool: Vec::new(),
+            transforms: Vec::new(),
             #[cfg(feature = "glyph-run")]
             fonts: HashMap::new(),
             #[cfg(feature = "glyph-run")]
@@ -277,6 +281,19 @@ impl VelloCpuBackend {
             PaintCommand::PopClip => {
                 let context = self.context_mut()?;
                 context.pop_clip_path();
+            }
+            PaintCommand::PushTransform { transform } => {
+                let current = *self.context_mut()?.transform();
+                self.transforms.push(current);
+                self.context_mut()?
+                    .set_transform(affine_transform(*transform));
+            }
+            PaintCommand::PopTransform => {
+                let previous = self
+                    .transforms
+                    .pop()
+                    .ok_or(PaintError::BackendFailure("transform stack underflow"))?;
+                self.context_mut()?.set_transform(previous);
             }
         }
         Ok(())
@@ -561,8 +578,10 @@ impl VelloCpuBackend {
         // Start a fresh frame on the (possibly just-recreated) context, then
         // record the scene's commands and rasterize them into the target.
         let render_started = Instant::now();
+        self.transforms.clear();
         if let Some(context) = self.context.as_mut() {
             context.reset();
+            context.set_transform(Affine::IDENTITY);
         }
 
         for command in &scene.commands {
@@ -674,7 +693,6 @@ fn kurbo_rect(rect: Rect) -> KurboRect {
 /// `x' = xx*x + yx*y + dx`, `y' = xy*x + yy*y + dy` become
 /// `[xx, xy, yx, yy, dx, dy]`; widening the coefficients from f32 to f64
 /// preserves every input value.
-#[cfg(feature = "glyph-run")]
 fn affine_transform(transform: AffineTransform) -> Affine {
     Affine::new([
         f64::from(transform.xx),

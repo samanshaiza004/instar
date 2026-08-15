@@ -30,11 +30,6 @@ interface kernel-types {
     variant commit-error {
         /// The batch failed to decode or validate.
         invalid-batch(string),
-        /// One of the commit's text-view attachments was refused, before any
-        /// tree work happened. The payload is the attachment subsystem's own
-        /// validation taxonomy rather than a flat error case; see
-        /// `attachment-error` for why it is nested.
-        invalid-attachment(attachment-error),
         /// Another commit from this generation is still outstanding, so this
         /// one is refused without being queued. The guest should retry after
         /// the earlier commit resolves.
@@ -53,50 +48,6 @@ interface kernel-types {
         /// If that owner disappears mid-flight the guest must be told, rather
         /// than left parked on a reply that is never coming.
         host-unavailable,
-    }
-
-    /// Why one of a commit's text-view attachments was refused.
-    ///
-    /// A nested family rather than four more top-level `commit-error` cases,
-    /// because this is one subsystem's validation taxonomy: every variant
-    /// exists because of the attachment side table, and flattening them into
-    /// the top-level API beside `commit-in-progress` and `host-unavailable`
-    /// would turn the commit error surface into one long list of unrelated
-    /// rules. The nested case keeps "the commit itself" separate from "the
-    /// text-view attachments this commit carried".
-    ///
-    /// No variant carries a slot number, key, or count: the refusal is about
-    /// the side table as a whole, and the host's job is to tell the guest
-    /// *which* family of rule it tripped, not to hand the guest back enough
-    /// to re-derive the failure.
-    variant attachment-error {
-        /// The side table is larger than the maximum useful cardinality.
-        ///
-        /// A valid snapshot has at most MAX_NODES nodes and every text view
-        /// refers to at most one slot, so no valid tree can reference more
-        /// than MAX_NODES distinct slots; entries beyond that cannot
-        /// contribute, so Instar refuses them to bound resolution work. This
-        /// is a policy on table size, not a theorem falling out of wire
-        /// validity.
-        too-many-attachments,
-        /// The side-table entry exists, but the key fails to resolve to a
-        /// lease this generation owns.
-        ///
-        /// The name is deliberately not "unknown text view": this covers a
-        /// stale incarnation and cross-generation use, where the key still
-        /// names a slot the host knows about, just not one this generation's
-        /// side table may reach.
-        unavailable-text-view,
-        /// The entry named a slot outside the side table it is supposed to
-        /// index into.
-        attachment-out-of-range,
-        /// Two live NodeKeys reached one TextViewId.
-        ///
-        /// Duplicate side-table entries like `[V7, V7]` are legal -- a single
-        /// text view may be attached in several places. What is illegal is
-        /// two *different* live NodeKeys naming the same TextViewId, which is
-        /// the state this refusal exists to catch.
-        text-view-already-attached,
     }
 
     record commit-result {
@@ -140,21 +91,103 @@ interface kernel-runtime {
 /// thread that owns the tree, applies it atomically, and replies. Suspending a
 /// concurrent guest call while the host does work elsewhere is exactly what
 /// the Component Model's async support is for.
-///
-/// As of B2e-3a, `instar:kernel` also `use`s `instar:text`: the kernel world
-/// already assembles that package (the `instar:text/text` import below), and
-/// carrying a capability through a commit is the first place kernel vocabulary
-/// references text's vocabulary too. The commit keeps the side table as a list
-/// of borrowed `text-view` handles, transported alongside the batch and
-/// resolved only by the host that owns both the tree and the text subsystem.
 interface kernel-ui {
     use kernel-types.{commit-result, commit-error};
-    use instar:text/text@0.1.0.{text-view};
 
-    commit: async func(
-        batch: list<u8>,
-        text-views: list<borrow<text-view>>,
-    ) -> result<commit-result, commit-error>;
+    commit: async func(batch: list<u8>) -> result<commit-result, commit-error>;
+}
+
+interface text-layout-types {
+    enum affinity { downstream, upstream }
+    record cursor { byte-index: u32, affinity: affinity }
+    record rect { x: f32, y: f32, width: f32, height: f32 }
+    record metrics { width: f32, height: f32, lines: u32, clusters: u32 }
+    enum font-role { system-ui, monospace }
+    enum alignment { start, center, end }
+    variant line-height {
+        metrics-relative(f32),
+        font-size-relative(f32),
+        absolute(f32),
+    }
+    record layout-style {
+        role: font-role,
+        size: f32,
+        weight: u16,
+        wrap: bool,
+        line-height: line-height,
+        width: option<f32>,
+        alignment: alignment,
+    }
+    variant layout-error {
+        text-too-large(u32),
+        invalid-style,
+        too-many-lines(u32),
+        too-many-clusters(u32),
+        invalid-cursor(u32),
+        too-many-selection-rects(u32),
+        too-many-live-layouts(u32),
+        no-such-layout,
+        stale-generation,
+        host-unavailable,
+    }
+}
+
+interface text-layouts {
+    use text-layout-types.{cursor, rect, metrics, layout-style, layout-error};
+
+    resource text-layout {
+        metrics: func() -> result<metrics, layout-error>;
+        cursor-from-point: func(x: f32, y: f32) -> result<cursor, layout-error>;
+        caret-rect: func(cursor: cursor, width: f32) -> result<rect, layout-error>;
+        selection-rects: func(anchor: cursor, focus: cursor) -> result<list<rect>, layout-error>;
+        previous-visual: func(cursor: cursor) -> result<cursor, layout-error>;
+        next-visual: func(cursor: cursor) -> result<cursor, layout-error>;
+        visual-line-start: func(cursor: cursor) -> result<cursor, layout-error>;
+        visual-line-end: func(cursor: cursor) -> result<cursor, layout-error>;
+        hard-line-start: func(cursor: cursor) -> result<cursor, layout-error>;
+        hard-line-end: func(cursor: cursor) -> result<cursor, layout-error>;
+        previous-standard-word-boundary: func(cursor: cursor) -> result<cursor, layout-error>;
+        next-standard-word-boundary: func(cursor: cursor) -> result<cursor, layout-error>;
+    }
+
+    create-layout: func(text: string, style: layout-style) -> result<text-layout, layout-error>;
+}
+
+interface surface-types {
+    record node-key { id: u32, generation: u32 }
+    record local-rect { x: f32, y: f32, width: f32, height: f32 }
+    variant surface-error {
+        stale-generation,
+        no-such-surface,
+        update-in-progress,
+        scene-too-large(u32),
+        too-many-layouts(u32),
+        no-such-layout,
+        invalid-scene(string),
+        not-focusable,
+        not-interested,
+        host-unavailable,
+    }
+}
+
+interface surfaces {
+    use text-layouts.{text-layout};
+    use surface-types.{node-key, local-rect, surface-error};
+
+    update-surface: async func(
+        target: node-key,
+        scene: list<u8>,
+        layouts: list<borrow<text-layout>>,
+    ) -> result<u64, surface-error>;
+
+    capture-pointer: func(target: node-key) -> result<_, surface-error>;
+    release-pointer: func(target: node-key) -> result<_, surface-error>;
+    request-focus: func(target: node-key) -> result<_, surface-error>;
+    configure-text-input: func(
+        target: node-key,
+        enabled: bool,
+        local-candidate-rect: local-rect,
+    ) -> result<_, surface-error>;
 }
 
 /// Host-owned long-running operations.
@@ -189,11 +222,9 @@ interface ops {
 world kernel {
     import kernel-runtime;
     import kernel-ui;
+    import text-layouts;
+    import surfaces;
     import ops;
-
-    // An optional host capability, in its own package. The kernel world
-    // assembles it; it is not kernel vocabulary. See wit/deps/instar-text.
-    import instar:text/text@0.1.0;
 
     /// The guest's entire program: run until the host says shutdown.
     export run: async func() -> result<_, string>;

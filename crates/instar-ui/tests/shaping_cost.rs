@@ -10,14 +10,14 @@
 use std::time::{Duration, Instant};
 
 use instar_ui::NodeKey;
-use instar_ui::text::{Alignment, Available, FontRole, ShapingStyle, TextContext};
+use instar_ui::text::{Alignment, Available, FontRole, ShapingStyle, TextEngine};
 
 fn median(mut samples: Vec<Duration>) -> Duration {
     samples.sort_unstable();
     samples[samples.len() / 2]
 }
 
-fn shape(text: &mut TextContext, key: NodeKey, string: &str, style: ShapingStyle) -> Duration {
+fn shape(text: &mut TextEngine, key: NodeKey, string: &str, style: ShapingStyle) -> Duration {
     let started = Instant::now();
     text.measure(key, string, style, Available::Definite(400.0));
     let _ = text.finalize(key, 400.0, Alignment::Start);
@@ -28,7 +28,7 @@ fn shape(text: &mut TextContext, key: NodeKey, string: &str, style: ShapingStyle
 fn where_the_shaping_time_goes() {
     // 1. Constructing the context.
     let started = Instant::now();
-    let mut text = TextContext::new();
+    let mut text = TextEngine::new();
     let construction = started.elapsed();
 
     let style = ShapingStyle::default();
@@ -69,7 +69,7 @@ fn where_the_shaping_time_goes() {
     }
 
     println!("\n--- shaping cost ---");
-    println!("TextContext::new()      {construction:?}");
+    println!("TextEngine::new()      {construction:?}");
     println!("first shape (system-ui) {first:?}");
     println!("rebuild  median         {:?}", median(rebuilds.clone()));
     println!(
