@@ -4,8 +4,13 @@ version = "0.0.2"
 edition = "2024"
 publish = false
 
+[lib]
+crate-type = ["cdylib"]
+
 [workspace]
 
 [dependencies]
+wit-bindgen = "0.60.0"
 instar-editor-core = { path = "../../crates/instar-editor-core" }
+instar-surface-protocol = { path = "../../crates/instar-surface-protocol" }
 instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }
