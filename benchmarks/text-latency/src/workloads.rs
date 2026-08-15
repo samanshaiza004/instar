@@ -34,22 +34,49 @@ fn character_key(ch: char, pressed: bool, repeat: bool) -> WindowOutput {
     })
 }
 
-fn press_and_release_character(harness: &mut RuntimeHarness, ch: char) {
-    harness.send_output(character_key(ch, true, false));
-    harness.send_output(character_key(ch, false, false));
-}
-
 /// Ensures the Surface actually has focus and an active text-input session,
 /// exactly as a real click would establish -- every workload starts from
 /// this so a measured sample's latency is the edit's cost, not focus setup.
+/// Call through `GateRun::send_untimed`, not `measure_one`: a focus click is
+/// setup, not the thing being measured, and it may or may not itself be
+/// visible under dirty presentation (irrelevant either way to a sample it
+/// precedes).
 pub fn focus_surface(harness: &mut RuntimeHarness) {
     let (x, y) = harness.screen_point_of(SURFACE);
     harness.click_at(x, y);
 }
 
-/// 1: ordinary ASCII typing. One printable character, pressed and released.
+/// 1: ordinary ASCII typing. Only the keydown is measured -- see
+/// [`release_character`] for why the paired keyup is deliberately sent
+/// afterward, outside the timed interval, through `GateRun::send_untimed`
+/// rather than folded into this same call.
 pub fn ascii_typing(harness: &mut RuntimeHarness, ch: char) {
-    press_and_release_character(harness, ch);
+    harness.send_output(character_key(ch, true, false));
+}
+
+/// Measures one ordinary keystroke correctly: keydown timed, keyup settled
+/// afterward outside the timed interval. Every call site in `main.rs` that
+/// wants "the latency of typing one character against some backdrop" should
+/// go through this rather than calling `measure_one`/`ascii_typing`
+/// directly, so the keydown/keyup split does not have to be re-derived (and
+/// potentially re-broken) at each of the many places that need it.
+pub fn measure_keystroke(run: &mut crate::gate::GateRun, ch: char) -> crate::sample::StageTimes {
+    let stage_times = run.measure_one(true, |h| ascii_typing(h, ch));
+    run.send_untimed(|h| release_character(h, ch));
+    stage_times
+}
+
+/// The untimed companion to [`ascii_typing`]/[`key_repeat`]. A key release
+/// carries no text and, under `guests/scratchpad`'s dirty-presentation
+/// event loop, provably changes nothing visible -- there is no `pressed:
+/// false` arm in its key-handling match, so release always falls to the
+/// wildcard and skips `present()`. Timing it would either wait forever for
+/// a revision that correctly never arrives, or -- worse -- fold a real but
+/// invisible processing cost into a "keystroke" latency number nobody
+/// asked for. Settling it here, right after the measured keydown, is what
+/// keeps it from bleeding into the next sample's baseline instead.
+pub fn release_character(harness: &mut RuntimeHarness, ch: char) {
+    harness.send_output(character_key(ch, false, false));
 }
 
 /// 2: key repeat. A single autorepeated keydown (`repeat: true`), the shape
@@ -215,7 +242,7 @@ pub fn preload_document(run: &mut crate::gate::GateRun, total_bytes: usize, newl
             chunk.truncate(end);
         }
         sent += chunk.len();
-        run.measure_one(|h| {
+        run.measure_one(true, |h| {
             h.send_output(WindowOutput::ImeCommit {
                 window_id: WINDOW,
                 text: chunk,
@@ -228,8 +255,16 @@ pub fn preload_document(run: &mut crate::gate::GateRun, total_bytes: usize, newl
 /// target line count instead of a newline-every-N-bytes cadence, so byte
 /// size and line count can be varied independently of each other. Same
 /// chunking/draining discipline.
-pub fn preload_document_with_lines(run: &mut crate::gate::GateRun, total_bytes: usize, target_lines: usize) {
-    let bytes_per_line = if target_lines == 0 { 0 } else { (total_bytes / target_lines).max(1) };
+pub fn preload_document_with_lines(
+    run: &mut crate::gate::GateRun,
+    total_bytes: usize,
+    target_lines: usize,
+) {
+    let bytes_per_line = if target_lines == 0 {
+        0
+    } else {
+        (total_bytes / target_lines).max(1)
+    };
     preload_document(run, total_bytes, bytes_per_line);
 }
 
@@ -313,5 +348,12 @@ pub fn preload_document_then_home_of_last_line(
     newline_every: usize,
 ) {
     preload_document(run, total_bytes, newline_every);
-    run.harness.press_key(NamedKey::Home);
+    // Through `send_untimed`, not a bare `run.harness.press_key(..)` call, to
+    // settle before the caller's first `measure_one` establishes its
+    // baseline -- matching every other untimed setup action in this file.
+    // `measure_one` also unconditionally settles first, so this was not a
+    // correctness bug even before the change, only an inconsistency.
+    run.send_untimed(|h| {
+        h.press_key(NamedKey::Home);
+    });
 }

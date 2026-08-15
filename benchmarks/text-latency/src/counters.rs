@@ -11,7 +11,10 @@ pub struct BoundaryCounters {
 
 impl BoundaryCounters {
     pub fn total(&self) -> u64 {
-        self.event_rx_bytes + self.layout_text_bytes + self.scene_bytes + self.other_guest_host_bytes
+        self.event_rx_bytes
+            + self.layout_text_bytes
+            + self.scene_bytes
+            + self.other_guest_host_bytes
     }
 }
 
@@ -88,7 +91,9 @@ mod mutant_tests {
         let visible_window = 4096;
         let small_doc_bound_input = 4096 * 3;
         let large_doc_materialized_if_buggy = 10 * 1024 * 1024; // 10 MiB
-        assert!(no_whole_document_materialization(small_doc_bound_input, visible_window, 8).is_ok());
+        assert!(
+            no_whole_document_materialization(small_doc_bound_input, visible_window, 8).is_ok()
+        );
         assert!(
             no_whole_document_materialization(large_doc_materialized_if_buggy, visible_window, 8)
                 .is_err()

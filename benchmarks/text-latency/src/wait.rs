@@ -71,9 +71,12 @@ mod mutant_tests {
 
     #[test]
     fn no_baseline_accepts_the_first_revision_observed() {
-        let result = wait_for_new_revision(None, Duration::from_millis(40), Duration::from_millis(5), || {
-            Some(1)
-        });
+        let result = wait_for_new_revision(
+            None,
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            || Some(1),
+        );
         assert_eq!(result, Some(1));
     }
 }

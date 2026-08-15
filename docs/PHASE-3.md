@@ -106,42 +106,74 @@ dependent manual check; the automated joined seam covers logical candidate
 geometry, multi-row preedit projection, empty-preedit-before-commit ordering,
 and guest-owned pixel changes without host document state.
 
-## Latency gate: provisional FAIL (13.1 ms p95)
+## Latency gate: UNVALIDATED (pre-fix reference run: FAIL, 13.1 ms p95)
 
 The userland-authority pivot adopts a new, stricter Phase 3 typing target:
 **p95 native-input → rasterized-pixels ≤ 5 ms**, measured end-to-end through
-the real `guests/scratchpad` component (`benchmarks/text-latency`). The initial
-reference run, preserved at
-`benchmarks/text-latency/results/initial-fail-macos-arm64-2026-08-14`:
-**FAIL**, worst graded p95 **13.1 ms**, from a keystroke measured against a
-1 MiB preloaded document.
+the real `guests/scratchpad` component (`benchmarks/text-latency`).
 
-This is the provisional result currently blocking latency closure. A valid
-rerun is still required before the gate is treated as closed; the 5 ms target
-is not being relaxed.
+Current status, precisely:
 
-This narrows the problem rather than reopening it. Ordinary interactive
-editing — typing, IME commit, pointer, drag, scroll, a bounded-max text
-commit, all against a small/empty document — is comfortably inside budget
-(p95 well under 1.2 ms across every such workload). The failure is
-specific to editing *inside a large preloaded document*, and its shape rules
-out the leading suspect from `docs/DOS-STARVATION-AUDIT.md`'s F1 (expensive
-shaping of one long unbroken line): a 128 KiB pathological single-line
-document passes the gate at 2.8 ms p95, while much larger but ordinarily
-paragraphed 1 MiB / 10 MiB documents cost 8-13 ms for a single keystroke.
-That points at something scaling with overall document size or line count —
-most likely a guest-side line/caret lookup that scans rather than seeks —
-not per-call shaping cost. Full diagnosis, the follow-up
-byte-size×line-count×caret-position matrix, and the reference data are in
-`benchmarks/text-latency/README.md`.
+```text
+pre-fix run:      provisional FAIL, 13.1 ms p95 (historical evidence, kept)
+root cause:       repeated visible-row TextLayout creation in present()
+                   (NOT line_of_byte/line_range scanning -- see below)
+fix:               landed on master, correctness tests green
+current gate status: UNVALIDATED -- the benchmark's own completion harness
+                   had a bug and must be repaired before any new number
+                   from it means anything
+```
 
-The gate stays FAIL until this is root-caused and fixed. The 5 ms target is
-not being relaxed to make this pass, and the fix under investigation is a
-generic guest/host algorithmic one (seek instead of scan), not a reversal of
-the userland-authority pivot: no host document replica, no host-local edit
-shortcut. When the gate passes, the initial failing run is kept, not
-overwritten — a before/after record of the pivot's actual latency behavior
-is more useful than a benchmark that happened to pass on its first run.
+Not PASS. Not "current FAIL caused by production latency" — the
+`GateRun::measure_one` invariant the benchmark used to decide "did the
+guest finish responding to this input" assumed one Surface revision per
+queued guest message. `guests/scratchpad`'s dirty-presentation optimization
+(skip `present()` for events that change nothing visible -- a key release,
+a passive pointer move, focus-gained, `ImeEnabled`, metrics) correctly broke
+that assumption in both directions: the harness could wait indefinitely for
+a revision that correctly never arrives, and unsettled setup/trailing events
+could satisfy part of an unrelated later sample. See
+`benchmarks/text-latency/README.md` for the repair and why it explains the
+stalls observed while re-confirming the fix below, without needing to
+invoke system load as the explanation.
+
+The initial pre-fix reference run is preserved at
+`benchmarks/text-latency/results/initial-fail-macos-arm64-2026-08-14` and
+kept, not overwritten, once a validated number exists — a before/after
+record of the pivot's actual latency behavior is more useful than a
+benchmark that happened to pass on its first (or third) run. That run still
+narrows the problem usefully: ordinary interactive editing — typing, IME
+commit, pointer, drag, scroll, a bounded-max text commit, all against a
+small/empty document — was comfortably inside budget (p95 well under 1.2 ms
+across every such workload); the failure was specific to editing *inside a
+large preloaded document*, and its shape ruled out the leading suspect from
+`docs/DOS-STARVATION-AUDIT.md`'s F1 (expensive shaping of one long unbroken
+line): a 128 KiB pathological single-line document passed at 2.8 ms p95,
+while much larger but ordinarily paragraphed 1 MiB / 10 MiB documents cost
+8-13 ms for a single keystroke.
+
+**Root cause, confirmed by direct code inspection, not by guesswork**:
+`present()` in `guests/scratchpad` re-shaped every visible row (up to
+`VIEWPORT_ROWS + OVERSCAN_ROWS` = 28) via `text_layouts::create_layout` on
+*every* keystroke, with no reuse of a row whose line and text were
+unchanged since the previous call. A small/empty document only ever has a
+few visible rows, so it was fast; once a document has 28+ lines, every
+keystroke paid for 28 full TextLayout shapes regardless of which row
+actually changed. `Document::line_of_byte`/`line_range`
+(`crates/instar-editor-core`) are Crop-native seeks, not scans, and were
+never the bottleneck — an earlier draft of this section named them as the
+leading suspect; that was wrong and is corrected here.
+
+**Fix, landed**: `present()` now retains the previous call's row layouts and
+reuses a row's existing `TextLayout` when its line number and bounded text
+are unchanged, only calling `create_layout` for rows that actually differ.
+All 5 tests in `crates/instar-shell/tests/scratchpad.rs` pass against it.
+
+The gate stays UNVALIDATED, not PASS and not FAIL, until the repaired
+benchmark harness produces a clean run under normal (uncontended) system
+load. The 5 ms target is not being relaxed, and neither the row-cache fix
+nor the harness repair reopens the userland-authority pivot: no host
+document replica, no host-local edit shortcut.
 
 ### A second, distinct scan bug found by the coverage gap itself
 

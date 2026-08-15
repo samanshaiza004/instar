@@ -314,6 +314,34 @@ impl Document {
     pub fn is_char_boundary(&self, byte: usize) -> bool {
         byte <= self.len_bytes() && self.rope.is_char_boundary(byte)
     }
+    /// **Known cost caveat, upstream in `crop` 0.4.3, not fixed here:** this
+    /// call -- and therefore [`Self::next_grapheme_boundary`] and
+    /// [`Self::previous_grapheme_boundary`], both of which validate `byte`
+    /// through it first via `validate_grapheme` -- is `O(len_bytes() -
+    /// byte)`, not `O(log n)`. `crop::Rope::is_grapheme_boundary` walks its
+    /// *entire* chunk list backward from the rope's end until it reaches the
+    /// chunk containing `byte` (`crop-0.4.3/src/rope/utils.rs`,
+    /// `is_grapheme_boundary`, whose own comment reads: `// TODO: we need
+    /// something like Rope{Slice}::chunks_{from,up_to}_byte() if we want to
+    /// make this fast`). Measured on a 10 MB document: ~35 us near byte 0,
+    /// ~12 us at the midpoint, ~0.1 us near the end.
+    ///
+    /// This does **not** undo the fix in `previous_grapheme_boundary` below
+    /// for the case that motivated it -- Backspace at or near a document's
+    /// *end*, where `len_bytes() - byte` is small regardless of how large
+    /// the document is -- and is why `benchmarks/text-latency`'s
+    /// `backspace_at_end_*mib` workloads measure it as fast. It does mean
+    /// Backspace/Delete validation performed far from the document's end
+    /// (near the start, or the middle of a large document) still pays a
+    /// real cost proportional to the remaining distance, unrelated to and
+    /// not addressed by the reverse-traversal fix here. No newer `crop`
+    /// release fixes this as of 0.4.3 (checked crates.io: 0.4.3 is current).
+    /// Replacing it would mean reimplementing `unicode-segmentation`
+    /// grapheme-boundary detection locally and bounded, which is real
+    /// correctness surface (extended grapheme clusters, ZWJ sequences,
+    /// regional indicators, pre-context lookback) deliberately not
+    /// attempted here rather than risk a subtly wrong Unicode segmentation
+    /// in a hurry.
     pub fn is_grapheme_boundary(&self, byte: usize) -> bool {
         byte <= self.len_bytes() && self.rope.is_grapheme_boundary(byte)
     }
@@ -721,5 +749,114 @@ mod tests {
                  boundary forward iteration from 0 already agrees is correct"
             );
         }
+    }
+
+    /// Cheap, crate-local proof that calling `previous_grapheme_boundary`
+    /// near a document's end stays fast regardless of document size -- much
+    /// faster than the full `benchmarks/text-latency` harness (real winit
+    /// events, a real wasm guest, real rendering), so this can be run on
+    /// every change to this file rather than only when someone remembers to
+    /// run the full benchmark suite.
+    ///
+    /// Measures the public function end to end, including its
+    /// `validate_grapheme` prefix -- not the reverse-traversal fix in
+    /// isolation. That prefix has its own, *separate*, upstream cost
+    /// caveat documented on [`Document::is_grapheme_boundary`]: it is
+    /// `O(len_bytes() - byte)`, cheap near a document's end (this test's
+    /// `near_end` probe) but not near its start (this test's `near_start`
+    /// probe, which is the *slower* of the two here for exactly that
+    /// reason -- not because the traversal fix regressed anything there).
+    /// This test's assertion is deliberately about the end-near case this
+    /// fix actually targets, not a claim that every position is now equally
+    /// fast.
+    ///
+    /// Ignored by default: wall-clock timing is inherently noisy on a
+    /// shared/loaded machine, and a flaky timing assertion in the default
+    /// `cargo test` run is worse than an occasionally-stale ignored one. Run
+    /// explicitly with `cargo test -p instar-editor-core -- --ignored`.
+    #[test]
+    #[ignore = "timing-based; run explicitly, see doc comment"]
+    fn previous_grapheme_boundary_does_not_scale_with_caret_position() {
+        use std::time::Instant;
+
+        // ~10 MB, deliberately not grapheme-cluster-trivial: every 64th
+        // character is followed by a combining acute accent, so the boundary
+        // walk (both directions) has to do real grapheme-cluster work, not
+        // just count ASCII bytes.
+        let combining_acute = '\u{0301}';
+        let mut text = String::with_capacity(10 << 20);
+        while text.len() < 10 << 20 {
+            text.push('a');
+            if text.len().is_multiple_of(64) {
+                text.push(combining_acute);
+            }
+        }
+        let d = Document::from_text(&text);
+        let len = d.len_bytes();
+
+        // Both probes are found the *same way* -- scanned forward from a
+        // target for the nearest actual grapheme boundary, since a combining
+        // mark can put a plain char boundary mid-cluster. This matters more
+        // than it looks: an earlier version of this test compared
+        // `previous_grapheme_boundary(near_start)` against
+        // `previous_grapheme_boundary(len)` directly, where `len` is the
+        // literal end of the buffer -- a boundary check that's trivially
+        // O(1) by construction (end-of-text is always a boundary, special-
+        // cased, no grapheme-cluster analysis needed). That confounded two
+        // different things: distance from byte 0 (what this test wants to
+        // measure) and how much actual Unicode grapheme-break work each
+        // probe's *local* position requires (unrelated noise, and it
+        // dominated -- the literal end-of-text probe was ~90x faster than an
+        // arbitrary interior position regardless of which fix was active).
+        // Symmetric probes -- both interior, both found identically -- keep
+        // distance from byte 0 as the only thing that differs between them.
+        let near_start = (4096..4096 + 64)
+            .find(|&b| d.is_grapheme_boundary(b))
+            .expect("a grapheme boundary exists within 64 bytes of the target");
+        let near_end = (len - 4096..len)
+            .find(|&b| d.is_grapheme_boundary(b))
+            .expect("a grapheme boundary exists within 64 bytes of the target");
+
+        // Warm up both positions before timing either, so neither loop's
+        // measurement absorbs cold-cache/page-fault costs the other gets for
+        // free just by running second.
+        for _ in 0..100 {
+            d.previous_grapheme_boundary(near_start).unwrap();
+            d.previous_grapheme_boundary(near_end).unwrap();
+        }
+
+        let start_timing = Instant::now();
+        for _ in 0..2000 {
+            d.previous_grapheme_boundary(near_start).unwrap();
+        }
+        let start_elapsed = start_timing.elapsed();
+
+        // Near the end: the OLD implementation's worst case -- this is where
+        // Backspace on a large document used to pay for the entire document
+        // on every keystroke.
+        let end_timing = Instant::now();
+        for _ in 0..2000 {
+            d.previous_grapheme_boundary(near_end).unwrap();
+        }
+        let end_elapsed = end_timing.elapsed();
+
+        eprintln!(
+            "previous_grapheme_boundary near byte {near_start}: {start_elapsed:?} / 2000 calls, \
+             near byte {near_end} (document is {len} bytes): {end_elapsed:?} / 2000 calls"
+        );
+
+        // A genuinely near-caret traversal costs about the same regardless
+        // of where the caret is. The old forward-scan implementation would
+        // make the near-end case slower by a factor proportional to
+        // `near_end / near_start` -- roughly 2500x here. 10x is generous
+        // slack for machine noise while still failing loudly on anything
+        // shaped like the old bug.
+        assert!(
+            end_elapsed.as_nanos() < start_elapsed.as_nanos().max(1) * 10,
+            "previous_grapheme_boundary near the document's end took {end_elapsed:?}, \
+             {}x the near-start cost of {start_elapsed:?} -- this is the shape of the \
+             O(caret position) forward-scan bug this test exists to catch",
+            end_elapsed.as_nanos() / start_elapsed.as_nanos().max(1)
+        );
     }
 }

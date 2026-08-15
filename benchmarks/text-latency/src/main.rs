@@ -79,16 +79,17 @@ fn main() {
     // the extreme, exhausting patience entirely. Each workload measures
     // against the same *intended* starting condition instead.
     macro_rules! workload {
-        ($name:expr, $what:expr, $graded:expr, $iters:expr, $setup:expr, $body:expr) => {{
+        ($name:expr, $what:expr, $graded:expr, $iters:expr, $setup:expr, $expects_render:expr, $body:expr) => {{
             eprintln!("running workload {} ({} iterations)...", $name, $iters);
             let mut run = GateRun::launch();
             let setup: fn(&mut GateRun) = $setup;
-            workloads::focus_surface(&mut run.harness);
+            run.send_untimed(|h| workloads::focus_surface(h));
             setup(&mut run);
             let mut samples = Vec::with_capacity($iters);
             for _ in 0..$iters {
-                workloads::focus_surface(&mut run.harness);
-                let stage_times: StageTimes = run.measure_one(|harness| $body(harness));
+                run.send_untimed(|h| workloads::focus_surface(h));
+                let stage_times: StageTimes =
+                    run.measure_one($expects_render, |harness| $body(harness));
                 if let Err(error) = stage_times.validate() {
                     panic!("workload {} produced an invalid sample: {error}", $name);
                 }
@@ -104,19 +105,33 @@ fn main() {
                 graded: $graded,
             });
         }};
-        ($name:expr, $what:expr, $graded:expr, $iters:expr, $body:expr) => {
-            workload!($name, $what, $graded, $iters, |_: &mut GateRun| {}, $body)
+        ($name:expr, $what:expr, $graded:expr, $iters:expr, $expects_render:expr, $body:expr) => {
+            workload!(
+                $name,
+                $what,
+                $graded,
+                $iters,
+                |_: &mut GateRun| {},
+                $expects_render,
+                $body
+            )
         };
     }
 
-    workload!("ascii_typing", "one ordinary ASCII keystroke", true, iterations, |h| {
-        workloads::ascii_typing(h, 'x')
-    });
+    workload!(
+        "ascii_typing",
+        "one ordinary ASCII keystroke (keydown only; keyup settled untimed)",
+        true,
+        iterations,
+        true,
+        |h| { workloads::ascii_typing(h, 'x') }
+    );
     workload!(
         "key_repeat",
         "one autorepeated keydown (repeat=true)",
         true,
         iterations,
+        true,
         |h| workloads::key_repeat(h, 'x')
     );
     workload!(
@@ -124,6 +139,7 @@ fn main() {
         "combining-mark commit (e + acute + acute + n + tilde)",
         true,
         iterations,
+        true,
         |h| workloads::unicode_combining_commit(h)
     );
     workload!(
@@ -131,6 +147,7 @@ fn main() {
         "mixed Hebrew/Latin commit forcing bidi reordering",
         true,
         iterations,
+        true,
         |h| workloads::bidi_commit(h)
     );
     workload!(
@@ -138,6 +155,7 @@ fn main() {
         "two-update preedit composition then commit",
         true,
         iterations,
+        true,
         |h| workloads::ime_commit_sequence(h)
     );
     workload!(
@@ -145,6 +163,7 @@ fn main() {
         "one multi-line preedit update",
         true,
         iterations,
+        true,
         |h| workloads::multiline_preedit_update(h)
     );
     {
@@ -162,11 +181,11 @@ fn main() {
         let mut checksum = 0u64;
         for _ in 0..capped {
             let mut run = GateRun::launch();
-            workloads::focus_surface(&mut run.harness);
-            let stage_times = run.measure_one(|h| workloads::max_bounded_text_commit(h));
-            stage_times
-                .validate()
-                .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
+            run.send_untimed(|h| workloads::focus_surface(h));
+            let stage_times = run.measure_one(true, |h| workloads::max_bounded_text_commit(h));
+            stage_times.validate().unwrap_or_else(|error| {
+                panic!("workload {name} produced an invalid sample: {error}")
+            });
             if let Some(total) = stage_times.total() {
                 samples.push(total);
             }
@@ -182,19 +201,30 @@ fn main() {
             graded: true,
         });
     }
-    workload!("pointer_placement", "one click inside the Surface", true, iterations, |h| {
-        workloads::pointer_placement(h)
-    });
+    workload!(
+        "pointer_placement",
+        "one click inside the Surface",
+        true,
+        iterations,
+        true,
+        |h| { workloads::pointer_placement(h) }
+    );
     workload!(
         "drag_selection",
         "press, 6 intermediate moves, release",
         true,
         iterations,
+        true,
         |h| workloads::drag_selection(h)
     );
-    workload!("rapid_scrolling", "burst of 8 wheel events", true, iterations, |h| {
-        workloads::rapid_scrolling(h)
-    });
+    workload!(
+        "rapid_scrolling",
+        "burst of 8 wheel events",
+        true,
+        iterations,
+        true,
+        |h| { workloads::rapid_scrolling(h) }
+    );
 
     // 12/13/14: preload once (as this workload's setup, against its own
     // fresh guest instance), then measure one ordinary keystroke per
@@ -202,10 +232,11 @@ fn main() {
     // this keystroke's latency does not scale with the preload size.
     workload!(
         "keystroke_after_1mib_doc",
-        "one keystroke, 1 MiB document preloaded",
+        "one keystroke, 1 MiB document preloaded (keydown only; keyup settled untimed)",
         true,
         iterations.min(50),
         |run: &mut GateRun| workloads::preload_document(run, 1 << 20, 200),
+        true,
         |h| workloads::ascii_typing(h, 'y')
     );
     workload!(
@@ -214,6 +245,7 @@ fn main() {
         true,
         iterations.min(50),
         |run: &mut GateRun| workloads::preload_document(run, 10 << 20, 200),
+        true,
         |h| workloads::ascii_typing(h, 'y')
     );
     workload!(
@@ -227,6 +259,7 @@ fn main() {
         // pathological without being untestable.
         iterations.min(20),
         |run: &mut GateRun| workloads::preload_document(run, 128 << 10, 0),
+        true,
         |h| workloads::ascii_typing(h, 'y')
     );
 
@@ -248,8 +281,80 @@ fn main() {
         false,
         iterations.min(50),
         |run: &mut GateRun| workloads::preload_document_with_lines(run, 6 << 10, 28),
+        true,
         |h| workloads::ascii_typing(h, 'y')
     );
+
+    // backspace_at_end_1mib / backspace_at_end_10mib / delete_forward_large_doc:
+    // the deletion counterpart to the *_after_Nmib_doc keystroke workloads
+    // above. Nothing in the original 15-workload request measured deletion,
+    // and `Document::previous_grapheme_boundary` (`crates/instar-editor-core`)
+    // turned out to scan every grapheme from byte 0 up to the caret on every
+    // call -- Backspace was O(caret position) regardless of how well the
+    // rest of the editor performed, so a large document could pass every
+    // insertion workload above while Backspace near its end stayed
+    // pathological. See `workloads.rs`'s doc comment on `backspace` for the
+    // full account, including why these are hand-rolled loops rather than
+    // `workload!` calls: that macro re-clicks the Surface before every
+    // measured iteration, and the click would silently relocate the caret
+    // away from the document's end before each measured Backspace.
+    for (name, bytes) in [
+        ("backspace_at_end_1mib", 1usize << 20),
+        ("backspace_at_end_10mib", 10usize << 20),
+    ] {
+        let iters = iterations.min(50);
+        eprintln!("running workload {name} ({iters} iterations)...");
+        let mut run = GateRun::launch();
+        run.send_untimed(|h| workloads::focus_surface(h));
+        workloads::preload_document(&mut run, bytes, 200);
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            // No `focus_surface` re-click here -- see the comment above.
+            // Real typing does not re-click before every keystroke either;
+            // focus, once established, persists across key presses.
+            let stage_times = run.measure_one(true, |h| workloads::backspace(h));
+            stage_times.validate().unwrap_or_else(|error| {
+                panic!("workload {name} produced an invalid sample: {error}")
+            });
+            if let Some(total) = stage_times.total() {
+                samples.push(total);
+            }
+        }
+        total_checksum = total_checksum.wrapping_add(run.checksum());
+        results.push(WorkloadResult {
+            name,
+            what: "one Backspace, caret at the document's end, N MiB preloaded -- \
+                   previous_grapheme_boundary's former worst case",
+            percentiles: percentiles(&samples),
+            graded: true,
+        });
+    }
+    {
+        let name = "delete_forward_large_doc";
+        let iters = iterations.min(50);
+        eprintln!("running workload {name} ({iters} iterations)...");
+        let mut run = GateRun::launch();
+        run.send_untimed(|h| workloads::focus_surface(h));
+        workloads::preload_document_then_home_of_last_line(&mut run, 10 << 20, 200);
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let stage_times = run.measure_one(true, |h| workloads::delete_forward(h));
+            stage_times.validate().unwrap_or_else(|error| {
+                panic!("workload {name} produced an invalid sample: {error}")
+            });
+            if let Some(total) = stage_times.total() {
+                samples.push(total);
+            }
+        }
+        total_checksum = total_checksum.wrapping_add(run.checksum());
+        results.push(WorkloadResult {
+            name,
+            what: "one forward-delete near the tail of a 10 MiB document (caret moved to the \
+                   last preloaded line's start via Home, so there is real trailing content)",
+            percentiles: percentiles(&samples),
+            graded: true,
+        });
+    }
 
     // Diagnostic matrix, not part of the graded gate (`graded: false`):
     // isolates whether the large-document regression above tracks document
@@ -267,15 +372,15 @@ fn main() {
     ] {
         eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
         let mut run = GateRun::launch();
-        workloads::focus_surface(&mut run.harness);
+        run.send_untimed(|h| workloads::focus_surface(h));
         workloads::preload_document_with_lines(&mut run, 10 << 20, lines);
         let mut samples = Vec::with_capacity(MATRIX_ITERS);
         for _ in 0..MATRIX_ITERS {
-            workloads::focus_surface(&mut run.harness);
-            let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
-            stage_times
-                .validate()
-                .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
+            run.send_untimed(|h| workloads::focus_surface(h));
+            let stage_times = workloads::measure_keystroke(&mut run, 'y');
+            stage_times.validate().unwrap_or_else(|error| {
+                panic!("workload {name} produced an invalid sample: {error}")
+            });
             if let Some(total) = stage_times.total() {
                 samples.push(total);
             }
@@ -297,15 +402,15 @@ fn main() {
     ] {
         eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
         let mut run = GateRun::launch();
-        workloads::focus_surface(&mut run.harness);
+        run.send_untimed(|h| workloads::focus_surface(h));
         workloads::preload_document_with_lines(&mut run, bytes, 2_000);
         let mut samples = Vec::with_capacity(MATRIX_ITERS);
         for _ in 0..MATRIX_ITERS {
-            workloads::focus_surface(&mut run.harness);
-            let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
-            stage_times
-                .validate()
-                .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
+            run.send_untimed(|h| workloads::focus_surface(h));
+            let stage_times = workloads::measure_keystroke(&mut run, 'y');
+            stage_times.validate().unwrap_or_else(|error| {
+                panic!("workload {name} produced an invalid sample: {error}")
+            });
             if let Some(total) = stage_times.total() {
                 samples.push(total);
             }
@@ -326,7 +431,7 @@ fn main() {
     // further through the document, clamped at the end.
     {
         let mut run = GateRun::launch();
-        workloads::focus_surface(&mut run.harness);
+        run.send_untimed(|h| workloads::focus_surface(h));
         workloads::preload_document_with_lines(&mut run, 10 << 20, 2_000);
         for (name, wheel_lines) in [
             ("matrix_caret_near_start", 0.0f32),
@@ -335,10 +440,10 @@ fn main() {
             ("matrix_caret_near_end", -100_000.0),
         ] {
             eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
-            run.measure_one(|h| workloads::scroll_then_click(h, wheel_lines));
+            run.send_untimed(|h| workloads::scroll_then_click(h, wheel_lines));
             let mut samples = Vec::with_capacity(MATRIX_ITERS);
             for _ in 0..MATRIX_ITERS {
-                let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
+                let stage_times = workloads::measure_keystroke(&mut run, 'y');
                 stage_times.validate().unwrap_or_else(|error| {
                     panic!("workload {name} produced an invalid sample: {error}")
                 });
@@ -361,7 +466,8 @@ fn main() {
         total_checksum
     );
 
-    let output_dir = output.unwrap_or_else(|| PathBuf::from("benchmarks/text-latency/results/reference"));
+    let output_dir =
+        output.unwrap_or_else(|| PathBuf::from("benchmarks/text-latency/results/reference"));
     write_report(&output_dir, &results, iterations);
 }
 
@@ -369,7 +475,8 @@ fn write_report(dir: &Path, results: &[WorkloadResult], iterations: usize) {
     fs::create_dir_all(dir).expect("results directory is writable");
 
     let mut summary = String::new();
-    summary.push_str("workload\tp50_ms\tp95_ms\tp99_ms\tmax_ms\tcount\tgraded\tpass_p95_5ms\twhat\n");
+    summary
+        .push_str("workload\tp50_ms\tp95_ms\tp99_ms\tmax_ms\tcount\tgraded\tpass_p95_5ms\twhat\n");
     let mut worst_p95 = Duration::ZERO;
     let mut any_graded_failed = false;
     for result in results {
@@ -389,7 +496,11 @@ fn write_report(dir: &Path, results: &[WorkloadResult], iterations: usize) {
             fmt_ms(result.percentiles.max),
             result.percentiles.count,
             result.graded,
-            if result.graded { pass.to_string() } else { "n/a (characterization only)".to_string() },
+            if result.graded {
+                pass.to_string()
+            } else {
+                "n/a (characterization only)".to_string()
+            },
             result.what,
         ));
     }
@@ -408,7 +519,11 @@ fn write_report(dir: &Path, results: &[WorkloadResult], iterations: usize) {
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .unwrap_or_else(|| "unknown".to_string());
-    let profile = if cfg!(debug_assertions) { "dev (unoptimized)" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "dev (unoptimized)"
+    } else {
+        "release"
+    };
     let metadata = format!(
         "timestamp_unix_ns={}\n\
          os={}\n\

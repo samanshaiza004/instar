@@ -35,8 +35,17 @@ pub struct StageTimes {
     /// Strictly incremented once per `Presenter::render` call this sample's
     /// measurement performed. Exists so "stopped at scene acceptance
     /// instead of actual rasterization" is mechanically detectable: a
-    /// sample with `t5` set but `frames_rendered == 0` is a benchmark bug.
+    /// sample declared visible (see `expects_render`) with `t5` set but
+    /// `frames_rendered == 0` is a benchmark bug.
     pub frames_rendered: u64,
+    /// The workload's own declaration of whether this interaction should
+    /// have changed what is presented. Not inferred from message counts or
+    /// event shape: `guests/scratchpad`'s dirty-presentation optimization
+    /// means the same *kind* of input (a keydown vs. a keyup) can differ in
+    /// whether it renders, and nothing on the host side can recover that
+    /// after the fact -- see `gate::GateRun::measure_one`'s doc comment.
+    /// `frames_rendered == 0` is only a bug when this is `true`.
+    pub expects_render: bool,
 }
 
 impl StageTimes {
@@ -66,11 +75,12 @@ impl StageTimes {
             }
             previous = Some((name, value));
         }
-        if self.t5.is_some() && self.frames_rendered == 0 {
+        if self.expects_render && self.t5.is_some() && self.frames_rendered == 0 {
             return Err(
-                "T5 is set but frames_rendered is 0 -- this sample recorded a timestamp \
-                 without an actual Presenter::render call ever completing; it measured \
-                 scene acceptance, not rasterization"
+                "this sample was declared to expect a render, T5 is set, but \
+                 frames_rendered is 0 -- it recorded a timestamp without an actual \
+                 Presenter::render call ever completing; it measured scene acceptance, \
+                 not rasterization"
                     .to_string(),
             );
         }
@@ -97,27 +107,52 @@ mod mutant_tests {
             t1: Some(Duration::from_millis(2)),
             t5: Some(Duration::from_millis(6)),
             frames_rendered: 1,
+            expects_render: true,
             ..Default::default()
         };
         let error = broken.validate().expect_err("T0 after T1 must be rejected");
-        assert!(error.contains('T'), "error should name the violating stage: {error}");
+        assert!(
+            error.contains('T'),
+            "error should name the violating stage: {error}"
+        );
     }
 
     /// Mutant: the benchmark stops at scene acceptance instead of actual
-    /// rasterization -- T5 gets a timestamp but no frame was ever rendered.
+    /// rasterization -- T5 gets a timestamp but no frame was ever rendered,
+    /// for an interaction the workload declared should be visible.
     #[test]
-    fn t5_without_a_rendered_frame_is_rejected() {
+    fn t5_without_a_rendered_frame_is_rejected_when_a_render_was_expected() {
         let broken = StageTimes {
             t0: Some(Duration::from_millis(0)),
             t4: Some(Duration::from_millis(3)),
             t5: Some(Duration::from_millis(3)),
             frames_rendered: 0,
+            expects_render: true,
             ..Default::default()
         };
         let error = broken
             .validate()
-            .expect_err("T5 with zero rendered frames must be rejected");
+            .expect_err("T5 with zero rendered frames must be rejected when a render was expected");
         assert!(error.contains("frames_rendered"));
+    }
+
+    /// Not a mutant: a workload-declared non-visible interaction (a key
+    /// release, a passive pointer move) legitimately produces `t5` with
+    /// `frames_rendered == 0` under dirty presentation. The validator must
+    /// accept this -- it is not the same shape as the mutant above, and the
+    /// distinction is exactly `expects_render`.
+    #[test]
+    fn zero_frames_is_accepted_when_no_render_was_expected() {
+        let quiet = StageTimes {
+            t0: Some(Duration::from_millis(0)),
+            t5: Some(Duration::from_millis(1)),
+            frames_rendered: 0,
+            expects_render: false,
+            ..Default::default()
+        };
+        quiet
+            .validate()
+            .expect("a declared non-visible sample with zero frames must pass");
     }
 
     /// A well-formed DIAGNOSTIC sample with every stage present and
@@ -133,6 +168,7 @@ mod mutant_tests {
             t4: Some(Duration::from_micros(1100)),
             t5: Some(Duration::from_micros(2400)),
             frames_rendered: 1,
+            expects_render: true,
         };
         good.validate().expect("well-ordered sample must pass");
         assert_eq!(good.total(), Some(Duration::from_micros(2400)));
@@ -146,6 +182,7 @@ mod mutant_tests {
             t0: Some(Duration::from_micros(0)),
             t5: Some(Duration::from_micros(1800)),
             frames_rendered: 1,
+            expects_render: true,
             ..Default::default()
         };
         gate.validate().expect("GATE-mode sample must pass");

@@ -104,6 +104,24 @@ leading suspect being a guest-side line/caret *lookup* (`primary_line`,
 addresses. Fixing Backspace does not by itself resolve that FAIL — re-run
 the gate after both are addressed before expecting a PASS.
 
+**And a third, upstream one this fix does not close.** Both
+`next_grapheme_boundary` and `previous_grapheme_boundary` validate `byte`
+through `Document::is_grapheme_boundary` before doing anything else, and
+that call is itself `O(len_bytes() - byte)` in `crop` 0.4.3 — its own
+`rope/utils.rs` walks the rope's chunk list backward from the *end* to find
+`byte`, with a `// TODO: ... if we want to make this fast` left in the
+crate's own source. Measured on a 10 MB document: ~35 us near byte 0, ~12 us
+at the midpoint, ~0.1 us near the end. This is exactly why
+`backspace_at_end_1mib`/`backspace_at_end_10mib` name "at end": that's where
+`len_bytes() - byte` is small and this cost disappears, which is also
+precisely the case the original bug report was about. It is **not** fixed
+for Backspace/Delete performed near a document's start or middle — those
+still pay a real, position-dependent cost, unrelated to and not addressed by
+the reverse-traversal change here. See the doc comment on
+`Document::is_grapheme_boundary` (`crates/instar-editor-core/src/lib.rs`)
+for the full account and why a local reimplementation wasn't attempted here
+(real Unicode grapheme-segmentation correctness surface, not a quick patch).
+
 **Not implemented in this session**, both because they need a small,
 guest-reachable addition to `guests/scratchpad` that the same concurrent-
 development concern above applies to:
@@ -132,22 +150,90 @@ than silently understating a 100 KB claim. The document-size backdrops (1
 MiB / 10 MiB) build up via many small chunked commits instead of one giant
 one, for the same reason.
 
-A second, related implementation bug is worth naming because it is exactly
-the shape of bug this benchmark's own mutant catalog exists to catch:
-an earlier version of the harness waited only for the *first* Surface
-revision after a multi-event interaction (e.g. a drag: press + 6 moves +
-release = 7 events), not for every event to finish being processed. The
-leftover unprocessed events silently bled into the *next* measured
-interaction's wait, eventually overflowing the guest's bounded event queue
-and terminating the generation — a real instance of "an already-completed
-[partial] frame satisfies the wait," discovered by the benchmark stalling
-rather than by a targeted mutant test catching it after the fact. The fix
-(`GateRun::measure_one` in `src/gate.rs`) waits for the Surface revision to
-advance by exactly the number of messages `RuntimeHarness::guest_message_count`
-reports were actually queued, draining every injected event before
-returning.
+## The completion-invariant bug (why the gate is currently UNVALIDATED)
 
-## Results (reference-macos-arm64-2026-08-14)
+The harness went through two different broken ideas of "this interaction is
+done," in sequence, before landing on the current one. Both are worth
+recording, because both are the same category of mistake this benchmark's
+own mutant catalog exists to catch: treating an *assumption about the
+implementation* as a *causal signal*, instead of actually observing
+completion.
+
+**Attempt 1 — wait for the first new Surface revision.** The original
+`measure_one` sent one interaction and waited for `surface_revision` to
+increase by any amount. This broke for multi-event interactions (a drag:
+press + 6 moves + release): the first revision bump satisfied the wait, but
+the *remaining* injected events were still unprocessed, and were left to
+complete during the *next* measured interaction instead of this one. Enough
+of that pressure overflowed the guest's bounded event queue and terminated
+the generation outright — a real instance of "an already-completed
+[partial] frame satisfies the wait."
+
+**Attempt 2 — wait for exactly one revision per queued message.** The fix
+for attempt 1 counted `RuntimeHarness::guest_message_count` before and
+after `inject`, and waited for the Surface revision to advance by exactly
+that many. This is what actually produced the pre-fix 13.1 ms reference
+run below. It broke the moment `guests/scratchpad` gained (correctly)
+dirty-driven presentation: `present()` no longer runs unconditionally after
+every event, only after ones that change something visible. A key release,
+a passive pointer move, focus-gained, `ImeEnabled`, and metrics all reach
+the guest's event loop and correctly produce zero new revisions. Attempt
+2's arithmetic still expected one revision per message regardless, so it
+could hang for up to `PATIENCE` waiting for a revision that was never
+going to arrive — this is what a "keystroke sends keydown+keyup as two
+messages, expects two revisions, but keyup is correctly invisible" workload
+looks like from the outside, and it is not a system-load artifact: it
+reproduced identically at a 60-second patience budget on this same machine.
+A second, compounding version of the same mistake existed in `main.rs`
+itself: `focus_surface`'s click was never settled before the next sample's
+baseline was captured, so unsettled setup could satisfy part of an
+unrelated measured interaction (the opposite failure: a false pass instead
+of a false hang).
+
+**Current design (`GateRun::measure_one`/`GateRun::settle` in
+`src/gate.rs`)**: every workload declares `expects_render: bool` for the
+interaction it measures — a fact about what the interaction *means*, not
+something inferred from message counts. Completion is quiescence: the
+harness polls until Surface-revision activity and host effects both go
+idle for a few consecutive short polls, recording T5 at the *last* observed
+revision change (so a burst of events that coalesces into fewer rendered
+frames is treated as the legitimate optimization it is, not a correctness
+failure) rather than the first. `GateRun::settle()` runs both before and
+after every measured interaction, so setup and trailing effects never
+contaminate a sample's baseline in either direction. Typing specifically
+now measures keydown alone (`workloads::ascii_typing`); the paired keyup is
+sent through `GateRun::send_untimed` afterward, deliberately outside the
+timed interval (`workloads::release_character`'s doc comment has the full
+argument for why release cannot be timed at all under dirty presentation).
+`StageTimes::expects_render` lets `validate()` continue to require
+`frames_rendered >= 1` when a render was expected, while correctly
+accepting `frames_rendered == 0` for a workload that declared it did not
+expect one — see `src/sample.rs`'s mutant tests for both directions.
+
+This is landed and unit-tested (13 tests, `cargo test --release`), and
+partial live verification (3 of the graded workloads, run against the real
+guest) shows the fix working correctly: fast, correct timings, no false
+hangs on non-visible events. **A full clean run has not yet completed.**
+While re-verifying, a *separate, newly discovered* issue surfaced:
+`bidi_text` currently hangs waiting for a Surface revision that never
+arrives, reproducing identically at a 30-second patience budget — this
+argues against a system-load explanation, since every other tested
+workload completed in well under a millisecond in the same run. This has
+not been root-caused. It was not present in the pre-fix reference run
+below (`bidi_text` passed there, p95 0.67 ms), so something changed
+between that run and now, in code this session did not author, and it is
+reported here rather than worked around. Until it (and a clean full run)
+are resolved, **no PASS/FAIL verdict from this benchmark should be
+trusted** — see `docs/PHASE-3.md`'s "Latency gate: UNVALIDATED" section.
+
+## Results (reference-macos-arm64-2026-08-14) -- historical, pre-fix
+
+Preserved as the first failing baseline, not overwritten. This run used the
+now-replaced "one revision per queued message" completion logic (see
+above), which happened to be adequate for every workload it measured
+*except* the ones that never got the chance to expose its flaw — so its
+individual numbers below are trustworthy as *evidence a regression exists*,
+but the harness itself should not be considered validated by this run.
 
 **Verdict: FAIL.** Worst graded p95: **13.1 ms** (target: ≤5 ms), from
 `keystroke_after_1mib_doc`. Full numbers in `summary.csv` /
