@@ -255,6 +255,27 @@ impl HostWindow {
             .flatten()
     }
 
+    /// Revision of the independently retained Surface scene for `key`.
+    ///
+    /// This is read-only observation for production seam tests; scene
+    /// admission and replacement remain exclusively host-bridge operations.
+    pub fn surface_revision(&self, key: NodeKey) -> Option<u64> {
+        self.surface_scenes.get(&key).map(|scene| scene.revision)
+    }
+
+    /// Source-byte lengths of the immutable layouts retained by a Surface
+    /// scene. This is read-only seam observation for bounded-presentation
+    /// tests; layout admission and ownership remain host-internal.
+    pub fn surface_layout_source_lengths(&self, key: NodeKey) -> Option<Vec<usize>> {
+        self.surface_scenes.get(&key).map(|scene| {
+            scene
+                .commands
+                .iter()
+                .filter_map(|command| command.layout.as_ref().map(|layout| layout.source_len()))
+                .collect()
+        })
+    }
+
     pub fn redraw_pending(&self) -> bool {
         self.redraw_pending
     }
@@ -511,10 +532,31 @@ impl Host {
     ) {
         let mut effects = Vec::new();
         let answer = match operation {
-            PresentationOperation::CreateLayout { text, style } => self
-                .layouts
-                .create(&mut self.text, generation, &text, style)
-                .map(PresentationAnswer::Layout),
+            PresentationOperation::CreateLayout { text, style } => {
+                #[cfg(feature = "bench-probe")]
+                let text_bytes = text.len() as u64;
+                let result = self
+                    .layouts
+                    .create(&mut self.text, generation, &text, style)
+                    .map(PresentationAnswer::Layout);
+                // Diagnostic-build only (see benchmarks/text-latency). T3 is
+                // defined as the *last* create-layout completion attributed
+                // to the current sample, not the first -- one interaction
+                // can request several rows, so later marks legitimately
+                // overwrite earlier ones for the same sample in the log; the
+                // harness takes the max, not the first.
+                #[cfg(feature = "bench-probe")]
+                {
+                    instar_kernel::bench_probe::record_host_counter(
+                        instar_kernel::bench_probe::COUNTER_LAYOUT_TEXT_BYTES,
+                        text_bytes,
+                    );
+                    instar_kernel::bench_probe::record_host_mark(
+                        instar_kernel::bench_probe::STAGE_T3_LAYOUT_COMPLETE,
+                    );
+                }
+                result
+            }
             PresentationOperation::QueryLayout { key, query } => {
                 self.layouts.query(generation, key, query)
             }
@@ -557,6 +599,11 @@ impl Host {
                                     Err(PresentationRefusal::InvalidScene(error.to_string()))
                                 }
                                 Ok(decoded) => {
+                                    #[cfg(feature = "bench-probe")]
+                                    instar_kernel::bench_probe::record_host_counter(
+                                        instar_kernel::bench_probe::COUNTER_SCENE_BYTES,
+                                        scene.len() as u64,
+                                    );
                                     let window = self.windows.entry(window_id).or_default();
                                     let revision = window
                                         .surface_scenes
@@ -566,6 +613,14 @@ impl Host {
                                         decoded, &resolved, revision,
                                     );
                                     window.surface_scenes.insert(key, staged);
+                                    // T4: the moment the host accepts the
+                                    // scene into the retained tree, before
+                                    // lowering/rebuild runs. Diagnostic-build
+                                    // only.
+                                    #[cfg(feature = "bench-probe")]
+                                    instar_kernel::bench_probe::record_host_mark(
+                                        instar_kernel::bench_probe::STAGE_T4_SCENE_ACCEPTED,
+                                    );
                                     self.layouts.collect();
                                     self.rebuild_scene(window_id);
                                     if self
@@ -1314,9 +1369,17 @@ impl Host {
 
         let (x, y) = event.logical_pos.round();
 
-        if let Some((target, local_x, local_y, interests)) =
-            self.surface_at(event.window_id, x, y, true)
+        let surface = if self
+            .windows
+            .get(&event.window_id)
+            .and_then(|window| window.surface_capture)
+            .is_some()
         {
+            self.captured_surface_at(event.window_id, x, y, true)
+        } else {
+            self.surface_at(event.window_id, x, y, true)
+        };
+        if let Some((target, local_x, local_y, interests)) = surface {
             let captured = self
                 .windows
                 .get(&event.window_id)
@@ -1332,6 +1395,11 @@ impl Host {
             };
             if !interests.pointer_buttons {
                 return Vec::new();
+            }
+            if event.state == PointerState::Pressed
+                && let Some(window) = self.windows.get_mut(&event.window_id)
+            {
+                window.focus.focus_by_pointer(Some(target));
             }
             let surface_event = match event.state {
                 PointerState::Pressed => SurfaceEvent::PointerDown {
@@ -1606,8 +1674,17 @@ impl Host {
     /// Separate from [`Host::on_pointer`] because a move is not a button
     /// event, and because both of the things it can do are pure presentation.
     pub fn on_pointer_moved(&mut self, window_id: WindowId, x: i32, y: i32) -> Vec<HostEffect> {
-        if let Some((target, local_x, local_y, interests)) = self.surface_at(window_id, x, y, true)
+        let surface = if self
+            .windows
+            .get(&window_id)
+            .and_then(|window| window.surface_capture)
+            .is_some()
         {
+            self.captured_surface_at(window_id, x, y, false)
+        } else {
+            self.surface_at(window_id, x, y, true)
+        };
+        if let Some((target, local_x, local_y, interests)) = surface {
             let captured = self.windows.get(&window_id).and_then(|w| w.surface_capture);
             if captured == Some(target) || (captured.is_none() && interests.pointer_movement) {
                 return vec![HostEffect::SendToGuest(
@@ -1699,6 +1776,34 @@ impl Host {
         let rect = layout.get(node.key)?;
         Some((
             node.key,
+            f64::from(x - rect.x),
+            f64::from(y - rect.y),
+            interests,
+        ))
+    }
+
+    fn captured_surface_at(
+        &self,
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+        buttons: bool,
+    ) -> Option<(NodeKey, f64, f64, instar_ui::SurfaceInterests)> {
+        let window = self.windows.get(&window_id)?;
+        let target = window.surface_capture?;
+        let tree = window.tree.as_ref()?;
+        let layout = window.layout.as_ref()?;
+        let node = tree.find(target)?;
+        let interests = match node.kind {
+            instar_ui::NodeKind::Surface { interests, .. } => interests,
+            _ => return None,
+        };
+        if buttons && !interests.pointer_buttons {
+            return None;
+        }
+        let rect = layout.get(target)?;
+        Some((
+            target,
             f64::from(x - rect.x),
             f64::from(y - rect.y),
             interests,

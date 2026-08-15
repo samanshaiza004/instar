@@ -97,6 +97,13 @@ impl RuntimeHarness {
         }
     }
 
+    /// Injects an already translated native output through the production
+    /// bridge. This is reserved for outputs (notably IME strings) that winit
+    /// cannot construct as a `WindowEvent` in a headless test.
+    pub fn send_output(&mut self, output: WindowOutput) -> Vec<HostEffect> {
+        self.bridge.on_window_event(output)
+    }
+
     /// Clicks the centre of a retained node using cursor movement and primary
     /// mouse button events. The target is resolved from current host layout,
     /// never by calling a host interaction method directly.
@@ -253,6 +260,10 @@ impl RuntimeHarness {
         );
     }
 
+    pub fn guest_message_count(&self) -> u64 {
+        self.bridge.guest_message_count()
+    }
+
     pub fn focused(&self) -> Option<NodeKey> {
         self.window().focus().focused()
     }
@@ -331,6 +342,27 @@ impl RuntimeHarness {
 
     pub fn scene(&self) -> Option<&instar_paint::PaintScene> {
         self.window().scene()
+    }
+
+    /// Observes the host-owned Surface scene revision without routing or
+    /// mutating anything. A revision change proves an independent scene
+    /// update, not a semantic tree commit.
+    pub fn surface_revision(&self, key: NodeKey) -> Option<u64> {
+        self.window().surface_revision(key)
+    }
+
+    pub fn surface_layout_source_lengths(&self, key: NodeKey) -> Option<Vec<usize>> {
+        self.window().surface_layout_source_lengths(key)
+    }
+
+    pub fn tree_revision(&self) -> u64 {
+        self.window().tree_revision()
+    }
+
+    /// Lets the real bridge process queued guest work while a test observes
+    /// host presentation state.
+    pub fn wait(&mut self, duration: Duration) -> Vec<HostEffect> {
+        self.bridge.wait(duration)
     }
 
     fn window(&self) -> &instar_host::HostWindow {

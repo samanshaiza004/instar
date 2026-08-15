@@ -1,0 +1,24 @@
+timestamp_unix_ns=1786762295588346000
+os=Darwin MacBook-Air-181.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:26:46 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8103 arm64
+arch=aarch64
+family=unix
+latency_edits=1000
+latency_edits_ascii_character=1000
+latency_edits_multibyte_unicode=1000
+latency_edits_ime_commit=1000
+latency_edits_one_kib_edit=500
+latency_edits_one_hundred_kib_paste=50
+recovery_edits=1000,10000,100000
+crash_edits=100
+checkpoint_edit_interval=2048
+checkpoint_byte_interval=1048576
+sync_interval_ms=5
+sync_bytes=65536
+
+measurement_boundaries:
+write_return=File::write returned; bytes were accepted by the kernel write path
+page_cache_accepted=separate event at the same observable write-return boundary; no second POSIX timestamp exists
+flush_return=File::sync_data returned
+crash_after_write=child aborts after write return and before the next explicit flush
+crash_after_flush=child aborts after explicit sync_data returns
+crash_limit=process crash/restart observation, not a power-loss guarantee

@@ -45,3 +45,11 @@ tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time
 
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }
+
+[features]
+# Off by default in every production build. See instar-kernel's feature of
+# the same name (crates/instar-kernel/src/bench_probe.rs) -- this only adds
+# a few `#[cfg]`-guarded Instant::now() calls and byte counts around
+# `serve_presentation`'s CreateLayout/UpdateSurface arms for the Phase 3
+# text-latency benchmark's DIAGNOSTIC build.
+bench-probe = ["instar-kernel/bench-probe"]

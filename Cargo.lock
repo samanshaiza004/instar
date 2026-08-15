@@ -2660,6 +2660,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "recovery-harness"
+version = "0.0.2"
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

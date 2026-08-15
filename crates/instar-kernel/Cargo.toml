@@ -29,3 +29,10 @@ tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time
 
 [build-dependencies]
 instar-guest-build = { path = "../instar-guest-build" }
+
+[features]
+# Off by default in every production build. Registers the benchmark-only
+# `instar:kernel/probe` interface (`wit/bench.wit`) on the linker so the
+# Phase 3 text-latency benchmark's DIAGNOSTIC build can instantiate a
+# `world kernel-bench` guest. See `src/bench_probe.rs`.
+bench-probe = []

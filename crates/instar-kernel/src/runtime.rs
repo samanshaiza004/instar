@@ -1268,6 +1268,8 @@ impl Runtime {
         let mut linker: Linker<GenerationState> = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         Kernel::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)?;
+        #[cfg(feature = "bench-probe")]
+        crate::bench_probe::add_to_linker(&mut linker)?;
 
         Ok(Self {
             engine,

@@ -1,0 +1,40 @@
+[package]
+name = "instar-text-latency-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Detached from the production workspace, like guests/scratchpad and
+# benchmarks/crash-recovery -- this crate exists to exercise the real
+# Instar crates from the outside, not to be built as part of them.
+[workspace]
+
+[[bin]]
+name = "text-latency-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The real production pipeline this benchmark measures, unmodified. Only
+# instar-kernel and instar-host gain a `bench-probe` feature -- see their
+# own Cargo.toml comments -- and it is the DIAGNOSTIC build (this crate's
+# own `bench-probe` feature, off by default) that turns it on.
+instar-shell = { path = "../../crates/instar-shell" }
+instar-host = { path = "../../crates/instar-host" }
+instar-window = { path = "../../crates/instar-window" }
+instar-kernel = { path = "../../crates/instar-kernel" }
+instar-ui = { path = "../../crates/instar-ui" }
+instar-ui-protocol = { path = "../../crates/instar-ui-protocol" }
+instar-surface-protocol = { path = "../../crates/instar-surface-protocol" }
+instar-paint = { path = "../../crates/instar-paint" }
+# Pinned to match instar-window/instar-shell exactly: RuntimeHarness's public
+# API takes real winit::event::WindowEvent values.
+winit = "=0.30.13"
+
+[features]
+# Off by default -- the GATE build. On: the DIAGNOSTIC build, which also
+# needs guests/scratchpad compiled against world kernel-bench (see
+# guests/scratchpad's own bench-probe feature and this crate's build.rs).
+bench-probe = ["instar-kernel/bench-probe", "instar-host/bench-probe"]
+
+[build-dependencies]
+instar-guest-build = { path = "../../crates/instar-guest-build" }

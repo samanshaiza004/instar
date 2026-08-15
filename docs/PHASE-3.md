@@ -56,8 +56,12 @@ synchronization state.
 carets in `instar-editor-core`, projects arbitrary multi-line preedit
 transiently, preserves the empty-preedit-before-commit target, and applies a
 two-caret commit (`abc` with carets at 1 and 3 plus `X` becomes `aXbcX`). The
-remaining component-level wiring of this proof to TextLayout scene requests
-is deliberately separate from the host authority contract.
+The component adapter now commits a real Surface tree, requests bounded
+immutable TextLayouts for visible hard rows plus two-row overscan, submits an
+independent scene, routes pointer focus and native IME commits, and derives
+candidate geometry from the same layout used for caret paint. The joined
+`instar-shell` Scratchpad seam test observes the retained scene revision and
+rasterized pixels while the semantic tree revision remains unchanged.
 
 ## P0 deletion and history
 
@@ -87,6 +91,7 @@ bounded selection output, cursor validation, and navigation wrappers. The
 editor-core tests cover revisioned edits, undo/redo, CRLF grapheme movement,
 and the two-caret descending batch.
 
-Native IME candidate-window smoke checks and component-level Scratchpad scene
-wiring remain the next execution step; they do not change the authority
-contract.
+The remaining native-platform candidate-window smoke check is an environment-
+dependent manual check; the automated joined seam covers logical candidate
+geometry, multi-row preedit projection, empty-preedit-before-commit ordering,
+and guest-owned pixel changes without host document state.

@@ -89,16 +89,16 @@ fn instar_crates(tree: &str) -> Vec<String> {
     found
 }
 
-/// The Instar crates a guest may link.
-///
-/// Two, since H1. `instar-sdk` is a thin snapshot builder and event router
-/// that depends on the protocol and nothing else — the property this rule
-/// actually protects is not "one crate" but "no guest links a layout engine
-/// or a renderer", and that survives the addition. The subset below is
-/// therefore paired with `the_sdk_is_not_a_back_door_into_the_host`: without
-/// that second test, widening this list would let anything reach a guest by
-/// hiding behind the SDK.
-const GUEST_ALLOWED: [&str; 2] = ["instar-ui-protocol", "instar-sdk"];
+/// The userland pivot deliberately permits the guest-owned editor core and
+/// independent Surface wire protocol alongside the existing UI protocol and
+/// SDK. The property this rule protects is that guests still cannot link a
+/// layout engine, host, renderer, or kernel implementation.
+const GUEST_ALLOWED: [&str; 4] = [
+    "instar-ui-protocol",
+    "instar-surface-protocol",
+    "instar-editor-core",
+    "instar-sdk",
+];
 
 /// Stated as a subset rule rather than a list of forbidden crates, because a
 /// blocklist stops covering the case that matters — the crate that does not
@@ -109,14 +109,21 @@ const GUEST_ALLOWED: [&str; 2] = ["instar-ui-protocol", "instar-sdk"];
 /// exercise idle suspension and generation lifecycle, and never describe an
 /// interface at all. An empty set satisfies the rule.
 #[test]
-fn no_guest_links_any_instar_crate_but_the_protocol() {
+fn no_guest_links_host_or_renderer_crates() {
     let mut saw_protocol = false;
 
     for guest in guests() {
         let name = guest.file_name().unwrap_or_default().to_string_lossy();
         let tree = tree(&guest, &[]);
 
-        let linked = instar_crates(&tree);
+        // `cargo tree` includes the guest package itself. It is not a
+        // dependency edge and must not be mistaken for a forbidden Instar
+        // crate when the guest package follows the `instar-*` naming scheme.
+        let root_package = format!("instar-{name}");
+        let linked = instar_crates(&tree)
+            .into_iter()
+            .filter(|crate_| crate_ != &root_package)
+            .collect::<Vec<_>>();
         let offenders: Vec<&String> = linked
             .iter()
             .filter(|crate_| !GUEST_ALLOWED.contains(&crate_.as_str()))
@@ -124,10 +131,9 @@ fn no_guest_links_any_instar_crate_but_the_protocol() {
         assert!(
             offenders.is_empty(),
             "the {name} guest links {offenders:?}.\n\
-             A guest speaks the wire format, optionally through the SDK, and \
-             links nothing else of Instar's — that is what lets instar-ui take \
-             on a layout engine and instar-host a renderer. Whatever this edge \
-             was for belongs above the guest boundary.\n\nFull tree:\n{tree}"
+             A guest may use only the public protocols, SDK, and replaceable \
+             userland editor core; it cannot link the host, kernel, layout \
+             engine, or renderer.\n\nFull tree:\n{tree}"
         );
 
         saw_protocol |= linked.iter().any(|crate_| crate_ == "instar-ui-protocol");

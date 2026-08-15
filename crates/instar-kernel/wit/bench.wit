@@ -1,0 +1,50 @@
+package instar:kernel@0.1.0;
+
+// Benchmark-only diagnostics, kept out of `kernel.wit`'s `world kernel` on
+// purpose. `world kernel` is Instar's actual application ABI; a timing
+// marker is not an application mechanism, so it does not belong there even
+// as an unused import. This file is additive: it does not modify a single
+// line of `kernel.wit`, and no guest built against `world kernel` sees any
+// of this.
+//
+// `world kernel-bench` exists only for the Phase 3 text-latency benchmark's
+// DIAGNOSTIC build (see benchmarks/text-latency). The benchmark's GATE
+// build -- the one whose numbers are checked against the p95 <= 5 ms target
+// -- links the real `guests/scratchpad` against the untouched `kernel`
+// world and never sees `probe` at all.
+
+interface probe {
+    /// A guest-observed instant, tagged with the harness-assigned `sample`
+    /// this call belongs to (an opaque correlation id -- bursty workloads
+    /// like key repeat or wheel scrolling can have several samples' stages
+    /// interleaved in flight, so a bare unlabelled marker cannot be paired
+    /// back to the event it timed). `stage` is caller-defined; the host
+    /// does not interpret it beyond recording it as given.
+    ///
+    /// Returns the host's own monotonic reading, taken from the same
+    /// process-wide epoch `instar_kernel::bench_probe::bench_epoch()`
+    /// exposes to the benchmark harness, so guest-reported and
+    /// host-reported instants subtract directly into correct deltas with
+    /// no epoch-calibration step.
+    ///
+    /// Read-only. Touches no guest document, selection, or presentation
+    /// state, and has no effect on any other host-provided interface.
+    mark: func(sample: u64, stage: u32) -> u64;
+
+    /// A guest-side work counter (e.g. document bytes actually read or
+    /// materialized while building a presentation projection), tagged the
+    /// same way as `mark`. Exists because "no whole-document host
+    /// transfer" is not provable from wire-transfer byte counts alone: a
+    /// guest can materialize an entire document locally and only slice a
+    /// small piece for the wire, which leaves WIT traffic looking cheap
+    /// while doing O(document size) work every call. `counter` is
+    /// caller-defined and meaningless to the host; it only extends the
+    /// benchmark's log entry for `sample`.
+    report: func(sample: u64, counter: u32, value: u64);
+}
+
+world kernel-bench {
+    include kernel;
+
+    import probe;
+}
