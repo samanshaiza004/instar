@@ -62,24 +62,27 @@ fn wait_for_revision(
 fn wait_for_candidate_area(
     harness: &mut instar_shell::test_harness::RuntimeHarness,
     previous_revision: u64,
-) -> (f32, f32) {
-    let mut candidate = None;
+    expected_source_len: usize,
+) -> (i32, i32) {
     for _ in 0..150 {
-        for effect in harness.wait(Duration::from_millis(20)) {
-            if let HostEffect::ConfigureIme {
-                cursor_area: Some(area),
-                ..
-            } = effect
-            {
-                candidate = Some((area.x, area.y));
-            }
-        }
-        if harness
-            .surface_revision(SURFACE)
-            .is_some_and(|revision| revision > previous_revision)
-            && let Some(candidate) = candidate
+        let effects = harness.wait(Duration::from_millis(20));
+        let scene_ready = harness
+            .surface_layout_source_lengths(SURFACE)
+            .is_some_and(|lengths| lengths == [expected_source_len]);
+        if scene_ready
+            && harness
+                .surface_revision(SURFACE)
+                .is_some_and(|revision| revision > previous_revision)
         {
-            return candidate;
+            if let Some((x, y)) = effects.into_iter().rev().find_map(|effect| match effect {
+                HostEffect::ConfigureIme {
+                    cursor_area: Some(area),
+                    ..
+                } => Some((area.x, area.y)),
+                _ => None,
+            }) {
+                return (x, y);
+            }
         }
     }
     panic!(
@@ -235,23 +238,25 @@ fn preedit_cursor_moves_native_candidate_area() {
     let (x, y) = harness.screen_point_of(SURFACE);
     harness.click_at(x, y);
     let focused_revision = wait_for_revision(&mut harness, opening_revision);
+    harness.wait(Duration::from_millis(20));
 
     let _ = harness.send_output(WindowOutput::ImePreedit {
         window_id: WINDOW,
         text: "abcdef".to_owned(),
         cursor_range: Some((0, 0)),
     });
-    let first_area = wait_for_candidate_area(&mut harness, focused_revision);
+    let first_area = wait_for_candidate_area(&mut harness, focused_revision, 6);
 
+    harness.wait(Duration::from_millis(20));
     let second_previous = harness
         .surface_revision(SURFACE)
         .unwrap_or(focused_revision);
     let _ = harness.send_output(WindowOutput::ImePreedit {
         window_id: WINDOW,
-        text: "abcdef".to_owned(),
-        cursor_range: Some((0, 6)),
+        text: "abcdefghij".to_owned(),
+        cursor_range: Some((0, 10)),
     });
-    let second_area = wait_for_candidate_area(&mut harness, second_previous);
+    let second_area = wait_for_candidate_area(&mut harness, second_previous, 10);
     assert!(
         second_area.0 > first_area.0,
         "candidate x should follow the preedit cursor: start={first_area:?}, end={second_area:?}"

@@ -269,6 +269,16 @@ impl Scratchpad {
         ) && let Some(prefix) = preedit.get(..end)
         {
             let target = target.range();
+            if self.document.len_lines() == 0 {
+                if let Some(newline) = prefix.rfind('\n') {
+                    let line = prefix[..=newline]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                    return Ok((line, prefix.len() - newline - 1));
+                }
+                return Ok((0, prefix.len()));
+            }
             let target_line = self.document.line_of_byte(target.start)?;
             let target_line_start = self.document.line_range(target_line)?.start;
             if let Some(newline) = prefix.rfind('\n') {
@@ -280,6 +290,10 @@ impl Scratchpad {
                 return Ok((line, prefix.len() - newline - 1));
             }
             return Ok((target_line, target.start - target_line_start + prefix.len()));
+        }
+
+        if self.document.len_lines() == 0 {
+            return Ok((0, 0));
         }
 
         let position = self.primary_position();
@@ -698,7 +712,7 @@ impl GuestComponent {
                     }
                 }
             }
-            if app.document.len_lines() > 0 && visual_line == line {
+            if visual_line == line {
                 let local = visual_byte.min(bounded.len());
                 let caret = layout
                     .caret_rect(
@@ -1099,6 +1113,14 @@ mod tests {
         app.preedit_with_cursor("X\nYZ", Some((0, 3)));
 
         assert_eq!(app.visual_cursor().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn empty_document_preedit_cursor_has_projected_geometry() {
+        let mut app = Scratchpad::new("");
+        app.preedit_with_cursor("abcdef", Some((0, 6)));
+
+        assert_eq!(app.visual_cursor().unwrap(), (0, 6));
     }
 
     #[test]

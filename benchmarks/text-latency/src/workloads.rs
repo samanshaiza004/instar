@@ -8,6 +8,7 @@
 
 use instar_shell::test_harness::RuntimeHarness;
 use instar_window::{RawKeyEvent, WindowOutput};
+use winit::keyboard::NamedKey;
 
 use crate::gate::{SURFACE, WINDOW};
 
@@ -254,4 +255,63 @@ pub fn scroll_then_click(harness: &mut RuntimeHarness, wheel_lines: f32) {
         harness.wheel(x, y, wheel_lines);
     }
     harness.click_at(x, y);
+}
+
+/// 15/16/17: deletion-latency backdrop. Not part of the original 15-workload
+/// evidence request (`docs/PHASE-3.md`) -- added after that request found
+/// its own gap: every existing large-document workload measured *insertion*
+/// (a keystroke after [`preload_document`]), and nothing measured deletion.
+/// `Document::previous_grapheme_boundary` (`crates/instar-editor-core`) used
+/// to scan every grapheme from byte 0 up to the caret on every call, making
+/// Backspace O(caret position) regardless of how the rest of the editor
+/// performed -- a large document could pass every insertion workload while
+/// Backspace near its end stayed pathological. These three exist to make
+/// that regression class visible the same way the insertion workloads made
+/// F1 (`docs/DOS-STARVATION-AUDIT.md`) visible.
+///
+/// Deliberately **not** driven through the `workload!` macro in `main.rs`:
+/// that macro calls [`focus_surface`] before every measured iteration, and
+/// `focus_surface`'s click hit-tests against whatever rows are currently
+/// *presented*. Nothing here ever sends a scroll command, so after a
+/// multi-MiB preload the presented rows are still the document's first
+/// ~26 lines -- a repeated click would silently relocate the caret back
+/// near byte 0 before every measured Backspace, which would measure
+/// "backspace near the start" while claiming to measure "backspace at the
+/// end". `main.rs`'s bespoke loops for these three establish focus once,
+/// before the preload, and never re-click.
+///
+/// Presses [`NamedKey::Backspace`] through [`RuntimeHarness::press_key`] --
+/// the same production `winit_adapter` key mapping every other keyboard
+/// workload in this file uses, not a hand-built event.
+pub fn backspace(harness: &mut RuntimeHarness) {
+    harness.press_key(NamedKey::Backspace);
+}
+
+/// Forward-delete counterpart to [`backspace`]. Not chasing a known
+/// pathology -- `Document::next_grapheme_boundary` was already near-caret,
+/// slicing `byte..len_bytes()` and taking only the first grapheme -- this
+/// exists so a *future* regression on the forward-delete path is caught by
+/// the same class of benchmark that caught the backward one, rather than
+/// assumed safe because nothing currently measures it.
+pub fn delete_forward(harness: &mut RuntimeHarness) {
+    harness.press_key(NamedKey::Delete);
+}
+
+/// Setup for `delete_forward_large_doc`: preload, then move the caret to the
+/// start of the document's last line via [`NamedKey::Home`] (`move_edge` in
+/// `guests/scratchpad`, line-relative -- there is no document-Home command).
+///
+/// [`preload_document`] alone leaves the caret at the document's very end
+/// (every chunk it sends replaces at the *current* caret, which is how the
+/// caret ends up there in the first place), where forward-delete has
+/// nothing following it to remove and would measure a no-op rather than a
+/// real deletion. `Home` guarantees real trailing content -- at minimum the
+/// rest of the last preloaded line -- for the measured deletes to consume.
+pub fn preload_document_then_home_of_last_line(
+    run: &mut crate::gate::GateRun,
+    total_bytes: usize,
+    newline_every: usize,
+) {
+    preload_document(run, total_bytes, newline_every);
+    run.harness.press_key(NamedKey::Home);
 }

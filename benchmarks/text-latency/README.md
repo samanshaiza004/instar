@@ -81,6 +81,29 @@ stress test, pointer placement, drag selection, rapid scrolling, and
 document-size backdrops (1 MiB / 10 MiB / pathological long line) each
 paired with one measured ordinary keystroke.
 
+**Three more beyond the original 15, added after a review found a gap the
+list above didn't cover**: `backspace_at_end_1mib`, `backspace_at_end_10mib`,
+and `delete_forward_large_doc`. Every large-document workload above measures
+*insertion*; nothing measured *deletion*. That gap was hiding a real,
+distinct bug: `Document::previous_grapheme_boundary`
+(`crates/instar-editor-core/src/lib.rs`) scanned every grapheme from byte 0
+up to the caret on every call, making Backspace `O(caret position)`
+regardless of how well the rest of the editor performed — a document could
+pass every graded insertion workload while Backspace near its end stayed
+pathological. Fixed to a reverse, near-caret traversal (`crop::Rope`'s
+`Graphemes` is a `DoubleEndedIterator`; `next_back()` from the caret is
+`O(log n)`, not `O(caret position)` — see the fix's own doc comment).
+`next_grapheme_boundary` (forward-delete) was already near-caret and did not
+need the same fix; `delete_forward_large_doc` exists so a future regression
+there is caught the same way, not because one is currently suspected.
+
+This is a **separate finding from the keystroke-latency gate FAIL below**.
+That investigation is about *insertion* scaling with document size, with the
+leading suspect being a guest-side line/caret *lookup* (`primary_line`,
+`line_of_byte`-style calls), not the grapheme-boundary walk this fix
+addresses. Fixing Backspace does not by itself resolve that FAIL — re-run
+the gate after both are addressed before expecting a PASS.
+
 **Not implemented in this session**, both because they need a small,
 guest-reachable addition to `guests/scratchpad` that the same concurrent-
 development concern above applies to:

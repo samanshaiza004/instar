@@ -128,3 +128,36 @@ the userland-authority pivot: no host document replica, no host-local edit
 shortcut. When the gate passes, the initial failing run is kept, not
 overwritten — a before/after record of the pivot's actual latency behavior
 is more useful than a benchmark that happened to pass on its first run.
+
+### A second, distinct scan bug found by the coverage gap itself
+
+Every workload above measures *insertion* against a large preloaded
+document. Nothing measured *deletion* — and that gap was hiding a second,
+independent `O(document)` bug: `Document::previous_grapheme_boundary`
+(`crates/instar-editor-core/src/lib.rs`) scanned every grapheme from byte 0
+up to the caret on every call, making Backspace `O(caret position)`
+regardless of how well the rest of the editor performed. A document could
+pass every graded insertion workload above while Backspace near its end
+stayed pathological — exactly the failure mode "12 of 15 required workloads
+measured" can hide: a correctly-implemented benchmark suite still has
+whatever gap its own workload list has.
+
+Fixed to a reverse, near-caret traversal (`crop::Rope`'s `Graphemes` is a
+`DoubleEndedIterator`; walking backward from the caret with `next_back()` is
+`O(log n)`, the same complexity class as the rope's own insert/delete, not
+`O(caret position)`). `Document::next_grapheme_boundary` (forward-delete) was
+already near-caret and needed no equivalent fix. Three workloads —
+`backspace_at_end_1mib`, `backspace_at_end_10mib`, `delete_forward_large_doc`
+— now cover deletion the way the original list covers insertion; see
+`benchmarks/text-latency/README.md`'s "Workload coverage" section for the
+full account, including why they're driven by hand-written loops rather than
+the shared `workload!` macro (that macro's per-iteration re-click would
+silently relocate the caret away from the document's end before every
+measured Backspace).
+
+**This is a separate bug from the keystroke-scaling FAIL above, not a fix for
+it.** The leading suspect for that one is a guest-side line/caret *lookup*
+(`primary_line`, `line_of_byte`-style calls) — different code, different
+call path from the grapheme-boundary walk this fix addresses. Re-run the
+gate after both are resolved before expecting the P95_TARGET to pass; fixing
+Backspace alone does not flip the verdict recorded above.
