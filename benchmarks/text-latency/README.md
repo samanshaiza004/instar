@@ -104,7 +104,7 @@ text over `limits::MAX_TEXT_BYTES` (4096 bytes) — checked unconditionally.
 **A native "100 KB paste" cannot be delivered as one `ImeCommit` event under
 the current protocol at all.** This benchmark's "100 KB paste" workload was
 redesigned as a single commit at the protocol's actual achievable maximum
-(`large_text_commit_stress`, ~4000 bytes), explicitly labeled as such rather
+(`max_bounded_text_commit`, ~4000 bytes), explicitly labeled as such rather
 than silently understating a 100 KB claim. The document-size backdrops (1
 MiB / 10 MiB) build up via many small chunked commits instead of one giant
 one, for the same reason.
@@ -138,7 +138,7 @@ returning.
 | bidi_text | 0.44 ms | 0.67 ms | 0.73 ms | 4.76 ms | ✅ |
 | ime_commit | 0.43 ms | 0.52 ms | 0.60 ms | 235.03 ms | ✅ |
 | multiline_preedit | 0.11 ms | 0.16 ms | 0.26 ms | 0.43 ms | ✅ |
-| large_text_commit_stress | 0.17 ms | 0.61 ms | 0.86 ms | 0.86 ms | ✅ |
+| max_bounded_text_commit | 0.17 ms | 0.61 ms | 0.86 ms | 0.86 ms | ✅ |
 | pointer_placement | 0.21 ms | 0.26 ms | 0.46 ms | 0.61 ms | ✅ |
 | drag_selection | 0.56 ms | 0.66 ms | 0.78 ms | 0.80 ms | ✅ |
 | rapid_scrolling | 0.95 ms | 1.16 ms | 1.37 ms | 2.27 ms | ✅ |

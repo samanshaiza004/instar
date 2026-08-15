@@ -128,7 +128,7 @@ pub fn multiline_preedit_update(harness: &mut RuntimeHarness) {
 /// measurement instead of failing loudly, which is its own finding).
 pub const MAX_SINGLE_COMMIT_BYTES: usize = 4000;
 
-pub fn large_text_commit_stress(harness: &mut RuntimeHarness) {
+pub fn max_bounded_text_commit(harness: &mut RuntimeHarness) {
     const WORD: &str = "The quick brown fox jumps over the lazy dog.";
     let mut text = String::with_capacity(MAX_SINGLE_COMMIT_BYTES);
     let mut column = 0usize;
@@ -221,4 +221,37 @@ pub fn preload_document(run: &mut crate::gate::GateRun, total_bytes: usize, newl
             });
         });
     }
+}
+
+/// Diagnostic-matrix variant of [`preload_document`]: takes an explicit
+/// target line count instead of a newline-every-N-bytes cadence, so byte
+/// size and line count can be varied independently of each other. Same
+/// chunking/draining discipline.
+pub fn preload_document_with_lines(run: &mut crate::gate::GateRun, total_bytes: usize, target_lines: usize) {
+    let bytes_per_line = if target_lines == 0 { 0 } else { (total_bytes / target_lines).max(1) };
+    preload_document(run, total_bytes, bytes_per_line);
+}
+
+/// Diagnostic-matrix helper: scrolls by `wheel_lines` (negative moves the
+/// viewport *forward*/down through the document -- winit's positive wheel Y
+/// is flipped to a negative Instar scroll delta by
+/// `crates/instar-window/src/lib.rs`'s `on_wheel` translation, and
+/// `guests/scratchpad`'s own `Scratchpad::scroll` then treats a positive
+/// `dy` as "scroll_y increases") and clicks near the vertical middle of the
+/// viewport, placing the caret in whatever row is now presented there.
+///
+/// This does not hit an exact document percentage -- `scroll_y` is guest-
+/// private state this benchmark cannot read back to verify, and the wheel
+/// magnitude's line-to-line mapping was not independently calibrated. What
+/// it does give: `wheel_lines` values in increasing magnitude produce a
+/// monotonically non-decreasing scroll position (clamped at the document's
+/// end), which is what a "does latency correlate with caret position"
+/// sweep actually needs. Treat the resulting labels ("near start", "near
+/// end") as approximate, not exact percentages -- see README.md.
+pub fn scroll_then_click(harness: &mut RuntimeHarness, wheel_lines: f32) {
+    let (x, y) = harness.screen_point_of(SURFACE);
+    if wheel_lines != 0.0 {
+        harness.wheel(x, y, wheel_lines);
+    }
+    harness.click_at(x, y);
 }

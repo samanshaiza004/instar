@@ -95,3 +95,36 @@ The remaining native-platform candidate-window smoke check is an environment-
 dependent manual check; the automated joined seam covers logical candidate
 geometry, multi-row preedit projection, empty-preedit-before-commit ordering,
 and guest-owned pixel changes without host document state.
+
+## Latency gate: FAIL (13.1 ms p95)
+
+The userland-authority pivot adopts a new, stricter Phase 3 typing target:
+**p95 native-input → rasterized-pixels ≤ 5 ms**, measured end-to-end through
+the real `guests/scratchpad` component (`benchmarks/text-latency`). First
+reference run, preserved at
+`benchmarks/text-latency/results/initial-fail-macos-arm64-2026-08-14`:
+**FAIL**, worst graded p95 **13.1 ms**, from a keystroke measured against a
+1 MiB preloaded document.
+
+This narrows the problem rather than reopening it. Ordinary interactive
+editing — typing, IME commit, pointer, drag, scroll, a bounded-max text
+commit, all against a small/empty document — is comfortably inside budget
+(p95 well under 1.2 ms across every such workload). The failure is
+specific to editing *inside a large preloaded document*, and its shape rules
+out the leading suspect from `docs/DOS-STARVATION-AUDIT.md`'s F1 (expensive
+shaping of one long unbroken line): a 128 KiB pathological single-line
+document passes the gate at 2.8 ms p95, while much larger but ordinarily
+paragraphed 1 MiB / 10 MiB documents cost 8-13 ms for a single keystroke.
+That points at something scaling with overall document size or line count —
+most likely a guest-side line/caret lookup that scans rather than seeks —
+not per-call shaping cost. Full diagnosis, the follow-up
+byte-size×line-count×caret-position matrix, and the reference data are in
+`benchmarks/text-latency/README.md`.
+
+The gate stays FAIL until this is root-caused and fixed. The 5 ms target is
+not being relaxed to make this pass, and the fix under investigation is a
+generic guest/host algorithmic one (seek instead of scan), not a reversal of
+the userland-authority pivot: no host document replica, no host-local edit
+shortcut. When the gate passes, the initial failing run is kept, not
+overwritten — a before/after record of the pivot's actual latency behavior
+is more useful than a benchmark that happened to pass on its first run.

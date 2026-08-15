@@ -155,7 +155,7 @@ fn main() {
         // and stop measuring "one large commit" at a stable baseline.
         // Capped independently of --iterations because relaunching a
         // component per sample is itself not free.
-        let name = "large_text_commit_stress";
+        let name = "max_bounded_text_commit";
         eprintln!("running workload {name} (fresh guest per iteration)...");
         let capped = iterations.min(30);
         let mut samples = Vec::with_capacity(capped);
@@ -163,7 +163,7 @@ fn main() {
         for _ in 0..capped {
             let mut run = GateRun::launch();
             workloads::focus_surface(&mut run.harness);
-            let stage_times = run.measure_one(|h| workloads::large_text_commit_stress(h));
+            let stage_times = run.measure_one(|h| workloads::max_bounded_text_commit(h));
             stage_times
                 .validate()
                 .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
@@ -229,6 +229,111 @@ fn main() {
         |run: &mut GateRun| workloads::preload_document(run, 128 << 10, 0),
         |h| workloads::ascii_typing(h, 'y')
     );
+
+    // Diagnostic matrix, not part of the graded gate (`graded: false`):
+    // isolates whether the large-document regression above tracks document
+    // *bytes*, *line count*, or *caret position*, per the request that
+    // prompted it. Low iteration counts on purpose -- these exist to locate
+    // the scaling law, not to produce a tight percentile estimate.
+    const MATRIX_ITERS: usize = 15;
+
+    // Experiment 1: line count varies, bytes held at ~10 MiB.
+    for (name, lines) in [
+        ("matrix_10mib_10_lines", 10usize),
+        ("matrix_10mib_1000_lines", 1_000),
+        ("matrix_10mib_10000_lines", 10_000),
+        ("matrix_10mib_100000_lines", 100_000),
+    ] {
+        eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
+        let mut run = GateRun::launch();
+        workloads::focus_surface(&mut run.harness);
+        workloads::preload_document_with_lines(&mut run, 10 << 20, lines);
+        let mut samples = Vec::with_capacity(MATRIX_ITERS);
+        for _ in 0..MATRIX_ITERS {
+            workloads::focus_surface(&mut run.harness);
+            let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
+            stage_times
+                .validate()
+                .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
+            if let Some(total) = stage_times.total() {
+                samples.push(total);
+            }
+        }
+        total_checksum = total_checksum.wrapping_add(run.checksum());
+        results.push(WorkloadResult {
+            name,
+            what: "diagnostic: one keystroke, ~10 MiB document, line count varied",
+            percentiles: percentiles(&samples),
+            graded: false,
+        });
+    }
+
+    // Experiment 2: bytes vary, line count held at ~2,000.
+    for (name, bytes) in [
+        ("matrix_1mib_2000_lines", 1usize << 20),
+        ("matrix_5mib_2000_lines", 5 << 20),
+        ("matrix_10mib_2000_lines", 10 << 20),
+    ] {
+        eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
+        let mut run = GateRun::launch();
+        workloads::focus_surface(&mut run.harness);
+        workloads::preload_document_with_lines(&mut run, bytes, 2_000);
+        let mut samples = Vec::with_capacity(MATRIX_ITERS);
+        for _ in 0..MATRIX_ITERS {
+            workloads::focus_surface(&mut run.harness);
+            let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
+            stage_times
+                .validate()
+                .unwrap_or_else(|error| panic!("workload {name} produced an invalid sample: {error}"));
+            if let Some(total) = stage_times.total() {
+                samples.push(total);
+            }
+        }
+        total_checksum = total_checksum.wrapping_add(run.checksum());
+        results.push(WorkloadResult {
+            name,
+            what: "diagnostic: one keystroke, ~2000-line document, byte size varied",
+            percentiles: percentiles(&samples),
+            graded: false,
+        });
+    }
+
+    // Experiment 3: caret position sweep within one fixed 10 MiB / 2,000-line
+    // document. `wheel_lines` magnitudes are not independently calibrated to
+    // exact document percentages -- see `workloads::scroll_then_click`'s doc
+    // comment -- but increasing magnitude monotonically moves the viewport
+    // further through the document, clamped at the end.
+    {
+        let mut run = GateRun::launch();
+        workloads::focus_surface(&mut run.harness);
+        workloads::preload_document_with_lines(&mut run, 10 << 20, 2_000);
+        for (name, wheel_lines) in [
+            ("matrix_caret_near_start", 0.0f32),
+            ("matrix_caret_25pct_ish", -500.0),
+            ("matrix_caret_75pct_ish", -1500.0),
+            ("matrix_caret_near_end", -100_000.0),
+        ] {
+            eprintln!("running workload {name} ({MATRIX_ITERS} iterations)...");
+            run.measure_one(|h| workloads::scroll_then_click(h, wheel_lines));
+            let mut samples = Vec::with_capacity(MATRIX_ITERS);
+            for _ in 0..MATRIX_ITERS {
+                let stage_times = run.measure_one(|h| workloads::ascii_typing(h, 'y'));
+                stage_times.validate().unwrap_or_else(|error| {
+                    panic!("workload {name} produced an invalid sample: {error}")
+                });
+                if let Some(total) = stage_times.total() {
+                    samples.push(total);
+                }
+            }
+            results.push(WorkloadResult {
+                name,
+                what: "diagnostic: one keystroke at an approximate caret position in a fixed 10 MiB doc",
+                percentiles: percentiles(&samples),
+                graded: false,
+            });
+        }
+        total_checksum = total_checksum.wrapping_add(run.checksum());
+    }
 
     println!(
         "checksum(pixels observed, non-zero proves rendering really ran): {}",
