@@ -129,7 +129,10 @@ fn assert_was_really_killed_rejects_a_status_that_was_never_killed() {
     // clean exit, standing in for what a broken "kill" scenario -- one
     // that silently stopped killing anything -- would produce instead.
     let status = child.wait().expect("wait for the clean exit");
-    assert!(status.success(), "fixture check: this must be a real clean exit");
+    assert!(
+        status.success(),
+        "fixture check: this must be a real clean exit"
+    );
 
     let caught = std::panic::catch_unwind(|| assert_was_really_killed(&status));
     assert!(

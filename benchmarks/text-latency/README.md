@@ -219,13 +219,9 @@ generic layer that dominates, don't special-case editors.
   `bench-probe` feature to `guests/scratchpad` itself.
 - Two-caret insertion and the background/unrelated-work workload (A/B/C)
   are not implemented — see "Workload coverage" above.
-- One pre-existing test in this working tree,
+- The joined Scratchpad seam test
   `crates/instar-shell/tests/scratchpad.rs`'s
-  `pointer_selection_and_wheel_stay_guest_local_and_reuse_bounded_layouts`,
-  currently fails on a color-comparison assertion. This benchmark's changes
-  do not touch `guests/scratchpad`, `instar-editor-core`, or that test file,
-  and every shared-crate change this benchmark made is behind an
-  off-by-default Cargo feature not enabled by that test's build — this
-  looks like unrelated, pre-existing, still-in-progress work from a
-  concurrent session, not something introduced here, but it was not
-  independently root-caused.
+  `pointer_selection_and_wheel_stay_guest_local_and_reuse_bounded_layouts`
+  is green on the current master baseline. It is part of the required
+  end-to-end signal and must remain green; a future benchmark or host change
+  must root-cause any regression rather than carrying a stale limitation note.
