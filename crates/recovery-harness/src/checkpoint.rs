@@ -1,8 +1,10 @@
 //! One full-document snapshot, replacing the previous one atomically:
-//! written to a temp file, fsynced, renamed over the old checkpoint, and the
-//! containing directory fsynced -- so a crash at any point during a
-//! checkpoint write either leaves the *previous* checkpoint fully intact, or
-//! leaves the *new* one fully intact, and never a torn blend of both.
+//! written to a temp file, fsynced, and replaced over the old checkpoint with
+//! the strongest platform-supported replacement durability. On POSIX the
+//! containing directory is fsynced; on Windows the replacement uses
+//! `MoveFileExW(MOVEFILE_WRITE_THROUGH)`. A crash at any point during a
+//! checkpoint write therefore leaves the *previous* checkpoint fully intact,
+//! or leaves the *new* one fully intact, and never a torn blend of both.
 //!
 //! # Record layout
 //!
@@ -30,9 +32,10 @@
 //! avoid it. Real crash-lifecycle safety needs a write that cannot begin
 //! destroying old data until the new data is already fully durable, which
 //! is exactly what write-tmp / fsync-tmp / rename / fsync-parent-dir
-//! guarantees: `rename` is atomic with respect to a concurrent reader or a
-//! crash, so `checkpoint.bin` is, at every instant, either the old complete
-//! checkpoint or the new complete checkpoint, never a mixture.
+//! guarantees: the replacement primitive is atomic with respect to a
+//! concurrent reader or a crash, so `checkpoint.bin` is, at every instant,
+//! either the old complete checkpoint or the new complete checkpoint, never a
+//! mixture.
 //!
 //! The in-place, synthetic-corruption helpers (`write_raw`, `truncate_to`)
 //! stay, but only for building a specific corrupt or truncated byte pattern
@@ -143,9 +146,10 @@ pub enum WriteFault {
 
 /// Writes `checkpoint` as the new checkpoint for the scope directory `dir`,
 /// atomically: content lands fully in `checkpoint.bin.tmp` and is fsynced
-/// there, `checkpoint.bin.tmp` is renamed over `checkpoint.bin`, and `dir`
-/// itself is fsynced so the rename is durable too, not just visible to
-/// readers in the same process.
+/// there. POSIX then renames the file and fsyncs `dir`; Windows uses
+/// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING`.
+/// This requests the strongest documented OS-level replacement semantics; it
+/// does not claim to defeat storage hardware that ignores write-through.
 ///
 /// A fault injected via `fault` interrupts only the write into the tmp
 /// file. Whether that succeeds or fails, `checkpoint.bin` (the previous
@@ -189,26 +193,62 @@ pub fn write_checkpoint_atomic(
     }
     drop(tmp);
 
-    std::fs::rename(&tmp_path, &final_path)?;
+    replace_checkpoint(&tmp_path, &final_path)?;
 
     sync_directory(dir)?;
     Ok(())
 }
 
-/// Flush the directory entry containing the atomic rename. Windows requires
-/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle; a plain
-/// `File::open` returns `ERROR_ACCESS_DENIED` there.
+fn replace_checkpoint(tmp: &Path, final_path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        replace_checkpoint_windows(tmp, final_path)
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, final_path)
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_MOVE_FLAGS: u32 = 0x0000_0001 | 0x0000_0008;
+
+#[cfg(windows)]
+fn replace_checkpoint_windows(tmp: &Path, final_path: &Path) -> io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let tmp = wide(tmp);
+    let final_path = wide(final_path);
+    let moved = unsafe { MoveFileExW(tmp.as_ptr(), final_path.as_ptr(), WINDOWS_MOVE_FLAGS) };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Flush the directory entry containing the atomic replacement where the
+/// platform exposes that operation. Windows gets the equivalent write-through
+/// guarantee from `MoveFileExW`, so there is no unsupported directory flush.
 fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)?
-            .sync_all()
+        let _ = dir;
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -327,6 +367,12 @@ mod tests {
         let read = read_checkpoint_file(&checkpoint_path_for(&tmp_dir)).unwrap();
         assert_eq!(read, Some(checkpoint));
         std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_requests_replace_and_write_through() {
+        assert_eq!(WINDOWS_MOVE_FLAGS, 0x0000_0009);
     }
 
     #[test]
