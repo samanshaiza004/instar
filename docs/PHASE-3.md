@@ -52,12 +52,12 @@ Crop for rope storage and exposes byte/grapheme/CRLF helpers, positions,
 selections, atomic edits, revision, and undo/redo without host identifiers or
 synchronization state.
 
-The closure application is a guest-owned Scratchpad. It sends only bounded
-visible hard-row slices and overscan to TextLayout, projects arbitrary
-multi-line preedit transiently, preserves the empty-preedit-before-commit
-target, and commits without preedit. Its novel-widget proof is two carets:
-`abc` with carets at 1 and 3 plus commit `X` becomes `aXbcX`; the host sees only
-raw input, layout requests, scene commands, and pixels.
+`guests/scratchpad` is the guest-owned policy proof. It keeps its document and
+carets in `instar-editor-core`, projects arbitrary multi-line preedit
+transiently, preserves the empty-preedit-before-commit target, and applies a
+two-caret commit (`abc` with carets at 1 and 3 plus `X` becomes `aXbcX`). The
+remaining component-level wiring of this proof to TextLayout scene requests
+is deliberately separate from the host authority contract.
 
 ## P0 deletion and history
 
@@ -87,5 +87,6 @@ bounded selection output, cursor validation, and navigation wrappers. The
 editor-core tests cover revisioned edits, undo/redo, CRLF grapheme movement,
 and the two-caret descending batch.
 
-Native IME candidate-window smoke checks and the full guest Scratchpad wiring
-remain the next execution step; they do not change the authority contract.
+Native IME candidate-window smoke checks and component-level Scratchpad scene
+wiring remain the next execution step; they do not change the authority
+contract.
