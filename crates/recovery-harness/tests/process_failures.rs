@@ -166,7 +166,8 @@ fn host_process_forcibly_killed_with_nothing_in_flight() {
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a real kill");
+    let recovered =
+        FakeGuest::recover_document(dir.path()).expect("recover_document after a real kill");
 
     assert_eq!(
         recovered.content, "hello world",
@@ -199,7 +200,8 @@ fn clean_restart_recovers_exactly_what_was_durable_no_more_no_less() {
         "the child must have exited cleanly, not crashed"
     );
 
-    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a clean exit");
+    let recovered =
+        FakeGuest::recover_document(dir.path()).expect("recover_document after a clean exit");
 
     assert_eq!(recovered.content, "hello world");
     assert_eq!(recovered.last_recovered_sequence, 2);
@@ -233,7 +235,8 @@ fn killed_during_checkpoint_write_falls_back_to_the_untouched_journal() {
         "a torn checkpoint must decode to nothing, never a partial document"
     );
 
-    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a torn checkpoint");
+    let recovered =
+        FakeGuest::recover_document(dir.path()).expect("recover_document after a torn checkpoint");
     assert_eq!(
         recovered.content, "seed edit",
         "the journal entry the checkpoint would have superseded is still there, \
@@ -257,15 +260,22 @@ fn killed_during_checkpoint_write_falls_back_to_the_untouched_journal() {
 fn a_crash_during_a_second_checkpoint_write_leaves_the_first_checkpoint_intact() {
     let dir = TestDir::new("checkpoint-b-preserves-checkpoint-a");
 
-    let mut setup = spawn(dir.path(), "durable", &["establish-checkpoint", "checkpoint A content"]);
+    let mut setup = spawn(
+        dir.path(),
+        "durable",
+        &["establish-checkpoint", "checkpoint A content"],
+    );
     wait_for_ready(&mut setup);
-    let status = setup.wait().expect("wait for clean exit establishing checkpoint A");
+    let status = setup
+        .wait()
+        .expect("wait for clean exit establishing checkpoint A");
     assert!(status.success());
 
-    let checkpoint_a =
-        recovery_harness::checkpoint::read_checkpoint_file(&FakeGuest::checkpoint_path_for(dir.path()))
-            .expect("read checkpoint A")
-            .expect("checkpoint A must exist after establish-checkpoint");
+    let checkpoint_a = recovery_harness::checkpoint::read_checkpoint_file(
+        &FakeGuest::checkpoint_path_for(dir.path()),
+    )
+    .expect("read checkpoint A")
+    .expect("checkpoint A must exist after establish-checkpoint");
 
     // Resume against the same directory (picking up checkpoint A) and get
     // killed while writing checkpoint B.
@@ -282,9 +292,10 @@ fn a_crash_during_a_second_checkpoint_write_leaves_the_first_checkpoint_intact()
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let checkpoint_after =
-        recovery_harness::checkpoint::read_checkpoint_file(&FakeGuest::checkpoint_path_for(dir.path()))
-            .expect("read checkpoint after the crash");
+    let checkpoint_after = recovery_harness::checkpoint::read_checkpoint_file(
+        &FakeGuest::checkpoint_path_for(dir.path()),
+    )
+    .expect("read checkpoint after the crash");
     assert_eq!(
         checkpoint_after,
         Some(checkpoint_a),
@@ -316,7 +327,8 @@ fn killed_during_journal_append_loses_only_the_interrupted_record() {
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a torn journal append");
+    let recovered = FakeGuest::recover_document(dir.path())
+        .expect("recover_document after a torn journal append");
 
     assert_eq!(
         recovered.content, "onetwo",
@@ -421,7 +433,8 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
         std::fs::write(&journal_path, &bytes).expect("write corrupted journal");
 
         let first = FakeGuest::recover_document(dir.path()).expect("recover_document (first pass)");
-        let second = FakeGuest::recover_document(dir.path()).expect("recover_document (second pass)");
+        let second =
+            FakeGuest::recover_document(dir.path()).expect("recover_document (second pass)");
 
         assert_eq!(
             first, second,
@@ -471,7 +484,8 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
         let dir = TestDir::new("corrupt-empty-file");
         let journal_path = FakeGuest::journal_path_for(dir.path());
         std::fs::write(&journal_path, []).expect("write empty journal");
-        let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document an empty journal");
+        let recovered =
+            FakeGuest::recover_document(dir.path()).expect("recover_document an empty journal");
         assert_eq!(recovered.content, "");
         assert_eq!(recovered.tail_fault, None, "empty is healthy, not corrupt");
     }

@@ -111,6 +111,21 @@ impl Scratchpad {
         self.composition_target = None;
     }
 
+    fn line_for_position(&self, byte: usize) -> Result<usize, instar_editor_core::EditError> {
+        if self.document.len_lines() == 0 {
+            return Ok(0);
+        }
+        // Crop reports the byte immediately after a trailing newline as the
+        // next line index, while `line_range` quite correctly exposes only
+        // the completed hard lines. A caret at document EOF still belongs to
+        // the final presentable row.
+        if byte == self.document.len_bytes() {
+            Ok(self.document.len_lines() - 1)
+        } else {
+            self.document.line_of_byte(byte)
+        }
+    }
+
     /// Returns the bounded document window currently intended for
     /// presentation. The real presentation path never materializes the whole
     /// document.
@@ -279,7 +294,7 @@ impl Scratchpad {
                 }
                 return Ok((0, prefix.len()));
             }
-            let target_line = self.document.line_of_byte(target.start)?;
+            let target_line = self.line_for_position(target.start)?;
             let target_line_start = self.document.line_range(target_line)?.start;
             if let Some(newline) = prefix.rfind('\n') {
                 let line = target_line
@@ -297,7 +312,7 @@ impl Scratchpad {
         }
 
         let position = self.primary_position();
-        let line = self.document.line_of_byte(position.byte)?;
+        let line = self.line_for_position(position.byte)?;
         let line_start = self.document.line_range(line)?.start;
         Ok((line, position.byte.saturating_sub(line_start)))
     }
@@ -316,7 +331,7 @@ impl Scratchpad {
 
     fn primary_line(&self) -> Result<(usize, usize, String), instar_editor_core::EditError> {
         let byte = self.primary_position().byte;
-        let line = self.document.line_of_byte(byte)?;
+        let line = self.line_for_position(byte)?;
         let (start, text) = self.bounded_line(line)?;
         Ok((line, start, text))
     }
@@ -1121,6 +1136,13 @@ mod tests {
         app.preedit_with_cursor("abcdef", Some((0, 6)));
 
         assert_eq!(app.visual_cursor().unwrap(), (0, 6));
+    }
+
+    #[test]
+    fn eof_after_a_trailing_newline_stays_on_the_last_hard_row() {
+        let app = Scratchpad::new("first\nsecond\n");
+
+        assert_eq!(app.visual_cursor().unwrap(), (1, 7));
     }
 
     #[test]

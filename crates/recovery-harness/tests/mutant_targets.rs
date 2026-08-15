@@ -160,8 +160,7 @@ fn a_partially_written_then_failed_journal_append_poisons_the_store_and_is_recov
     assert_eq!(guest.document(), "first second");
     assert_eq!(guest.last_presented_sequence(), 2);
 
-    let recovered_after_repair =
-        FakeGuest::recover_document(dir.path()).expect("recover_document");
+    let recovered_after_repair = FakeGuest::recover_document(dir.path()).expect("recover_document");
     assert_eq!(recovered_after_repair.content, "first second");
     assert_eq!(recovered_after_repair.tail_fault, None);
 }

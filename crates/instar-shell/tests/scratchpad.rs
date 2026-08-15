@@ -73,16 +73,15 @@ fn wait_for_candidate_area(
             && harness
                 .surface_revision(SURFACE)
                 .is_some_and(|revision| revision > previous_revision)
-        {
-            if let Some((x, y)) = effects.into_iter().rev().find_map(|effect| match effect {
+            && let Some((x, y)) = effects.into_iter().rev().find_map(|effect| match effect {
                 HostEffect::ConfigureIme {
                     cursor_area: Some(area),
                     ..
                 } => Some((area.x, area.y)),
                 _ => None,
-            }) {
-                return (x, y);
-            }
+            })
+        {
+            return (x, y);
         }
     }
     panic!(

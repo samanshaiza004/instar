@@ -103,15 +103,27 @@ pub enum StoreError {
     /// successful checkpoint plus a subsequent `repair` is a legitimate way
     /// out of poisoning.
     Poisoned,
-    RecordTooLarge { len: usize, max: usize },
-    CheckpointTooLarge { len: usize, max: usize },
-    JournalBudgetExceeded { would_be_bytes: u64, max_bytes: u64 },
+    RecordTooLarge {
+        len: usize,
+        max: usize,
+    },
+    CheckpointTooLarge {
+        len: usize,
+        max: usize,
+    },
+    JournalBudgetExceeded {
+        would_be_bytes: u64,
+        max_bytes: u64,
+    },
     /// `append`'s `sequence` was not exactly one more than the last
     /// sequence this store has durably recorded (via journal or
     /// checkpoint). A pure ordering check on the sequence number itself --
     /// it requires no interpretation of the payload, so the store can
     /// enforce it without knowing what a record means.
-    SequenceMismatch { expected: u64, found: u64 },
+    SequenceMismatch {
+        expected: u64,
+        found: u64,
+    },
     Io(io::Error),
 }
 

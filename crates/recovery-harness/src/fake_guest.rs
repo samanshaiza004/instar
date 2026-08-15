@@ -17,8 +17,8 @@ use std::path::Path;
 
 use crate::{
     CheckpointTrigger, EditOutcome, GenerationId, InputEvent, InputOverflow, JournalMode,
-    OverflowAction, RecoveryPolicy, RecoveryStore, SequenceGap, StoreBounds, StoreError,
-    TailFault, checkpoint, recovery,
+    OverflowAction, RecoveryPolicy, RecoveryStore, SequenceGap, StoreBounds, StoreError, TailFault,
+    checkpoint, recovery,
 };
 
 /// The result of reconstructing a document from whatever a [`RecoveryStore`]
