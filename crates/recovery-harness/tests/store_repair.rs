@@ -8,7 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use recovery_harness::{FakeGuest, RecoveryPolicy, RecoveryStore, SequenceGap, StoreBounds, StoreError};
+use recovery_harness::{
+    FakeGuest, RecoveryPolicy, RecoveryStore, SequenceGap, StoreBounds, StoreError,
+};
 
 struct TestDir(PathBuf);
 
@@ -163,7 +165,9 @@ fn append_refuses_a_non_contiguous_sequence() {
     // The store must still be healthy after refusing both -- a refusal is
     // not itself a fault.
     assert!(!store.is_poisoned());
-    store.append(2, b"b", true).expect("the correct next sequence still succeeds");
+    store
+        .append(2, b"b", true)
+        .expect("the correct next sequence still succeeds");
 }
 
 /// A journal whose sequence numbers are not contiguous with the checkpoint
@@ -183,7 +187,8 @@ fn a_sequence_gap_stops_replay_at_the_gap_not_after_it() {
     // check cannot produce this on its own, which is exactly why this test
     // builds the file by hand rather than through the store.
     {
-        let mut store = RecoveryStore::open(dir.path(), StoreBounds::DEFAULT).expect("re-open store");
+        let mut store =
+            RecoveryStore::open(dir.path(), StoreBounds::DEFAULT).expect("re-open store");
         // Bypass the store's own contiguity check to construct the gap.
         store
             .journal_writer_mut()
@@ -231,7 +236,9 @@ fn a_failed_checkpoint_write_does_not_poison_the_store() {
     assert_eq!(read.checkpoint, None);
 
     // The store still works normally afterward.
-    store.append(2, b"b", true).expect("append 2 after a failed checkpoint");
+    store
+        .append(2, b"b", true)
+        .expect("append 2 after a failed checkpoint");
 }
 
 /// Resuming a guest against an existing, healthy scope directory picks up
@@ -253,7 +260,9 @@ fn resume_picks_up_the_document_and_sequence_a_previous_guest_left_behind() {
     assert_eq!(resumed.document(), "hello world");
     assert_eq!(resumed.last_presented_sequence(), 2);
 
-    resumed.apply_edit("!").expect("continue editing after resume");
+    resumed
+        .apply_edit("!")
+        .expect("continue editing after resume");
     assert_eq!(resumed.document(), "hello world!");
     assert_eq!(resumed.last_presented_sequence(), 3);
 
