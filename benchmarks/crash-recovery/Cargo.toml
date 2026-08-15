@@ -1,0 +1,13 @@
+[package]
+name = "instar-crash-recovery-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep this experiment outside Instar's production workspace and dependency
+# graph. It is intentionally a filesystem prototype, not a runtime API.
+[workspace]
+
+[[bin]]
+name = "crash-recovery-bench"
+path = "src/main.rs"

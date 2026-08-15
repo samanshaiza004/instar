@@ -1,0 +1,13 @@
+strategy,crash_phase,requested_edits,recovered_edits,recovered_bytes,child_status
+checkpoint_atomic,after_write,100,99,99,signaled
+checkpoint_atomic,after_flush,100,100,100,signaled
+journal_append,after_write,100,100,100,signaled
+journal_append,after_flush,100,100,100,signaled
+journal_checkpoint,after_write,100,100,100,signaled
+journal_checkpoint,after_flush,100,100,100,signaled
+page_cache,after_write,100,100,100,signaled
+page_cache,after_flush,100,100,100,signaled
+sync_per_edit,after_write,100,100,100,signaled
+sync_per_edit,after_flush,100,100,100,signaled
+sync_batch,after_write,100,100,100,signaled
+sync_batch,after_flush,100,100,100,signaled
