@@ -1,5 +1,9 @@
 # Instar wire protocol, revision 0
 
+> **Archived Phase 1 record.** This document describes the original semantic
+> UI wire and is retained for historical comparison. It is not the current
+> protocol reference; see [`docs/PROTOCOL.md`](../PROTOCOL.md).
+
 The bytes between a guest and the host. Two messages, both little-endian, both
 hand-written.
 
@@ -8,8 +12,8 @@ hand-written.
 > refusal rather than a misparse. `PROTOCOL_VERSION` is **1**; revision 0 refers
 > to the design generation, not the byte.
 
-Normative source: `crates/instar-ui-protocol/src/lib.rs`. If this document and
-that file disagree, the file is right and this is a bug.
+Normative source at the time: `crates/instar-ui-protocol/src/lib.rs`. If this
+record and that file disagree, the file is right.
 
 ## Principles
 
@@ -27,9 +31,9 @@ apart from "your message is impossible".
 **Every limit is checked before allocation.** The input is untrusted, and a
 guest is exactly the party who would send 4 GB of node headers.
 
-**A guest cannot express geometry.** There is no rectangle in this format. The
-layout section was removed outright rather than deprecated, so a guest cannot
-become authoritative over pixel positions even deliberately.
+**A guest cannot express geometry.** There is no rectangle in this historical
+format. The layout section was removed outright rather than deprecated, so a
+guest could not become authoritative over pixel positions.
 
 ## Limits
 
@@ -114,7 +118,7 @@ say it; the layer above says no.
 
 ## Event: host → guest
 
-Magic `IUE1`. One event kind exists.
+Magic `IUE1`. One event kind existed.
 
 ```text
 ┌────────────────────────────────────────────┐
@@ -125,30 +129,29 @@ Magic `IUE1`. One event kind exists.
 └────────────────────────────────────────────┘
 ```
 
-Ten bytes. A click is reported **only for a completed interaction** on an
+Ten bytes. A click was reported **only for a completed interaction** on an
 enabled button that the host hit-tested itself; press, release, hover, and drag
-never cross this boundary. Transient interaction state is the host's.
+never crossed this boundary. Transient interaction state was the host's.
 
-Events are bounds-checked guest-side by the same `Reader`, for the same reason
-batches are host-side: a guest should not be crashable by a malformed host
-event either. This is the direction people forget.
+Events were bounds-checked guest-side by the same `Reader`, for the same reason
+batches were host-side: a guest should not be crashable by a malformed host
+event either.
 
 ## The WIT contract
 
-The transport for these bytes is `crates/instar-kernel/wit/kernel.wit`:
+The transport for these bytes was `crates/instar-kernel/wit/kernel.wit`:
 
 ```wit
 next-event: async func() -> result<list<u8>, runtime-error>;
 commit:     async func(batch: list<u8>) -> result<commit-result, commit-error>;
 ```
 
-Both are `async`, and both matter:
+Both were `async`, and both mattered:
 
-- **`next-event` suspends at zero cost.** That is Gate 0's finding and the
+- **`next-event` suspended at zero cost.** That was Gate 0's finding and the
   premise of the whole runtime.
-- **`commit` suspends until the host has accepted the interface as a usable
-  presentation state** — after layout, not merely after the tree is swapped.
-  The guest resumes with a revision or one of four verdicts.
+- **`commit` suspended until the host accepted the interface as a usable
+  presentation state** — after layout, not merely after the tree was swapped.
 
 ```wit
 variant commit-error {
@@ -158,25 +161,22 @@ variant commit-error {
 }
 ```
 
-`host-unavailable` exists because `commit` is async: the batch has been handed
-to a thread-affine owner and the guest is suspended waiting. If that owner
-disappears mid-flight the guest must be told rather than left parked forever.
-The host makes this structurally total — a dropped reply *is* `host-unavailable`.
+`host-unavailable` existed because `commit` was async: the batch had been
+handed to a thread-affine owner and the guest was suspended waiting. If that
+owner disappeared mid-flight the guest had to be told rather than left parked
+forever.
 
-## What a guest may rely on
+## What a guest could rely on
 
-- Bytes it commits are either fully applied or fully refused. There is no
-  partial application: the tree swap is one assignment after all validation.
-- A refusal leaves the previous interface standing. A malformed commit does not
-  blank the window.
-- Node keys are the guest's own. The host learns them from the wire and gives
-  them back in events; it never invents one.
-- Every commit is answered exactly once.
+- Bytes it committed were either fully applied or fully refused.
+- A refusal left the previous interface standing.
+- Node keys were the guest's own.
+- Every commit was answered exactly once.
 
-## What a guest may not rely on
+## What a guest could not rely on
 
-- **Any of this staying the same.** No compatibility promise; see the top.
-- Geometry. It cannot see any, and the host may lay out however it likes.
-- Appearance. Colour, spacing, fonts, and press feedback are the host's.
-- Being asked before the host does something. Close policy, crash presentation,
-  and teardown are host decisions a guest cannot observe or veto.
+- **Any of this staying the same.** No compatibility promise.
+- Geometry. It could not see any, and the host could lay out however it liked.
+- Appearance. Colour, spacing, fonts, and press feedback were the host's.
+- Being asked before the host acted. Close policy, crash presentation, and
+  teardown were host decisions.

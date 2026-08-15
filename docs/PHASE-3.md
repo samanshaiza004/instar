@@ -5,6 +5,16 @@ transports native input, validates bounded presentation requests, owns retained
 geometry and rendering, and never keeps a recoverable document, selection,
 undo stack, or composition projection.
 
+## Status
+
+| Area | Status |
+|---|---|
+| Architecture decision | **Frozen.** Application text, selection, undo, and composition policy remain guest-owned. |
+| Component seam | **Implemented.** Scratchpad exercises the real WIT, Surface input, TextLayout, scene, retained-tree, and pixel path. |
+| Latency closure | **Pending a valid rerun.** The initial 1 MiB reference benchmark is a provisional failure at 13.1 ms p95; the 5 ms target remains unchanged. |
+| Native IME smoke | **Pending.** Logical candidate geometry is covered; native platform candidate-window behavior still needs a manual smoke check. |
+| Containment findings | **Open.** The latency/containment investigation and follow-up byte-size × line-count × caret-position matrix remain active. See [`DOS-STARVATION-AUDIT.md`](DOS-STARVATION-AUDIT.md). |
+
 ## Contract
 
 ```text
@@ -56,7 +66,7 @@ synchronization state.
 carets in `instar-editor-core`, projects arbitrary multi-line preedit
 transiently, preserves the empty-preedit-before-commit target, and applies a
 two-caret commit (`abc` with carets at 1 and 3 plus `X` becomes `aXbcX`). The
-The component adapter now commits a real Surface tree, requests bounded
+component adapter now commits a real Surface tree, requests bounded
 immutable TextLayouts for visible hard rows plus two-row overscan, submits an
 independent scene, routes pointer focus and native IME commits, and derives
 candidate geometry from the same layout used for caret paint. The joined
@@ -96,15 +106,19 @@ dependent manual check; the automated joined seam covers logical candidate
 geometry, multi-row preedit projection, empty-preedit-before-commit ordering,
 and guest-owned pixel changes without host document state.
 
-## Latency gate: FAIL (13.1 ms p95)
+## Latency gate: provisional FAIL (13.1 ms p95)
 
 The userland-authority pivot adopts a new, stricter Phase 3 typing target:
 **p95 native-input → rasterized-pixels ≤ 5 ms**, measured end-to-end through
-the real `guests/scratchpad` component (`benchmarks/text-latency`). First
+the real `guests/scratchpad` component (`benchmarks/text-latency`). The initial
 reference run, preserved at
 `benchmarks/text-latency/results/initial-fail-macos-arm64-2026-08-14`:
 **FAIL**, worst graded p95 **13.1 ms**, from a keystroke measured against a
 1 MiB preloaded document.
+
+This is the provisional result currently blocking latency closure. A valid
+rerun is still required before the gate is treated as closed; the 5 ms target
+is not being relaxed.
 
 This narrows the problem rather than reopening it. Ordinary interactive
 editing — typing, IME commit, pointer, drag, scroll, a bounded-max text

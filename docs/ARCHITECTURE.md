@@ -670,13 +670,13 @@ Recorded so it is not mistaken for design:
   has never been checked for whether it is genuinely additive *physical* memory
   across several running apps. A dedicated gate answers that before any
   architectural decision rests on it.
-- **No scrollbar chrome.** Wheel and touchpad scrolling work; there is nothing
-  drawn to drag. Package D, and the completion of `Scroll`.
-- **No focus or keyboard.** Package E, and the point at which generational
-  `NodeKey` earns its place a second time — focus is exactly the kind of
-  long-lived reference that outlives the node it names.
-- **No accessibility.** Package F. `NodeKey::to_accesskit_id` is ready; the
-  mapping is not written.
-- **No SDK.** A guest builds a snapshot through `BatchEncoder` directly, which
-  is tolerable for a counter and is expected not to be for a calculator. The
-  thin SDK grows from what package H finds painful, and from nothing else.
+- **Native accessibility interpretation is not smoke-tested on every target.**
+  The retained projection and AccessKit mapping exist; platform behavior still
+  needs the documented native smoke check.
+- **Native IME candidate-window behavior is not smoke-tested.** Logical
+  candidate geometry is covered through the joined Surface seam; native
+  platform interpretation remains open.
+- **Phase 3 latency closure is pending a valid rerun.** The initial reference
+  benchmark is a provisional failure; the 5 ms target remains in force.
+- **Containment findings remain open.** See `docs/DOS-STARVATION-AUDIT.md` for
+  the active investigation and measurement matrix.
