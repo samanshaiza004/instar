@@ -232,9 +232,17 @@ pub struct JournalWriter {
 impl JournalWriter {
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true);
         #[cfg(windows)]
-        options.write(true);
+        {
+            // Windows append handles can lack the FILE_WRITE_DATA access
+            // needed by set_len during checkpoint compaction. Keep the
+            // handle writable and seek to the end explicitly before each
+            // append instead.
+            options.read(true).write(true);
+        }
+        #[cfg(not(windows))]
+        options.append(true);
         let file = options.open(path)?;
         Ok(Self {
             file,
@@ -281,6 +289,8 @@ impl JournalWriter {
 
         match fault {
             WriteFault::None => {
+                #[cfg(windows)]
+                self.file.seek(SeekFrom::End(0))?;
                 self.file.write_all(&bytes)?;
             }
             WriteFault::FailBeforeWrite => {
@@ -288,6 +298,8 @@ impl JournalWriter {
             }
             WriteFault::FailAfterPartialWrite(n) => {
                 let n = n.min(bytes.len());
+                #[cfg(windows)]
+                self.file.seek(SeekFrom::End(0))?;
                 self.file.write_all(&bytes[..n])?;
                 self.file.sync_all()?;
                 return Err(io::Error::other("injected: fail after partial write"));
