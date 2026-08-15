@@ -231,7 +231,11 @@ pub struct JournalWriter {
 
 impl JournalWriter {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .write(true)
+            .open(path)?;
         Ok(Self {
             file,
             next_fault: WriteFault::None,
