@@ -181,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          wasm=$(find target/debug/build -type f -path '*/out/artifacts/counter.wasm' -print -quit)
+          wasm=$(find target/debug/build -type f -path '*/out/artifacts/counter_wasm.wasm' -print -quit)
           [ -n "$wasm" ] || { echo "no counter component built" >&2; exit 1; }
           wasm-tools component wit "$wasm" | grep -q 'export run: async func' \
             || { echo "the counter guest lost its async export" >&2; exit 1; }

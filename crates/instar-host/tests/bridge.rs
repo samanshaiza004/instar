@@ -615,10 +615,18 @@ fn a_runtime_wake_reaches_a_parked_main_thread() {
         "the parked thread should come back holding the applied commit's frame"
     );
     assert_prompt(elapsed, "a click round-trip");
+    // The runtime deliberately queues the payload before invoking the wake
+    // callback. A parked receiver can therefore observe and drain the event
+    // before the callback's atomic increment is visible on this thread.
+    // Observe the actual contract — a successful enqueue is followed promptly
+    // by a wake — without changing the production ordering.
+    let deadline = Instant::now() + Duration::from_millis(50);
+    while wakes.count() <= before && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
     assert!(
         wakes.count() > before,
-        "the runtime thread must signal the wake, not rely on the main thread \
-         looking of its own accord"
+        "the runtime queued the commit but never issued the corresponding wake"
     );
 }
 
