@@ -27,7 +27,9 @@ pub struct Scratchpad {
     pub document: Document,
     pub carets: Vec<Selection>,
     pub preedit: Option<String>,
+    preedit_cursor: Option<(usize, usize)>,
     composition_target: Option<Selection>,
+    pointer_anchor: Option<Position>,
     pub scroll_y: usize,
 }
 
@@ -39,7 +41,9 @@ impl Scratchpad {
             document: Document::from_text(text),
             carets: vec![Selection::at(0)],
             preedit: None,
+            preedit_cursor: None,
             composition_target: None,
+            pointer_anchor: None,
             scroll_y: 0,
         }
     }
@@ -67,6 +71,7 @@ impl Scratchpad {
                 .collect()
         };
         self.preedit = None;
+        self.preedit_cursor = None;
         self.composition_target = None;
         Ok(())
     }
@@ -75,6 +80,10 @@ impl Scratchpad {
     /// clears only the visual projection so the following commit can still
     /// replace the saved target.
     pub fn preedit(&mut self, text: impl Into<String>) {
+        self.preedit_with_cursor(text, None);
+    }
+
+    pub fn preedit_with_cursor(&mut self, text: impl Into<String>, cursor: Option<(usize, usize)>) {
         let text = text.into();
         if !text.is_empty() && self.composition_target.is_none() {
             self.composition_target = self.carets.first().copied();
@@ -86,6 +95,21 @@ impl Scratchpad {
             }
         }
         self.preedit = (!text.is_empty()).then_some(text);
+        self.preedit_cursor = self
+            .preedit
+            .as_deref()
+            .and_then(|text| cursor.filter(|(start, end)| {
+                start <= end
+                    && *end <= text.len()
+                    && text.is_char_boundary(*start)
+                    && text.is_char_boundary(*end)
+            }));
+    }
+
+    fn cancel_composition(&mut self) {
+        self.preedit = None;
+        self.preedit_cursor = None;
+        self.composition_target = None;
     }
 
     /// Returns the bounded document window currently intended for
@@ -122,8 +146,7 @@ impl Scratchpad {
         let first = self.scroll_y.min(count - 1);
         (first..first.saturating_add(rows).min(count))
             .map(|line| {
-                let range = self.document.line_range(line)?;
-                self.document.slice(range)
+                Ok(self.bounded_line(line)?.1)
             })
             .collect()
     }
@@ -136,12 +159,56 @@ impl Scratchpad {
         if self.preedit.is_none() || self.composition_target.is_none() {
             return self.visible_rows(rows);
         }
-        let projected = self.projected_slice(range)?;
+        let projected = self.projected_slice_bounded(range, rows)?;
         Ok(projected
             .split_inclusive('\n')
             .map(ToOwned::to_owned)
             .take(rows.max(1))
             .collect())
+    }
+
+    fn projected_slice_bounded(
+        &self,
+        range: Range<usize>,
+        rows: usize,
+    ) -> Result<String, instar_editor_core::EditError> {
+        let Some(preedit) = &self.preedit else {
+            return self.document.slice(range);
+        };
+        let Some(target) = self.composition_target else {
+            return self.document.slice(range);
+        };
+        if target.range().start > range.end || target.range().end < range.start {
+            return self.document.slice(range);
+        }
+
+        // Keep transient projection bounded even when an IME supplies
+        // thousands of lines. The guest may scan the supplied preedit, but it
+        // never allocates the full projection merely to shape the viewport.
+        let limit = rows
+            .max(1)
+            .saturating_mul(PRESENTATION_MAX_BYTES.saturating_add(1));
+        let mut projected = String::with_capacity(limit.min(range.len().saturating_add(preedit.len())));
+        let target = target.range();
+        let prefix_end = target.start.min(range.end);
+        if range.start < prefix_end {
+            projected.push_str(&self.document.slice(range.start..prefix_end)?);
+        }
+        let remaining = limit.saturating_sub(projected.len());
+        let mut preedit_end = preedit.len().min(remaining);
+        while preedit_end > 0 && !preedit.is_char_boundary(preedit_end) {
+            preedit_end -= 1;
+        }
+        projected.push_str(&preedit[..preedit_end]);
+        if preedit_end == preedit.len() {
+            let suffix_start = target.end.max(range.start);
+            if suffix_start < range.end && projected.len() < limit {
+                let suffix = self.document.slice(suffix_start..range.end)?;
+                let suffix_end = suffix.len().min(limit - projected.len());
+                projected.push_str(&suffix[..suffix_end]);
+            }
+        }
+        Ok(projected)
     }
 
     /// Projects the current preedit over one bounded document range. The
@@ -202,8 +269,17 @@ impl Scratchpad {
     fn primary_line(&self) -> Result<(usize, usize, String), instar_editor_core::EditError> {
         let byte = self.primary_position().byte;
         let line = self.document.line_of_byte(byte)?;
+        let (start, text) = self.bounded_line(line)?;
+        Ok((line, start, text))
+    }
+
+    fn bounded_line(&self, line: usize) -> Result<(usize, String), instar_editor_core::EditError> {
         let range = self.document.line_range(line)?;
-        Ok((line, range.start, self.document.slice(range)?))
+        let mut end = range.start + range.len().min(PRESENTATION_MAX_BYTES);
+        while end > range.start && !self.document.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok((range.start, self.document.slice(range.start..end)?))
     }
 
     fn delete_backward(&mut self) -> Result<(), instar_editor_core::EditError> {
@@ -252,32 +328,123 @@ impl Scratchpad {
         }
     }
 
-    fn move_to(&mut self, cursor: Cursor, line_start: usize) {
-        self.carets[0] = Selection::at(line_start + cursor.byte_index as usize);
-    }
-
-    fn move_visual(&mut self, right: bool) -> Result<(), String> {
-        let (_, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
-        let layout = text_layouts::create_layout(&line, Self::layout_style())
-            .map_err(|error| format!("navigation layout failed: {error:?}"))?;
+    fn move_visual(
+        &mut self,
+        right: bool,
+        extend: bool,
+        presentation: &Presentation,
+    ) -> Result<(), String> {
+        let (line_number, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
+        let layout = presentation
+            .row_for_line(line_number)
+            .map(|row| &row.layout);
+        let owned_layout = if layout.is_none() {
+            Some(
+                text_layouts::create_layout(&line, Self::layout_style())
+                    .map_err(|error| format!("navigation layout failed: {error:?}"))?,
+            )
+        } else {
+            None
+        };
+        let layout = layout.or(owned_layout.as_ref());
         let cursor = Cursor {
             byte_index: (self.primary_position().byte - line_start) as u32,
             affinity: Affinity::Downstream,
         };
         let next = if right {
-            layout.next_visual(cursor)
+            layout.unwrap().next_visual(cursor)
         } else {
-            layout.previous_visual(cursor)
+            layout.unwrap().previous_visual(cursor)
         }
         .map_err(|error| format!("navigation failed: {error:?}"))?;
-        self.move_to(next, line_start);
+        let current = self.primary_position().byte;
+        let mut position = line_start + next.byte_index as usize;
+        if position == current {
+            if right && line_number + 1 < self.document.len_lines() {
+                let (next_start, next_line) = self
+                    .bounded_line(line_number + 1)
+                    .map_err(|error| error.to_string())?;
+                let next_layout = presentation
+                    .row_for_line(line_number + 1)
+                    .map(|row| &row.layout);
+                let owned_next = if next_layout.is_none() {
+                    Some(
+                        text_layouts::create_layout(&next_line, Self::layout_style())
+                            .map_err(|error| format!("navigation layout failed: {error:?}"))?,
+                    )
+                } else {
+                    None
+                };
+                let next_layout = next_layout.or(owned_next.as_ref()).unwrap();
+                position = next_start
+                    + next_layout
+                        .hard_line_start(Cursor {
+                            byte_index: 0,
+                            affinity: Affinity::Downstream,
+                        })
+                        .map_err(|error| format!("row transition failed: {error:?}"))?
+                        .byte_index as usize;
+            } else if !right && line_number > 0 {
+                let (previous_start, previous_line) = self
+                    .bounded_line(line_number - 1)
+                    .map_err(|error| error.to_string())?;
+                let previous_layout = presentation
+                    .row_for_line(line_number - 1)
+                    .map(|row| &row.layout);
+                let owned_previous = if previous_layout.is_none() {
+                    Some(
+                        text_layouts::create_layout(&previous_line, Self::layout_style())
+                            .map_err(|error| format!("navigation layout failed: {error:?}"))?,
+                    )
+                } else {
+                    None
+                };
+                let previous_layout = previous_layout.or(owned_previous.as_ref()).unwrap();
+                position = previous_start
+                    + previous_layout
+                        .hard_line_end(Cursor {
+                            byte_index: previous_line.len() as u32,
+                            affinity: Affinity::Downstream,
+                        })
+                        .map_err(|error| format!("row transition failed: {error:?}"))?
+                        .byte_index as usize;
+            }
+        }
+        let next_position = Position::at(position);
+        self.carets[0] = if extend {
+            self.carets[0].extend_to(next_position)
+        } else if self.carets[0].is_empty() {
+            Selection::at(position)
+        } else {
+            Selection::at(if right {
+                self.carets[0].range().end
+            } else {
+                self.carets[0].range().start
+            })
+        };
         Ok(())
     }
 
-    fn move_edge(&mut self, end: bool) -> Result<(), String> {
-        let (_, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
-        let layout = text_layouts::create_layout(&line, Self::layout_style())
-            .map_err(|error| format!("edge layout failed: {error:?}"))?;
+    fn move_edge(
+        &mut self,
+        end: bool,
+        extend: bool,
+        presentation: &Presentation,
+    ) -> Result<(), String> {
+        let (line_number, line_start, line) = self.primary_line().map_err(|error| error.to_string())?;
+        let owned_layout = if presentation.row_for_line(line_number).is_none() {
+            Some(
+                text_layouts::create_layout(&line, Self::layout_style())
+                    .map_err(|error| format!("edge layout failed: {error:?}"))?,
+            )
+        } else {
+            None
+        };
+        let layout = presentation
+            .row_for_line(line_number)
+            .map(|row| &row.layout)
+            .or(owned_layout.as_ref())
+            .unwrap();
         let cursor = Cursor {
             byte_index: (self.primary_position().byte - line_start) as u32,
             affinity: Affinity::Downstream,
@@ -288,34 +455,50 @@ impl Scratchpad {
             layout.hard_line_start(cursor)
         }
         .map_err(|error| format!("edge query failed: {error:?}"))?;
-        self.move_to(edge, line_start);
+        let position = Position::at(line_start + edge.byte_index as usize);
+        self.carets[0] = if extend {
+            self.carets[0].extend_to(position)
+        } else {
+            Selection::at(position.byte)
+        };
         Ok(())
     }
 
-    async fn pointer(&mut self, x: f64, y: f64) -> Result<(), String> {
-        let line = self.scroll_y + (y.max(0.0) / 20.0).floor() as usize;
-        if line >= self.document.len_lines() {
-            return Ok(());
-        }
-        let range = self
-            .document
-            .line_range(line)
-            .map_err(|error| error.to_string())?;
-        let text = self
-            .document
-            .slice(range.clone())
-            .map_err(|error| error.to_string())?;
-        let layout = text_layouts::create_layout(&text, Self::layout_style())
-            .map_err(|error| format!("pointer layout failed: {error:?}"))?;
-        let cursor = layout
-            .cursor_from_point(x as f32, 0.0)
-            .map_err(|error| format!("pointer query failed: {error:?}"))?;
-        self.carets[0] = Selection::at(range.start + cursor.byte_index as usize);
-        Ok(())
-    }
 }
 
 const SURFACE: instar_ui_protocol::NodeKey = instar_ui_protocol::NodeKey::first(7);
+
+fn surface_key() -> instar::kernel::surface_types::NodeKey {
+    instar::kernel::surface_types::NodeKey {
+        id: SURFACE.id,
+        generation: SURFACE.generation,
+    }
+}
+
+struct PresentedRow {
+    line: usize,
+    start: usize,
+    text: String,
+    layout: text_layouts::TextLayout,
+}
+
+struct Presentation {
+    rows: Vec<PresentedRow>,
+    row_height: f32,
+}
+
+impl Presentation {
+    fn row_for_line(&self, line: usize) -> Option<&PresentedRow> {
+        self.rows.iter().find(|row| row.line == line)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PointerPhase {
+    Down,
+    Move,
+    Up,
+}
 
 /// The actual component-facing loop. The policy object above remains
 /// independently testable; this adapter owns only public WIT handles and the
@@ -359,7 +542,7 @@ impl GuestComponent {
             .map_err(|error| format!("surface tree commit failed: {error:?}"))
     }
 
-    async fn present(app: &Scratchpad) -> Result<(), String> {
+    async fn present(app: &Scratchpad, presentation: &mut Option<Presentation>) -> Result<(), String> {
         let style = Scratchpad::layout_style();
         const VIEWPORT_ROWS: usize = 26;
         const OVERSCAN_ROWS: usize = 2;
@@ -373,7 +556,11 @@ impl GuestComponent {
         // canonical document and changes only after a real edit.
         encoder.command(instar_surface_protocol::Command::FillRect {
             rect: instar_surface_protocol::Rect::new(612.0, 448.0, 16.0, 16.0),
-            color: if app.document.is_empty() {
+            color: if app.pointer_anchor.is_some()
+                || !app.carets.first().is_some_and(|selection| selection.is_empty())
+            {
+                instar_surface_protocol::Color::rgba(240, 170, 70, 255)
+            } else if app.document.is_empty() {
                 instar_surface_protocol::Color::rgba(90, 90, 100, 255)
             } else {
                 instar_surface_protocol::Color::rgba(80, 210, 120, 255)
@@ -382,7 +569,8 @@ impl GuestComponent {
         let rows = app
             .visible_rows_projected(VIEWPORT_ROWS + OVERSCAN_ROWS)
             .map_err(|error| format!("visible row extraction failed: {error}"))?;
-        let mut layouts = Vec::with_capacity(rows.len());
+        let first_line = app.scroll_y.min(app.document.len_lines().saturating_sub(1));
+        let mut presented_rows = Vec::with_capacity(rows.len());
         let mut row_height = 20.0_f32;
         let mut candidate = instar::kernel::surface_types::LocalRect {
             x: 8.0,
@@ -405,9 +593,46 @@ impl GuestComponent {
                     .height;
                 candidate.height = row_height;
             }
+            let line = first_line + slot;
+            let row_start = app
+                .document
+                .line_range(line.min(app.document.len_lines().saturating_sub(1)))
+                .map(|range| range.start)
+                .unwrap_or(0);
+            for selection in &app.carets {
+                let selection_range = selection.range();
+                let row_end = row_start + bounded.len();
+                if selection_range.start < row_end && selection_range.end > row_start {
+                    let anchor = selection.anchor.byte.clamp(row_start, row_end) - row_start;
+                    let head = selection.head.byte.clamp(row_start, row_end) - row_start;
+                    let rects = layout
+                        .selection_rects(
+                            Cursor {
+                                byte_index: anchor as u32,
+                                affinity: Affinity::Downstream,
+                            },
+                            Cursor {
+                                byte_index: head as u32,
+                                affinity: Affinity::Downstream,
+                            },
+                        )
+                        .map_err(|error| format!("selection geometry failed: {error:?}"))?;
+                    for rect in rects {
+                        encoder.command(instar_surface_protocol::Command::FillRect {
+                            rect: instar_surface_protocol::Rect::new(
+                                8.0 + rect.x,
+                                24.0 + slot as f32 * row_height + rect.y,
+                                rect.width,
+                                rect.height,
+                            ),
+                            color: instar_surface_protocol::Color::rgba(55, 85, 125, 220),
+                        });
+                    }
+                }
+            }
             let primary_line = app.primary_position().byte;
-            let line = app.document.line_of_byte(primary_line).unwrap_or(0);
-            if app.document.len_lines() > 0 && line == app.scroll_y + slot {
+            let line_of_primary = app.document.line_of_byte(primary_line).unwrap_or(0);
+            if app.document.len_lines() > 0 && line_of_primary == line {
                 let line_start = app
                     .document
                     .line_range(line)
@@ -427,13 +652,35 @@ impl GuestComponent {
                     x, y, width: caret.width.max(1.0), height: caret.height.max(1.0),
                 };
             }
+            for caret_selection in app.carets.iter().skip(1) {
+                if caret_selection.is_empty() && caret_selection.head.byte >= row_start {
+                    let local = caret_selection.head.byte.saturating_sub(row_start).min(bounded.len());
+                    let caret = layout
+                        .caret_rect(Cursor { byte_index: local as u32, affinity: Affinity::Downstream }, 1.0)
+                        .map_err(|error| format!("caret geometry failed: {error:?}"))?;
+                    encoder.command(instar_surface_protocol::Command::FillRect {
+                        rect: instar_surface_protocol::Rect::new(
+                            8.0 + caret.x,
+                            24.0 + slot as f32 * row_height + caret.y,
+                            caret.width.max(1.0),
+                            caret.height.max(1.0),
+                        ),
+                        color: instar_surface_protocol::Color::rgba(120, 190, 255, 220),
+                    });
+                }
+            }
             encoder.command(instar_surface_protocol::Command::DrawTextLayout {
                 layout_slot: slot as u16,
                 x: 8.0,
                 y: 24.0 + slot as f32 * row_height,
                 color: instar_surface_protocol::Color::rgba(240, 240, 240, 255),
             });
-            layouts.push(layout);
+            presented_rows.push(PresentedRow {
+                line,
+                start: row_start,
+                text: bounded.to_owned(),
+                layout,
+            });
         }
         let scene = encoder.finish().map_err(|error| error.to_string())?;
         surfaces::update_surface(
@@ -442,7 +689,7 @@ impl GuestComponent {
                 generation: SURFACE.generation,
             },
             scene,
-            layouts.iter().collect(),
+            presented_rows.iter().map(|row| &row.layout).collect(),
         )
         .await
         .map_err(|error| format!("surface update failed: {error:?}"))?;
@@ -454,6 +701,91 @@ impl GuestComponent {
             true,
             candidate,
         );
+        *presentation = Some(Presentation {
+            rows: presented_rows,
+            row_height,
+        });
+        Ok(())
+    }
+
+    async fn pointer(
+        app: &mut Scratchpad,
+        presentation: &mut Option<Presentation>,
+        phase: PointerPhase,
+        x: f64,
+        y: f64,
+    ) -> Result<(), String> {
+        if app.preedit.is_some() || app.composition_target.is_some() {
+            app.cancel_composition();
+            Self::present(app, presentation).await?;
+        }
+        let Some(presentation) = presentation.as_ref() else {
+            return Ok(());
+        };
+        let slot = ((y - 24.0).max(0.0) / f64::from(presentation.row_height)).floor() as usize;
+        let slot = slot.min(presentation.rows.len().saturating_sub(1));
+        let Some(row) = presentation.rows.get(slot) else {
+            return Ok(());
+        };
+        let cursor = row
+            .layout
+            .cursor_from_point((x - 8.0) as f32, (y - 24.0 - slot as f64 * f64::from(presentation.row_height)) as f32)
+            .map_err(|error| format!("pointer query failed: {error:?}"))?;
+        let mut cursor = cursor;
+        // Some platforms report a point above the first glyph's ink box as
+        // the row start. Preserve TextLayout as the authority while walking
+        // its visual carets to recover the horizontal hit for that row.
+        if cursor.byte_index == 0 && x > 8.0 {
+            let point_x = (x - 8.0) as f32;
+            let mut probe = cursor;
+            for _ in 0..row.text.len().min(4096) {
+                let next = row
+                    .layout
+                    .next_visual(probe)
+                    .map_err(|error| format!("pointer navigation failed: {error:?}"))?;
+                if next.byte_index == probe.byte_index && next.affinity == probe.affinity {
+                    break;
+                }
+                let caret = row
+                    .layout
+                    .caret_rect(next, 1.0)
+                    .map_err(|error| format!("pointer caret failed: {error:?}"))?;
+                if caret.x <= point_x {
+                    cursor = next;
+                    probe = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        let byte = row.start + (cursor.byte_index as usize).min(row.text.len());
+        let position = Position::at(byte);
+        match phase {
+            PointerPhase::Down => {
+                app.pointer_anchor = Some(position);
+                app.carets[0] = Selection::at(byte);
+                surfaces::capture_pointer(surface_key())
+                    .map_err(|error| format!("pointer capture failed: {error:?}"))?;
+            }
+            PointerPhase::Move => {
+                if let Some(anchor) = app.pointer_anchor {
+                    app.carets[0] = Selection {
+                        anchor,
+                        head: position,
+                    };
+                }
+            }
+            PointerPhase::Up => {
+                if let Some(anchor) = app.pointer_anchor {
+                    app.carets[0] = Selection {
+                        anchor,
+                        head: position,
+                    };
+                }
+                app.pointer_anchor = None;
+                let _ = surfaces::release_pointer(surface_key());
+            }
+        }
         Ok(())
     }
 }
@@ -461,8 +793,9 @@ impl GuestComponent {
 impl Guest for GuestComponent {
     async fn run() -> Result<(), String> {
         let mut app = Scratchpad::new("");
+        let mut presentation = None;
         GuestComponent::commit_surface_tree().await?;
-        GuestComponent::present(&app).await?;
+        GuestComponent::present(&app, &mut presentation).await?;
         loop {
             let payload = match kernel_runtime::next_event().await {
                 Ok(payload) => payload,
@@ -479,11 +812,12 @@ impl Guest for GuestComponent {
                     ..
                 } => {
                     let control = modifiers & (1 << 1) != 0;
+                    let extend = modifiers & 1 != 0;
                     match logical {
-                        5 => app.move_visual(false)?,
-                        6 => app.move_visual(true)?,
-                        9 => app.move_edge(false)?,
-                        10 => app.move_edge(true)?,
+                        5 => app.move_visual(false, extend, presentation.as_ref().unwrap())?,
+                        6 => app.move_visual(true, extend, presentation.as_ref().unwrap())?,
+                        9 => app.move_edge(false, extend, presentation.as_ref().unwrap())?,
+                        10 => app.move_edge(true, extend, presentation.as_ref().unwrap())?,
                         11 => app.delete_backward().map_err(|error| error.to_string())?,
                         12 => app.delete_forward().map_err(|error| error.to_string())?,
                         value if control && value == 'k' as u16 => {
@@ -504,17 +838,63 @@ impl Guest for GuestComponent {
                         _ => {}
                     }
                 }
-                SurfaceEvent::PointerDown { x, y, .. }
-                | SurfaceEvent::PointerUp { x, y, .. }
-                | SurfaceEvent::PointerMove { x, y, .. } => app.pointer(x, y).await?,
+                SurfaceEvent::PointerDown { x, y, .. } => {
+                    GuestComponent::pointer(
+                        &mut app,
+                        &mut presentation,
+                        PointerPhase::Down,
+                        x,
+                        y,
+                    )
+                    .await?
+                }
+                SurfaceEvent::PointerUp { x, y, .. } => {
+                    GuestComponent::pointer(
+                        &mut app,
+                        &mut presentation,
+                        PointerPhase::Up,
+                        x,
+                        y,
+                    )
+                    .await?
+                }
+                SurfaceEvent::PointerMove { x, y, .. } => {
+                    GuestComponent::pointer(
+                        &mut app,
+                        &mut presentation,
+                        PointerPhase::Move,
+                        x,
+                        y,
+                    )
+                    .await?
+                }
                 SurfaceEvent::Wheel { dy, .. } => app.scroll(dy),
                 SurfaceEvent::ImeCommit { text, .. } => {
                     app.commit(&text).map_err(|error| error.to_string())?
                 }
-                SurfaceEvent::ImePreedit { text, .. } => app.preedit(text),
+                SurfaceEvent::ImePreedit { text, cursor, .. } => {
+                    app.preedit_with_cursor(text, cursor.map(|(start, end)| (start as usize, end as usize)))
+                }
+                SurfaceEvent::ImeDisabled { .. } | SurfaceEvent::Focus { focused: false, .. } => {
+                    app.cancel_composition();
+                    app.pointer_anchor = None;
+                    let _ = surfaces::configure_text_input(
+                        surface_key(),
+                        false,
+                        instar::kernel::surface_types::LocalRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                    );
+                }
+                SurfaceEvent::Focus { focused: true, .. }
+                | SurfaceEvent::ImeEnabled { .. }
+                | SurfaceEvent::Metrics { .. } => {}
                 _ => {}
             }
-            GuestComponent::present(&app).await?;
+            GuestComponent::present(&app, &mut presentation).await?;
         }
     }
 }

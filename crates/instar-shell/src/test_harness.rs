@@ -260,6 +260,10 @@ impl RuntimeHarness {
         );
     }
 
+    pub fn guest_message_count(&self) -> u64 {
+        self.bridge.guest_message_count()
+    }
+
     pub fn focused(&self) -> Option<NodeKey> {
         self.window().focus().focused()
     }
@@ -345,6 +349,10 @@ impl RuntimeHarness {
     /// update, not a semantic tree commit.
     pub fn surface_revision(&self, key: NodeKey) -> Option<u64> {
         self.window().surface_revision(key)
+    }
+
+    pub fn surface_layout_source_lengths(&self, key: NodeKey) -> Option<Vec<usize>> {
+        self.window().surface_layout_source_lengths(key)
     }
 
     pub fn tree_revision(&self) -> u64 {

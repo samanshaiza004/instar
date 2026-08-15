@@ -263,6 +263,19 @@ impl HostWindow {
         self.surface_scenes.get(&key).map(|scene| scene.revision)
     }
 
+    /// Source-byte lengths of the immutable layouts retained by a Surface
+    /// scene. This is read-only seam observation for bounded-presentation
+    /// tests; layout admission and ownership remain host-internal.
+    pub fn surface_layout_source_lengths(&self, key: NodeKey) -> Option<Vec<usize>> {
+        self.surface_scenes.get(&key).map(|scene| {
+            scene
+                .commands
+                .iter()
+                .filter_map(|command| command.layout.as_ref().map(|layout| layout.source_len()))
+                .collect()
+        })
+    }
+
     pub fn redraw_pending(&self) -> bool {
         self.redraw_pending
     }
@@ -1322,9 +1335,17 @@ impl Host {
 
         let (x, y) = event.logical_pos.round();
 
-        if let Some((target, local_x, local_y, interests)) =
-            self.surface_at(event.window_id, x, y, true)
+        let surface = if self
+            .windows
+            .get(&event.window_id)
+            .and_then(|window| window.surface_capture)
+            .is_some()
         {
+            self.captured_surface_at(event.window_id, x, y, true)
+        } else {
+            self.surface_at(event.window_id, x, y, true)
+        };
+        if let Some((target, local_x, local_y, interests)) = surface {
             let captured = self
                 .windows
                 .get(&event.window_id)
@@ -1341,10 +1362,10 @@ impl Host {
             if !interests.pointer_buttons {
                 return Vec::new();
             }
-            if event.state == PointerState::Pressed {
-                if let Some(window) = self.windows.get_mut(&event.window_id) {
-                    window.focus.focus_by_pointer(Some(target));
-                }
+            if event.state == PointerState::Pressed
+                && let Some(window) = self.windows.get_mut(&event.window_id)
+            {
+                window.focus.focus_by_pointer(Some(target));
             }
             let surface_event = match event.state {
                 PointerState::Pressed => SurfaceEvent::PointerDown {
@@ -1619,8 +1640,17 @@ impl Host {
     /// Separate from [`Host::on_pointer`] because a move is not a button
     /// event, and because both of the things it can do are pure presentation.
     pub fn on_pointer_moved(&mut self, window_id: WindowId, x: i32, y: i32) -> Vec<HostEffect> {
-        if let Some((target, local_x, local_y, interests)) = self.surface_at(window_id, x, y, true)
+        let surface = if self
+            .windows
+            .get(&window_id)
+            .and_then(|window| window.surface_capture)
+            .is_some()
         {
+            self.captured_surface_at(window_id, x, y, false)
+        } else {
+            self.surface_at(window_id, x, y, true)
+        };
+        if let Some((target, local_x, local_y, interests)) = surface {
             let captured = self.windows.get(&window_id).and_then(|w| w.surface_capture);
             if captured == Some(target) || (captured.is_none() && interests.pointer_movement) {
                 return vec![HostEffect::SendToGuest(
@@ -1712,6 +1742,34 @@ impl Host {
         let rect = layout.get(node.key)?;
         Some((
             node.key,
+            f64::from(x - rect.x),
+            f64::from(y - rect.y),
+            interests,
+        ))
+    }
+
+    fn captured_surface_at(
+        &self,
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+        buttons: bool,
+    ) -> Option<(NodeKey, f64, f64, instar_ui::SurfaceInterests)> {
+        let window = self.windows.get(&window_id)?;
+        let target = window.surface_capture?;
+        let tree = window.tree.as_ref()?;
+        let layout = window.layout.as_ref()?;
+        let node = tree.find(target)?;
+        let interests = match node.kind {
+            instar_ui::NodeKind::Surface { interests, .. } => interests,
+            _ => return None,
+        };
+        if buttons && !interests.pointer_buttons {
+            return None;
+        }
+        let rect = layout.get(target)?;
+        Some((
+            target,
             f64::from(x - rect.x),
             f64::from(y - rect.y),
             interests,
