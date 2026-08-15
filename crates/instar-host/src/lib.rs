@@ -255,6 +255,14 @@ impl HostWindow {
             .flatten()
     }
 
+    /// Revision of the independently retained Surface scene for `key`.
+    ///
+    /// This is read-only observation for production seam tests; scene
+    /// admission and replacement remain exclusively host-bridge operations.
+    pub fn surface_revision(&self, key: NodeKey) -> Option<u64> {
+        self.surface_scenes.get(&key).map(|scene| scene.revision)
+    }
+
     pub fn redraw_pending(&self) -> bool {
         self.redraw_pending
     }
@@ -1332,6 +1340,11 @@ impl Host {
             };
             if !interests.pointer_buttons {
                 return Vec::new();
+            }
+            if event.state == PointerState::Pressed {
+                if let Some(window) = self.windows.get_mut(&event.window_id) {
+                    window.focus.focus_by_pointer(Some(target));
+                }
             }
             let surface_event = match event.state {
                 PointerState::Pressed => SurfaceEvent::PointerDown {

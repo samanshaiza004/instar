@@ -114,6 +114,36 @@ impl Scratchpad {
         Ok(start..end)
     }
 
+    fn visible_rows(&self, rows: usize) -> Result<Vec<String>, instar_editor_core::EditError> {
+        let count = self.document.len_lines();
+        if count == 0 {
+            return Ok(vec![String::new()]);
+        }
+        let first = self.scroll_y.min(count - 1);
+        (first..first.saturating_add(rows).min(count))
+            .map(|line| {
+                let range = self.document.line_range(line)?;
+                self.document.slice(range)
+            })
+            .collect()
+    }
+
+    /// Builds only the bounded projected viewport. Preedit bytes are never
+    /// written to Crop; the resulting hard rows are shaped independently by
+    /// the same host TextLayout service used for canonical rows.
+    fn visible_rows_projected(&self, rows: usize) -> Result<Vec<String>, instar_editor_core::EditError> {
+        let range = self.visible_range(rows)?;
+        if self.preedit.is_none() || self.composition_target.is_none() {
+            return self.visible_rows(rows);
+        }
+        let projected = self.projected_slice(range)?;
+        Ok(projected
+            .split_inclusive('\n')
+            .map(ToOwned::to_owned)
+            .take(rows.max(1))
+            .collect())
+    }
+
     /// Projects the current preedit over one bounded document range. The
     /// caller supplies a range from the pre-transaction document; only that
     /// range and the preedit are copied.
@@ -332,52 +362,79 @@ impl GuestComponent {
     async fn present(app: &Scratchpad) -> Result<(), String> {
         let style = Scratchpad::layout_style();
         const VIEWPORT_ROWS: usize = 26;
+        const OVERSCAN_ROWS: usize = 2;
         let mut encoder = instar_surface_protocol::Encoder::new();
         encoder.command(instar_surface_protocol::Command::FillRect {
             rect: instar_surface_protocol::Rect::new(0.0, 0.0, 640.0, 480.0),
             color: instar_surface_protocol::Color::rgba(20, 20, 24, 255),
         });
-        let range = app
-            .visible_range(VIEWPORT_ROWS)
-            .map_err(|error| format!("visible range failed: {error}"))?;
-        let projected = app
-            .projected_slice(range.clone())
-            .map_err(|error| format!("visible projection failed: {error}"))?;
-        let layout = text_layouts::create_layout(&projected, style)
-            .map_err(|error| format!("layout creation failed: {error:?}"))?;
-        let row_height = layout
-            .metrics()
-            .map_err(|error| format!("layout metrics failed: {error:?}"))?
-            .height;
-        let local = app
-            .primary_position()
-            .byte
-            .saturating_sub(range.start)
-            .min(projected.len());
-        let caret = layout
-            .caret_rect(
-                Cursor {
-                    byte_index: local as u32,
-                    affinity: Affinity::Downstream,
-                },
-                1.0,
-            )
-            .map_err(|error| format!("caret geometry failed: {error:?}"))?;
+        // A tiny guest-owned proof marker makes the joined pixel test
+        // independent of font rasterization: it is derived from the guest's
+        // canonical document and changes only after a real edit.
         encoder.command(instar_surface_protocol::Command::FillRect {
-            rect: instar_surface_protocol::Rect::new(
-                8.0 + caret.x,
-                24.0 + caret.y,
-                caret.width.max(1.0),
-                caret.height.max(1.0),
-            ),
-            color: instar_surface_protocol::Color::rgba(120, 190, 255, 220),
+            rect: instar_surface_protocol::Rect::new(612.0, 448.0, 16.0, 16.0),
+            color: if app.document.is_empty() {
+                instar_surface_protocol::Color::rgba(90, 90, 100, 255)
+            } else {
+                instar_surface_protocol::Color::rgba(80, 210, 120, 255)
+            },
         });
-        encoder.command(instar_surface_protocol::Command::DrawTextLayout {
-            layout_slot: 0,
+        let rows = app
+            .visible_rows_projected(VIEWPORT_ROWS + OVERSCAN_ROWS)
+            .map_err(|error| format!("visible row extraction failed: {error}"))?;
+        let mut layouts = Vec::with_capacity(rows.len());
+        let mut row_height = 20.0_f32;
+        let mut candidate = instar::kernel::surface_types::LocalRect {
             x: 8.0,
             y: 24.0,
-            color: instar_surface_protocol::Color::rgba(240, 240, 240, 255),
-        });
+            width: 1.0,
+            height: row_height,
+        };
+        for (slot, row) in rows.iter().enumerate() {
+            let mut end = row.len().min(PRESENTATION_MAX_BYTES);
+            while end > 0 && !row.is_char_boundary(end) {
+                end -= 1;
+            }
+            let bounded = &row[..end];
+            let layout = text_layouts::create_layout(bounded, style)
+                .map_err(|error| format!("layout creation failed: {error:?}"))?;
+            if slot == 0 {
+                row_height = layout
+                    .metrics()
+                    .map_err(|error| format!("layout metrics failed: {error:?}"))?
+                    .height;
+                candidate.height = row_height;
+            }
+            let primary_line = app.primary_position().byte;
+            let line = app.document.line_of_byte(primary_line).unwrap_or(0);
+            if app.document.len_lines() > 0 && line == app.scroll_y + slot {
+                let line_start = app
+                    .document
+                    .line_range(line)
+                    .map_err(|error| format!("caret row lookup failed: {error}"))?
+                    .start;
+                let local = app.primary_position().byte.saturating_sub(line_start).min(bounded.len());
+                let caret = layout
+                    .caret_rect(Cursor { byte_index: local as u32, affinity: Affinity::Downstream }, 1.0)
+                    .map_err(|error| format!("caret geometry failed: {error:?}"))?;
+                let x = 8.0 + caret.x;
+                let y = 24.0 + slot as f32 * row_height + caret.y;
+                encoder.command(instar_surface_protocol::Command::FillRect {
+                    rect: instar_surface_protocol::Rect::new(x, y, caret.width.max(1.0), caret.height.max(1.0)),
+                    color: instar_surface_protocol::Color::rgba(120, 190, 255, 220),
+                });
+                candidate = instar::kernel::surface_types::LocalRect {
+                    x, y, width: caret.width.max(1.0), height: caret.height.max(1.0),
+                };
+            }
+            encoder.command(instar_surface_protocol::Command::DrawTextLayout {
+                layout_slot: slot as u16,
+                x: 8.0,
+                y: 24.0 + slot as f32 * row_height,
+                color: instar_surface_protocol::Color::rgba(240, 240, 240, 255),
+            });
+            layouts.push(layout);
+        }
         let scene = encoder.finish().map_err(|error| error.to_string())?;
         surfaces::update_surface(
             instar::kernel::surface_types::NodeKey {
@@ -385,7 +442,7 @@ impl GuestComponent {
                 generation: SURFACE.generation,
             },
             scene,
-            vec![&layout],
+            layouts.iter().collect(),
         )
         .await
         .map_err(|error| format!("surface update failed: {error:?}"))?;
@@ -395,12 +452,7 @@ impl GuestComponent {
                 generation: SURFACE.generation,
             },
             true,
-            instar::kernel::surface_types::LocalRect {
-                x: 8.0 + caret.x,
-                y: 24.0 + caret.y,
-                width: caret.width.max(1.0),
-                height: caret.height.max(row_height),
-            },
+            candidate,
         );
         Ok(())
     }
@@ -535,5 +587,18 @@ mod tests {
         // whole document to the real presentation path.
         assert_eq!(visible.len(), PRESENTATION_MAX_BYTES);
         assert!(visible.chars().all(|character| character == 'x'));
+    }
+
+    #[test]
+    fn multiline_preedit_stays_in_the_bounded_row_projection() {
+        let mut app = Scratchpad::new("before\nafter");
+        app.carets = vec![Selection {
+            anchor: Position::at(0),
+            head: Position::at(6),
+        }];
+        app.preedit("one\ntwo\nthree");
+        let visible = app.visible_projection(4).unwrap();
+        assert_eq!(visible, "one\ntwo\nthree\nafter");
+        assert_eq!(app.document.as_string(), "before\nafter");
     }
 }

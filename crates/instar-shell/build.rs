@@ -6,5 +6,6 @@ fn main() {
         ("counter", "counter", "COUNTER_WASM"),
         ("gallery", "gallery", "GALLERY_WASM"),
         ("calculator", "calculator", "CALCULATOR_WASM"),
+        ("scratchpad", "instar-scratchpad", "SCRATCHPAD_WASM"),
     ]);
 }
