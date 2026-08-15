@@ -1,0 +1,16 @@
+timestamp_unix_ns=1786776588447782000
+os=macos
+arch=aarch64
+cpu=Apple M1
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo_profile=release
+window_size=640x480 scale_factor=1.0
+iterations_per_workload=150
+gate_target_p95_ms=5.000
+gate_worst_graded_p95_ms=13.117
+verdict=FAIL
+measurement_boundaries:
+T0=harness feeds a real winit::event::WindowEvent/WindowOutput into the production bridge (native input accepted)
+T5=Presenter::render returns RGBA pixels (rasterization complete -- NOT presented to a compositor; see README.md)
+gate_build=production guests/scratchpad, world kernel, zero probe hostcalls
+mutant_tests=cargo test --release (12 tests, 4 are the required mutant/fault checks; see src/sample.rs, src/wait.rs, src/counters.rs)

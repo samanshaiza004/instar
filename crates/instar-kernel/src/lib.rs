@@ -23,6 +23,8 @@
 //! runtime generations -- is not written yet, and the spike's event
 //! "protocol" is a test fixture, not a draft of it.
 
+#[cfg(feature = "bench-probe")]
+pub mod bench_probe;
 pub mod bridge;
 pub mod engine;
 pub mod presentation;

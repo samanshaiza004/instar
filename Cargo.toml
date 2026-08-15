@@ -14,6 +14,7 @@ members = [
     "crates/instar-host",
     "crates/instar-shell",
     "crates/instar-guest-build",
+    "crates/recovery-harness",
 ]
 
 # The predecessor's crates are gone as of WP10. Every one was either salvaged

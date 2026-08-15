@@ -87,7 +87,27 @@ pub fn build_guests(guests: &[(&str, &str, &str)]) {
     let _cleanup = TempTarget(target_dir.clone());
 
     for (name, package, env_var) in guests {
-        build_guest_into(name, package, env_var, &target_dir, &artifacts);
+        build_guest_into(name, package, env_var, &[], &target_dir, &artifacts);
+    }
+}
+
+/// Same as [`build_guests`], with an explicit `--features` list per guest.
+///
+/// Exists for `benchmarks/text-latency`: its GATE build needs the ordinary
+/// production guest, and its DIAGNOSTIC build needs the same guest source
+/// compiled with an extra Cargo feature (see the guest's own `bench-probe`
+/// feature) that switches its `wit_bindgen::generate!` world and adds timing
+/// marks. Two builds of one guest, from one crate's `build.rs`, need two
+/// artifact names -- `env_var` still identifies each uniquely.
+pub fn build_guests_with_features(guests: &[(&str, &str, &str, &[&str])]) {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR always set by cargo"));
+    let target_dir = out_dir.join("guest-target");
+    let artifacts = out_dir.join("artifacts");
+    std::fs::create_dir_all(&artifacts).expect("OUT_DIR is writable");
+    let _cleanup = TempTarget(target_dir.clone());
+
+    for (name, package, env_var, features) in guests {
+        build_guest_into(name, package, env_var, features, &target_dir, &artifacts);
     }
 }
 
@@ -106,7 +126,14 @@ impl Drop for TempTarget {
     }
 }
 
-fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path, artifacts: &Path) {
+fn build_guest_into(
+    name: &str,
+    package: &str,
+    env_var: &str,
+    features: &[&str],
+    target_dir: &Path,
+    artifacts: &Path,
+) {
     // CARGO_MANIFEST_DIR is the *calling* crate's, and every caller lives at
     // crates/<crate>, so the guests tree is two levels up.
     let manifest = PathBuf::from(
@@ -134,7 +161,8 @@ fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path,
     watch_package(&guest, &mut Vec::new());
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .current_dir(&guest)
         .arg("build")
         .arg("--target")
@@ -145,7 +173,11 @@ fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path,
         // outer workspace.
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
+    }
+    let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to spawn cargo for the {name} guest: {error}"));
 
@@ -180,7 +212,12 @@ fn build_guest_into(name: &str, package: &str, env_var: &str, target_dir: &Path,
     // Copied out before the nested target is removed. The env var points at
     // the retained artifact, so a consumer holding it across a rebuild still
     // has a file.
-    let artifact = artifacts.join(format!("{name}.wasm"));
+    //
+    // Named after `env_var`, not `name`: `build_guests_with_features` can
+    // build the same guest directory/package twice with different feature
+    // sets (one artifact per build mode), and `env_var` is the one thing
+    // guaranteed distinct between those two calls -- `name` is not.
+    let artifact = artifacts.join(format!("{}.wasm", env_var.to_lowercase()));
     std::fs::copy(&built, &artifact).unwrap_or_else(|error| {
         panic!(
             "could not retain the {name} component at {}: {error}",

@@ -532,10 +532,31 @@ impl Host {
     ) {
         let mut effects = Vec::new();
         let answer = match operation {
-            PresentationOperation::CreateLayout { text, style } => self
-                .layouts
-                .create(&mut self.text, generation, &text, style)
-                .map(PresentationAnswer::Layout),
+            PresentationOperation::CreateLayout { text, style } => {
+                #[cfg(feature = "bench-probe")]
+                let text_bytes = text.len() as u64;
+                let result = self
+                    .layouts
+                    .create(&mut self.text, generation, &text, style)
+                    .map(PresentationAnswer::Layout);
+                // Diagnostic-build only (see benchmarks/text-latency). T3 is
+                // defined as the *last* create-layout completion attributed
+                // to the current sample, not the first -- one interaction
+                // can request several rows, so later marks legitimately
+                // overwrite earlier ones for the same sample in the log; the
+                // harness takes the max, not the first.
+                #[cfg(feature = "bench-probe")]
+                {
+                    instar_kernel::bench_probe::record_host_counter(
+                        instar_kernel::bench_probe::COUNTER_LAYOUT_TEXT_BYTES,
+                        text_bytes,
+                    );
+                    instar_kernel::bench_probe::record_host_mark(
+                        instar_kernel::bench_probe::STAGE_T3_LAYOUT_COMPLETE,
+                    );
+                }
+                result
+            }
             PresentationOperation::QueryLayout { key, query } => {
                 self.layouts.query(generation, key, query)
             }
@@ -578,6 +599,11 @@ impl Host {
                                     Err(PresentationRefusal::InvalidScene(error.to_string()))
                                 }
                                 Ok(decoded) => {
+                                    #[cfg(feature = "bench-probe")]
+                                    instar_kernel::bench_probe::record_host_counter(
+                                        instar_kernel::bench_probe::COUNTER_SCENE_BYTES,
+                                        scene.len() as u64,
+                                    );
                                     let window = self.windows.entry(window_id).or_default();
                                     let revision = window
                                         .surface_scenes
@@ -587,6 +613,14 @@ impl Host {
                                         decoded, &resolved, revision,
                                     );
                                     window.surface_scenes.insert(key, staged);
+                                    // T4: the moment the host accepts the
+                                    // scene into the retained tree, before
+                                    // lowering/rebuild runs. Diagnostic-build
+                                    // only.
+                                    #[cfg(feature = "bench-probe")]
+                                    instar_kernel::bench_probe::record_host_mark(
+                                        instar_kernel::bench_probe::STAGE_T4_SCENE_ACCEPTED,
+                                    );
                                     self.layouts.collect();
                                     self.rebuild_scene(window_id);
                                     if self

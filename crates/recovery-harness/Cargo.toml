@@ -1,0 +1,20 @@
+[package]
+name = "recovery-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = """
+Not a production Instar feature. A policy-agnostic test harness for proving
+whichever host-side recovery policy is eventually chosen for Instar's guest
+document model -- built to answer a document/architecture audit that found
+no such policy, and no such mechanism, currently exists or was ever built.
+Deliberately depends on nothing else in the workspace: it is a standalone
+journal/checkpoint/recovery testbed, not a feature wired into instar-host.
+"""
+
+[dependencies]
+
+[[bin]]
+name = "fault_child"
+path = "src/bin/fault_child.rs"

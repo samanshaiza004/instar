@@ -1,0 +1,14 @@
+workload	p50_ms	p95_ms	p99_ms	max_ms	count	graded	pass_p95_5ms	what
+ascii_typing	0.226	0.248	0.405	0.508	150	true	true	one ordinary ASCII keystroke
+key_repeat	0.141	0.156	0.161	0.263	150	true	true	one autorepeated keydown (repeat=true)
+unicode_combining	0.201	0.285	0.338	0.346	150	true	true	combining-mark commit (e + acute + acute + n + tilde)
+bidi_text	0.435	0.667	0.725	4.759	150	true	true	mixed Hebrew/Latin commit forcing bidi reordering
+ime_commit	0.428	0.524	0.595	235.029	150	true	true	two-update preedit composition then commit
+multiline_preedit	0.108	0.157	0.262	0.430	150	true	true	one multi-line preedit update
+large_text_commit_stress	0.172	0.607	0.861	0.861	30	true	true	single commit at the protocol's actual max (MAX_TEXT_BYTES=4096; not a paste benchmark -- no clipboard event exists, and no single event can carry 100 KiB at all -- see workloads.rs)
+pointer_placement	0.214	0.264	0.461	0.611	150	true	true	one click inside the Surface
+drag_selection	0.555	0.660	0.783	0.800	150	true	true	press, 6 intermediate moves, release
+rapid_scrolling	0.945	1.158	1.374	2.268	150	true	true	burst of 8 wheel events
+keystroke_after_1mib_doc	7.848	13.117	15.710	15.710	50	true	false	one keystroke, 1 MiB document preloaded
+keystroke_after_10mib_doc	7.373	8.153	9.039	9.039	50	true	false	one keystroke, 10 MiB document preloaded
+keystroke_pathological_long_line	2.709	2.767	2.854	2.854	20	true	true	one keystroke, 128 KiB single unbroken line preloaded
