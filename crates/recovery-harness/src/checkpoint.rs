@@ -191,9 +191,30 @@ pub fn write_checkpoint_atomic(
 
     std::fs::rename(&tmp_path, &final_path)?;
 
-    let dir_handle = File::open(dir)?;
-    dir_handle.sync_all()?;
+    sync_directory(dir)?;
     Ok(())
+}
+
+/// Flush the directory entry containing the atomic rename. Windows requires
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle; a plain
+/// `File::open` returns `ERROR_ACCESS_DENIED` there.
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+
+    #[cfg(not(windows))]
+    {
+        File::open(dir)?.sync_all()
+    }
 }
 
 /// Removes a leftover `checkpoint.bin.tmp`, if one exists -- the residue of
