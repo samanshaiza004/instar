@@ -26,8 +26,6 @@
 //! | Spin | Runs a non-yielding Wasm loop forever | that out-of-band shutdown can interrupt executing Wasm |
 //! | Grow | Allocates past the Instar memory policy | that a policy violation is a contained guest failure |
 //! | Sleep | Awaits a 30s host operation | that shutdown stays bounded for a guest suspended in a host op |
-//! | Commit text views | Commits the interface with two text-view nodes and a crossed side table | attachment resolution is by identity, not slot position |
-//! | Reverse text table | Re-commits the same tree with the side table reversed | a re-commit that changes the table but not the retained map is a no-op |
 //!
 //! # A trap's message is not the guest's
 //!
@@ -44,10 +42,6 @@
 wit_bindgen::generate!({
     path: "../../crates/instar-kernel/wit",
     world: "kernel",
-    // The world now spans two packages: instar:kernel and the optional
-    // instar:text capability. Without this, types from the second are an
-    // error rather than generated bindings.
-    generate_all,
 });
 
 use instar_ui_protocol::{
@@ -58,7 +52,6 @@ use crate::instar::kernel::kernel_runtime;
 use crate::instar::kernel::kernel_types::{CommitError, CommitResult, RuntimeError};
 use crate::instar::kernel::kernel_ui;
 use crate::instar::kernel::ops;
-use crate::instar::text::text;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -80,23 +73,6 @@ const FLOOD_COMMITS: NodeKey = NodeKey::first(12);
 const SPIN: NodeKey = NodeKey::first(13);
 const GROW: NodeKey = NodeKey::first(14);
 const SLEEP: NodeKey = NodeKey::first(15);
-/// Acquires a text buffer and two views of it, and keeps the handles.
-const TEXT_ACQUIRE: NodeKey = NodeKey::first(16);
-/// Drops one view handle, leaving the rest held.
-const TEXT_RELEASE_VIEW: NodeKey = NodeKey::first(17);
-/// Commits the interface with both text-view nodes and a crossed side table.
-const TEXT_COMMIT: NodeKey = NodeKey::first(18);
-/// Re-commits the same interface with the side table reversed.
-const TEXT_REVERSE: NodeKey = NodeKey::first(19);
-/// The label both text-commit buttons show.
-///
-/// Shared on purpose: the two commits must describe an identical interface so
-/// that the only thing differing between them is the side table.
-const TEXT_ATTACHED_LABEL: &str = "two text views attached";
-/// The first text-view surface the commit buttons attach.
-const TEXT_NODE_A: NodeKey = NodeKey::first(30);
-/// The second text-view surface the commit buttons attach.
-const TEXT_NODE_B: NodeKey = NodeKey::first(31);
 
 /// How long the bulk operation runs. Long enough that it is unambiguously
 /// still in flight while the gate measures a click round-trip against it.
@@ -148,13 +124,6 @@ enum Mode {
     /// that simply stops speaking, which the host must not confuse with one
     /// that has died.
     Silent,
-    /// Commit the two text-view surfaces with a crossed side table: node A
-    /// names slot 1 (V7) and node B names slot 0 (V8).
-    TextCommit,
-    /// Re-commit the same tree with the side table reversed, keeping each
-    /// node on the same view: node A names slot 0 (V7) and node B slot 1
-    /// (V8).
-    TextReverse,
 }
 
 struct Hostile {
@@ -174,14 +143,6 @@ struct Hostile {
     grow: bool,
     /// Set to suspend inside a 30s host operation.
     sleep: bool,
-    /// Text capabilities this guest holds.
-    ///
-    /// Held, not used: B2e-1 proves acquisition and release, and there is no
-    /// way to attach a view to the interface yet. What matters is that these
-    /// handles exist, that dropping one tells the host, and that a generation
-    /// ending releases whatever is left.
-    buffers: Vec<text::TextBuffer>,
-    views: Vec<text::TextView>,
     /// When set, replaces the label text for the next normal commit.
     label_override: Option<String>,
 }
@@ -190,32 +151,14 @@ impl Hostile {
     /// The interface. Structure and text only — the protocol cannot express a
     /// rectangle, so even a hostile guest has no way to lie about geometry.
     fn encode(&self) -> Vec<u8> {
-        self.encode_with_views(None)
-    }
-
-    /// The same interface with the two text-view surfaces appended.
-    ///
-    /// `crossed` chooses which slot each node names; the caller pairs that
-    /// with the matching side-table order. Both commits describe the same
-    /// tree, so the host's tree diff is empty and only the attachment
-    /// resolution can tell them apart.
-    fn encode_with_views(&self, crossed: Option<bool>) -> Vec<u8> {
         // Reset is meaningless at zero, and the host refuses to hit disabled
         // nodes -- a real behavioural difference, not decoration.
         let reset_flags = if self.count == 0 { 0 } else { flags::ENABLED };
-        let extra_views = if crossed.is_some() { 2 } else { 0 };
 
         let mut encoder = BatchEncoder::new();
         encoder
             .node(opcode::NODE_ROOT, ROOT, 0, None, container(8, 0), 1)
-            .node(
-                opcode::NODE_COLUMN,
-                COLUMN,
-                0,
-                None,
-                container(0, 4),
-                (18 + extra_views) as u16,
-            )
+            .node(opcode::NODE_COLUMN, COLUMN, 0, None, container(0, 4), 14)
             .node(
                 opcode::NODE_TEXT,
                 LABEL,
@@ -326,60 +269,12 @@ impl Hostile {
             )
             .node(
                 opcode::NODE_BUTTON,
-                TEXT_ACQUIRE,
-                flags::ENABLED,
-                Some("Acquire text"),
-                WireLayout::default(),
-                0,
-            )
-            .node(
-                opcode::NODE_BUTTON,
-                TEXT_RELEASE_VIEW,
-                flags::ENABLED,
-                Some("Release one view"),
-                WireLayout::default(),
-                0,
-            )
-            .node(
-                opcode::NODE_BUTTON,
-                TEXT_COMMIT,
-                flags::ENABLED,
-                Some("Commit text views"),
-                WireLayout::default(),
-                0,
-            )
-            .node(
-                opcode::NODE_BUTTON,
-                TEXT_REVERSE,
-                flags::ENABLED,
-                Some("Reverse text table"),
-                WireLayout::default(),
-                0,
-            )
-            .node(
-                opcode::NODE_BUTTON,
                 SLEEP,
                 flags::ENABLED,
                 Some("Sleep on host op"),
                 WireLayout::default(),
                 0,
             );
-        if let Some(crossed) = crossed {
-            let (first_slot, second_slot) = if crossed { (1, 0) } else { (0, 1) };
-            encoder
-                .text_view(
-                    TEXT_NODE_A,
-                    flags::ENABLED,
-                    first_slot,
-                    WireLayout::default(),
-                )
-                .text_view(
-                    TEXT_NODE_B,
-                    flags::ENABLED,
-                    second_slot,
-                    WireLayout::default(),
-                );
-        }
         encoder.finish()
     }
 
@@ -412,15 +307,7 @@ impl Hostile {
     /// hearing "no" could not be used to test what happens after a rejection —
     /// which is most of what this guest is for.
     async fn commit(&mut self) -> Result<(), String> {
-        // Two views are needed to say anything interesting about identity
-        // versus position, so a text mode with fewer falls back to the
-        // ordinary interface rather than committing slots that name nothing.
-        let mode = match self.mode {
-            Mode::TextCommit | Mode::TextReverse if self.views.len() < 2 => Mode::Normal,
-            mode => mode,
-        };
-
-        let batch = match mode {
+        let batch = match self.mode {
             Mode::Normal => self.encode(),
             Mode::Garbage => b"\xff\xff\xff this is not a batch".to_vec(),
             Mode::Nonsense => self.nonsense(),
@@ -429,9 +316,8 @@ impl Hostile {
             // to `next-event` and stays responsive; it simply never describes
             // an interface again.
             Mode::Silent => return Ok(()),
-            Mode::TextCommit => self.encode_with_views(Some(true)),
-            Mode::TextReverse => self.encode_with_views(Some(false)),
         };
+        let mode = self.mode;
 
         // Bad commits are one-shot: the guest misbehaves once and goes back to
         // normal. That makes the more interesting property testable — not just
@@ -439,37 +325,17 @@ impl Hostile {
         // afterwards", which is where a host that half-applied something would
         // finally show it. `Silent` is deliberately not reset; a guest that
         // has stopped speaking has stopped speaking.
-        //
-        // Assigned before the side table is borrowed below, because that
-        // borrow lives across the await.
         self.mode = Mode::Normal;
 
-        // The side table, paired with the slots the batch just encoded so that
-        // both text commits resolve to the *same* retained map:
-        //
-        //   TextCommit   node A -> slot 1, node B -> slot 0, table [V8, V7]
-        //   TextReverse  node A -> slot 0, node B -> slot 1, table [V7, V8]
-        //
-        // Node A names V7 and node B names V8 either way. Every slot number
-        // and every table position moved between the two commits and nothing
-        // the host retains did, which is the whole claim.
-        let views: Vec<&text::TextView> = match mode {
-            Mode::TextCommit => self.views.iter().rev().collect(),
-            Mode::TextReverse => self.views.iter().collect(),
-            _ => Vec::new(),
-        };
-
-        match kernel_ui::commit(batch, views).await {
+        match kernel_ui::commit(batch).await {
             Ok(_) => Ok(()),
             // A rejection is *not* an error here. The host refusing a batch is
             // a normal outcome the guest is told about, and a guest that fell
             // over on hearing "no" could not be used to test what happens
             // after a rejection — which is most of what this guest is for.
-            Err(_) if matches!(mode, Mode::Garbage | Mode::Nonsense | Mode::Giant) => Ok(()),
+            Err(_) if mode != Mode::Normal => Ok(()),
             // A rejected *well-formed* commit is a different matter: the guest
-            // asked for something reasonable and did not get it. The text
-            // commits are well-formed by construction, so a refusal there is
-            // the joined seam failing and must not be swallowed.
+            // asked for something reasonable and did not get it.
             Err(error) => Err(format!("a normal commit was refused: {error:?}")),
         }
     }
@@ -482,7 +348,7 @@ impl Hostile {
     async fn flood_commits(&self) -> String {
         let mut pending: Vec<Option<PendingCommit>> = Vec::with_capacity(CONCURRENT_COMMITS);
         for _ in 0..CONCURRENT_COMMITS {
-            pending.push(Some(Box::pin(kernel_ui::commit(self.encode(), Vec::new()))));
+            pending.push(Some(Box::pin(kernel_ui::commit(self.encode()))));
         }
         let outcome = JoinCommits {
             pending,
@@ -586,60 +452,6 @@ impl Hostile {
                 self.label_override = Some("Sleeping...".to_string());
                 self.sleep = true;
             }
-            // Text capabilities, reached exactly like any other interaction:
-            // a click the host hit-tested and delivered. Nothing about these
-            // is special to the wire format or to the host.
-            WireEvent::Click { node } if node == TEXT_ACQUIRE => {
-                match text::create_empty_buffer() {
-                    Ok(buffer) => {
-                        for _ in 0..2 {
-                            match text::create_view(&buffer) {
-                                Ok(view) => self.views.push(view),
-                                Err(error) => {
-                                    self.label_override = Some(format!("view failed: {error:?}"));
-                                }
-                            }
-                        }
-                        self.label_override = Some(format!("held {} view(s)", self.views.len()));
-                        self.buffers.push(buffer);
-                    }
-                    Err(error) => {
-                        self.label_override = Some(format!("buffer failed: {error:?}"));
-                    }
-                }
-            }
-            // The two commits that carry capabilities. Same interface, same
-            // views, different slot numbers and a different table order --
-            // so the host's retained map must come out identical.
-            WireEvent::Click { node } if node == TEXT_COMMIT => {
-                if self.views.len() < 2 {
-                    self.label_override =
-                        Some("need two views: press Acquire text first".to_string());
-                } else {
-                    self.label_override = Some(TEXT_ATTACHED_LABEL.to_string());
-                    self.mode = Mode::TextCommit;
-                }
-            }
-            WireEvent::Click { node } if node == TEXT_REVERSE => {
-                if self.views.len() < 2 {
-                    self.label_override =
-                        Some("need two views: press Acquire text first".to_string());
-                } else {
-                    // Deliberately the *same* label as the commit above. The
-                    // two commits have to describe the same interface for the
-                    // permutation to mean anything: if the label differed, the
-                    // tree diff would be non-empty and "only the table moved"
-                    // would be untestable.
-                    self.label_override = Some(TEXT_ATTACHED_LABEL.to_string());
-                    self.mode = Mode::TextReverse;
-                }
-            }
-            WireEvent::Click { node } if node == TEXT_RELEASE_VIEW => {
-                // Dropping the handle is the release: the generated resource
-                // destructor is what tells the host.
-                self.views.pop();
-                self.label_override = Some(format!("held {} view(s)", self.views.len()));
-            }
             // Not an error: the host may address nodes this version does not
             // act on.
             WireEvent::Click { .. } => {}
@@ -712,8 +524,6 @@ impl Guest for Component {
             spin: false,
             grow: false,
             sleep: false,
-            buffers: Vec::new(),
-            views: Vec::new(),
             label_override: None,
         };
         hostile.commit().await?;

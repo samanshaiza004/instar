@@ -1580,6 +1580,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "instar-editor-core"
+version = "0.0.2"
+dependencies = [
+ "crop",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "instar-guest-build"
 version = "0.0.2"
 
@@ -1591,12 +1599,11 @@ dependencies = [
  "instar-guest-build",
  "instar-kernel",
  "instar-paint",
- "instar-text",
+ "instar-surface-protocol",
+ "instar-text-layout",
  "instar-ui",
- "instar-ui-protocol",
  "instar-window",
  "tokio",
- "unicode-segmentation",
  "wasmtime",
 ]
 
@@ -1643,7 +1650,6 @@ dependencies = [
  "instar-host",
  "instar-paint",
  "instar-render-vello-cpu",
- "instar-text",
  "instar-ui",
  "instar-window",
  "softbuffer",
@@ -1651,11 +1657,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "instar-text"
+name = "instar-surface-protocol"
+version = "0.0.2"
+
+[[package]]
+name = "instar-text-layout"
 version = "0.0.2"
 dependencies = [
- "crop",
- "thiserror 2.0.19",
+ "instar-ui-protocol",
+ "parley",
 ]
 
 [[package]]
@@ -1665,8 +1675,8 @@ dependencies = [
  "accesskit",
  "instar-guest-build",
  "instar-kernel",
+ "instar-text-layout",
  "instar-ui-protocol",
- "parley",
  "taffy",
  "thiserror 2.0.19",
  "tokio",

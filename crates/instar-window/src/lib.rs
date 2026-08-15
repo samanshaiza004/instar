@@ -222,6 +222,61 @@ pub enum Key {
     Other,
 }
 
+/// Stable Web-style logical key names, independent of winit formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableKey {
+    Tab,
+    Enter,
+    Space,
+    Escape,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    Character(char),
+    Unidentified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableCode {
+    Key(char),
+    Digit(char),
+    Enter,
+    Space,
+    Tab,
+    Escape,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    Unidentified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyLocation {
+    #[default]
+    Standard,
+    Left,
+    Right,
+    Numpad,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
 /// A key going down or coming up.
 ///
 /// Like [`RawPointerEvent`], it carries no interpretation: no focused node, no
@@ -240,6 +295,10 @@ pub struct RawKeyEvent {
     /// UI question: it should re-activate a scroll step and must not
     /// re-activate a button.
     pub repeat: bool,
+    pub logical_key: StableKey,
+    pub physical_code: StableCode,
+    pub location: KeyLocation,
+    pub modifiers: Modifiers,
 }
 
 /// The window's geometry changed: resized, moved between monitors, or the
@@ -538,12 +597,56 @@ impl WindowState {
     /// pressed-looking for as long as it is held, so the release is what ends
     /// that, not a detail to filter out here.
     pub fn on_key(&self, key: Key, pressed: bool, repeat: bool) -> RawKeyEvent {
+        let logical_key = match key {
+            Key::Tab => StableKey::Tab,
+            Key::Enter => StableKey::Enter,
+            Key::Space => StableKey::Space,
+            Key::Escape => StableKey::Escape,
+            Key::ArrowLeft => StableKey::ArrowLeft,
+            Key::ArrowRight => StableKey::ArrowRight,
+            Key::Home => StableKey::Home,
+            Key::End => StableKey::End,
+            Key::Backspace => StableKey::Backspace,
+            Key::Delete => StableKey::Delete,
+            Key::Other => StableKey::Unidentified,
+        };
         RawKeyEvent {
             window_id: self.window_id,
             key,
             pressed,
             shift: self.shift,
             repeat,
+            logical_key,
+            physical_code: StableCode::Unidentified,
+            location: KeyLocation::Standard,
+            modifiers: Modifiers {
+                shift: self.shift,
+                ..Modifiers::default()
+            },
+        }
+    }
+
+    pub fn on_key_with_details(
+        &self,
+        logical_key: StableKey,
+        physical_code: StableCode,
+        location: KeyLocation,
+        pressed: bool,
+        repeat: bool,
+    ) -> RawKeyEvent {
+        RawKeyEvent {
+            window_id: self.window_id,
+            key: legacy_key(logical_key),
+            pressed,
+            shift: self.shift,
+            repeat,
+            logical_key,
+            physical_code,
+            location,
+            modifiers: Modifiers {
+                shift: self.shift,
+                ..Modifiers::default()
+            },
         }
     }
 
@@ -599,6 +702,22 @@ impl WindowState {
             physical_size: self.physical_size,
             scale_factor: self.scale_factor,
         }
+    }
+}
+
+fn legacy_key(key: StableKey) -> Key {
+    match key {
+        StableKey::Tab => Key::Tab,
+        StableKey::Enter => Key::Enter,
+        StableKey::Space => Key::Space,
+        StableKey::Escape => Key::Escape,
+        StableKey::ArrowLeft => Key::ArrowLeft,
+        StableKey::ArrowRight => Key::ArrowRight,
+        StableKey::Home => Key::Home,
+        StableKey::End => Key::End,
+        StableKey::Backspace => Key::Backspace,
+        StableKey::Delete => Key::Delete,
+        _ => Key::Other,
     }
 }
 

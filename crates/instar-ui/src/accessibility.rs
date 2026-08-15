@@ -133,13 +133,6 @@ fn build(
     }
 
     match &node.kind {
-        // No label, no actions, no text-range semantics — yet. AccessKit has
-        // `MultilineTextInput`, and having a role is not the same as having an
-        // accessible editor: value, selection and text ranges need B3 and B4
-        // to have established what editing does. Advertising an action here
-        // would promise behaviour that does not exist, which is the rule the
-        // button arm below is written to.
-        NodeKind::TextView => {}
         NodeKind::Text { text } => access.set_label(text.clone()),
         NodeKind::Button { label, enabled } => {
             access.set_label(label.clone());
@@ -170,7 +163,11 @@ fn build(
                 });
             access.set_scroll_y_max(f64::from(extent));
         }
-        NodeKind::Root | NodeKind::Column | NodeKind::Row | NodeKind::Stack => {}
+        NodeKind::Root
+        | NodeKind::Column
+        | NodeKind::Row
+        | NodeKind::Stack
+        | NodeKind::Surface { .. } => {}
     }
 
     // Suppressed subtrees are absent, not hidden-but-present. `Display::None`
@@ -201,10 +198,8 @@ fn role_of(kind: &NodeKind) -> Role {
         NodeKind::Column | NodeKind::Row | NodeKind::Stack => Role::GenericContainer,
         NodeKind::Text { .. } => Role::Label,
         NodeKind::Button { .. } => Role::Button,
-        // The role is honest about what the surface is. What it exposes about
-        // its contents is B3/B4's to fill in.
-        NodeKind::TextView => Role::MultilineTextInput,
         NodeKind::Scroll => Role::ScrollView,
+        NodeKind::Surface { .. } => Role::GenericContainer,
     }
 }
 
@@ -361,10 +356,10 @@ fn fingerprint_of(node: &AccessNode) -> Fingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeKey, TextContext, Viewport, WireAlign, WireColor, WireLayout, WireSize};
+    use crate::{NodeKey, TextEngine, Viewport, WireAlign, WireColor, WireLayout, WireSize};
 
     fn projected(tree: &Tree) -> (TreeUpdate, LayoutSnapshot) {
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
         let update = project(tree, &layout, &FocusState::new(), &ScrollState::new(), 1.0)
             .expect("a presented root projects");
@@ -384,7 +379,7 @@ mod tests {
     /// Drives a projection across successive states, like the host would.
     struct Session {
         projection: A11yProjection,
-        text: TextContext,
+        text: TextEngine,
         focus: FocusState,
         scroll: ScrollState,
         /// Scale 1 unless a test says otherwise, so the transforms are the
@@ -396,7 +391,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 projection: A11yProjection::new(),
-                text: TextContext::new(),
+                text: TextEngine::new(),
                 focus: FocusState::new(),
                 scroll: ScrollState::new(),
                 scale: 1.0,
@@ -618,7 +613,7 @@ mod tests {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
         let mut scroll = ScrollState::new();
@@ -721,7 +716,7 @@ mod tests {
     #[test]
     fn the_transform_chain_is_right_at_every_scale_and_offset() {
         let tree = nested_fixture();
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
         let root = NodeKey::first(0);
         let outer = NodeKey::first(10);
@@ -782,7 +777,7 @@ mod tests {
     #[test]
     fn a_dpi_change_does_not_move_a_single_logical_rectangle() {
         let tree = nested_fixture();
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
 
         // The same window: a scale change does not alter the logical viewport,
         // which is the whole point of the logical viewport.
@@ -827,7 +822,7 @@ mod tests {
     #[test]
     fn a_scale_change_alone_produces_an_update() {
         let tree = Tree::new(Node::root(0, vec![Node::button(1, "press")]));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
         let focus = FocusState::new();
         let scroll = ScrollState::new();
@@ -965,7 +960,7 @@ mod tests {
                 Node::scroll(3, Node::text(4, "content")),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
         text.reset_stats();
@@ -1123,7 +1118,7 @@ mod tests {
             0,
             vec![Node::button(1, "first"), Node::button(2, "second")],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
         let unfocused =
@@ -1162,7 +1157,7 @@ mod tests {
                 }),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
         let mut scroll = ScrollState::new();
@@ -1212,7 +1207,7 @@ mod tests {
                 .with_layout(stretch(100)),
             ],
         ));
-        let mut text = TextContext::new();
+        let mut text = TextEngine::new();
         let layout = tree.layout(&mut text, Viewport::new(400.0, 300.0));
 
         let mut scroll = ScrollState::new();

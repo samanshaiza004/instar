@@ -258,7 +258,7 @@ fn collect(node: &Node, out: &mut Vec<NodeKey>) {
     if !is_presented(node) {
         return;
     }
-    if node.kind.is_interactive() {
+    if node.kind.is_focusable() {
         out.push(node.key);
     }
     for child in &node.children {

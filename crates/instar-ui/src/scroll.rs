@@ -514,8 +514,8 @@ fn collect_viewports(
 
 /// The content child of a `Scroll`, if it has the one it is required to have.
 ///
-/// `DecodedUiSnapshot::from_wire` rejects any other arity, so this returning
-/// `None` means the tree was hand-built rather than decoded.
+/// `Tree::from_wire` rejects any other arity, so this returning `None` means
+/// the tree was hand-built rather than decoded.
 pub fn content_of(node: &Node) -> Option<&Node> {
     matches!(node.kind, NodeKind::Scroll)
         .then(|| node.children.first())

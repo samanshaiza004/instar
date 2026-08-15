@@ -48,6 +48,8 @@ pub const PROTOCOL_VERSION: u8 = 9;
 pub const BATCH_MAGIC: [u8; 4] = *b"IUI1";
 /// Leading bytes of a host-to-guest event.
 pub const EVENT_MAGIC: [u8; 4] = *b"IUE1";
+/// Leading bytes of a targeted Surface input event.
+pub const SURFACE_EVENT_MAGIC: [u8; 4] = *b"IUS1";
 
 /// Hard bounds applied to every decode.
 ///
@@ -76,7 +78,7 @@ pub mod limits {
 
 /// Node kind opcodes.
 ///
-/// Deliberately seven. The layout vocabulary is meant to stay small enough to
+/// Deliberately small. The layout vocabulary is meant to stay small enough to
 /// reason about completely; a general CSS surface is not a goal, and every
 /// kind added here is one the host must lay out, hit-test, and paint forever.
 pub mod opcode {
@@ -96,16 +98,9 @@ pub mod opcode {
     /// A retained viewport over exactly one content child, with a host-owned
     /// scroll offset the guest cannot see or set.
     pub const NODE_SCROLL: u8 = 6;
-    /// A surface showing a host-owned text view.
-    ///
-    /// Carries an `attachment` slot: an index into *this commit's* borrowed
-    /// handle table, resolved during admission and never retained. It is not a
-    /// resource identity — see `docs/PHASE-3.md`, "The slot is commit-local
-    /// indirection".
-    ///
-    /// A leaf. The inside of the surface is host presentation of the attached
-    /// resource, and there must be one answer to who owns it.
-    pub const NODE_TEXT_VIEW: u8 = 7;
+    /// Guest-rendered semantic leaf. Its independently replaceable scene is
+    /// addressed by this node's generational key, never by another resource.
+    pub const NODE_SURFACE: u8 = 7;
 
     pub const SECTION_END: u8 = 0;
     pub const SECTION_TREE: u8 = 1;
@@ -156,6 +151,76 @@ pub mod opcode {
 pub mod flags {
     /// Set when an interactive node is enabled.
     pub const ENABLED: u8 = 1 << 0;
+    /// Surface-only flag: eligible to receive focus.
+    pub const SURFACE_FOCUSABLE: u8 = 1 << 0;
+    pub const SURFACE_POINTER_BUTTONS: u8 = 1 << 1;
+    pub const SURFACE_POINTER_MOVEMENT: u8 = 1 << 2;
+    pub const SURFACE_WHEEL: u8 = 1 << 3;
+    pub const SURFACE_RAW_KEYS: u8 = 1 << 4;
+    pub const SURFACE_FOCUS: u8 = 1 << 5;
+    pub const SURFACE_TEXT_INPUT: u8 = 1 << 6;
+}
+
+/// Neutral events a guest-rendered Surface wants to receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurfaceInterests {
+    pub pointer_buttons: bool,
+    pub pointer_movement: bool,
+    pub wheel: bool,
+    pub raw_keys: bool,
+    pub focus: bool,
+    pub text_input: bool,
+}
+
+impl SurfaceInterests {
+    pub const fn all() -> Self {
+        Self {
+            pointer_buttons: true,
+            pointer_movement: true,
+            wheel: true,
+            raw_keys: true,
+            focus: true,
+            text_input: true,
+        }
+    }
+
+    pub const fn bits(self, focusable: bool) -> u8 {
+        (if focusable {
+            flags::SURFACE_FOCUSABLE
+        } else {
+            0
+        }) | (if self.pointer_buttons {
+            flags::SURFACE_POINTER_BUTTONS
+        } else {
+            0
+        }) | (if self.pointer_movement {
+            flags::SURFACE_POINTER_MOVEMENT
+        } else {
+            0
+        }) | (if self.wheel { flags::SURFACE_WHEEL } else { 0 })
+            | (if self.raw_keys {
+                flags::SURFACE_RAW_KEYS
+            } else {
+                0
+            })
+            | (if self.focus { flags::SURFACE_FOCUS } else { 0 })
+            | (if self.text_input {
+                flags::SURFACE_TEXT_INPUT
+            } else {
+                0
+            })
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        Self {
+            pointer_buttons: bits & flags::SURFACE_POINTER_BUTTONS != 0,
+            pointer_movement: bits & flags::SURFACE_POINTER_MOVEMENT != 0,
+            wheel: bits & flags::SURFACE_WHEEL != 0,
+            raw_keys: bits & flags::SURFACE_RAW_KEYS != 0,
+            focus: bits & flags::SURFACE_FOCUS != 0,
+            text_input: bits & flags::SURFACE_TEXT_INPUT != 0,
+        }
+    }
 }
 
 /// A node's identity on the wire. Assigned by the guest and stable across
@@ -690,12 +755,6 @@ pub struct WireNode {
     pub flags: u8,
     /// Present for text and button nodes.
     pub text: Option<String>,
-    /// Present for text-view nodes: which entry of this commit's attachment
-    /// table the surface shows.
-    ///
-    /// Commit-local. Nothing downstream retains it; admission resolves it to a
-    /// host resource identity and keeps that instead.
-    pub attachment: Option<u16>,
     pub layout: WireLayout,
     pub style: WireStyle,
     pub child_count: u16,
@@ -737,6 +796,7 @@ pub enum ProtocolError {
     TooDeep,
     TextTooLong(usize),
     InvalidUtf8,
+    InvalidNumber,
     /// A fixed dimension, padding, or gap exceeded [`limits::MAX_LENGTH`].
     LengthTooLarge(u16),
     /// A flex factor was not a finite value in `0.0..=MAX_FLEX_FACTOR`.
@@ -786,6 +846,7 @@ impl fmt::Display for ProtocolError {
                 limits::MAX_TEXT_BYTES
             ),
             Self::InvalidUtf8 => write!(f, "text is not valid UTF-8"),
+            Self::InvalidNumber => write!(f, "numeric field is not finite"),
             Self::InvalidFlexFactor { bits } => write!(
                 f,
                 "flex factor {} is not a finite value in 0.0..={}",
@@ -854,6 +915,15 @@ impl<'a> Reader<'a> {
     pub fn u32(&mut self, while_reading: &'static str) -> Result<u32, ProtocolError> {
         let b = self.take(4, while_reading)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn f64(&mut self, while_reading: &'static str) -> Result<f64, ProtocolError> {
+        let b = self.take(8, while_reading)?;
+        let value = f64::from_le_bytes(b.try_into().expect("eight bytes"));
+        if !value.is_finite() {
+            return Err(ProtocolError::InvalidNumber);
+        }
+        Ok(value)
     }
 
     /// A node key on the wire: id then generation, each little-endian, 8
@@ -1357,45 +1427,6 @@ impl BatchEncoder {
         self
     }
 
-    /// Appends a text-view surface.
-    ///
-    /// Its own method rather than an argument on [`Self::node`], because the
-    /// attachment slot is kind-specific exactly as text is, and threading an
-    /// `Option<u16>` through every call site would put a field on six node
-    /// kinds that cannot carry one.
-    ///
-    /// Always a leaf: the child count is not a parameter because the only
-    /// value the host accepts is zero.
-    pub fn text_view(
-        &mut self,
-        key: NodeKey,
-        flags: u8,
-        attachment: u16,
-        layout: WireLayout,
-    ) -> &mut Self {
-        self.text_view_styled(key, flags, attachment, layout, WireStyle::default())
-    }
-
-    pub fn text_view_styled(
-        &mut self,
-        key: NodeKey,
-        flags: u8,
-        attachment: u16,
-        layout: WireLayout,
-        style: WireStyle,
-    ) -> &mut Self {
-        self.nodes.push(opcode::NODE_TEXT_VIEW);
-        self.nodes.extend_from_slice(&key.id.to_le_bytes());
-        self.nodes.extend_from_slice(&key.generation.to_le_bytes());
-        self.nodes.push(flags);
-        self.nodes.extend_from_slice(&attachment.to_le_bytes());
-        write_layout(&mut self.nodes, layout);
-        write_style(&mut self.nodes, style);
-        self.nodes.extend_from_slice(&0u16.to_le_bytes());
-        self.node_count += 1;
-        self
-    }
-
     pub fn finish(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16 + self.nodes.len());
         out.extend_from_slice(&BATCH_MAGIC);
@@ -1487,7 +1518,7 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             | opcode::NODE_ROW
             | opcode::NODE_STACK
             | opcode::NODE_SCROLL
-            | opcode::NODE_TEXT_VIEW => None,
+            | opcode::NODE_SURFACE => None,
             opcode::NODE_TEXT => Some(reader.text("text content")?),
             opcode::NODE_BUTTON => Some(reader.text("button label")?),
             value => {
@@ -1496,12 +1527,6 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
                     value,
                 });
             }
-        };
-        // Kind-dependent, in the same position text occupies: after the
-        // flags, before the layout.
-        let attachment = match kind {
-            opcode::NODE_TEXT_VIEW => Some(reader.u16("text view attachment")?),
-            _ => None,
         };
         let layout = reader.layout("layout")?;
         let style = reader.style("style")?;
@@ -1521,7 +1546,6 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
             key,
             flags: node_flags,
             text,
-            attachment,
             layout,
             style,
             child_count,
@@ -1558,6 +1582,296 @@ fn decode_tree_section(reader: &mut Reader<'_>) -> Result<Vec<WireNode>, Protoco
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireEvent {
     Click { node: NodeKey },
+}
+
+/// Neutral input delivered to a guest-owned Surface. This is intentionally
+/// separate from button activation so userland receives raw policy-free data.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SurfaceEvent {
+    PointerDown {
+        node: NodeKey,
+        x: f64,
+        y: f64,
+        button: u8,
+    },
+    PointerUp {
+        node: NodeKey,
+        x: f64,
+        y: f64,
+        button: u8,
+    },
+    PointerMove {
+        node: NodeKey,
+        x: f64,
+        y: f64,
+    },
+    Wheel {
+        node: NodeKey,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
+    Key {
+        node: NodeKey,
+        logical: u16,
+        physical: u16,
+        pressed: bool,
+        repeat: bool,
+        modifiers: u8,
+    },
+    Focus {
+        node: NodeKey,
+        focused: bool,
+    },
+    ImeEnabled {
+        node: NodeKey,
+    },
+    ImePreedit {
+        node: NodeKey,
+        text: String,
+        cursor: Option<(u32, u32)>,
+    },
+    ImeCommit {
+        node: NodeKey,
+        text: String,
+    },
+    ImeDisabled {
+        node: NodeKey,
+    },
+    Metrics {
+        node: NodeKey,
+        width: f64,
+        height: f64,
+    },
+}
+
+impl SurfaceEvent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SURFACE_EVENT_MAGIC);
+        out.push(PROTOCOL_VERSION);
+        let node = |out: &mut Vec<u8>, n: NodeKey| {
+            out.extend_from_slice(&n.id.to_le_bytes());
+            out.extend_from_slice(&n.generation.to_le_bytes());
+        };
+        let f = |out: &mut Vec<u8>, v: f64| out.extend_from_slice(&v.to_le_bytes());
+        match self {
+            Self::PointerDown {
+                node: n,
+                x,
+                y,
+                button,
+            } => {
+                out.push(0);
+                node(&mut out, *n);
+                f(&mut out, *x);
+                f(&mut out, *y);
+                out.push(*button);
+            }
+            Self::PointerUp {
+                node: n,
+                x,
+                y,
+                button,
+            } => {
+                out.push(1);
+                node(&mut out, *n);
+                f(&mut out, *x);
+                f(&mut out, *y);
+                out.push(*button);
+            }
+            Self::PointerMove { node: n, x, y } => {
+                out.push(2);
+                node(&mut out, *n);
+                f(&mut out, *x);
+                f(&mut out, *y);
+            }
+            Self::Wheel {
+                node: n,
+                x,
+                y,
+                dx,
+                dy,
+            } => {
+                out.push(3);
+                node(&mut out, *n);
+                f(&mut out, *x);
+                f(&mut out, *y);
+                f(&mut out, *dx);
+                f(&mut out, *dy);
+            }
+            Self::Key {
+                node: n,
+                logical,
+                physical,
+                pressed,
+                repeat,
+                modifiers,
+            } => {
+                out.push(4);
+                node(&mut out, *n);
+                out.extend_from_slice(&logical.to_le_bytes());
+                out.extend_from_slice(&physical.to_le_bytes());
+                out.push(u8::from(*pressed));
+                out.push(u8::from(*repeat));
+                out.push(*modifiers);
+            }
+            Self::Focus { node: n, focused } => {
+                out.push(5);
+                node(&mut out, *n);
+                out.push(u8::from(*focused));
+            }
+            Self::ImeEnabled { node: n } => {
+                out.push(6);
+                node(&mut out, *n);
+            }
+            Self::ImePreedit {
+                node: n,
+                text,
+                cursor,
+            } => {
+                out.push(7);
+                node(&mut out, *n);
+                out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+                match cursor {
+                    Some((a, b)) => {
+                        out.push(1);
+                        out.extend_from_slice(&a.to_le_bytes());
+                        out.extend_from_slice(&b.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+            Self::ImeCommit { node: n, text } => {
+                out.push(8);
+                node(&mut out, *n);
+                out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+            Self::ImeDisabled { node: n } => {
+                out.push(9);
+                node(&mut out, *n);
+            }
+            Self::Metrics {
+                node: n,
+                width,
+                height,
+            } => {
+                out.push(10);
+                node(&mut out, *n);
+                f(&mut out, *width);
+                f(&mut out, *height);
+            }
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let mut r = Reader::new(bytes);
+        if r.take(4, "surface event magic")? != SURFACE_EVENT_MAGIC {
+            return Err(ProtocolError::BadMagic);
+        }
+        let version = r.u8("version")?;
+        if version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(version));
+        }
+        let kind = r.u8("surface event kind")?;
+        macro_rules! node {
+            () => {
+                NodeKey::new(r.u32("node id")?, r.u32("node generation")?)
+            };
+        }
+        macro_rules! f {
+            () => {
+                r.f64("surface coordinate")
+            };
+        }
+        macro_rules! text {
+            () => {{
+                let n = r.u32("text length")? as usize;
+                if n > limits::MAX_TEXT_BYTES {
+                    return Err(ProtocolError::TextTooLong(n));
+                }
+                let b = r.take(n, "surface text")?;
+                String::from_utf8(b.to_vec()).map_err(|_| ProtocolError::InvalidUtf8)?
+            }};
+        }
+        let event = match kind {
+            0 => Self::PointerDown {
+                node: node!(),
+                x: f!()?,
+                y: f!()?,
+                button: r.u8("button")?,
+            },
+            1 => Self::PointerUp {
+                node: node!(),
+                x: f!()?,
+                y: f!()?,
+                button: r.u8("button")?,
+            },
+            2 => Self::PointerMove {
+                node: node!(),
+                x: f!()?,
+                y: f!()?,
+            },
+            3 => Self::Wheel {
+                node: node!(),
+                x: f!()?,
+                y: f!()?,
+                dx: f!()?,
+                dy: f!()?,
+            },
+            4 => Self::Key {
+                node: node!(),
+                logical: r.u16("logical key")?,
+                physical: r.u16("physical code")?,
+                pressed: r.u8("pressed")? != 0,
+                repeat: r.u8("repeat")? != 0,
+                modifiers: r.u8("modifiers")?,
+            },
+            5 => Self::Focus {
+                node: node!(),
+                focused: r.u8("focused")? != 0,
+            },
+            6 => Self::ImeEnabled { node: node!() },
+            7 => {
+                let n = node!();
+                let value = text!();
+                let cursor = if r.u8("cursor present")? == 1 {
+                    Some((r.u32("cursor start")?, r.u32("cursor end")?))
+                } else {
+                    None
+                };
+                Self::ImePreedit {
+                    node: n,
+                    text: value,
+                    cursor,
+                }
+            }
+            8 => Self::ImeCommit {
+                node: node!(),
+                text: text!(),
+            },
+            9 => Self::ImeDisabled { node: node!() },
+            10 => Self::Metrics {
+                node: node!(),
+                width: f!()?,
+                height: f!()?,
+            },
+            value => {
+                return Err(ProtocolError::UnknownOpcode {
+                    context: "surface event",
+                    value,
+                });
+            }
+        };
+        if r.remaining() != 0 {
+            return Err(ProtocolError::TrailingBytes(r.remaining()));
+        }
+        Ok(event)
+    }
 }
 
 impl WireEvent {
@@ -1608,6 +1922,22 @@ impl WireEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_events_round_trip_and_bound_text() {
+        let event = SurfaceEvent::ImePreedit {
+            node: NodeKey::first(7),
+            text: "か\nき".into(),
+            cursor: Some((0, 3)),
+        };
+        assert_eq!(SurfaceEvent::decode(&event.encode()).unwrap(), event);
+        let mut bytes = event.encode();
+        bytes.extend_from_slice(&[1]);
+        assert!(matches!(
+            SurfaceEvent::decode(&bytes),
+            Err(ProtocolError::TrailingBytes(1))
+        ));
+    }
 
     /// A container that spans its parent's cross axis -- what `Fill` width
     /// used to say, now said as the alignment it always meant.
@@ -2401,114 +2731,5 @@ mod tests {
                 "byte {offset} is the {context} tag"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod text_view_wire {
-    use super::*;
-
-    /// The slot survives the wire exactly, at every value a `u16` can hold.
-    #[test]
-    fn an_attachment_slot_round_trips() {
-        for slot in [0u16, 1, 255, 256, 4095, u16::MAX] {
-            let mut encoder = BatchEncoder::new();
-            encoder.node(
-                opcode::NODE_ROOT,
-                NodeKey::first(0),
-                0,
-                None,
-                WireLayout::default(),
-                1,
-            );
-            encoder.text_view(
-                NodeKey::first(1),
-                flags::ENABLED,
-                slot,
-                WireLayout::default(),
-            );
-            let batch = decode_batch(&encoder.finish()).expect("valid");
-
-            let view = &batch.nodes[1];
-            assert_eq!(view.kind, opcode::NODE_TEXT_VIEW);
-            assert_eq!(view.attachment, Some(slot), "slot {slot} round-trips");
-            assert_eq!(view.child_count, 0, "a text view is a leaf on the wire");
-            assert_eq!(view.text, None, "and carries no text of its own");
-        }
-    }
-
-    /// Nothing but a text view has an attachment.
-    #[test]
-    fn other_kinds_carry_no_attachment() {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(0),
-            0,
-            None,
-            WireLayout::default(),
-            1,
-        );
-        encoder.node(
-            opcode::NODE_TEXT,
-            NodeKey::first(1),
-            0,
-            Some("hello"),
-            WireLayout::default(),
-            0,
-        );
-        let batch = decode_batch(&encoder.finish()).expect("valid");
-        assert_eq!(batch.nodes[1].attachment, None);
-    }
-
-    /// A batch cut inside the slot is an error, not a panic.
-    #[test]
-    fn truncation_inside_the_slot_is_a_protocol_error() {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(0),
-            0,
-            None,
-            WireLayout::default(),
-            1,
-        );
-        encoder.text_view(NodeKey::first(1), 0, 0x1234, WireLayout::default());
-        let full = encoder.finish();
-
-        // The slot is two bytes; cut between them, and before them.
-        for trim in 1..=6 {
-            let cut = &full[..full.len() - trim];
-            match decode_batch(cut) {
-                Err(_) => {}
-                Ok(_) => panic!("a batch cut {trim} bytes short decoded anyway"),
-            }
-        }
-    }
-
-    /// A protocol this build does not speak is refused by version, before any
-    /// node is looked at.
-    #[test]
-    fn the_previous_protocol_version_is_refused() {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(0),
-            0,
-            None,
-            WireLayout::default(),
-            0,
-        );
-        let mut old = encoder.finish();
-        old[BATCH_MAGIC.len()] = PROTOCOL_VERSION - 1;
-
-        assert!(
-            matches!(
-                decode_batch(&old),
-                Err(ProtocolError::UnsupportedVersion { .. })
-            ),
-            "protocol {} is not this build's",
-            PROTOCOL_VERSION - 1
-        );
     }
 }

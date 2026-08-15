@@ -408,6 +408,12 @@ pub enum PaintCommand {
         rect: Rect,
     },
     PopClip,
+    /// Changes the geometry transform for subsequent commands until the
+    /// matching `PopTransform`.
+    PushTransform {
+        transform: AffineTransform,
+    },
+    PopTransform,
 }
 
 /// A complete, ordered description of one frame's paint intent.
@@ -426,6 +432,10 @@ pub enum PaintSceneError {
     ClipUnderflow(usize),
     #[error("{0} PushClip command(s) left unclosed at the end of the scene")]
     ClipImbalance(usize),
+    #[error("PopTransform at command index {0} has no matching PushTransform")]
+    TransformUnderflow(usize),
+    #[error("{0} PushTransform command(s) left unclosed at the end of the scene")]
+    TransformImbalance(usize),
 }
 
 impl PaintScene {
@@ -438,6 +448,7 @@ impl PaintScene {
     /// the check is usable both by producers and by backends.
     pub fn validate(&self) -> Result<(), PaintSceneError> {
         let mut depth: usize = 0;
+        let mut transforms: usize = 0;
         for (index, command) in self.commands.iter().enumerate() {
             match command {
                 PaintCommand::PushClip { .. } => depth += 1,
@@ -446,11 +457,20 @@ impl PaintScene {
                         .checked_sub(1)
                         .ok_or(PaintSceneError::ClipUnderflow(index))?;
                 }
+                PaintCommand::PushTransform { .. } => transforms += 1,
+                PaintCommand::PopTransform => {
+                    transforms = transforms
+                        .checked_sub(1)
+                        .ok_or(PaintSceneError::TransformUnderflow(index))?;
+                }
                 _ => {}
             }
         }
         if depth != 0 {
             return Err(PaintSceneError::ClipImbalance(depth));
+        }
+        if transforms != 0 {
+            return Err(PaintSceneError::TransformImbalance(transforms));
         }
         Ok(())
     }

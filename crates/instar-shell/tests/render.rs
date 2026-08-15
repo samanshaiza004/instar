@@ -434,6 +434,10 @@ fn a_focused_control_actually_shows_a_ring_in_the_pixels() {
         pressed: true,
         shift: false,
         repeat: false,
+        logical_key: instar_window::StableKey::Tab,
+        physical_code: instar_window::StableCode::Tab,
+        location: instar_window::KeyLocation::Standard,
+        modifiers: Default::default(),
     }));
 
     let after = near(&frame(&bridge, &mut presenter), ring, 24);

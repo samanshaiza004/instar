@@ -6,7 +6,7 @@
 //! in Instar is the thread that owns winit's event loop and the retained tree.
 //!
 //! ```text
-//! guest calls commit(batch, text_views).await
+//! guest calls commit(batch).await
 //!   -> kernel wraps it in a CommitRequest with a one-shot reply
 //!   -> CommitSink hands it to whoever owns presentation
 //!   -> guest stays suspended, costing nothing
@@ -21,14 +21,11 @@
 //! work on its behalf.
 //!
 //! That rule is enforced by the type, not by a comment: a [`CommitRequest`]
-//! offers no way at all to see the batch *or the text-view side table it
-//! carries*. The only thing you can do with one is [`CommitRequest::screen`]
-//! it against the current generation, and only the [`ScreenedCommit`] that
-//! comes back has bytes or keys on it. The side table is an opaque-key list
-//! in 3a — resolving it to `TextViewId`s belongs to the host, and belongs
-//! *after* screening exactly like the batch does. Screening also replies on
-//! the failure path, so a rejected commit cannot be left parked by forgetting
-//! to answer it.
+//! offers no way at all to see the batch. The only thing you can do with one is
+//! [`CommitRequest::screen`] it against the current generation, and only the
+//! [`ScreenedCommit`] that comes back has bytes on it. Screening also replies
+//! on the failure path, so a rejected commit cannot be left parked by
+//! forgetting to answer it.
 //!
 //! # Every commit is answered exactly once, including the ones nobody handles
 //!
@@ -45,7 +42,6 @@
 use tokio::sync::oneshot;
 
 use crate::runtime::GenerationId;
-use crate::text_bridge::{AttachmentRefusal, OpaqueResourceKey};
 
 /// An event on its way to a guest.
 ///
@@ -79,9 +75,6 @@ impl GuestEvent {
 pub enum CommitRejection {
     /// The batch failed to decode or to validate.
     Invalid(String),
-    /// One of the commit's text-view attachments was refused, before any tree
-    /// work happened.
-    Attachment(AttachmentRefusal),
     /// The committing generation has been superseded.
     StaleGeneration,
     /// Nobody is left to apply it — the presentation side is shutting down.
@@ -91,10 +84,9 @@ pub enum CommitRejection {
 /// The guest's end of one commit, and the guarantee that it is answered.
 ///
 /// Every commit resolves to exactly one of four terminal verdicts — a
-/// revision, or [`CommitRejection::Invalid`], [`CommitRejection::Attachment`],
-/// [`CommitRejection::StaleGeneration`], or
-/// [`CommitRejection::HostUnavailable`] — and the last of those is the default
-/// rather than a case anyone has to handle. Dropping a `Reply` without
+/// revision, [`CommitRejection::Invalid`], [`CommitRejection::StaleGeneration`],
+/// or [`CommitRejection::HostUnavailable`] — and the last of those is the
+/// default rather than a case anyone has to handle. Dropping a `Reply` without
 /// answering *is* `HostUnavailable`, because a presentation side that
 /// disappears mid-commit does not get the chance to be tidy about it.
 ///
@@ -128,16 +120,14 @@ impl Drop for Reply {
 
 /// A guest's commit, waiting for the side that owns the retained tree.
 ///
-/// Deliberately has no accessor for the batch or for the text-view side table
-/// it carries. See the module docs: the only route to either is
-/// [`CommitRequest::screen`], which is also the generation check, so the
-/// normative "check before decoding" ordering cannot be got wrong by writing
-/// the two steps in the other order.
+/// Deliberately has no accessor for the batch. See the module docs: the only
+/// route to the bytes is [`CommitRequest::screen`], which is also the
+/// generation check, so the normative "check before decoding" ordering cannot
+/// be got wrong by writing the two steps in the other order.
 #[derive(Debug)]
 pub struct CommitRequest {
     generation: GenerationId,
     batch: Vec<u8>,
-    text_views: Vec<OpaqueResourceKey>,
     reply: Reply,
 }
 
@@ -161,19 +151,17 @@ impl CommitRequest {
         Ok(ScreenedCommit {
             generation: self.generation,
             batch: self.batch,
-            text_views: self.text_views,
             reply: self.reply,
         })
     }
 }
 
 /// A commit that has passed the generation check, and may therefore be
-/// decoded and have its text-view side table read.
+/// decoded.
 #[derive(Debug)]
 pub struct ScreenedCommit {
     generation: GenerationId,
     batch: Vec<u8>,
-    text_views: Vec<OpaqueResourceKey>,
     reply: Reply,
 }
 
@@ -184,14 +172,6 @@ impl ScreenedCommit {
 
     pub fn batch(&self) -> &[u8] {
         &self.batch
-    }
-
-    /// The text-view side table, in the order the guest supplied it.
-    ///
-    /// Unreachable before screening — a stale commit's keys must not be
-    /// resolvable any more than its batch must be decodable.
-    pub fn text_view_keys(&self) -> &[OpaqueResourceKey] {
-        &self.text_views
     }
 
     /// Applied. `revision` is the host's identifier for the interface that is
@@ -235,7 +215,6 @@ pub trait CommitSink: Send + Sync + 'static {
 pub fn commit_request(
     generation: GenerationId,
     batch: Vec<u8>,
-    text_views: Vec<OpaqueResourceKey>,
 ) -> (
     CommitRequest,
     oneshot::Receiver<Result<u64, CommitRejection>>,
@@ -245,7 +224,6 @@ pub fn commit_request(
         CommitRequest {
             generation,
             batch,
-            text_views,
             reply: Reply(Some(reply)),
         },
         wait,
@@ -261,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn screening_a_current_generation_yields_the_batch() {
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), Vec::new());
+        let (request, wait) = commit_request(GEN1, b"batch".to_vec());
         let screened = request.screen(GEN1).expect("gen1 is current");
         assert_eq!(screened.batch(), b"batch");
         screened.accept(7);
@@ -270,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn screening_a_stale_generation_replies_without_exposing_the_batch() {
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), Vec::new());
+        let (request, wait) = commit_request(GEN1, b"batch".to_vec());
         assert_eq!(
             request.screen(GEN2).unwrap_err(),
             GEN1,
@@ -294,7 +272,7 @@ mod tests {
     /// the work.
     #[tokio::test]
     async fn dropping_a_request_answers_it_as_host_unavailable() {
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), Vec::new());
+        let (request, wait) = commit_request(GEN1, b"batch".to_vec());
         drop(request);
         assert_eq!(
             wait.await
@@ -309,7 +287,7 @@ mod tests {
     /// sequence that can panic on it.
     #[tokio::test]
     async fn dropping_a_screened_commit_answers_it_too() {
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), Vec::new());
+        let (request, wait) = commit_request(GEN1, b"batch".to_vec());
         drop(request.screen(GEN1).expect("gen1 is current"));
         assert_eq!(
             wait.await
@@ -323,68 +301,13 @@ mod tests {
     /// on a channel the guest may already have moved past.
     #[tokio::test]
     async fn answering_disarms_the_guard() {
-        let (request, mut wait) = commit_request(GEN1, b"batch".to_vec(), Vec::new());
+        let (request, mut wait) = commit_request(GEN1, b"batch".to_vec());
         request.screen(GEN1).expect("gen1 is current").accept(7);
 
         assert_eq!(wait.try_recv(), Ok(Ok(7)));
         assert!(
             matches!(wait.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
             "a second verdict must not follow the first"
-        );
-    }
-
-    /// The side table is part of the screened commit, not of the request:
-    /// exactly as with the batch, the only way to read the keys is to pass
-    /// the generation gate first. Order and contents must survive unchanged.
-    #[tokio::test]
-    async fn screened_commit_carries_text_view_keys_unchanged_and_in_order() {
-        let keys = vec![
-            OpaqueResourceKey {
-                slot: 3,
-                incarnation: 1,
-            },
-            OpaqueResourceKey {
-                slot: 9,
-                incarnation: 2,
-            },
-            OpaqueResourceKey {
-                slot: 3,
-                incarnation: 1,
-            },
-        ];
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), keys.clone());
-
-        let screened = request.screen(GEN1).expect("gen1 is current");
-        assert_eq!(
-            screened.text_view_keys(),
-            keys.as_slice(),
-            "the side table must arrive at the host in the exact order the guest supplied"
-        );
-        screened.accept(7);
-        assert_eq!(wait.await.expect("replied"), Ok(7));
-    }
-
-    /// A stale commit's keys are unreadable before screening, exactly like its
-    /// batch. The `CommitRequest` type has no `text_view_keys` accessor, so
-    /// "refused before the keys are readable" is a property of the API rather
-    /// than a convention; this test pins the refusal itself.
-    #[tokio::test]
-    async fn a_stale_commit_refuses_before_its_keys_can_be_read() {
-        let keys = vec![OpaqueResourceKey {
-            slot: 3,
-            incarnation: 1,
-        }];
-        let (request, wait) = commit_request(GEN1, b"batch".to_vec(), keys);
-
-        assert_eq!(
-            request.screen(GEN2).unwrap_err(),
-            GEN1,
-            "a superseded generation's commit must not become screened"
-        );
-        assert_eq!(
-            wait.await.expect("replied"),
-            Err(CommitRejection::StaleGeneration),
-            "the keys are dropped with the batch, and the guest is told so"
         );
     }
 }

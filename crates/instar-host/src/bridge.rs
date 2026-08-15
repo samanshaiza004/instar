@@ -78,12 +78,10 @@ use std::time::{Duration, Instant};
 
 use instar_kernel::bridge::{CommitRejection, CommitRequest, CommitSink, GuestEvent};
 use instar_kernel::runtime::{GenerationId, Runtime};
-use instar_kernel::text_bridge::{AttachmentRefusal, TextRequest, TextSink};
-use instar_ui::DecodedUiSnapshot;
+use instar_ui::Tree;
 use instar_window::{WindowId, WindowOutput};
 use tokio::sync::mpsc;
 
-use crate::attachment::UiCommitRefusal;
 use crate::{Host, HostEffect};
 
 /// How many messages may be in flight in either direction.
@@ -142,18 +140,7 @@ pub enum HostUserEvent {
         generation: GenerationId,
         request: CommitRequest,
     },
-    /// The guest asked for a text resource and is suspended awaiting it.
-    ///
-    /// Ordinary work, deliberately on the same bounded queue as commits rather
-    /// than a text-specific one: creating and dropping a resource is guest
-    /// work like any other, and a second queue would mean a second answer to
-    /// back-pressure and a second pump budget to keep in step. Terminal
-    /// lifecycle stays on the out-of-band path, so `GuestGone` still outranks
-    /// every queued text request.
-    TextRequest {
-        generation: GenerationId,
-        request: TextRequest,
-    },
+    Presentation(instar_kernel::presentation::PresentationRequest),
 }
 
 /// How a guest generation ended.
@@ -187,6 +174,7 @@ struct MainThreadSink {
     events: SyncSender<HostUserEvent>,
     wake: Wake,
     dropped: Arc<AtomicU64>,
+    surface_in_flight: instar_kernel::presentation::SurfaceInFlight,
 }
 
 /// The main-thread side of the bridge, as handed to the runtime thread.
@@ -215,23 +203,6 @@ impl MainThreadSink {
     }
 }
 
-impl TextSink for MainThreadSink {
-    /// Non-blocking, exactly as commits are. A full or disconnected queue
-    /// means the main thread has stopped draining, and in that state a guest
-    /// is better told its request will not be answered than parked on it.
-    fn submit(&self, request: TextRequest) -> Result<(), TextRequest> {
-        let generation = request.generation();
-        match self.emit(HostUserEvent::TextRequest {
-            generation,
-            request,
-        }) {
-            Ok(()) => Ok(()),
-            Err(HostUserEvent::TextRequest { request, .. }) => Err(request),
-            Err(_) => unreachable!("emit returns the event it was given"),
-        }
-    }
-}
-
 impl CommitSink for MainThreadSink {
     fn submit(&self, request: CommitRequest) -> Result<(), CommitRequest> {
         let generation = request.generation();
@@ -244,8 +215,25 @@ impl CommitSink for MainThreadSink {
             // is the one that knows how to turn "nobody took this" into a
             // verdict the guest can act on.
             Err(HostUserEvent::UiCommit { request, .. }) => Err(request),
-            Err(_) => unreachable!("emit returns the event it was given"),
+            Err(HostUserEvent::Presentation(_)) => unreachable!(),
         }
+    }
+}
+
+impl instar_kernel::presentation::PresentationSink for MainThreadSink {
+    fn submit(
+        &self,
+        mut request: instar_kernel::presentation::PresentationRequest,
+    ) -> Result<(), instar_kernel::presentation::PresentationRequest> {
+        if !request.try_mark_surface(Arc::clone(&self.surface_in_flight)) {
+            request.refuse(instar_kernel::presentation::PresentationRefusal::UpdateInProgress);
+            return Ok(());
+        }
+        self.emit(HostUserEvent::Presentation(request))
+            .map_err(|event| match event {
+                HostUserEvent::Presentation(request) => request,
+                _ => unreachable!(),
+            })
     }
 }
 
@@ -449,6 +437,7 @@ fn run_thread(
         events: channels.events,
         wake: channels.wake,
         dropped: channels.dropped_commits,
+        surface_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
 
     runtime.block_on(async move {
@@ -465,11 +454,7 @@ fn run_thread(
             let _ = started.send(Err(error.to_string()));
             return;
         }
-        // Before the component can run, so a guest never finds the capability
-        // missing. Absence would be an immediate refusal rather than a hang,
-        // but a guest that has to handle a service the host simply forgot to
-        // install is a guest handling a bug.
-        if let Err(error) = kernel.install_text_sink(sink.clone()) {
+        if let Err(error) = kernel.install_presentation_sink(sink.clone()) {
             let _ = started.send(Err(error.to_string()));
             return;
         }
@@ -643,16 +628,6 @@ pub struct BridgeStats {
     /// Commits refused because their generation was no longer current. Refused
     /// *before* decoding — that is the point of counting them here.
     pub stale_commits: u64,
-    /// Text requests refused because their generation was already gone.
-    pub stale_text_requests: u64,
-    /// Commits refused by the attachment gates: an unresolvable key, a slot
-    /// outside the side table, or two live nodes naming one text view.
-    ///
-    /// Kept apart from [`BridgeStats::rejected_commits`], which counts the
-    /// decode/validate/diff refusals, because the attachment gates have their
-    /// own place in the normative order and their own counter keeps a
-    /// regression in that order visible as a counter change.
-    pub attachment_refusals: u64,
     /// Commits that decoded but did not validate, or did not decode.
     pub rejected_commits: u64,
     /// Commits applied.
@@ -697,9 +672,7 @@ pub struct HostBridge {
     /// contract, and it must not be tied to whether the host found the tree
     /// interesting.
     commit_sequence: u64,
-    /// Host-to-guest interaction messages successfully queued by this bridge.
-    /// This is diagnostic state for the internal real-runtime test harness;
-    /// it is not part of the guest protocol.
+    /// Host-to-guest messages accepted by this bridge.
     guest_message_count: u64,
     stats: BridgeStats,
 }
@@ -790,15 +763,6 @@ impl HostBridge {
         self.commit_sequence
     }
 
-    /// The number of host-to-guest interaction messages successfully queued.
-    ///
-    /// This deliberately counts after host policy and routing have run, so a
-    /// disabled or otherwise rejected interaction does not look like a guest
-    /// message merely because a platform event arrived.
-    pub fn guest_message_count(&self) -> u64 {
-        self.guest_message_count
-    }
-
     /// The version of the retained UI state this bridge's window is showing.
     ///
     /// Forwards to the host's tree revision for this window. It advances only
@@ -822,6 +786,11 @@ impl HostBridge {
         self.runtime.queued_commands()
     }
 
+    /// Number of messages routed toward the guest by production input paths.
+    pub fn guest_message_count(&self) -> u64 {
+        self.guest_message_count
+    }
+
     /// Routes one window event.
     ///
     /// [`HostEffect::SendToGuest`] is consumed here — it becomes a
@@ -836,21 +805,29 @@ impl HostBridge {
     /// Turns every [`HostEffect::SendToGuest`] into a queued runtime command,
     /// leaving only what the caller still has to do.
     fn consume_guest_sends(&mut self, effects: Vec<HostEffect>) -> Vec<HostEffect> {
-        effects
-            .into_iter()
-            .filter(|effect| match effect {
+        let mut remaining = Vec::with_capacity(effects.len());
+        for effect in effects {
+            match effect {
                 HostEffect::SendToGuest(bytes) => {
-                    if self
+                    self.guest_message_count = self.guest_message_count.saturating_add(1);
+                    if !self
                         .runtime
-                        .send(RuntimeCommand::DeliverEvent(GuestEvent::new(bytes.clone())))
+                        .send(RuntimeCommand::DeliverEvent(GuestEvent::new(bytes)))
                     {
-                        self.guest_message_count += 1;
+                        // Input overflow is lifecycle control, not another
+                        // guest event. Shut down through the out-of-band
+                        // stop/epoch path and expose the visible failure.
+                        self.runtime.shutdown();
+                        remaining.push(HostEffect::GuestGone {
+                            generation: self.generation,
+                            error: Some("guest input queue overflow".into()),
+                        });
                     }
-                    false
                 }
-                _ => true,
-            })
-            .collect()
+                effect => remaining.push(effect),
+            }
+        }
+        remaining
     }
 
     /// Chooses where scrollbars sit. See [`Host::set_scrollbar_style`].
@@ -1017,7 +994,19 @@ impl HostBridge {
     pub fn on_user_event(&mut self, event: HostUserEvent) -> Vec<HostEffect> {
         match event {
             HostUserEvent::UiCommit { request, .. } => self.on_ui_commit(request),
-            HostUserEvent::TextRequest { request, .. } => self.on_text_request(request),
+            HostUserEvent::Presentation(request) => {
+                if request.generation() != self.generation {
+                    request
+                        .refuse(instar_kernel::presentation::PresentationRefusal::StaleGeneration);
+                    return Vec::new();
+                }
+                let (generation, operation, reply, _single_flight) = request.into_parts();
+                let (answer, effects) =
+                    self.host
+                        .serve_presentation(self.window, generation, operation);
+                let _ = reply.send(answer);
+                effects
+            }
         }
     }
 
@@ -1057,24 +1046,6 @@ impl HostBridge {
         }
     }
 
-    /// Serves one text request, generation first.
-    ///
-    /// Same ordering rule as a commit and for the same reason: a superseded
-    /// generation does not get to allocate host resources on its way out, and
-    /// `TextRequest` has no way to show its operation until it has been
-    /// screened. A stale request is answered by `screen` itself, so it can
-    /// neither park the guest nor reach `TextHost`.
-    ///
-    /// Returns no effects: a resource appearing or going away changes nothing
-    /// on screen until something attaches it, which is B2e-4.
-    fn on_text_request(&mut self, request: TextRequest) -> Vec<HostEffect> {
-        match request.screen(self.generation) {
-            Ok(screened) => self.host.text_resources_mut().serve(screened),
-            Err(_stale) => self.stats.stale_text_requests += 1,
-        }
-        Vec::new()
-    }
-
     fn on_ui_commit(&mut self, request: CommitRequest) -> Vec<HostEffect> {
         // 1. Generation, before anything else. A superseded guest does not get
         //    to spend the host's parser and allocator on its behalf, so this
@@ -1088,32 +1059,11 @@ impl HostBridge {
             }
         };
 
-        // 2. Resolve each attachment key before a single byte is decoded. A
-        //    bad capability must never buy parser work, and keeping the keys
-        //    in front of the batch gives each class of bad input exactly one
-        //    refusal it can produce. The resolution is positional scratch:
-        //    slot `i` names `resolved[i]`, and nothing here polices whether
-        //    the table is a projection of the tree.
-        let resolved = match self
-            .host
-            .resolve_attachment_table(screened.generation(), screened.text_view_keys())
-        {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                self.stats.attachment_refusals += 1;
-                screened.reject(CommitRejection::Attachment(
-                    AttachmentRefusal::UnavailableTextView,
-                ));
-                return Vec::new();
-            }
-        };
-
-        // 3. Decode and validate semantics. `DecodedUiSnapshot::decode` is
-        //    both: the wire parser with its hard bounds, then the checks that
-        //    reject a structurally decodable but meaningless tree — and it is
-        //    the one parser, returning the attachment refs the bytes said.
-        let snapshot = match DecodedUiSnapshot::decode(screened.batch()) {
-            Ok(snapshot) => snapshot,
+        // 2. Decode, and 3. validate semantics. `Tree::decode` is both: the
+        //    wire parser with its hard bounds, then the checks that reject a
+        //    structurally decodable but meaningless tree.
+        let tree = match Tree::decode(screened.batch()) {
+            Ok(tree) => tree,
             Err(error) => {
                 self.stats.rejected_commits += 1;
                 // Nothing was mutated, so the previous interface still stands.
@@ -1122,37 +1072,33 @@ impl HostBridge {
             }
         };
 
-        // Steps 4-8 move into the one authoritative admission path so the
-        // production host and every test exercise the same sequence: slot
-        // resolution and uniqueness, tree diff, ledger validation, attachment
-        // diff, then the infallible promotion. Only the refusal family and
-        // the guest-visible rejection differ from a direct caller.
-        match self.host.apply_ui_commit(self.window, snapshot, &resolved) {
-            Ok(effects) => {
-                // Every accepted commit is a new sequence number for the
-                // guest, even when the snapshot was a no-op for the host; the
-                // tree revision is the host's answer to "did anything
-                // actually change".
-                self.commit_sequence += 1;
-                self.stats.applied_commits += 1;
-
-                // 9. Reply last. The guest resumes knowing the interface it
-                //    described is the one the host is now showing.
-                screened.accept(self.commit_sequence);
-                effects
-            }
-            Err(UiCommitRefusal::Attachment(refusal)) => {
-                self.stats.attachment_refusals += 1;
-                screened.reject(CommitRejection::Attachment(refusal));
-                Vec::new()
-            }
-            Err(UiCommitRefusal::Tree(error)) => {
+        // 4. Diff against the retained tree, 5. apply atomically, 6. lay out,
+        //    7. lower, 8. ask for a frame. All of it lives inside `apply_tree`,
+        //    in that order.
+        //
+        //    The diff can refuse — a key that named one kind of node and now
+        //    names another. That is a semantic rejection like any other and
+        //    lands here rather than inside the apply, because it happens
+        //    before a single byte of state is touched.
+        let effects = match self.host.apply_tree(self.window, tree) {
+            Ok(effects) => effects,
+            Err(error) => {
                 self.stats.rejected_commits += 1;
-                // Nothing was mutated, so the previous interface still stands.
                 screened.reject(CommitRejection::Invalid(error.to_string()));
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+
+        // Every accepted commit is a new sequence number for the guest, even
+        // when the snapshot was a no-op for the host; the tree revision is the
+        // host's answer to "did anything actually change".
+        self.commit_sequence += 1;
+        self.stats.applied_commits += 1;
+
+        // 9. Reply last. The guest resumes knowing the interface it described
+        //    is the one the host is now showing.
+        screened.accept(self.commit_sequence);
+        effects
     }
 
     /// Stops the guest and joins its thread.
@@ -1178,11 +1124,9 @@ mod tests {
     use crate::HostWindow;
     use instar_kernel::bridge::commit_request;
     use instar_kernel::runtime::SharedKernel;
-    use instar_kernel::text_bridge::{OpaqueResourceKey, TextAnswer, TextOperation, text_request};
-    use instar_text::TextViewId;
     use instar_ui::protocol::{BatchEncoder, WireAlign, WireLayout, flags, opcode};
     use instar_ui::{NodeKey, NodeKind};
-    use instar_window::{Key, LogicalSize, PhysicalSize, RawKeyEvent, WindowMetricsChanged};
+    use instar_window::{LogicalSize, PhysicalSize, WindowMetricsChanged};
 
     const WINDOW: WindowId = WindowId::from_raw(1);
     const GEN: GenerationId = GenerationId(1);
@@ -1271,8 +1215,8 @@ mod tests {
             events: events_rx,
             terminal: Arc::default(),
             wake,
-            commit_sequence: 0,
             guest_message_count: 0,
+            commit_sequence: 0,
             stats: BridgeStats::default(),
         };
         (bridge, events_tx, wake_count)
@@ -1281,61 +1225,8 @@ mod tests {
     fn queued_commit(batch: Vec<u8>) -> HostUserEvent {
         HostUserEvent::UiCommit {
             generation: GEN,
-            request: commit_request(GEN, batch, Vec::new()).0,
+            request: commit_request(GEN, batch).0,
         }
-    }
-
-    /// Opens one buffer and one view for `GEN`, registering both leases.
-    fn create_view(bridge: &mut HostBridge) -> OpaqueResourceKey {
-        let mut serve = |operation: TextOperation| {
-            let (request, wait) = text_request(GEN, operation);
-            let screened = request.screen(GEN).expect("current generation");
-            bridge.host.text_resources_mut().serve(screened);
-            wait.blocking_recv().expect("answered")
-        };
-
-        let buffer = match serve(TextOperation::CreateBuffer) {
-            Ok(TextAnswer::Created(key)) => key,
-            other => panic!("expected a buffer, got {other:?}"),
-        };
-        match serve(TextOperation::CreateView { buffer }) {
-            Ok(TextAnswer::Created(key)) => key,
-            other => panic!("expected a view, got {other:?}"),
-        }
-    }
-
-    /// A root whose text-view children name the given slots.
-    fn attachment_batch(nodes: &[(u32, u16)]) -> Vec<u8> {
-        let mut encoder = BatchEncoder::new();
-        encoder.node(
-            opcode::NODE_ROOT,
-            NodeKey::first(0),
-            0,
-            None,
-            WireLayout::default(),
-            nodes.len() as u16,
-        );
-        for (id, slot) in nodes {
-            encoder.text_view(
-                NodeKey::first(*id),
-                flags::ENABLED,
-                *slot,
-                WireLayout::default(),
-            );
-        }
-        encoder.finish()
-    }
-
-    /// Delivers one commit through the main-thread half and returns the
-    /// verdict the guest would have seen.
-    fn deliver_commit(
-        bridge: &mut HostBridge,
-        batch: Vec<u8>,
-        keys: Vec<OpaqueResourceKey>,
-    ) -> Result<u64, CommitRejection> {
-        let (request, wait) = commit_request(GEN, batch, keys);
-        bridge.on_ui_commit(request);
-        wait.blocking_recv().expect("commit answered")
     }
 
     #[test]
@@ -1448,358 +1339,5 @@ mod tests {
             bridge.pump().is_empty(),
             "the terminal outcome is consumed exactly once"
         );
-    }
-
-    // --- Text-view attachments (B2e-3b) ---
-
-    /// `[V7, V7]` in the side table is legal: a single text view may be
-    /// attached in several places, and an entry nobody references is just an
-    /// unreferenced scratch slot.
-    #[test]
-    fn duplicate_side_table_entries_are_accepted_when_one_node_names_the_view() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 0)]);
-
-        assert!(deliver_commit(&mut bridge, batch, vec![v7, v7]).is_ok());
-        assert_eq!(bridge.stats().attachment_refusals, 0);
-    }
-
-    /// Unreferenced side-table entries are legal too: the table is a guest
-    /// scratch list, not a projection of the tree.
-    #[test]
-    fn unreferenced_side_table_entries_are_accepted() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let v8 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 0)]);
-
-        assert!(deliver_commit(&mut bridge, batch, vec![v7, v8]).is_ok());
-        assert_eq!(
-            bridge
-                .host()
-                .window(WINDOW)
-                .unwrap()
-                .text_attachments()
-                .len(),
-            1,
-            "slot 1 names V8 but no node references it, so nothing is retained"
-        );
-    }
-
-    /// The illegal state is two live NodeKeys reaching one TextViewId, not a
-    /// duplicated table entry.
-    #[test]
-    fn two_live_nodes_naming_one_view_are_refused() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 0), (20, 0)]);
-
-        assert_eq!(
-            deliver_commit(&mut bridge, batch, vec![v7, v7]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::TextViewAlreadyAttached
-            ))
-        );
-        assert_eq!(bridge.stats().attachment_refusals, 1);
-        assert_eq!(bridge.stats().rejected_commits, 0);
-    }
-
-    #[test]
-    fn a_slot_at_the_table_length_is_refused_out_of_range() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 1)]);
-
-        assert_eq!(
-            deliver_commit(&mut bridge, batch, vec![v7]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::AttachmentOutOfRange
-            ))
-        );
-        assert_eq!(bridge.stats().attachment_refusals, 1);
-    }
-
-    #[test]
-    fn slot_u16_max_is_refused_out_of_range_against_a_short_table() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, u16::MAX)]);
-
-        assert_eq!(
-            deliver_commit(&mut bridge, batch, vec![v7]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::AttachmentOutOfRange
-            ))
-        );
-    }
-
-    /// Resolution precedes decoding, so a batch that is ALSO malformed gets
-    /// the attachment verdict and nothing else. The fault being caught here is
-    /// decoding before resolving: a key this generation does not own must not
-    /// buy parser work, even when the parser would have refused anyway.
-    #[test]
-    fn an_unowned_key_is_refused_before_a_malformed_batch_is_decoded() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let key = OpaqueResourceKey {
-            slot: 1,
-            incarnation: 0,
-        };
-
-        assert_eq!(
-            deliver_commit(&mut bridge, b"not a batch".to_vec(), vec![key]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::UnavailableTextView
-            ))
-        );
-        assert_eq!(bridge.stats().attachment_refusals, 1);
-        assert_eq!(
-            bridge.stats().rejected_commits,
-            0,
-            "decode never ran, so the batch's malformation is never observed"
-        );
-    }
-
-    /// Switching which view a node shows, with the tree byte-identical.
-    ///
-    /// The tree diff is empty and the attachment diff is not, which is the one
-    /// shape the old no-op gate could not see: it returned early on an empty
-    /// *tree* diff, so the new view was never promoted while the guest was
-    /// told its commit had been accepted. An editor pane switching documents
-    /// is exactly this commit.
-    #[test]
-    fn an_attachment_only_change_is_promoted() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let v12 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 0)]);
-
-        assert!(deliver_commit(&mut bridge, batch.clone(), vec![v7]).is_ok());
-        assert!(
-            deliver_commit(&mut bridge, batch, vec![v12]).is_ok(),
-            "the same bytes, a different capability -- still an accepted commit"
-        );
-
-        let v12_id = bridge
-            .host
-            .resolve_attachment_table(GEN, &[v12])
-            .expect("leased")[0];
-        assert_eq!(
-            bridge
-                .host
-                .window(WINDOW)
-                .unwrap()
-                .text_attachments()
-                .get(&NodeKey::first(10)),
-            Some(&v12_id),
-            "the node must now name V12; an accepted commit that changed \
-             nothing is a commit the host lied about"
-        );
-    }
-
-    /// A **live** view another generation owns is refused at the attachment
-    /// seam.
-    ///
-    /// The distinction `docs/PHASE-3.md` draws as "the registry is
-    /// authoritative, not the id", carried to the commit path. The sibling
-    /// test above names a resource that never existed, so the identity check
-    /// alone refuses it — which proves resolution happens before decoding, and
-    /// proves nothing at all about *authority*. Here the `TextViewId` is
-    /// genuinely live, and the only thing wrong is who is asking.
-    ///
-    /// This is the test the phase rule demands: deleting the ownership check
-    /// in `TextHost::resolve_view_lease` must break a commit, not only a
-    /// `text_host` unit test.
-    #[test]
-    fn a_live_view_another_generation_owns_is_refused() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-
-        // Created for a generation that is not the one committing. Served
-        // directly, because the whole point is that no route exists for the
-        // committing generation to have acquired it.
-        let stranger = GenerationId(GEN.0 + 1);
-        let mut serve = |operation: TextOperation| {
-            let (request, wait) = text_request(stranger, operation);
-            let screened = request.screen(stranger).expect("current for the stranger");
-            bridge.host.text_resources_mut().serve(screened);
-            wait.blocking_recv().expect("answered")
-        };
-        let buffer = match serve(TextOperation::CreateBuffer) {
-            Ok(TextAnswer::Created(key)) => key,
-            other => panic!("expected a buffer, got {other:?}"),
-        };
-        let key = match serve(TextOperation::CreateView { buffer }) {
-            Ok(TextAnswer::Created(key)) => key,
-            other => panic!("expected a view, got {other:?}"),
-        };
-
-        // Live, and not this generation's to name.
-        assert!(
-            bridge
-                .host
-                .text_resources()
-                .resolve_view_lease(stranger, key)
-                .is_ok(),
-            "the view really is live -- otherwise identity would refuse it and \
-             this test would prove nothing about authority"
-        );
-
-        let batch = attachment_batch(&[(10, 0)]);
-        assert_eq!(
-            deliver_commit(&mut bridge, batch, vec![key]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::UnavailableTextView
-            )),
-            "a live id answers which resource, never whose"
-        );
-        assert!(
-            bridge
-                .host
-                .window(WINDOW)
-                .is_none_or(|window| window.text_attachments().is_empty()),
-            "and nothing was attached"
-        );
-    }
-
-    /// The happy path all the gates exist for: a `TextView` node whose slot
-    /// resolves ends up in the window's retained attachment map, keyed by the
-    /// node, with the resolved `TextViewId`.
-    #[test]
-    fn a_resolved_text_view_reaches_the_window_attachment_map() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        let v7 = create_view(&mut bridge);
-        let batch = attachment_batch(&[(10, 0)]);
-
-        assert!(deliver_commit(&mut bridge, batch, vec![v7]).is_ok());
-        let view = bridge
-            .host()
-            .window(WINDOW)
-            .unwrap()
-            .text_attachments()
-            .get(&NodeKey::first(10))
-            .copied()
-            .expect("the text view node is attached");
-        assert_eq!(
-            view,
-            TextViewId {
-                id: 0,
-                generation: 0
-            }
-        );
-    }
-
-    /// The atomicity invariant of the whole commit package: every operation
-    /// capable of refusing runs before the first mutation, so a refused
-    /// commit leaves ALL retained and transient state exactly as it was —
-    /// not just the tree.
-    ///
-    /// The refusal is deliberately an attachment-class one
-    /// (`TextViewAlreadyAttached`). A test that only checked the retained
-    /// tree would pass even if the attachment map or focus were touched
-    /// first; this test asserts tree, attachment map, and focus together,
-    /// because the failure it exists to prevent is a partial promotion that
-    /// leaves the tree looking fine while something else already moved.
-    #[test]
-    fn a_refused_commit_never_mutates_tree_attachments_or_focus() {
-        let (mut bridge, _tx, _wake) = test_bridge();
-        bridge.on_window_event(WindowOutput::MetricsChanged(metrics()));
-        let v7 = create_view(&mut bridge);
-
-        // A good commit: one text view plus a button the test can focus.
-        let mut encoder = BatchEncoder::new();
-        encoder
-            .node(
-                opcode::NODE_ROOT,
-                NodeKey::first(0),
-                0,
-                None,
-                WireLayout::default(),
-                1,
-            )
-            .node(
-                opcode::NODE_COLUMN,
-                NodeKey::first(1),
-                0,
-                None,
-                WireLayout::default(),
-                2,
-            )
-            .text_view(NodeKey::first(50), flags::ENABLED, 0, WireLayout::default())
-            .node(
-                opcode::NODE_BUTTON,
-                NodeKey::first(51),
-                flags::ENABLED,
-                Some("Focused"),
-                WireLayout::default(),
-                0,
-            );
-        assert!(deliver_commit(&mut bridge, encoder.finish(), vec![v7]).is_ok());
-
-        // Focus the button through the host-local keyboard path, so the focus
-        // assertion is about transient state and not about the refused commit.
-        bridge.on_window_event(WindowOutput::Key(RawKeyEvent {
-            window_id: WINDOW,
-            key: Key::Tab,
-            pressed: true,
-            shift: false,
-            repeat: false,
-        }));
-        let window = bridge.host().window(WINDOW).unwrap();
-        assert_eq!(window.focus().focused(), Some(NodeKey::first(51)));
-
-        let tree_before = window.tree().cloned();
-        let attachments_before = window.text_attachments().clone();
-        let focus_before = *window.focus();
-
-        // Two live NodeKeys resolving to one TextViewId: an attachment-class
-        // refusal, after which the map and focus must be exactly what they
-        // were, not merely the tree.
-        let mut refused = BatchEncoder::new();
-        refused
-            .node(
-                opcode::NODE_ROOT,
-                NodeKey::first(0),
-                0,
-                None,
-                WireLayout::default(),
-                1,
-            )
-            .node(
-                opcode::NODE_COLUMN,
-                NodeKey::first(1),
-                0,
-                None,
-                WireLayout::default(),
-                2,
-            )
-            .text_view(NodeKey::first(60), flags::ENABLED, 0, WireLayout::default())
-            .text_view(NodeKey::first(61), flags::ENABLED, 0, WireLayout::default());
-        assert_eq!(
-            deliver_commit(&mut bridge, refused.finish(), vec![v7]),
-            Err(CommitRejection::Attachment(
-                AttachmentRefusal::TextViewAlreadyAttached
-            ))
-        );
-
-        let window = bridge.host().window(WINDOW).unwrap();
-        assert_eq!(
-            window.tree().cloned(),
-            tree_before,
-            "a refused commit must leave the retained tree exactly as it was"
-        );
-        assert_eq!(
-            window.text_attachments(),
-            &attachments_before,
-            "and the retained attachment map with it -- checking only the tree \
-             would miss a map that was mutated before the refusal"
-        );
-        assert_eq!(
-            *window.focus(),
-            focus_before,
-            "and transient state with it: every operation capable of refusing \
-             runs before the first mutation"
-        );
-        assert_eq!(bridge.stats().attachment_refusals, 1);
-        assert_eq!(bridge.stats().rejected_commits, 0);
     }
 }
