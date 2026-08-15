@@ -77,24 +77,30 @@ subtask.
 
 | Crate | What it is |
 |---|---|
-| `instar-ui-protocol` | The wire format. Zero dependencies. |
-| `instar-sdk` | A thin guest-side snapshot builder and event router. Depends on the protocol and nothing else. Optional — the wire stays hand-encodable. |
+| `instar-ui-protocol` | Semantic UI snapshots and neutral Surface input. Zero dependencies. |
+| `instar-surface-protocol` | Independent bounded Surface scene wire. Zero dependencies. |
+| `instar-editor-core` | Optional guest-side document and editing primitives. Replaceable policy, not a host contract. |
+| `instar-sdk` | Optional guest-side snapshot builder and event router. Depends only on `instar-ui-protocol`; the wire stays hand-encodable. |
 | `instar-kernel` | Wasmtime Component Model async runtime: engine config, guest lifecycle, event delivery. No rendering, windowing, or UI dependency of any kind. |
 | `instar-ui` | The retained tree, Taffy layout, hit-testing. Never sees DPI. |
+| `instar-text-layout` | Host-owned immutable text shaping and layout seam. |
 | `instar-window` | winit translation and DPI conversion. Never sees a `NodeKey`. |
 | `instar-paint` | Paint intent: scene and command types. |
 | `instar-render-vello-cpu` | CPU rendering backend. |
 | `instar-host` | Orchestration: routing, the metrics barrier, the two-thread bridge, scene lowering. |
 | `instar-shell` | The event loop, presentation, the font, the binary. |
 | `instar-guest-build` | Build-script support for compiling guests. |
+| `recovery-harness` | Generic checkpoint and recovery test support. |
 
 `guests/` holds every WebAssembly component, each built from source rather than
 committed as an artifact. See [guests/README.md](guests/README.md).
 
 How Instar works and why each boundary is where it is:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The wire format:
-[docs/PROTOCOL-0.md](docs/PROTOCOL-0.md). What it costs, and what CI does and
-does not enforce: [docs/baselines/PERFORMANCE.md](docs/baselines/PERFORMANCE.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The current protocols:
+[docs/PROTOCOL.md](docs/PROTOCOL.md). The Phase 1 wire record is archived at
+[docs/history/PROTOCOL-0.md](docs/history/PROTOCOL-0.md). What it costs, and
+what CI does and does not enforce:
+[docs/baselines/PERFORMANCE.md](docs/baselines/PERFORMANCE.md).
 
 `docs/PHASE-1.md` and `docs/PHASE-2.md` are the record of *how* the decisions
 were reached, including the ones that turned out wrong. They are logs, not

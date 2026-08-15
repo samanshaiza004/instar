@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use instar_host::HostEffect;
 use instar_shell::{Presenter, test_harness::launch_component};
 use instar_ui::NodeKey;
 use instar_window::{LogicalSize, WindowId, WindowMetricsChanged, WindowOutput};
@@ -54,6 +55,38 @@ fn wait_for_revision(
     }
     panic!(
         "Scratchpad did not replace its Surface scene after revision {previous}: {:?}",
+        harness.surface_revision(SURFACE)
+    );
+}
+
+fn wait_for_candidate_area(
+    harness: &mut instar_shell::test_harness::RuntimeHarness,
+    previous_revision: u64,
+    expected_source_len: usize,
+) -> (i32, i32) {
+    for _ in 0..150 {
+        let effects = harness.wait(Duration::from_millis(20));
+        let scene_ready = harness
+            .surface_layout_source_lengths(SURFACE)
+            .is_some_and(|lengths| lengths == [expected_source_len]);
+        if scene_ready
+            && harness
+                .surface_revision(SURFACE)
+                .is_some_and(|revision| revision > previous_revision)
+        {
+            if let Some((x, y)) = effects.into_iter().rev().find_map(|effect| match effect {
+                HostEffect::ConfigureIme {
+                    cursor_area: Some(area),
+                    ..
+                } => Some((area.x, area.y)),
+                _ => None,
+            }) {
+                return (x, y);
+            }
+        }
+    }
+    panic!(
+        "Scratchpad did not publish candidate geometry after revision {previous_revision}: {:?}",
         harness.surface_revision(SURFACE)
     );
 }
@@ -194,6 +227,39 @@ fn empty_preedit_is_delivered_before_commit_without_losing_target() {
     assert!(
         harness.surface_revision(SURFACE).unwrap_or(0) >= 2,
         "preedit/commit should replace the scene: {effects:?}"
+    );
+}
+
+#[test]
+fn preedit_cursor_moves_native_candidate_area() {
+    let component = std::fs::read(env!("SCRATCHPAD_WASM")).expect("Scratchpad component");
+    let mut harness = launch_component(component, metrics());
+    let opening_revision = wait_for_scene(&mut harness);
+    let (x, y) = harness.screen_point_of(SURFACE);
+    harness.click_at(x, y);
+    let focused_revision = wait_for_revision(&mut harness, opening_revision);
+    harness.wait(Duration::from_millis(20));
+
+    let _ = harness.send_output(WindowOutput::ImePreedit {
+        window_id: WINDOW,
+        text: "abcdef".to_owned(),
+        cursor_range: Some((0, 0)),
+    });
+    let first_area = wait_for_candidate_area(&mut harness, focused_revision, 6);
+
+    harness.wait(Duration::from_millis(20));
+    let second_previous = harness
+        .surface_revision(SURFACE)
+        .unwrap_or(focused_revision);
+    let _ = harness.send_output(WindowOutput::ImePreedit {
+        window_id: WINDOW,
+        text: "abcdefghij".to_owned(),
+        cursor_range: Some((0, 10)),
+    });
+    let second_area = wait_for_candidate_area(&mut harness, second_previous, 10);
+    assert!(
+        second_area.0 > first_area.0,
+        "candidate x should follow the preedit cursor: start={first_area:?}, end={second_area:?}"
     );
 }
 

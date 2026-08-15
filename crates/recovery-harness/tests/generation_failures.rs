@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use recovery_harness::{Host, InputEvent, RecoveryPolicy, recover};
+use recovery_harness::{FakeGuest, InputEvent, RecoveryPolicy};
 
 /// A fresh directory per test/policy combination, cleaned up on drop.
 /// Hand-rolled rather than a `tempfile` dependency, matching the rest of
@@ -86,24 +86,20 @@ fn guest_trap_timing_does_not_affect_what_recovery_reconstructs() {
     for &(name, policy) in ALL_POLICIES {
         for guest_consumed in [false, true] {
             let dir = TestDir::new(&format!("trap-{name}-{guest_consumed}"));
-            let mut host = Host::open(dir.path(), policy).expect("open host");
+            let mut guest = FakeGuest::open(dir.path(), policy).expect("open guest");
 
-            let outcome = host.apply_edit("hello").expect("apply_edit");
+            let outcome = guest.apply_edit("hello").expect("apply_edit");
             if guest_consumed {
                 // "Guest traps immediately AFTER processing": the guest
                 // incorporated the edit into its own state before dying.
-                host.mark_guest_consumed(outcome.sequence);
+                guest.mark_guest_consumed(outcome.sequence);
             }
             // else: "guest traps immediately BEFORE processing" -- the edit
             // reached the host, and the guest never saw it at all.
-            let presented = host.last_presented_sequence();
-            drop(host); // stands in for the guest generation being gone
+            let presented = guest.last_presented_sequence();
+            drop(guest); // stands in for the guest generation being gone
 
-            let recovered = recover(
-                &Host::journal_path_for(dir.path()),
-                &Host::checkpoint_path_for(dir.path()),
-            )
-            .expect("recover");
+            let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document");
 
             if policy_keeps_any_record(policy) {
                 assert_eq!(
@@ -124,25 +120,17 @@ fn guest_trap_timing_does_not_affect_what_recovery_reconstructs() {
     // guest_consumed, produce byte-identical recovered content.
     for &(name, policy) in ALL_POLICIES {
         let dir_before = TestDir::new(&format!("trap-cmp-before-{name}"));
-        let mut host = Host::open(dir_before.path(), policy).expect("open host");
-        host.apply_edit("hello").expect("apply_edit");
-        drop(host);
-        let before = recover(
-            &Host::journal_path_for(dir_before.path()),
-            &Host::checkpoint_path_for(dir_before.path()),
-        )
-        .expect("recover");
+        let mut guest = FakeGuest::open(dir_before.path(), policy).expect("open guest");
+        guest.apply_edit("hello").expect("apply_edit");
+        drop(guest);
+        let before = FakeGuest::recover_document(dir_before.path()).expect("recover_document");
 
         let dir_after = TestDir::new(&format!("trap-cmp-after-{name}"));
-        let mut host = Host::open(dir_after.path(), policy).expect("open host");
-        let outcome = host.apply_edit("hello").expect("apply_edit");
-        host.mark_guest_consumed(outcome.sequence);
-        drop(host);
-        let after = recover(
-            &Host::journal_path_for(dir_after.path()),
-            &Host::checkpoint_path_for(dir_after.path()),
-        )
-        .expect("recover");
+        let mut guest = FakeGuest::open(dir_after.path(), policy).expect("open guest");
+        let outcome = guest.apply_edit("hello").expect("apply_edit");
+        guest.mark_guest_consumed(outcome.sequence);
+        drop(guest);
+        let after = FakeGuest::recover_document(dir_after.path()).expect("recover_document");
 
         assert_eq!(
             before, after,
@@ -154,25 +142,37 @@ fn guest_trap_timing_does_not_affect_what_recovery_reconstructs() {
 
 /// Scenario 3: a generation is replaced after an edit lands but before the
 /// next UI frame -- the replacement generation must see exactly what the
-/// old one committed, no more and no less, and the on-disk state must not
-/// grow without bound across the handoff.
+/// old one committed, no more and no less, and generation replacement
+/// itself must not mutate any on-disk recovery state.
+///
+/// An earlier version of this test asserted that the journal was pruned to
+/// zero bytes immediately after handoff. That assertion encoded the old
+/// architecture's behavior -- cleanup-before-handoff -- which the
+/// architectural critique identified as the exact hazard of retiring
+/// recovery data on a generation boundary rather than only on a durable
+/// checkpoint. The corrected claim is the opposite: replacing a generation
+/// must leave the journal and checkpoint *exactly* as they were.
 #[test]
 fn generation_replaced_after_edit_hands_off_exactly_what_was_committed() {
     for &(name, policy) in ALL_POLICIES {
         let dir = TestDir::new(&format!("handoff-{name}"));
-        let mut host = Host::open(dir.path(), policy).expect("open host");
+        let mut guest = FakeGuest::open(dir.path(), policy).expect("open guest");
 
-        host.apply_edit("hello ").expect("apply_edit");
-        host.apply_edit("world").expect("apply_edit");
-        let presented_before = host.last_presented_sequence();
-        let generation_before = host.generation();
+        guest.apply_edit("hello ").expect("apply_edit");
+        guest.apply_edit("world").expect("apply_edit");
+        let presented_before = guest.last_presented_sequence();
+        let generation_before = guest.generation();
+        let journal_bytes_before = guest.journal_size_bytes().expect("journal_size_bytes");
+        let checkpoint_before =
+            recovery_harness::checkpoint::read_checkpoint_file(&guest.checkpoint_path())
+                .expect("read checkpoint");
 
-        let handoff = host
+        let handoff = guest
             .replace_generation_with_handoff()
             .expect("replace_generation_with_handoff");
 
         assert_ne!(
-            host.generation(),
+            guest.generation(),
             generation_before,
             "policy {name}: replacement must actually advance the generation id"
         );
@@ -185,16 +185,36 @@ fn generation_replaced_after_edit_hands_off_exactly_what_was_committed() {
             );
             assert_eq!(handoff.last_recovered_sequence, presented_before);
         }
-        // Recovery data bounded: after a handoff, the journal must not
-        // still be carrying edits the checkpoint already captured for the
-        // *previous* generation forever -- it must have been pruned as
-        // part of cleanup, not accumulate across every future generation.
-        let journal_len = host.journal_size_bytes().expect("journal_size_bytes");
+
+        // Generation replacement must not itself retire any recovery data --
+        // only a successful checkpoint may prune the journal. This is the
+        // regression test for the mutant this file used to call "recovery
+        // cleanup runs before replacement guest has consumed it": under the
+        // current architecture that mutant can no longer be expressed as an
+        // ordering bug, because there is no cleanup step in
+        // `replace_generation_with_handoff` at all -- but if one is ever
+        // reintroduced, these two assertions catch it.
+        let journal_bytes_after = guest.journal_size_bytes().expect("journal_size_bytes");
         assert_eq!(
-            journal_len, 0,
-            "policy {name}: recovery data must be bounded across a handoff -- the \
-             journal must be pruned once its contents are captured, not carried \
-             forward forever"
+            journal_bytes_after, journal_bytes_before,
+            "policy {name}: replacing a generation must not itself mutate the journal"
+        );
+        let checkpoint_after =
+            recovery_harness::checkpoint::read_checkpoint_file(&guest.checkpoint_path())
+                .expect("read checkpoint");
+        assert_eq!(
+            checkpoint_after, checkpoint_before,
+            "policy {name}: replacing a generation must not itself mutate the checkpoint"
+        );
+
+        // A fresh, independent read must agree exactly with what the
+        // handoff returned -- proving the read was genuinely
+        // non-destructive, not a one-time-only view of state that a second
+        // look would find different.
+        let fresh = FakeGuest::recover_document(dir.path()).expect("recover_document");
+        assert_eq!(
+            fresh, handoff,
+            "policy {name}: a fresh read after handoff must match the handoff exactly"
         );
     }
 }
@@ -216,21 +236,21 @@ fn input_overflow_terminates_the_generation_and_respects_the_overflow_policy() {
             let mut policy = policy;
             policy.overflow_action = overflow_action;
             let dir = TestDir::new(&format!("overflow-{name}-{overflow_action:?}"));
-            let mut host = Host::open(dir.path(), policy).expect("open host");
+            let mut guest = FakeGuest::open(dir.path(), policy).expect("open guest");
 
-            host.apply_edit("hello").expect("apply_edit");
-            host.checkpoint().expect("checkpoint");
+            guest.apply_edit("hello").expect("apply_edit");
+            guest.checkpoint().expect("checkpoint");
             assert!(
-                recovery_harness::checkpoint::read_checkpoint_file(&host.checkpoint_path())
+                recovery_harness::checkpoint::read_checkpoint_file(&guest.checkpoint_path())
                     .expect("read checkpoint")
                     .is_some(),
                 "policy {name}: fixture must start with a real checkpoint on disk"
             );
 
-            let generation_before = host.generation();
+            let generation_before = guest.generation();
             let mut overflowed = false;
             for i in 0..policy.input_queue_capacity + 1 {
-                if host.push_input(InputEvent(format!("e{i}"))).is_err() {
+                if guest.push_input(InputEvent(format!("e{i}"))).is_err() {
                     overflowed = true;
                 }
             }
@@ -239,7 +259,7 @@ fn input_overflow_terminates_the_generation_and_respects_the_overflow_policy() {
                 "policy {name}: the queue must actually overflow"
             );
             assert_ne!(
-                host.generation(),
+                guest.generation(),
                 generation_before,
                 "policy {name}: InputOverflow must terminate the generation \
                  (docs/PHASE-3.md's own policy for a queue that cannot take an \
@@ -247,7 +267,7 @@ fn input_overflow_terminates_the_generation_and_respects_the_overflow_policy() {
             );
 
             let checkpoint_survived =
-                recovery_harness::checkpoint::read_checkpoint_file(&host.checkpoint_path())
+                recovery_harness::checkpoint::read_checkpoint_file(&guest.checkpoint_path())
                     .expect("read checkpoint")
                     .is_some();
             match overflow_action {
@@ -278,8 +298,8 @@ fn a_panicking_runtime_thread_does_not_take_the_process_or_the_recovery_log_with
         let policy_owned = policy;
 
         let handle = std::thread::spawn(move || {
-            let mut host = Host::open(&dir_path, policy_owned).expect("open host");
-            host.apply_edit("hello").expect("apply_edit");
+            let mut guest = FakeGuest::open(&dir_path, policy_owned).expect("open guest");
+            guest.apply_edit("hello").expect("apply_edit");
             panic!("the runtime thread disappearing, on purpose");
         });
 
@@ -294,11 +314,8 @@ fn a_panicking_runtime_thread_does_not_take_the_process_or_the_recovery_log_with
         // first half of the claim: a runtime-thread failure is not a
         // process failure. The second half: whatever that thread made
         // durable before it died must still be there.
-        let recovered = recover(
-            &Host::journal_path_for(dir.path()),
-            &Host::checkpoint_path_for(dir.path()),
-        )
-        .expect("recover -- the main thread and the filesystem are both still here");
+        let recovered = FakeGuest::recover_document(dir.path())
+            .expect("recover_document -- the main thread and the filesystem are both still here");
 
         if policy_keeps_any_record(policy) {
             assert_eq!(

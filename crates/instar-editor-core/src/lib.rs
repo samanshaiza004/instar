@@ -336,15 +336,27 @@ impl Document {
         if byte == 0 {
             return Ok(0);
         }
-        let mut at = 0;
-        for grapheme in self.rope.byte_slice(0..byte).graphemes() {
-            let next = at + grapheme.len();
-            if next >= byte {
-                return Ok(at);
-            }
-            at = next;
-        }
-        Ok(at)
+        // Reverse, near-caret traversal, not a forward scan from byte 0.
+        // `byte_slice` is a B-tree metric slice (`Rope::byte_slice` ->
+        // `self.tree.slice(ByteMetric(start)..ByteMetric(end))`), O(log n)
+        // regardless of `byte`; `Graphemes` implements `DoubleEndedIterator`
+        // with its own backward cursor/chunk state independent of the
+        // forward one, so `next_back()` walks backward from `byte` and finds
+        // exactly the one preceding grapheme in O(log n) -- tree descent to
+        // the rightmost leaf under `byte`, then O(1) amortized per chunk --
+        // instead of re-walking every grapheme from the document's start on
+        // every call. That forward-scan version made Backspace O(caret
+        // position): pathological on a large document, and specifically
+        // what `benchmarks/text-latency`'s `backspace_at_end_*mib` workloads
+        // exist to catch a regression of.
+        let width = self
+            .rope
+            .byte_slice(0..byte)
+            .graphemes()
+            .next_back()
+            .expect("byte > 0 and byte is a grapheme boundary, so a grapheme precedes it")
+            .len();
+        Ok(byte - width)
     }
     pub fn apply(&mut self, edit: TextEdit) -> Result<Revision, EditError> {
         self.apply_transaction(vec![edit])
@@ -669,5 +681,45 @@ mod tests {
         let d = Document::from_text("a\r\nb");
         assert_eq!(d.next_grapheme_boundary(1).unwrap(), 3);
         assert_eq!(d.previous_grapheme_boundary(3).unwrap(), 1);
+    }
+
+    /// `previous_grapheme_boundary` was rewritten from a forward scan (walk
+    /// every grapheme from byte 0, stop once past `byte`) to a reverse,
+    /// near-caret traversal (`Graphemes::next_back()`). Those are genuinely
+    /// different code paths through the same underlying grapheme-boundary
+    /// algorithm, so this checks they agree at every boundary in a buffer
+    /// that mixes plain ASCII, a CRLF pair, and a base character with a
+    /// combining mark -- not just the single-boundary cases the other tests
+    /// above already cover.
+    ///
+    /// The independent reference is `next_grapheme_boundary`, walked
+    /// forward from 0 to collect every boundary: untouched by this fix, and
+    /// a structurally different code path (forward slice + `.next()`), so
+    /// this is a genuine cross-check and not the fix validating itself.
+    #[test]
+    fn previous_grapheme_boundary_matches_forward_iteration_at_every_position() {
+        let text = "abc\r\ndef\u{0301}ghi";
+        let d = Document::from_text(text);
+
+        let mut boundaries = vec![0usize];
+        let mut at = 0usize;
+        while at < text.len() {
+            at = d.next_grapheme_boundary(at).unwrap();
+            boundaries.push(at);
+        }
+        assert!(
+            boundaries.len() > 3,
+            "the fixture text should contain more than a couple of graphemes"
+        );
+
+        for window in boundaries.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            assert_eq!(
+                d.previous_grapheme_boundary(end).unwrap(),
+                start,
+                "previous_grapheme_boundary({end}) should land on {start}, the \
+                 boundary forward iteration from 0 already agrees is correct"
+            );
+        }
     }
 }

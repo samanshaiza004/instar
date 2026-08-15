@@ -5,6 +5,16 @@ transports native input, validates bounded presentation requests, owns retained
 geometry and rendering, and never keeps a recoverable document, selection,
 undo stack, or composition projection.
 
+## Status
+
+| Area | Status |
+|---|---|
+| Architecture decision | **Frozen.** Application text, selection, undo, and composition policy remain guest-owned. |
+| Component seam | **Implemented.** Scratchpad exercises the real WIT, Surface input, TextLayout, scene, retained-tree, and pixel path. |
+| Latency closure | **Pending a valid rerun.** The initial 1 MiB reference benchmark is a provisional failure at 13.1 ms p95; the 5 ms target remains unchanged. |
+| Native IME smoke | **Pending.** Logical candidate geometry is covered; native platform candidate-window behavior still needs a manual smoke check. |
+| Containment findings | **Open.** The latency/containment investigation and follow-up byte-size × line-count × caret-position matrix remain active. See [`DOS-STARVATION-AUDIT.md`](DOS-STARVATION-AUDIT.md). |
+
 ## Contract
 
 ```text
@@ -56,7 +66,7 @@ synchronization state.
 carets in `instar-editor-core`, projects arbitrary multi-line preedit
 transiently, preserves the empty-preedit-before-commit target, and applies a
 two-caret commit (`abc` with carets at 1 and 3 plus `X` becomes `aXbcX`). The
-The component adapter now commits a real Surface tree, requests bounded
+component adapter now commits a real Surface tree, requests bounded
 immutable TextLayouts for visible hard rows plus two-row overscan, submits an
 independent scene, routes pointer focus and native IME commits, and derives
 candidate geometry from the same layout used for caret paint. The joined
@@ -95,3 +105,73 @@ The remaining native-platform candidate-window smoke check is an environment-
 dependent manual check; the automated joined seam covers logical candidate
 geometry, multi-row preedit projection, empty-preedit-before-commit ordering,
 and guest-owned pixel changes without host document state.
+
+## Latency gate: provisional FAIL (13.1 ms p95)
+
+The userland-authority pivot adopts a new, stricter Phase 3 typing target:
+**p95 native-input → rasterized-pixels ≤ 5 ms**, measured end-to-end through
+the real `guests/scratchpad` component (`benchmarks/text-latency`). The initial
+reference run, preserved at
+`benchmarks/text-latency/results/initial-fail-macos-arm64-2026-08-14`:
+**FAIL**, worst graded p95 **13.1 ms**, from a keystroke measured against a
+1 MiB preloaded document.
+
+This is the provisional result currently blocking latency closure. A valid
+rerun is still required before the gate is treated as closed; the 5 ms target
+is not being relaxed.
+
+This narrows the problem rather than reopening it. Ordinary interactive
+editing — typing, IME commit, pointer, drag, scroll, a bounded-max text
+commit, all against a small/empty document — is comfortably inside budget
+(p95 well under 1.2 ms across every such workload). The failure is
+specific to editing *inside a large preloaded document*, and its shape rules
+out the leading suspect from `docs/DOS-STARVATION-AUDIT.md`'s F1 (expensive
+shaping of one long unbroken line): a 128 KiB pathological single-line
+document passes the gate at 2.8 ms p95, while much larger but ordinarily
+paragraphed 1 MiB / 10 MiB documents cost 8-13 ms for a single keystroke.
+That points at something scaling with overall document size or line count —
+most likely a guest-side line/caret lookup that scans rather than seeks —
+not per-call shaping cost. Full diagnosis, the follow-up
+byte-size×line-count×caret-position matrix, and the reference data are in
+`benchmarks/text-latency/README.md`.
+
+The gate stays FAIL until this is root-caused and fixed. The 5 ms target is
+not being relaxed to make this pass, and the fix under investigation is a
+generic guest/host algorithmic one (seek instead of scan), not a reversal of
+the userland-authority pivot: no host document replica, no host-local edit
+shortcut. When the gate passes, the initial failing run is kept, not
+overwritten — a before/after record of the pivot's actual latency behavior
+is more useful than a benchmark that happened to pass on its first run.
+
+### A second, distinct scan bug found by the coverage gap itself
+
+Every workload above measures *insertion* against a large preloaded
+document. Nothing measured *deletion* — and that gap was hiding a second,
+independent `O(document)` bug: `Document::previous_grapheme_boundary`
+(`crates/instar-editor-core/src/lib.rs`) scanned every grapheme from byte 0
+up to the caret on every call, making Backspace `O(caret position)`
+regardless of how well the rest of the editor performed. A document could
+pass every graded insertion workload above while Backspace near its end
+stayed pathological — exactly the failure mode "12 of 15 required workloads
+measured" can hide: a correctly-implemented benchmark suite still has
+whatever gap its own workload list has.
+
+Fixed to a reverse, near-caret traversal (`crop::Rope`'s `Graphemes` is a
+`DoubleEndedIterator`; walking backward from the caret with `next_back()` is
+`O(log n)`, the same complexity class as the rope's own insert/delete, not
+`O(caret position)`). `Document::next_grapheme_boundary` (forward-delete) was
+already near-caret and needed no equivalent fix. Three workloads —
+`backspace_at_end_1mib`, `backspace_at_end_10mib`, `delete_forward_large_doc`
+— now cover deletion the way the original list covers insertion; see
+`benchmarks/text-latency/README.md`'s "Workload coverage" section for the
+full account, including why they're driven by hand-written loops rather than
+the shared `workload!` macro (that macro's per-iteration re-click would
+silently relocate the caret away from the document's end before every
+measured Backspace).
+
+**This is a separate bug from the keystroke-scaling FAIL above, not a fix for
+it.** The leading suspect for that one is a guest-side line/caret *lookup*
+(`primary_line`, `line_of_byte`-style calls) — different code, different
+call path from the grapheme-boundary walk this fix addresses. Re-run the
+gate after both are resolved before expecting the P95_TARGET to pass; fixing
+Backspace alone does not flip the verdict recorded above.

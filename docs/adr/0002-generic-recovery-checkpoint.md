@@ -36,9 +36,12 @@ Two durability tiers are exposed, not three, because a third
 "power-loss-safe" tier cannot be honestly provided or verified from user
 space:
 
-* `buffered` — process-restart-safe. Survives guest trap, ordered-input
-  saturation, and generation replacement. Does not survive host process
-  death.
+* `buffered` — generation-safe. Survives guest trap, ordered-input
+  saturation, and generation replacement, because it never leaves host
+  process memory. Does not survive host process death, and is deliberately
+  not called "process-restart-safe": a restart is definitionally the old
+  process ending, so a tier defined by what survives *within* one process
+  cannot honestly borrow that name.
 * `flushed` — host-process-crash-safe. Persisted via a real durable-flush
   syscall before acknowledgement. Power-loss-safe only insofar as the
   platform's flush syscall is honest, which Instar cannot verify and does

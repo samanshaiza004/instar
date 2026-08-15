@@ -34,40 +34,62 @@ one to trust and the phase log is the one to correct.
                     └──────────────────┘
 ```
 
-Nine crates. The two at the bottom are the only ones a guest can reach, and
-that is the load-bearing fact about the whole diagram.
+Fourteen workspace members. The guest-visible set is deliberately small, but it
+is no longer a single wire-format crate: the layering test permits the two
+protocols plus the optional guest-side SDK and editor core. That distinction is
+the load-bearing fact about the whole diagram.
 
 | Crate | Owns | Never knows about |
 |---|---|---|
-| `instar-ui-protocol` | the wire format: opcodes, `NodeKey`, hard bounds | anything at all — zero dependencies |
+| `instar-ui-protocol` | semantic UI snapshots and neutral Surface input: opcodes, `NodeKey`, hard bounds | anything at all — zero dependencies |
+| `instar-surface-protocol` | the independent Surface scene wire: bounded drawing commands and layout slots | semantic UI, windows, rendering |
+| `instar-editor-core` | optional guest-side document, selection, edit, and undo primitives | host state, WIT, UI semantics |
+| `instar-sdk` | optional guest-side snapshot builder and event router | host, layout, rendering; it depends only on `instar-ui-protocol` |
 | `instar-kernel` | Wasmtime, generations, operations, event delivery | windows, layout, pixels, UI |
 | `instar-ui` | the retained tree, Taffy layout, hit-testing | DPI, windows, the guest |
+| `instar-text-layout` | host-owned immutable text shaping and layout seam | windows, guest policy, rendering backend |
 | `instar-window` | winit translation, DPI conversion | node identity, hit-testing, trees |
 | `instar-paint` | paint intent: scene and command types | how any of it is rasterized |
 | `instar-render-vello-cpu` | a `PaintScene` → premultiplied RGBA8 | windows, the guest, layout |
 | `instar-host` | routing, the metrics barrier, the two-thread bridge, scene lowering | a renderer, a window system, a font |
 | `instar-shell` | the event loop, presentation, the font, the binary | — it is the top |
 | `instar-guest-build` | compiling guests from build scripts | runtime anything; it is a build-dependency |
+| `recovery-harness` | generic checkpoint, journal, checksum, and recovery test support | application UI and runtime policy |
 
 ## Five boundaries, and what each is protecting
 
-### 1. A guest links the wire format and nothing else
+### 1. A guest links only the allowed guest-side set
 
-`instar-ui-protocol` is tiny, has zero dependencies, and is the only Instar
-crate a guest ever links. That is what lets `instar-ui` take on a layout engine
-and `instar-host` take on a renderer: none of it can reach a guest, so none of
-it becomes a compatibility obligation.
+The layering test permits a guest to link only these Instar crates:
+
+```text
+instar-ui-protocol       semantic snapshot and neutral input wire
+instar-surface-protocol  independent Surface scene wire
+instar-editor-core       optional replaceable guest-side editing primitives
+instar-sdk               optional snapshot builder over instar-ui-protocol
+```
+
+The protocols have no host implementation dependencies. `instar-editor-core`
+is intentionally guest-side policy rather than an Instar semantic contract,
+and `instar-sdk` remains a thin convenience layer over the UI protocol. This
+is what lets `instar-ui` take on a layout engine and `instar-host` a renderer:
+neither can reach a guest, so neither becomes a guest compatibility obligation.
 
 Enforced by `crates/instar-shell/tests/layering.rs` as a **subset rule** — the
 set of Instar crates a guest links must be a subset of
-`{instar-ui-protocol}` — rather than as a blocklist. A blocklist stops
-covering the crate that does not exist yet.
+`{instar-ui-protocol, instar-surface-protocol, instar-editor-core, instar-sdk}`
+— rather than as a blocklist. A blocklist stops covering the crate that does
+not exist yet. A guest need not use every allowed crate; host, kernel, layout,
+window, renderer, and shell dependencies remain forbidden.
 
-### 2. The host owns geometry, entirely
+### 2. The host owns semantic UI and window geometry
 
-A guest sends layout *intent*. It cannot express a rectangle, because the
-protocol has no way to encode one — the layout section was removed outright
-rather than deprecated.
+A guest sends layout *intent*. The guest cannot dictate semantic UI/window
+geometry, but a `Surface` may describe Surface-local presentation geometry
+inside the rectangle allocated by the host. The independent Surface scene is
+therefore not a way to position semantic nodes or windows; its rectangles,
+clips, transforms, and text origins are local drawing coordinates consumed
+inside the host-assigned Surface bounds.
 
 ```text
 guest: "a column of these, each stretching across it"
@@ -75,7 +97,8 @@ host:  every number on the screen
 ```
 
 `LayoutSnapshot` is an internal `instar-ui` product, not protocol state. Taffy
-is an implementation detail of one file.
+is an implementation detail of one file. `instar-surface-protocol` is a
+separate presentation wire, not an extension of semantic layout.
 
 The vocabulary is four orthogonal questions, and keeping them orthogonal is the
 design:
@@ -647,13 +670,13 @@ Recorded so it is not mistaken for design:
   has never been checked for whether it is genuinely additive *physical* memory
   across several running apps. A dedicated gate answers that before any
   architectural decision rests on it.
-- **No scrollbar chrome.** Wheel and touchpad scrolling work; there is nothing
-  drawn to drag. Package D, and the completion of `Scroll`.
-- **No focus or keyboard.** Package E, and the point at which generational
-  `NodeKey` earns its place a second time — focus is exactly the kind of
-  long-lived reference that outlives the node it names.
-- **No accessibility.** Package F. `NodeKey::to_accesskit_id` is ready; the
-  mapping is not written.
-- **No SDK.** A guest builds a snapshot through `BatchEncoder` directly, which
-  is tolerable for a counter and is expected not to be for a calculator. The
-  thin SDK grows from what package H finds painful, and from nothing else.
+- **Native accessibility interpretation is not smoke-tested on every target.**
+  The retained projection and AccessKit mapping exist; platform behavior still
+  needs the documented native smoke check.
+- **Native IME candidate-window behavior is not smoke-tested.** Logical
+  candidate geometry is covered through the joined Surface seam; native
+  platform interpretation remains open.
+- **Phase 3 latency closure is pending a valid rerun.** The initial reference
+  benchmark is a provisional failure; the 5 ms target remains in force.
+- **Containment findings remain open.** See `docs/DOS-STARVATION-AUDIT.md` for
+  the active investigation and measurement matrix.

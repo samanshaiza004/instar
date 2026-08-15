@@ -1,12 +1,21 @@
 //! The real subprocess the process-failure tests spawn and kill.
 //!
 //! Never invoked directly by a person. Every mode below ends one of two
-//! ways: a clean `exit(0)` (the "clean restart" scenario), or printing a
-//! `READY` line to stdout and then blocking forever, waiting for the parent
-//! test to have sent a real `SIGKILL` / `TerminateProcess` by the time it
-//! gives up waiting. The blocking modes never exit on their own; if one is
-//! ever observed to exit, that is a bug in the parent test's kill logic, not
-//! in this binary.
+//! ways: a clean `exit(0)` (the "clean restart" / "establish a checkpoint"
+//! scenarios), or printing a `READY` line to stdout and then blocking
+//! forever, waiting for the parent test to have sent a real `SIGKILL` /
+//! `TerminateProcess` by the time it gives up waiting. The blocking modes
+//! never exit on their own; if one is ever observed to exit, that is a bug
+//! in the parent test's kill logic, not in this binary.
+//!
+//! Every mode resumes from whatever is already on disk under `dir`, via
+//! [`recovery_harness::FakeGuest::resume`], rather than starting fresh --
+//! standing in for a real host process restarting against an existing
+//! scope directory. A fresh, empty directory resumes to the same empty
+//! state `open` would produce, so this changes nothing for a first
+//! invocation; a *second* invocation against a directory a previous
+//! `fault_child` run already wrote to is what makes the multi-cycle
+//! "recover, continue, crash again" scenarios possible at all.
 //!
 //! # Why the "mid-write" modes write a *deliberately* incomplete record
 //! rather than racing a real write against a timed kill
@@ -28,7 +37,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use recovery_harness::{Host, RecoveryPolicy};
+use recovery_harness::{FakeGuest, RecoveryPolicy};
 
 fn print_ready() {
     println!("READY");
@@ -48,6 +57,7 @@ fn usage() -> ! {
          modes:\n\
          \x20 exit-after-edits <edit>...\n\
          \x20 block-after-edits <edit>...\n\
+         \x20 establish-checkpoint <edit>...\n\
          \x20 block-mid-journal-write <n_bytes> <edit>... -- <final_edit>\n\
          \x20 block-mid-checkpoint-write <n_bytes> <edit>..."
     );
@@ -65,22 +75,30 @@ fn main() {
         std::process::exit(2);
     });
 
-    let mut host = Host::open(&dir, policy).expect("open host");
+    let mut guest = FakeGuest::resume(&dir, policy).expect("resume guest");
 
     match mode.as_str() {
         "exit-after-edits" => {
             for edit in rest {
-                host.apply_edit(edit.clone()).expect("apply_edit");
+                guest.apply_edit(edit.clone()).expect("apply_edit");
             }
             print_ready();
             std::process::exit(0);
         }
         "block-after-edits" => {
             for edit in rest {
-                host.apply_edit(edit.clone()).expect("apply_edit");
+                guest.apply_edit(edit.clone()).expect("apply_edit");
             }
             print_ready();
             block_forever();
+        }
+        "establish-checkpoint" => {
+            for edit in rest {
+                guest.apply_edit(edit.clone()).expect("apply_edit");
+            }
+            guest.checkpoint().expect("checkpoint");
+            print_ready();
+            std::process::exit(0);
         }
         "block-mid-journal-write" => {
             let Some((n_bytes_arg, rest)) = rest.split_first() else {
@@ -101,29 +119,33 @@ fn main() {
                 .clone();
 
             for edit in setup_edits {
-                host.apply_edit(edit.clone()).expect("apply_edit");
+                guest.apply_edit(edit.clone()).expect("apply_edit");
             }
 
             // The record this edit *would* have become, if the write had
             // completed. Only the first `n_bytes` of it actually reach the
             // file.
-            let next_sequence = host.last_presented_sequence() + 1;
+            let next_sequence = guest.last_presented_sequence() + 1;
             let encoded_len = recovery_harness::journal::JournalRecord {
                 sequence: next_sequence,
                 payload: final_edit.clone().into_bytes(),
             }
             .encode()
+            .expect("test payload fits in a u32 length")
             .len();
             let n_bytes = n_bytes.min(encoded_len);
 
-            host.journal_writer_mut().set_next_fault(
+            guest.journal_writer_mut().set_next_fault(
                 recovery_harness::journal::WriteFault::FailAfterPartialWrite(n_bytes),
             );
             // Deliberately ignored: `FailAfterPartialWrite` always returns
             // `Err` after writing exactly `n_bytes`, which is the point --
             // this is not a bug in the child, it is the fault this mode
-            // exists to produce.
-            let _ = host.journal_writer_mut().append(
+            // exists to produce. Writes through the raw journal writer
+            // directly (not `RecoveryStore::append`) so the injected fault
+            // reaches the file exactly as requested, unmediated by the
+            // store's own bookkeeping.
+            let _ = guest.journal_writer_mut().append(
                 next_sequence,
                 final_edit.as_bytes(),
                 matches!(
@@ -142,19 +164,21 @@ fn main() {
             let n_bytes: usize = n_bytes_arg.parse().expect("n_bytes is a number");
 
             for edit in edits {
-                host.apply_edit(edit.clone()).expect("apply_edit");
+                guest.apply_edit(edit.clone()).expect("apply_edit");
             }
 
             let checkpoint = recovery_harness::checkpoint::Checkpoint {
-                sequence: host.last_presented_sequence(),
-                content: host.document().as_bytes().to_vec(),
+                sequence: guest.last_presented_sequence(),
+                content: guest.document().as_bytes().to_vec(),
             };
             let fault = recovery_harness::checkpoint::WriteFault::FailAfterPartialWrite(n_bytes);
             // Deliberately ignored, for the same reason as above: the
             // partial write and the resulting `Err` are the fault, not an
-            // accident.
-            let _ = recovery_harness::checkpoint::write_checkpoint(
-                &host.checkpoint_path(),
+            // accident. Writes directly through `checkpoint::write_checkpoint_atomic`
+            // (not `RecoveryStore::write_checkpoint`) for the same reason
+            // the journal mode above bypasses `RecoveryStore::append`.
+            let _ = recovery_harness::checkpoint::write_checkpoint_atomic(
+                guest.dir(),
                 &checkpoint,
                 fault,
             );

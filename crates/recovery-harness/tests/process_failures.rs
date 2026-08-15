@@ -14,12 +14,20 @@
 //! this file's own scenarios 8/9 already prove, a bad disk sector), and
 //! this file tests the *reader's* response to that state directly rather
 //! than re-deriving it from a fresh kill every time.
+//!
+//! Two scenarios beyond the original ten were added by the architectural
+//! critique this file's `RecoveryStore`/`FakeGuest` split responds to:
+//! a real crash mid-write to a *second* checkpoint, proving it cannot
+//! destroy a first checkpoint that was already durable (the concrete
+//! failure the old in-place-write mechanism could not rule out), and a
+//! multi-cycle "recover, continue, crash again" run, proving the property
+//! holds repeatedly rather than only once.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use recovery_harness::{Host, recover};
+use recovery_harness::FakeGuest;
 
 struct TestDir(PathBuf);
 
@@ -155,11 +163,7 @@ fn host_process_forcibly_killed_with_nothing_in_flight() {
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let recovered = recover(
-        &Host::journal_path_for(dir.path()),
-        &Host::checkpoint_path_for(dir.path()),
-    )
-    .expect("recover after a real kill");
+    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a real kill");
 
     assert_eq!(
         recovered.content, "hello world",
@@ -192,11 +196,7 @@ fn clean_restart_recovers_exactly_what_was_durable_no_more_no_less() {
         "the child must have exited cleanly, not crashed"
     );
 
-    let recovered = recover(
-        &Host::journal_path_for(dir.path()),
-        &Host::checkpoint_path_for(dir.path()),
-    )
-    .expect("recover after a clean exit");
+    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a clean exit");
 
     assert_eq!(recovered.content, "hello world");
     assert_eq!(recovered.last_recovered_sequence, 2);
@@ -205,8 +205,8 @@ fn clean_restart_recovers_exactly_what_was_durable_no_more_no_less() {
 /// Scenario 8: the process is killed mid-checkpoint-write. The checkpoint
 /// itself is torn and must be refused whole (never partially trusted); the
 /// journal entries the checkpoint was *about to* supersede were never
-/// pruned (`Host::checkpoint` only prunes after a successful write) and
-/// must still be there to fall back on.
+/// pruned (`RecoveryStore::write_checkpoint` only prunes after a successful
+/// write) and must still be there to fall back on.
 #[test]
 fn killed_during_checkpoint_write_falls_back_to_the_untouched_journal() {
     let dir = TestDir::new("kill-mid-checkpoint");
@@ -222,7 +222,7 @@ fn killed_during_checkpoint_write_falls_back_to_the_untouched_journal() {
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let checkpoint_path = Host::checkpoint_path_for(dir.path());
+    let checkpoint_path = FakeGuest::checkpoint_path_for(dir.path());
     let torn_checkpoint = recovery_harness::checkpoint::read_checkpoint_file(&checkpoint_path)
         .expect("read the checkpoint file itself");
     assert_eq!(
@@ -230,14 +230,64 @@ fn killed_during_checkpoint_write_falls_back_to_the_untouched_journal() {
         "a torn checkpoint must decode to nothing, never a partial document"
     );
 
-    let recovered = recover(&Host::journal_path_for(dir.path()), &checkpoint_path)
-        .expect("recover after a torn checkpoint");
+    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a torn checkpoint");
     assert_eq!(
         recovered.content, "seed edit",
         "the journal entry the checkpoint would have superseded is still there, \
          because a checkpoint that never finished writing must not have pruned it"
     );
     assert_eq!(recovered.last_recovered_sequence, 1);
+}
+
+/// New scenario: the process is killed mid-write to a *second* checkpoint,
+/// with a first checkpoint already durably installed. This is the exact
+/// production-shaped scenario the architectural critique identified as
+/// unproven by the old in-place `truncate(true)`-then-write mechanism: that
+/// mechanism truncated the existing checkpoint file before a single byte
+/// of the replacement had landed, so a crash in that window could destroy
+/// the *only* durable copy of the document, not merely leave a torn new
+/// one. The write-tmp/fsync/rename/fsync-parent-dir mechanism in
+/// `checkpoint::write_checkpoint_atomic` never touches `checkpoint.bin`
+/// until the rename, which is atomic -- this test is what would have been
+/// red under the old mechanism and is green under the new one.
+#[test]
+fn a_crash_during_a_second_checkpoint_write_leaves_the_first_checkpoint_intact() {
+    let dir = TestDir::new("checkpoint-b-preserves-checkpoint-a");
+
+    let mut setup = spawn(dir.path(), "durable", &["establish-checkpoint", "checkpoint A content"]);
+    wait_for_ready(&mut setup);
+    let status = setup.wait().expect("wait for clean exit establishing checkpoint A");
+    assert!(status.success());
+
+    let checkpoint_a =
+        recovery_harness::checkpoint::read_checkpoint_file(&FakeGuest::checkpoint_path_for(dir.path()))
+            .expect("read checkpoint A")
+            .expect("checkpoint A must exist after establish-checkpoint");
+
+    // Resume against the same directory (picking up checkpoint A) and get
+    // killed while writing checkpoint B.
+    let mut child = spawn(
+        dir.path(),
+        "durable",
+        &[
+            "block-mid-checkpoint-write",
+            "20",
+            " plus enough more content to make checkpoint B",
+        ],
+    );
+    wait_for_ready(&mut child);
+    let status = kill_and_reap(&mut child);
+    assert_was_really_killed(&status);
+
+    let checkpoint_after =
+        recovery_harness::checkpoint::read_checkpoint_file(&FakeGuest::checkpoint_path_for(dir.path()))
+            .expect("read checkpoint after the crash");
+    assert_eq!(
+        checkpoint_after,
+        Some(checkpoint_a),
+        "a crash mid-write to the *next* checkpoint must never destroy the \
+         previous, already-durable checkpoint"
+    );
 }
 
 /// Scenario 9: the process is killed mid-journal-append. Everything durably
@@ -263,11 +313,7 @@ fn killed_during_journal_append_loses_only_the_interrupted_record() {
     let status = kill_and_reap(&mut child);
     assert_was_really_killed(&status);
 
-    let recovered = recover(
-        &Host::journal_path_for(dir.path()),
-        &Host::checkpoint_path_for(dir.path()),
-    )
-    .expect("recover after a torn journal append");
+    let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document after a torn journal append");
 
     assert_eq!(
         recovered.content, "onetwo",
@@ -286,6 +332,58 @@ fn killed_during_journal_append_loses_only_the_interrupted_record() {
     );
 }
 
+/// New scenario, the direct realization of the architectural critique's
+/// "multi-crash 'recover, continue, crash again'" request: single
+/// failure-then-inspect tests cannot see a bug where a resumed writer
+/// starts from the wrong sequence and either loses or duplicates data on
+/// the *next* crash. Three real kills in a row against the same directory,
+/// each one resuming from where the last left off via `FakeGuest::resume`.
+#[test]
+fn recovering_then_continuing_then_crashing_again_does_not_lose_or_duplicate_anything() {
+    let dir = TestDir::new("multi-cycle");
+
+    let mut child1 = spawn(dir.path(), "durable", &["block-after-edits", "one", "two"]);
+    wait_for_ready(&mut child1);
+    let status1 = kill_and_reap(&mut child1);
+    assert_was_really_killed(&status1);
+
+    let after_cycle_1 = FakeGuest::recover_document(dir.path()).expect("recover after cycle 1");
+    assert_eq!(after_cycle_1.content, "onetwo");
+    assert_eq!(after_cycle_1.last_recovered_sequence, 2);
+    assert_eq!(after_cycle_1.sequence_gap, None);
+
+    // Cycle 2: a fresh process resumes the same directory and continues --
+    // its edit's sequence must pick up from 3, not restart at 1 and collide
+    // with what cycle 1 already durably wrote.
+    let mut child2 = spawn(dir.path(), "durable", &["block-after-edits", "three"]);
+    wait_for_ready(&mut child2);
+    let status2 = kill_and_reap(&mut child2);
+    assert_was_really_killed(&status2);
+
+    let after_cycle_2 = FakeGuest::recover_document(dir.path()).expect("recover after cycle 2");
+    assert_eq!(
+        after_cycle_2.content, "onetwothree",
+        "continuing after a recovery must not lose cycle 1's edits nor duplicate them"
+    );
+    assert_eq!(after_cycle_2.last_recovered_sequence, 3);
+    assert_eq!(
+        after_cycle_2.sequence_gap, None,
+        "sequences must stay contiguous across a recover-then-continue cycle"
+    );
+
+    // Cycle 3: crash again, proving the property holds repeatedly, not
+    // just once.
+    let mut child3 = spawn(dir.path(), "durable", &["block-after-edits", "four"]);
+    wait_for_ready(&mut child3);
+    let status3 = kill_and_reap(&mut child3);
+    assert_was_really_killed(&status3);
+
+    let after_cycle_3 = FakeGuest::recover_document(dir.path()).expect("recover after cycle 3");
+    assert_eq!(after_cycle_3.content, "onetwothreefour");
+    assert_eq!(after_cycle_3.last_recovered_sequence, 4);
+    assert_eq!(after_cycle_3.sequence_gap, None);
+}
+
 /// Scenario 10: a corrupted or truncated recovery record, examined directly
 /// rather than freshly produced by a kill -- corruption is a property of
 /// bytes, reachable by more causes than a crash mid-write (scenarios 8 and
@@ -298,17 +396,17 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
     // third record, taken alone, would still be well-formed.
     {
         let dir = TestDir::new("corrupt-mid-record");
-        let mut host = Host::open(
+        let mut guest = FakeGuest::open(
             dir.path(),
             recovery_harness::RecoveryPolicy::JOURNAL_EVERY_EDIT_DURABLE,
         )
-        .expect("open host");
-        host.apply_edit("aaa").expect("apply_edit");
-        host.apply_edit("bbb").expect("apply_edit");
-        host.apply_edit("ccc").expect("apply_edit");
-        drop(host);
+        .expect("open guest");
+        guest.apply_edit("aaa").expect("apply_edit");
+        guest.apply_edit("bbb").expect("apply_edit");
+        guest.apply_edit("ccc").expect("apply_edit");
+        drop(guest);
 
-        let journal_path = Host::journal_path_for(dir.path());
+        let journal_path = FakeGuest::journal_path_for(dir.path());
         let mut bytes = std::fs::read(&journal_path).expect("read journal");
         // Flip one byte inside the payload of the second record. Each
         // record here is FIXED_OVERHEAD(20) + payload_len(3) = 23 bytes;
@@ -319,9 +417,8 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
         bytes[flip_at] ^= 0xFF;
         std::fs::write(&journal_path, &bytes).expect("write corrupted journal");
 
-        let checkpoint_path = Host::checkpoint_path_for(dir.path());
-        let first = recover(&journal_path, &checkpoint_path).expect("recover (first pass)");
-        let second = recover(&journal_path, &checkpoint_path).expect("recover (second pass)");
+        let first = FakeGuest::recover_document(dir.path()).expect("recover_document (first pass)");
+        let second = FakeGuest::recover_document(dir.path()).expect("recover_document (second pass)");
 
         assert_eq!(
             first, second,
@@ -342,21 +439,20 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
     // one record's fixed header. Must not panic, must recover nothing.
     {
         let dir = TestDir::new("corrupt-header-truncated");
-        let mut host = Host::open(
+        let mut guest = FakeGuest::open(
             dir.path(),
             recovery_harness::RecoveryPolicy::JOURNAL_EVERY_EDIT_DURABLE,
         )
-        .expect("open host");
-        host.apply_edit("hello").expect("apply_edit");
-        drop(host);
+        .expect("open guest");
+        guest.apply_edit("hello").expect("apply_edit");
+        drop(guest);
 
-        let journal_path = Host::journal_path_for(dir.path());
+        let journal_path = FakeGuest::journal_path_for(dir.path());
         recovery_harness::checkpoint::write_raw(&journal_path, &[0xDE, 0xAD, 0xBE])
             .expect("truncate journal to 3 garbage bytes");
 
-        let checkpoint_path = Host::checkpoint_path_for(dir.path());
-        let recovered = recover(&journal_path, &checkpoint_path)
-            .expect("recover must not error, even on a file this short");
+        let recovered = FakeGuest::recover_document(dir.path())
+            .expect("recover_document must not error, even on a file this short");
         assert_eq!(recovered.content, "");
         assert_eq!(recovered.last_recovered_sequence, 0);
         assert_eq!(recovered.applied_from_journal, 0);
@@ -370,10 +466,9 @@ fn corrupted_or_truncated_recovery_record_is_handled_deterministically() {
     // must report no fault at all (an empty journal is not a torn one).
     {
         let dir = TestDir::new("corrupt-empty-file");
-        let journal_path = Host::journal_path_for(dir.path());
+        let journal_path = FakeGuest::journal_path_for(dir.path());
         std::fs::write(&journal_path, []).expect("write empty journal");
-        let checkpoint_path = Host::checkpoint_path_for(dir.path());
-        let recovered = recover(&journal_path, &checkpoint_path).expect("recover an empty journal");
+        let recovered = FakeGuest::recover_document(dir.path()).expect("recover_document an empty journal");
         assert_eq!(recovered.content, "");
         assert_eq!(recovered.tail_fault, None, "empty is healthy, not corrupt");
     }
