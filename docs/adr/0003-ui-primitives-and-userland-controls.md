@@ -64,10 +64,10 @@ widget. It may contain an icon, text, or arbitrary ordinary children.
 
 The eventual host mechanism may own:
 
-* hit testing and disabled gating;
-* pointer press/release and keyboard activation mechanics;
-* focus, hover, pressed, and focus-visible state; and
-* one semantic `Activate(NodeKey)` event for a completed activation.
+- hit testing and disabled gating;
+- pointer press/release and keyboard activation mechanics;
+- focus, hover, pressed, and focus-visible state; and
+- one semantic `Activate(NodeKey)` event for a completed activation.
 
 The guest owns the children, enabled/value state, appearance description, and
 the application response to `Activate`. `Action` is deliberately not assigned
@@ -154,15 +154,15 @@ This ADR records direction only. The implementation sequence is:
 Each roadmap package must carry a proof that would fail at the ownership
 boundary it protects:
 
-| Package | Boundary mutant | Required proof |
-|---|---|---|
-| A — Action | Force Action to accessibility role `Button`, or make it a visual host widget | A menu-row fixture shares activation mechanics but retains distinct semantics and arbitrary children without a new widget kind |
-| B — transient state | Hover or pressed state wakes the guest | Pointer movement/press changes retained presentation with zero guest event and no application-state mutation |
-| C — variants | Host invents a new state or mutates a guest value | Only the five admitted variants are selectable; a Checkbox value remains unchanged while host state changes |
-| D — replacement proof | A first-party Checkbox requires a new host `NodeKind` | The guest control composes existing public primitives and passes the same host layering test as a third-party replacement |
-| E — semantics | AccessKit types leak into the guest protocol | Wire-level metadata remains Instar-owned and portable; no guest dependency or field names an AccessKit type |
-| F — Surface a11y | Host infers semantics from paint commands | A Surface scene with misleading rectangles/text yields no semantic update without an explicit guest projection |
-| G — coherency | Semantic revision drifts from the displayed visual revision | Replacing either projection independently is refused or held until the explicit revision relationship is satisfied |
+| Package               | Boundary mutant                                                              | Required proof                                                                                                                 |
+| --------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| A — Action            | Force Action to accessibility role `Button`, or make it a visual host widget | A menu-row fixture shares activation mechanics but retains distinct semantics and arbitrary children without a new widget kind |
+| B — transient state   | Hover or pressed state wakes the guest                                       | Pointer movement/press changes retained presentation with zero guest event and no application-state mutation                   |
+| C — variants          | Host invents a new state or mutates a guest value                            | Only the five admitted variants are selectable; a Checkbox value remains unchanged while host state changes                    |
+| D — replacement proof | A first-party Checkbox requires a new host `NodeKind`                        | The guest control composes existing public primitives and passes the same host layering test as a third-party replacement      |
+| E — semantics         | AccessKit types leak into the guest protocol                                 | Wire-level metadata remains Instar-owned and portable; no guest dependency or field names an AccessKit type                    |
+| F — Surface a11y      | Host infers semantics from paint commands                                    | A Surface scene with misleading rectangles/text yields no semantic update without an explicit guest projection                 |
+| G — coherency         | Semantic revision drifts from the displayed visual revision                  | Replacing either projection independently is refused or held until the explicit revision relationship is satisfied             |
 
 ## Non-goals
 
