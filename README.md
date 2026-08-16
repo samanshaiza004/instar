@@ -1,56 +1,86 @@
 # Instar
 
-Instar is a native host for untrusted, architecture-independent WebAssembly
-application components. Applications describe semantic retained UI through a
-typed WIT contract; the host owns rendering, input, and the boundary around
+Instar was a native host for untrusted, architecture-independent WebAssembly
+application components. Applications described semantic retained UI through a
+typed WIT contract; the host owned rendering, input, and the boundary around
 every guest turn.
 
 [Website](https://instar.samanshaiza.com/) ·
 [Install guide](https://instar.samanshaiza.com/docs/getting-started/install) ·
 [Documentation](https://instar.samanshaiza.com/docs/)
 
-> **Status: early. Phase 1 complete; not stable.**
+> **Status: on hiatus, indefinitely. Kept as a reference, not developed
+> further in its current form.**
 >
-> Instar runs a real WebAssembly component in a real window: a guest that sits
-> idle at zero cost, is woken by a click, describes an interface it owns no
-> geometry in, and gets it rendered — and when it dies, the host says so on a
-> surface the guest cannot influence.
+> ### Why
 >
-> That is a validated foundation, not a product. The public API, the WIT
-> protocol, and the crate layout are all still expected to change, and there is
-> no compatibility promise of any kind.
+> Instar's thesis was that a whole desktop application should live behind a
+> Wasm Component Model boundary. Three phases of work — async runtime,
+> retained UI, and a host-owned text replica — went into proving that
+> boundary could carry a real application without giving up latency or
+> ownership clarity. It can. That was never the question that mattered.
 >
-> What Phase 1 proved, cost, and left as scaffolding:
-> [docs/PHASE-1-RESULTS.md](docs/PHASE-1-RESULTS.md).
+> The question that mattered: **what does the boundary buy, for an
+> application the host itself is writing?** Every hard problem the project
+> solved — authority reconciliation, generational teardown, resync after a
+> forced desync, host/guest revision protocols, IME across a process
+> boundary, epoch interruption, capability leases — exists *only because a
+> boundary is there*. None of it is free, all of it is real engineering, and
+> none of it would exist in a native Rust application built directly on the
+> same underlying stack (Taffy, Parley, Vello, AccessKit).
 >
-> Phase 2 built the retained UI foundation on top of it: full snapshots
-> diffed against a retained tree, generational node identity, a layout
-> vocabulary with rows, stacks, overlap, visibility and clipping, scroll
-> viewports the host owns — so a wheel moves the view with no Wasm round trip
-> — scrollbar chrome, focus and keyboard traversal, AccessKit accessibility,
-> and a style vocabulary sorted by what a change to it can invalidate.
+> The one property that justifies paying that cost is running code the host
+> does not trust. The README described Instar as a host for *untrusted*
+> components from the start, but nothing built in Phases 1–3 exercised that:
+> every guest was first-party Rust, written by the same person building the
+> host, with no capability model, no permission story, and no adversarial
+> input this project treated as real. The tax was paid; the thing it pays
+> for was never built.
 >
-> Two applications then went looking for what that missed. `guests/gallery` is
-> an integration harness first and a visual catalog second; `guests/calculator`
-> answers the different question of whether any of it is pleasant to write
-> against. Between them they found eight defects no package-level test could
-> have caught, and produced the wire's text alignment and flex basis.
+> Phase 3 made this legible rather than hiding it. Text is the most
+> latency-sensitive interaction in a desktop application, and putting it
+> behind the boundary meant either the host owning a replica — solved, at
+> real cost, in `docs/PHASE-3.md` — or the guest owning it, which reintroduces
+> the round-trip the whole architecture existed to avoid. Both are
+> consequences of the boundary. Choosing a text editor as the flagship
+> application was choosing the hardest possible case to validate a premise
+> that was never actually being tested.
 >
-> **Phase 2 is closed** at the `instar-phase-2` tag. What it froze — the green
-> gate, latency, binary size, runtime memory, the protocol version and the
-> whole supported UI vocabulary:
-> [docs/PHASE-2-RESULTS.md](docs/PHASE-2-RESULTS.md). How it got there:
-> [docs/PHASE-2.md](docs/PHASE-2.md).
+> Strip the boundary out and what remains is a retained-mode GUI stack on
+> Taffy, Parley, Vello, and AccessKit — which is also what
+> [Xilem/Masonry](https://github.com/linebender/xilem) is, natively, with no
+> IPC boundary in the middle. Instar's differentiator over that stack was a
+> boundary that cost latency and bought nothing exercised.
 >
-> One gate is outstanding and says so: native accessibility behaviour has not
-> been formally smoke-tested on any platform
-> ([docs/F4-SMOKE.md](docs/F4-SMOKE.md)).
+> ### What was real
 >
-> Next is text, which is where the ownership model gets its real test:
+> The engineering discipline held up under its own pressure: Gate 0 tested
+> the async premise before anything was built on it
+> ([docs/GATE-0.md](docs/GATE-0.md)); the crate seams stayed honest under
+> real load (the kernel has no render dependency, `instar-ui` never sees DPI,
+> `instar-window` never sees a `NodeKey`); wrong decisions were recorded
+> rather than quietly reverted
+> ([docs/DESIGN-LEDGER.md](docs/DESIGN-LEDGER.md)); provisional numbers were
+> labeled provisional. That discipline is the part of this repository worth
+> reading regardless of the verdict above.
+>
+> ### Where this goes, if it goes anywhere
+>
+> Not as a runtime every first-party Instar application runs inside. If this
+> resumes, it resumes narrower: a sandboxed extension/plugin host for code
+> the *application* deliberately does not trust — closer to how Zed runs its
+> extensions in Wasm while keeping its own editor native. That version has a
+> concrete user story (a third-party plugin that must not read arbitrary
+> files or hang the host) instead of an architectural one, and most of the
+> kernel — generations, capability leases, resource accounting, teardown —
+> is directly reusable there. Everything upstream of that decision (a
+> first-party application living inside the boundary) is what stops here.
+>
+> The phase documents are the historical record of how each decision was
+> reached, including the ones that turned out wrong:
+> [docs/PHASE-1-RESULTS.md](docs/PHASE-1-RESULTS.md),
+> [docs/PHASE-2-RESULTS.md](docs/PHASE-2-RESULTS.md),
 > [docs/PHASE-3.md](docs/PHASE-3.md).
->
-> What Instar deliberately does *not* have, and why:
-> [docs/DESIGN-LEDGER.md](docs/DESIGN-LEDGER.md).
 
 ## Why the rewrite
 
